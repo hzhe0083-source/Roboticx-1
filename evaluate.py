@@ -64,10 +64,15 @@ def evaluate_policy(
             conditions.append(condition)
         conditions = torch.stack(conditions, dim=1)  # [B, T, H, D]
 
-        predictions = model.sample_actions(
-            conditions.reshape(-1, conditions.shape[-2], conditions.shape[-1]),
-            steps=flow_steps,
-        )  # [B*T, H, A]
+        if getattr(model.config, "direct_head", False):
+            predictions = model.decode_actions(
+                conditions.reshape(-1, conditions.shape[-2], conditions.shape[-1])
+            )
+        else:
+            predictions = model.sample_actions(
+                conditions.reshape(-1, conditions.shape[-2], conditions.shape[-1]),
+                steps=flow_steps,
+            )  # [B*T, H, A]
         predicted = predictions.reshape(
             conditions.shape[0], conditions.shape[1], predictions.shape[-2], -1
         )

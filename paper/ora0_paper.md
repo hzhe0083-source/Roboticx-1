@@ -534,8 +534,11 @@ participates in decisions (logs/mw_va2_v4_ablation.log).
 **Closed loop (49 tasks × 10 trials, fixed seeds).** The chain of
 improvements: 7.1% [2.7%, 12.7%] (35/490, single-start data, coverage
 limited) → 16.3% [9.4%, 24.1%] (80/490, multi-start full-coverage rebuild)
-→ 17.8% [11.0%, 25.3%] (87/490, + Qwen-conditioned action queries). The
-residual gap to literature (SmolVLA 57.3% / Evo-1 80.6%, macro-4 protocol)
+→ 17.8% [11.0%, 25.3%] (87/490, + Qwen-conditioned action queries) →
+21.4% [13.7%, 29.0%] (105/490, executed-action clip contract, Sec. 4) →
+**31.8% [22.6%, 41.4%] (156/490, + direct deterministic head on executed
+labels, v5 contract; logs/mw_v5_direct_closedloop.log)**. The residual gap
+to literature (SmolVLA 57.3% / Evo-1 80.6%, macro-4 protocol)
 is attributed in Sec. 6.5 to exposure (≈40× fewer decision presentations),
 the 6-step open-loop execution protocol, and the flat 64-token visual
 pooling; the VA2 architecture (Sec. 3: causal-decomposed memory, sequential

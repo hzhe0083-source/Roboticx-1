@@ -78,6 +78,17 @@ class VACompoundConfig:
     # 下对 K 无梯度，λc 默认 0）。需要 direct_head；默认 False 完全兼容。
     c2_controller: bool = False
     c2_control_dim: int = 16  # 控制状态维度（P 与 c̄ 的投影维度）
+    # 第二轮完整版架构重构（2026-08-08，默认全关，现有行为逐字节不变）：
+    # learned role queries 替代语言 mask-weighted mean 摘要（TaskResampler 与
+    # action_query_cond 共享同一 RoleQueryResampler 实例）。
+    role_query: bool = False
+    role_query_tokens: int = 16
+    # 双注意力（非 sequential 层）：动作 query 拆 physical（无语言列）与
+    # semantic（仅语言列）两条注意力，融合门 g_A 初始 < 0.2。
+    dual_attention: bool = False
+    # flow head 逐层读语义上下文（compile readout tokens；flow_cond=adaln
+    # 时经 cross-attn 注入）。
+    flow_semantic: bool = False
 
     def __post_init__(self) -> None:
         if self.hidden_dim % self.num_heads:
@@ -96,6 +107,8 @@ class VACompoundConfig:
             raise ValueError("c2_controller requires direct_head")
         if self.c2_control_dim < 1:
             raise ValueError("c2_control_dim must be positive")
+        if self.role_query_tokens < 1:
+            raise ValueError("role_query_tokens must be positive")
 
 
 @dataclass(frozen=True)
@@ -283,14 +296,107 @@ class EvidenceGate(nn.Module):
         return x.transpose(1, 2).reshape(B, N, Hh * hd)
 
 
+class RoleQueryResampler(nn.Module):
+    """Learned role queries over the language flat key（第二轮架构重构 2026-08-08）。
+
+    ``n_role`` 个 learned role queries（hidden 空间，normal σ=0.02）对 layer-0
+    投影后的语言 flat key ``[B, L, hidden_dim]``（即 TaskResampler /
+    action_query_cond 使用的形式）做 masked multi-head cross-attention + FFN，
+    输出 ``[B, n_role, hidden_dim]`` role tokens。``config.role_query=True`` 时
+    policy 构造一个共享实例（``policy.role_resampler``）：TaskResampler 与
+    action_query_cond 分支各自取 role 输出的 token 均值作为摘要（实现自定：
+    取均值保持 [B, hidden] 摘要形状，与旧路径的 MLP 结构完全复用）。
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        language_dim: int,
+        n_role: int,
+        num_heads: int = 8,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if n_role < 1:
+            raise ValueError("n_role must be positive")
+        if hidden_dim % num_heads:
+            raise ValueError("hidden_dim must be divisible by num_heads")
+        self.n_role = n_role
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.role_queries = nn.Parameter(torch.empty(n_role, hidden_dim))
+        nn.init.normal_(self.role_queries, std=0.02)
+        self.norm_q = nn.LayerNorm(hidden_dim)
+        self.norm_k = nn.LayerNorm(hidden_dim)
+        self.q = nn.Linear(hidden_dim, hidden_dim)
+        self.k = nn.Linear(hidden_dim, hidden_dim)
+        self.v = nn.Linear(hidden_dim, hidden_dim)
+        self.out = nn.Linear(hidden_dim, hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, 2 * hidden_dim),
+            nn.GELU(),
+            nn.Linear(2 * hidden_dim, hidden_dim),
+        )
+
+    def forward(self, language_key: Tensor, language_mask: Tensor) -> Tensor:
+        """language_key: [B, L, hidden]; language_mask: [B, L] 布尔/数值。
+
+        Returns role tokens [B, n_role, hidden] in the language_key dtype
+        (padding positions are masked out of the attention weights).
+        """
+        if language_key.ndim != 3:
+            raise ValueError("language_key must have shape [batch, tokens, hidden_dim]")
+        batch, length, dim = language_key.shape
+        if tuple(language_mask.shape) != (batch, length):
+            raise ValueError("language_mask must match [batch, language_tokens]")
+        target_dtype = self.q.weight.dtype
+        key = language_key.to(dtype=target_dtype)
+        query = self._heads(
+            self.q(self.norm_q(self.role_queries[None].expand(batch, -1, -1)))
+        )
+        k = self._heads(self.k(self.norm_k(key)))
+        v = self._heads(self.v(key))
+        scores = torch.matmul(query.float(), k.float().transpose(-1, -2)) / math.sqrt(
+            dim // self.num_heads
+        )
+        scores = scores.masked_fill(
+            ~language_mask.bool()[:, None, None, :], torch.finfo(scores.dtype).min
+        )
+        weights = torch.softmax(scores, dim=-1).to(dtype=target_dtype)
+        weights = F.dropout(weights, p=self.dropout, training=self.training)
+        out = self._from_heads(torch.matmul(weights, v))
+        out = self.out(out)
+        out = out + self.ffn(self.norm(out))
+        return out.to(dtype=language_key.dtype)
+
+    def _heads(self, x: Tensor) -> Tensor:
+        B, N, H = x.shape
+        return x.view(B, N, self.num_heads, H // self.num_heads).transpose(1, 2)
+
+    def _from_heads(self, x: Tensor) -> Tensor:
+        B, Hh, N, hd = x.shape
+        return x.transpose(1, 2).reshape(B, N, Hh * hd)
+
+
 class TaskResampler(nn.Module):
     """Language-conditioned task-workspace initialization (2026-08-07).
 
     T_0 = task_queries + MLP(mask-weighted language summary), run once per
     episode so the workspace starts from the language contract.
+
+    ``role_resampler``（第二轮架构重构，config.role_query=True 时传入）非 None
+    时，摘要改为 RoleQueryResampler 输出的 token 均值（role tokens 已通过
+    masked cross-attention 聚合语言；取均值保持 [B, hidden] 摘要形状，MLP 结构
+    复用）。否则走旧版 mask-weighted mean（逐字节不变）。
     """
 
-    def __init__(self, hidden_dim: int, n_task: int) -> None:
+    def __init__(
+        self,
+        hidden_dim: int,
+        n_task: int,
+        role_resampler: RoleQueryResampler | None = None,
+    ) -> None:
         super().__init__()
         self.task_queries = nn.Parameter(torch.empty(n_task, hidden_dim))
         nn.init.normal_(self.task_queries, std=0.02)
@@ -299,11 +405,16 @@ class TaskResampler(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
+        self.role_resampler = role_resampler
 
     def forward(self, language_key: Tensor, language_mask: Tensor) -> Tensor:
         """language_key: [B, tokens, hidden] (layer-0 projected key, flattened)."""
-        denom = language_mask.float().sum(-1, keepdim=True).clamp_min(1.0)
-        summary = (language_key * language_mask[:, :, None]).sum(1) / denom
+        if self.role_resampler is not None:
+            role_out = self.role_resampler(language_key, language_mask)
+            summary = role_out.mean(dim=1)
+        else:
+            denom = language_mask.float().sum(-1, keepdim=True).clamp_min(1.0)
+            summary = (language_key * language_mask[:, :, None]).sum(1) / denom
         return self.task_queries[None] + self.mlp(summary[:, None, :])
 
 
@@ -483,6 +594,7 @@ class VACouplingLayer(nn.Module):
         qk_norm: bool = False,
         attention_variant: str = "flat",
         sequential: bool = False,
+        dual_attention: bool = False,
     ) -> None:
         super().__init__()
         self.sequential = sequential
@@ -494,6 +606,12 @@ class VACouplingLayer(nn.Module):
         self.dropout = dropout
         self.qk_norm = qk_norm
         self.attention_variant = attention_variant
+        # 双注意力（第二轮架构重构 2026-08-08）：仅非 sequential 层（policy
+        # 构造时 sequential 层传 False）。动作 query 的 physical 更新不含语言列，
+        # 语言列走独立 semantic 注意力；融合门 g_A = σ(G([A_mean, lang_mean]))。
+        # 末层 zero-init + 负偏置 → 初始 g ≈ σ(−2) ≈ 0.119 < 0.2（训练起点
+        # 接近纯 physical，语义通道从零开始学习）。
+        self.dual_attention = dual_attention
         self.save_attention = False  # 可选调试开关：记录 attention weights（默认关闭，不影响训练）
 
         self.norm_v_attn = nn.LayerNorm(hidden_dim)
@@ -530,6 +648,16 @@ class VACouplingLayer(nn.Module):
         self.norm_a_ffn = nn.LayerNorm(hidden_dim)
         self.ffn_v = self._make_ffn(hidden_dim, dropout)
         self.ffn_a = self._make_ffn(hidden_dim, dropout)
+
+        if dual_attention:
+            self.sem_gate = nn.Sequential(
+                nn.Linear(2 * hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, 1),
+            )
+            nn.init.zeros_(self.sem_gate[-1].weight)
+            nn.init.zeros_(self.sem_gate[-1].bias)
+            self.sem_gate[-1].bias.data.fill_(-2.0)
 
     @staticmethod
     def _make_ffn(hidden_dim: int, dropout: float) -> nn.Sequential:
@@ -689,7 +817,24 @@ class VACouplingLayer(nn.Module):
         self.last_max_logit = float(
             scores.detach().masked_fill(~allowed, float("-inf")).amax()
         )
-        weights = torch.softmax(scores, dim=-1).to(dtype=value.dtype)
+        if self.dual_attention:
+            weights, sem_update = self._dual_attention(
+                scores,
+                query,
+                key,
+                value,
+                action,
+                language_mask,
+                n_visual,
+                n_memory,
+                n_action,
+                n_language,
+                n_task,
+                n_state,
+            )
+        else:
+            weights = torch.softmax(scores, dim=-1).to(dtype=value.dtype)
+            sem_update = None
         weights = F.dropout(weights, p=self.dropout, training=self.training)
         update = self._from_heads(torch.matmul(weights, value))
 
@@ -701,6 +846,10 @@ class VACouplingLayer(nn.Module):
         else:
             update_v, update_a = update.split((n_query_v, n_query_a), dim=1)
             update_t = None
+        if sem_update is not None:
+            # 双注意力：g_A 已乘入 sem_update（见 _dual_attention），动作行
+            # 更新 = physical 更新 + g_A ⊙ semantic 更新，两者共用 out_a 投影。
+            update_a = update_a + sem_update
         visual = visual + self.out_v(update_v)
         action = action + self.out_a(update_a)
         visual = visual + self.ffn_v(self.norm_v_ffn(visual))
@@ -721,6 +870,76 @@ class VACouplingLayer(nn.Module):
                 n_state,
             )
         return visual, action, task_out
+
+    def _dual_attention(
+        self,
+        scores: Tensor,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        action: Tensor,
+        language_mask: Tensor,
+        n_visual: int,
+        n_memory: int,
+        n_action: int,
+        n_language: int,
+        n_task: int,
+        n_state: int,
+    ) -> tuple[Tensor, Tensor]:
+        """双注意力拆分（第二轮架构重构 2026-08-08，仅非 sequential 层）。
+
+        Key 布局 [visual, memory, task, action, language, state]（与 forward
+        中 key_parts 一致；语言列区间 = visual+memory+task+action 之后）。
+        返回 (weights, sem_update)：
+        - ``weights``：physical 权重——动作 query 行在共享 softmax 中屏蔽
+          语言列（physical 更新不读语言），其余 query 行（视觉/task）保持
+          原共享路径（含语言列，不动；uni_a 的视觉行规则照旧）；
+        - ``sem_update``：动作 query 对语言列的独立注意力更新 [B, n_action,
+          hidden]，已乘融合门 g_A = σ(G([A_mean, lang_mean]))，G 为小 MLP
+          （2*hidden → hidden → 1），末层 zero-init + bias=-2 → 初始 g ≈ 0.119
+          < 0.2。``lang_mean`` 是语言 key 的 mask 加权均值（按 [B, L, hidden]
+          还原）。
+        """
+        lang_start = n_visual + n_memory + n_task + n_action
+        lang_end = lang_start + n_language
+        action_start = n_visual
+        action_end = n_visual + n_action
+        physical = scores.clone()
+        physical[:, :, action_start:action_end, lang_start:lang_end] = torch.finfo(
+            scores.dtype
+        ).min
+        weights = torch.softmax(physical, dim=-1).to(dtype=value.dtype)
+        lang_key = key[:, :, lang_start:lang_end]
+        lang_value = value[:, :, lang_start:lang_end]
+        sem_scores = torch.matmul(
+            query[:, :, action_start:action_end].float(),
+            lang_key.float().transpose(-1, -2),
+        ) * self.scale
+        lang_mask = language_mask.to(device=query.device, dtype=torch.bool)
+        sem_scores = sem_scores.masked_fill(
+            ~lang_mask[:, None, None, :], torch.finfo(sem_scores.dtype).min
+        )
+        sem_weights = torch.softmax(sem_scores, dim=-1).to(dtype=value.dtype)
+        sem_weights = F.dropout(sem_weights, p=self.dropout, training=self.training)
+        sem_update = self._from_heads(torch.matmul(sem_weights, lang_value))
+        flat_lang = lang_key.transpose(1, 2).reshape(
+            query.shape[0], -1, self.hidden_dim
+        )
+        denom = language_mask.float().sum(-1, keepdim=True).clamp_min(1.0)
+        lang_mean = (flat_lang * language_mask[:, :, None]).sum(1) / denom
+        gate_dtype = next(self.sem_gate.parameters()).dtype
+        gate = torch.sigmoid(
+            self.sem_gate(
+                torch.cat(
+                    (
+                        action.mean(dim=1).to(dtype=gate_dtype),
+                        lang_mean.to(dtype=gate_dtype),
+                    ),
+                    dim=-1,
+                )
+            )
+        ).to(dtype=sem_update.dtype)  # [B, 1]
+        return weights, sem_update * gate[:, None, :]
 
     def _attend(
         self,
@@ -999,11 +1218,17 @@ class FlowMatchingHead(nn.Module):
         num_layers: int,
         dropout: float,
         flow_cond: str = "entry",
+        semantic_in_dim: int | None = None,
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.flow_cond_mode = flow_cond
+        # 第二轮架构重构：语义上下文（compile readout tokens，语言空间
+        # language_dim）→ hidden 空间的逐层 cross-attn k/v 投影。None = 关闭
+        # （flow_semantic=False 时 policy 不传；传入的 semantic_context 必须
+        # 是 hidden_dim 空间）。
+        self.semantic_in_dim = semantic_in_dim
         self.action_projection = nn.Linear(action_dim, hidden_dim)
         self.time_projection = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim * 2),
@@ -1048,6 +1273,8 @@ class FlowMatchingHead(nn.Module):
             for mlp in self.ada_mlps:
                 nn.init.zeros_(mlp.weight)
                 nn.init.zeros_(mlp.bias)
+        if semantic_in_dim is not None:
+            self.semantic_proj = nn.Linear(semantic_in_dim, hidden_dim)
 
         half_dim = hidden_dim // 2
         denominator = max(half_dim - 1, 1)
@@ -1072,11 +1299,33 @@ class FlowMatchingHead(nn.Module):
         action_condition: Tensor,
         noisy_actions: Tensor,
         flow_time: Tensor,
+        semantic_context: Tensor | None = None,
     ) -> Tensor:
+        """``semantic_context``（第二轮架构重构 2026-08-08）: 语义上下文
+        [B, M, D]（compile readout tokens，D = semantic_in_dim，语言空间）;
+        adaln 分支先经 ``semantic_proj`` 投影到 hidden，再与 action_condition
+        拼接为 cross-attn 的 k/v（逐层读语义上下文）。None 时与旧行为逐位
+        一致。entry 分支无逐层 cross-attn，该参数被忽略（传入不报错）。
+        """
         if noisy_actions.ndim != 3:
             raise ValueError("noisy_actions must have shape [batch, horizon, action_dim]")
         if noisy_actions.shape[:2] != action_condition.shape[:2]:
             raise ValueError("noisy_actions batch/horizon must match action_condition")
+        if semantic_context is not None:
+            context_dim = (
+                self.semantic_in_dim
+                if self.semantic_in_dim is not None
+                else action_condition.shape[-1]
+            )
+            if (
+                semantic_context.ndim != 3
+                or semantic_context.shape[0] != action_condition.shape[0]
+                or semantic_context.shape[-1] != context_dim
+            ):
+                raise ValueError(
+                    "semantic_context must have shape [batch, tokens, hidden_dim] "
+                    "matching action_condition"
+                )
         time_embedding = self._time_embedding(flow_time, action_condition.dtype)
         if time_embedding.shape[0] != action_condition.shape[0]:
             raise ValueError("flow_time batch size must match action_condition")
@@ -1085,6 +1334,8 @@ class FlowMatchingHead(nn.Module):
         action = self.action_projection(noisy_actions.to(dtype=dtype))
         time = self.time_projection(time_embedding)[:, None]
         if self.flow_cond_mode == "entry":
+            # entry 模式只在入口相加条件，无逐层注入机制；semantic_context 被
+            # 忽略（文档化：flow_semantic 需要 adaln 的逐层 cross-attn 才有意义）。
             hidden = action_condition + action + time
             for layer in self.layers:
                 hidden = layer(hidden)
@@ -1100,6 +1351,13 @@ class FlowMatchingHead(nn.Module):
                 ),
                 dim=-1,
             )
+            if semantic_context is None:
+                cond_kv = action_condition
+            else:
+                context = semantic_context.to(dtype=action_condition.dtype)
+                if self.semantic_in_dim is not None:
+                    context = self.semantic_proj(context)
+                cond_kv = torch.cat((action_condition, context), dim=1)
             for layer, ada_mlp, w_q, w_k, w_v, w_o, ca_norm in zip(
                 self.layers,
                 self.ada_mlps,
@@ -1116,11 +1374,12 @@ class FlowMatchingHead(nn.Module):
                 h = hidden * (1.0 + scale1) + shift1
                 h = layer(h)
                 hidden = hidden + gate1 * h
-                # 子层 2：条件 cross-attention（每层重新注入 action_condition）
+                # 子层 2：条件 cross-attention（每层重新注入 action_condition；
+                # flow_semantic 时拼接语义上下文）
                 h = ca_norm(hidden) * (1.0 + scale2) + shift2
                 q = self._ca_heads(w_q(h))
-                k = self._ca_heads(w_k(action_condition))
-                v = self._ca_heads(w_v(action_condition))
+                k = self._ca_heads(w_k(cond_kv))
+                v = self._ca_heads(w_v(cond_kv))
                 scores = torch.matmul(q.float(), k.float().transpose(-1, -2)) / (
                     (self.hidden_dim // self.num_heads) ** 0.5
                 )
@@ -1148,6 +1407,21 @@ class VACompoundPolicy(nn.Module):
         self.action_queries = nn.Parameter(torch.empty(config.action_horizon, config.hidden_dim))
         nn.init.normal_(self.action_queries, std=0.02)
 
+        # 第二轮架构重构：role query 共享实例（config.role_query=True 时构造）。
+        # TaskResampler（memory_split 的语言初始化）与 action_query_cond 分支
+        # 共用同一实例，把语言 mask-weighted mean 摘要替换为 role tokens 输出。
+        self.role_resampler = (
+            RoleQueryResampler(
+                hidden_dim=config.hidden_dim,
+                language_dim=config.language_dim,
+                n_role=config.role_query_tokens,
+                num_heads=config.num_heads,
+                dropout=config.dropout,
+            )
+            if config.role_query
+            else None
+        )
+
         if config.action_query_cond:
             # 语言摘要（cache 第 0 层投影 key 的 mask 加权均值）→ 每 horizon 步 query 偏移。
             # 最后一层 zero-init：训练开始时等价于静态 action_queries（不破坏现有行为）。
@@ -1172,6 +1446,14 @@ class VACompoundPolicy(nn.Module):
                     config.sequential_coupling > 0
                     and (index + 1) % config.sequential_coupling == 0
                 ),
+                # 双注意力只作用于非 sequential 层（sequential 层保持旧路径）。
+                dual_attention=(
+                    config.dual_attention
+                    and not (
+                        config.sequential_coupling > 0
+                        and (index + 1) % config.sequential_coupling == 0
+                    )
+                ),
             )
             for index in range(config.num_layers)
         )
@@ -1187,7 +1469,9 @@ class VACompoundPolicy(nn.Module):
                 dropout=config.dropout,
             )
             self.task_resampler = TaskResampler(
-                hidden_dim=config.hidden_dim, n_task=config.task_tokens
+                hidden_dim=config.hidden_dim,
+                n_task=config.task_tokens,
+                role_resampler=self.role_resampler,
             )
             self.task_gate = TaskGate(config.hidden_dim)
             self.task_to_action = nn.Linear(config.hidden_dim, config.hidden_dim)
@@ -1212,6 +1496,9 @@ class VACompoundPolicy(nn.Module):
             num_layers=config.flow_layers,
             dropout=config.dropout,
             flow_cond=config.flow_cond,
+            # flow_semantic：语义上下文（compile readout tokens）在语言空间，
+            # head 内部投影到 hidden 供逐层 cross-attn 使用。
+            semantic_in_dim=config.language_dim if config.flow_semantic else None,
         )
         if config.direct_head:
             self.direct_head = DirectActionHead(
@@ -1316,15 +1603,21 @@ class VACompoundPolicy(nn.Module):
         if self.config.action_query_cond:
             # Qwen-conditioned action queries：语言摘要（第 0 层投影 key 的 mask 加权均值）
             # 经 MLP 生成每 horizon 步偏移，zero-init 保证初始等价于静态 query。
+            # role_query（第二轮架构重构）开启时摘要改为共享 RoleQueryResampler
+            # 输出的 token 均值（role tokens 经 masked cross-attention 聚合语言）。
             first_key = language_cache.layers[0].key  # [B, heads, tokens, head_dim]
             B = vision.shape[0]
             flat_key = first_key.transpose(1, 2).reshape(
                 B, -1, self.config.hidden_dim
             )  # [B, tokens, hidden]
             mask = language_cache.attention_mask  # [B, tokens]
-            denom = mask.float().sum(-1, keepdim=True).clamp_min(1.0)  # [B, 1]
-            summary = (flat_key * mask[:, :, None]).sum(1) / denom  # [B, hidden]
-            summary = summary.to(dtype=target_dtype)
+            if self.config.role_query:
+                role_out = self.role_resampler(flat_key.to(dtype=target_dtype), mask)
+                summary = role_out.mean(dim=1).to(dtype=target_dtype)
+            else:
+                denom = mask.float().sum(-1, keepdim=True).clamp_min(1.0)  # [B, 1]
+                summary = (flat_key * mask[:, :, None]).sum(1) / denom  # [B, hidden]
+                summary = summary.to(dtype=target_dtype)
             offset = self.lang_to_query(summary).view(
                 B, self.config.action_horizon, self.config.hidden_dim
             )
@@ -1508,7 +1801,9 @@ class VACompoundPolicy(nn.Module):
         action_condition: Tensor,
         noisy_actions: Tensor,
         flow_time: Tensor,
+        semantic_context: Tensor | None = None,
     ) -> Tensor:
+        """``semantic_context``（第二轮架构重构）透传给 flow head（默认 None）。"""
         expected = (
             action_condition.shape[0],
             self.config.action_horizon,
@@ -1524,7 +1819,7 @@ class VACompoundPolicy(nn.Module):
                 "noisy_actions must have shape "
                 f"[batch, {self.config.action_horizon}, {self.config.action_dim}]"
             )
-        return self.flow_head(action_condition, noisy_actions, flow_time)
+        return self.flow_head(action_condition, noisy_actions, flow_time, semantic_context)
 
     def forward(
         self,
@@ -1539,6 +1834,7 @@ class VACompoundPolicy(nn.Module):
         language_cache: LanguageCache | None = None,
         visual_memory: VisualMemory | None = None,
         return_visual_memory: bool = False,
+        semantic_context: Tensor | None = None,
     ) -> Tensor | tuple[Tensor, VisualMemory]:
         encoded = self.encode_condition(
             vision_tokens,
@@ -1552,9 +1848,16 @@ class VACompoundPolicy(nn.Module):
         )
         if return_visual_memory:
             action_condition, next_memory = encoded
-            velocity = self.flow_velocity(action_condition, noisy_actions, flow_time)
+            velocity = self.flow_velocity(
+                action_condition,
+                noisy_actions,
+                flow_time,
+                semantic_context=semantic_context,
+            )
             return velocity, next_memory
-        return self.flow_velocity(encoded, noisy_actions, flow_time)
+        return self.flow_velocity(
+            encoded, noisy_actions, flow_time, semantic_context=semantic_context
+        )
 
     @torch.no_grad()
     def sample_actions(
@@ -1563,6 +1866,7 @@ class VACompoundPolicy(nn.Module):
         *,
         steps: int = 8,
         noise: Tensor | None = None,
+        semantic_context: Tensor | None = None,
     ) -> Tensor:
         """Integrate noise at tau=0 to an action chunk at tau=1 with Euler steps."""
         if steps < 1:
@@ -1595,6 +1899,7 @@ class VACompoundPolicy(nn.Module):
                 action_condition,
                 actions,
                 flow_time,
+                semantic_context=semantic_context,
             )
         return actions
 
@@ -1605,15 +1910,18 @@ class VACompoundPolicy(nn.Module):
         steps: int = 8,
         noise: Tensor | None = None,
         c_current: Tensor | None = None,
+        semantic_context: Tensor | None = None,
     ) -> Tensor:
         """从 action_condition 解码归一化动作 chunk（C²-VA 统一入口）。
 
         ``c2_controller=True``：C² 收缩解码——ū = DirectActionHead，
         c̄ = sg(c_anchor) + Δc，K = gain_head；a = clip(ū − K·(c_current − c̄))。
         ``c_current``（[B, c2_control_dim]，P 投影后的当前视觉状态）必须提供，
-        否则报错；``steps``/``noise`` 忽略。``direct_head=True``（无 c2）：
-        确定性 DirectActionHead，``steps``/``noise`` 忽略。否则走现有 flow
-        Euler 采样（等价于 ``sample_actions``，现有路径不变）。
+        否则报错；``steps``/``noise``/``semantic_context`` 忽略（C² 控制参数
+        由 direct_head/c2_head 生成，不读语义上下文）。``direct_head=True``
+        （无 c2）：确定性 DirectActionHead，``steps``/``noise``/``semantic_context``
+        忽略。否则走现有 flow Euler 采样（等价于 ``sample_actions``，
+        ``semantic_context`` 透传，现有路径不变）。
         """
         if self.config.c2_controller:
             if c_current is None:
@@ -1626,7 +1934,12 @@ class VACompoundPolicy(nn.Module):
             )
         if self.config.direct_head:
             return self.direct_head(action_condition)
-        return self.sample_actions(action_condition, steps=steps, noise=noise)
+        return self.sample_actions(
+            action_condition,
+            steps=steps,
+            noise=noise,
+            semantic_context=semantic_context,
+        )
 
     def controller_params(
         self,
@@ -1666,6 +1979,7 @@ class VACompoundPolicy(nn.Module):
         steps: int = 8,
         noise: Tensor | None = None,
         sigma: Tensor | None = None,
+        semantic_context: Tensor | None = None,
     ) -> list[Tensor]:
         """Stochastic Euler trajectory; returns path [x_0, ..., x_K].
 
@@ -1673,6 +1987,7 @@ class VACompoundPolicy(nn.Module):
         matching the ReinFlow-lite augmented Markov policy.  sigma has shape
         [K, action_dim] (per-step per-dim transition noise); None gives the
         deterministic Euler path (identical to sample_actions).
+        ``semantic_context``（第二轮架构重构）透传给 flow_velocity。
         """
         if steps < 1:
             raise ValueError("flow sampling steps must be positive")
@@ -1701,7 +2016,9 @@ class VACompoundPolicy(nn.Module):
                 device=action_condition.device,
                 dtype=action_condition.dtype,
             )
-            mu = x + step_size * self.flow_velocity(action_condition, x, flow_time)
+            mu = x + step_size * self.flow_velocity(
+                action_condition, x, flow_time, semantic_context=semantic_context
+            )
             if sigma is not None:
                 mu = mu + sigma[index] * torch.randn_like(mu)
             x = mu
@@ -1713,10 +2030,12 @@ class VACompoundPolicy(nn.Module):
         path: list[Tensor],
         action_condition: Tensor,
         sigma: Tensor,
+        semantic_context: Tensor | None = None,
     ) -> Tensor:
         """Log-prob of the sampled denoising path under the flow-noisy
         transition model: sum_k log N(x_{k+1}; x_k + (1/K) v(x_k, t_k),
         sigma_k^2 I).  Returns [batch] log-probs, differentiable in theta.
+        ``semantic_context``（第二轮架构重构）透传给 flow_velocity。
         """
         steps = len(path) - 1
         if sigma.shape != (steps, self.config.action_dim):
@@ -1737,7 +2056,10 @@ class VACompoundPolicy(nn.Module):
                 dtype=dtype,
             )
             mu = path[index] + step_size * self.flow_velocity(
-                action_condition, path[index], flow_time
+                action_condition,
+                path[index],
+                flow_time,
+                semantic_context=semantic_context,
             )
             sigma_k = sigma[index]  # [action_dim]
             diff = path[index + 1] - mu  # [B, H, A]

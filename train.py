@@ -8,11 +8,37 @@ from pathlib import Path
 import random
 
 import torch
-from torch import Tensor
+from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, Sampler
 
 from va_compound import VACompoundConfig, VACompoundPolicy
+
+
+def build_pair_groups(
+    pair_id: Tensor,
+    instruction_id: Tensor,
+) -> dict[int, dict[int, list[int]]]:
+    """Map every pair_id to its per-instruction sample indices.
+
+    Shared pair-contract builder reused by FeatureDataset and E2EDataset
+    (plus PairedBatchSampler's payload fallback): each pair must contain at
+    least two different instruction_id values, otherwise paired training is
+    impossible.  Validation matches the original FeatureDataset contract.
+    """
+    groups: dict[int, dict[int, list[int]]] = defaultdict(lambda: defaultdict(list))
+    for index, (pair, instruction) in enumerate(
+        zip(pair_id.tolist(), instruction_id.tolist(), strict=True)
+    ):
+        groups[int(pair)][int(instruction)].append(index)
+    if not groups:
+        raise ValueError("paired training requires at least one pair_id")
+    for pair, by_instruction in groups.items():
+        if len(by_instruction) < 2:
+            raise ValueError(
+                f"pair_id={pair} needs at least two different instruction_id values"
+            )
+    return {pair: dict(values) for pair, values in groups.items()}
 
 
 class FeatureDataset(Dataset):
@@ -130,23 +156,7 @@ class FeatureDataset(Dataset):
                 raise ValueError("language_mask must have shape [N,Nl]")
 
     def _build_pair_groups(self) -> dict[int, dict[int, list[int]]]:
-        groups: dict[int, dict[int, list[int]]] = defaultdict(lambda: defaultdict(list))
-        for index, (pair_id, instruction_id) in enumerate(
-            zip(
-                self.payload["pair_id"].tolist(),
-                self.payload["instruction_id"].tolist(),
-                strict=True,
-            )
-        ):
-            groups[int(pair_id)][int(instruction_id)].append(index)
-        if not groups:
-            raise ValueError("paired training requires at least one pair_id")
-        for pair_id, by_instruction in groups.items():
-            if len(by_instruction) < 2:
-                raise ValueError(
-                    f"pair_id={pair_id} needs at least two different instruction_id values"
-                )
-        return {pair_id: dict(values) for pair_id, values in groups.items()}
+        return build_pair_groups(self.payload["pair_id"], self.payload["instruction_id"])
 
     def _validate_pair_contract(
         self,
@@ -308,27 +318,52 @@ class E2EDataset(Dataset):
             raise ValueError(
                 f"e2e training requires T>={min_sequence_length}, got T={sequence_length}"
             )
+        if "pair_id" in payload and "instruction_id" in payload:
+            # 配对 E2E 数据（2026-08-07）：pair 结构与 feature 数据一致（每 pair 两行）。
+            self.pair_groups = build_pair_groups(
+                payload["pair_id"], payload["instruction_id"]
+            )
+        else:
+            # 旧数据无 pair 字段：无配对，走 --single-task 兼容路径。
+            self.pair_groups = {}
 
     def __len__(self) -> int:
         return self.length
 
     def __getitem__(self, index: int) -> dict:
+        payload = self.payload
+        has_pairs = "pair_id" in payload and "instruction_id" in payload
         return {
-            "video_frames": self.payload["video_frames"][index],
-            "instruction": self.payload["instructions"][index],
-            "proprio": self.payload["proprio"][index],
-            "previous_action": self.payload["previous_action"][index],
-            "actions": self.payload["actions"][index],
+            "video_frames": payload["video_frames"][index],
+            "instruction": payload["instructions"][index],
+            "proprio": payload["proprio"][index],
+            "previous_action": payload["previous_action"][index],
+            "actions": payload["actions"][index],
+            # 旧数据缺失时回退：pair_id=index（每样本唯一）、instruction_id=0。
+            "pair_id": int(payload["pair_id"][index]) if has_pairs else index,
+            "instruction_id": int(payload["instruction_id"][index]) if has_pairs else 0,
         }
 
 
 class PairedBatchSampler(Sampler[list[int]]):
     """Yield two different instructions from every selected decision pair."""
 
-    def __init__(self, dataset: FeatureDataset, batch_size: int, seed: int = 0) -> None:
+    def __init__(self, dataset: Dataset, batch_size: int, seed: int = 0) -> None:
         if batch_size < 2 or batch_size % 2:
             raise ValueError("paired batch_size must be a positive even number")
-        self.groups = dataset.pair_groups
+        groups = getattr(dataset, "pair_groups", None)
+        if groups is None:
+            # 泛化（2026-08-07）：任意带 payload pair_id/instruction_id 的
+            # 数据集（如无 pair_groups 属性的旧式数据集）也能配对采样。
+            payload = dataset.payload
+            if "pair_id" not in payload or "instruction_id" not in payload:
+                raise ValueError(
+                    "paired sampling requires pair_id/instruction_id in the dataset"
+                )
+            groups = build_pair_groups(payload["pair_id"], payload["instruction_id"])
+        if not groups:
+            raise ValueError("paired training requires at least one pair_id")
+        self.groups = groups
         self.pairs_per_batch = batch_size // 2
         self.seed = int(seed)
         self.epoch = 0
@@ -817,7 +852,7 @@ def compute_contract_metrics(
     }
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Paired multi-goal VA compound flow-matching trainer"
     )
@@ -827,7 +862,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="raw video/text dataset for end-to-end fine-tuning (V-JEPA+Qwen in graph)",
     )
-    parser.add_argument("--lora-rank", type=int, default=32, help="Qwen LoRA rank (0 disables LoRA)")
+    parser.add_argument("--lora-rank", type=int, default=0, help="Qwen LoRA rank (0 keeps Qwen fully frozen)")
     parser.add_argument("--lora-alpha", type=float, default=32.0)
     parser.add_argument(
         "--vision-unfreeze-all",
@@ -846,6 +881,111 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Qwen decoder layers to unfreeze (0 = LoRA instead)",
+    )
+    parser.add_argument(
+        "--semantic-adapter",
+        action="store_true",
+        help="第三种方案（2026-08-07）：冻结 Qwen 先验 + 仅顶部层 LoRA + "
+        "zero-init 门控融合（与 --lora-rank>0 / --qwen-unfreeze-blocks 互斥，"
+        "仅 --e2e-data 路径）",
+    )
+    parser.add_argument("--semantic-lora-rank", type=int, default=8)
+    parser.add_argument("--semantic-top-layers", type=int, default=4)
+    parser.add_argument(
+        "--semantic-anchor-weight",
+        type=float,
+        default=0.0,
+        help="anchor_loss 权重（锚定层 hidden 不偏离冻结先验；0 关闭）",
+    )
+    parser.add_argument(
+        "--semantic-geometry-weight",
+        type=float,
+        default=0.0,
+        help="geometry_loss 权重（G 矩阵几何约束；0 关闭）",
+    )
+    parser.add_argument(
+        "--semantic-anchor-layers",
+        type=str,
+        default="",
+        help="逗号分隔的 anchor 层索引（默认：被 LoRA 适配的顶部层）",
+    )
+    parser.add_argument(
+        "--compile-task",
+        action="store_true",
+        help="compile-task（Stage A，2026-08-07）：SemanticCompiler 把视觉 token/"
+        "语义历史/场景变化编译为语义 tokens 追加到语言序列，每 --compile-every "
+        "步重编译（仅 --e2e-data 路径；与 --scene-teacher/--plan-resampler 互斥）",
+    )
+    parser.add_argument(
+        "--compile-every",
+        type=int,
+        default=4,
+        help="compile-task 重编译间隔（每 compile_every 步 + t=0）",
+    )
+    parser.add_argument(
+        "--compile-n-scene",
+        type=int,
+        default=16,
+        help="compile-task 从 visual tokens 抽取的场景 token 数（adaptive pooling）",
+    )
+    parser.add_argument(
+        "--compile-n-readout",
+        type=int,
+        default=16,
+        help="SemanticCompiler readout token 数（第二轮架构重构 token 放开）",
+    )
+    parser.add_argument(
+        "--semantic-act-grad-scale",
+        type=float,
+        default=0.1,
+        help="η_act（第二轮架构重构）:SemanticAdapter LoRA 参数梯度缩放系数"
+        "（语义适配器动作侧梯度，默认 0.1；1.0 = 不缩放）",
+    )
+    parser.add_argument(
+        "--semantic-lora-suffixes",
+        type=str,
+        default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+        help="SemanticAdapter LoRA 投影后缀（逗号分隔；默认全 7 种 "
+        "q/k/v/o/gate/up/down，第二轮架构重构可配置子集）",
+    )
+    parser.add_argument(
+        "--language-max-length",
+        type=int,
+        default=64,
+        help="Qwen 语言 tokenizer max_length（e2e 路径透传）",
+    )
+    parser.add_argument(
+        "--role-query",
+        action="store_true",
+        help="第二轮架构重构：learned role queries 替代语言 mask-weighted mean "
+        "摘要（TaskResampler 与 action_query_cond 共享同一 RoleQueryResampler）",
+    )
+    parser.add_argument(
+        "--role-query-tokens",
+        type=int,
+        default=16,
+        help="RoleQueryResampler 的 role query 数（token 放开）",
+    )
+    parser.add_argument(
+        "--dual-attention",
+        action="store_true",
+        help="第二轮架构重构：非 sequential VA 层动作 query 拆 physical/semantic "
+        "双注意力（sequential 层保持旧共享路径；与 --sequential-coupling 同开时"
+        "仅警告，sequential 层不拆）",
+    )
+    parser.add_argument(
+        "--flow-semantic",
+        action="store_true",
+        help="第二轮架构重构：flow head 逐层读语义上下文（compile readout "
+        "tokens，需 --compile-task 才有上下文；flow_cond=adaln 时经 cross-attn 注入）",
+    )
+    parser.add_argument(
+        "--training-stage",
+        choices=("a", "b", "c"),
+        default=None,
+        help="训练阶段契约（None 不校验）：a = --compile-task（禁 --semantic-adapter/"
+        "anchor/geometry 损失）；b = --semantic-adapter；c = b 的全部要求 + "
+        "推荐 --vision-unfreeze-all（仅提示不强制）",
     )
     parser.add_argument("--qwen-lr", type=float, default=1e-5)
     parser.add_argument("--lora-lr", type=float, default=1e-4)
@@ -1077,7 +1217,136 @@ def parse_args() -> argparse.Namespace:
         help="periodically overwrite --save every N steps (atomic tmp+rename); "
         "0 disables periodic saves (crash loses the whole run)",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    """Arg 级契约校验（main 入口调用；纯参数检查，不加载数据/模型）。"""
+    if args.steps <= 0 or args.flow_steps <= 0 or args.lr <= 0.0:
+        raise ValueError("training steps, flow steps, and learning rate must be positive")
+    if args.pair_loss_weight < 0.0:
+        raise ValueError("pair loss weight must be non-negative")
+    if not args.single_task and (args.batch_size < 2 or args.batch_size % 2):
+        raise ValueError("paired batch size must be even")
+    if args.single_task and args.batch_size < 1:
+        raise ValueError("batch size must be positive")
+    if args.evsm and not (args.memory_split and args.future_predict):
+        raise ValueError("--evsm requires --memory-split and --future-predict")
+    if args.evsm and args.future_predict_weight <= 0.0:
+        raise ValueError("--evsm requires a positive --future-predict-weight")
+    if args.evsm and args.evsm_temp <= 0.0:
+        raise ValueError("--evsm-temp must be positive")
+    if args.compile_task and not args.e2e_data:
+        raise ValueError(
+            "--compile-task requires --e2e-data (online SemanticCompiler path only)"
+        )
+    if args.compile_every < 1:
+        raise ValueError("--compile-every must be >= 1")
+    if args.compile_task and (args.scene_teacher or args.plan_resampler):
+        raise ValueError(
+            "--compile-task is mutually exclusive with "
+            "--scene-teacher/--plan-resampler"
+        )
+    if args.training_stage == "a":
+        if not args.compile_task:
+            raise ValueError("--training-stage a requires --compile-task")
+        if args.semantic_adapter:
+            raise ValueError("--training-stage a forbids --semantic-adapter")
+        if args.semantic_anchor_weight != 0.0 or args.semantic_geometry_weight != 0.0:
+            raise ValueError(
+                "--training-stage a requires --semantic-anchor-weight=0 and "
+                "--semantic-geometry-weight=0"
+            )
+    elif args.training_stage in ("b", "c"):
+        if not args.semantic_adapter:
+            raise ValueError(
+                f"--training-stage {args.training_stage} requires --semantic-adapter"
+            )
+    if args.plan_resampler and args.scene_teacher:
+        raise ValueError("--plan-resampler and --scene-teacher are mutually exclusive")
+    if args.plan_resampler and args.e2e_data:
+        raise ValueError("--plan-resampler is not supported with --e2e-data")
+    if args.scene_teacher and (args.e2e_data or not args.data):
+        raise ValueError("--scene-teacher requires --data with precomputed features (needs metadata.tasks)")
+    if args.direct_head and args.e2e_data:
+        raise ValueError("--direct-head is not supported with --e2e-data (e2e rollout is flow-specific)")
+    if args.c2_controller and not args.direct_head:
+        raise ValueError("--c2-controller requires --direct-head")
+    if args.c2_controller and not args.single_task:
+        raise ValueError("--c2-controller requires --single-task (v6a/v6b 为按钮任务单任务数据)")
+    if args.c2_controller and not args.data:
+        raise ValueError("--c2-controller requires --data (precomputed features)")
+    if args.c2_controller and (
+        args.future_predict or args.evsm or args.plan_resampler or args.scene_teacher
+    ):
+        raise ValueError(
+            "--c2-controller 与 --future-predict/--evsm/--plan-resampler/--scene-teacher "
+            "互斥（Codex 修正 10：Stage B 不接其他结构；768D future head 与 L_f 重复）"
+        )
+    if args.c2_controller and args.c2_lambda_c > 0.0:
+        raise ValueError(
+            "--c2-lambda-c 必须为 0：固定离线 successor 下收缩项对 K 无梯度"
+            "（Codex 判决），收缩只作为 held-out 指标记录"
+        )
+    if args.c2_controller and not (0.0 <= args.c2_recovery_ratio < 1.0):
+        raise ValueError("--c2-recovery-ratio must be in [0, 1)")
+    if args.semantic_adapter and not args.e2e_data:
+        raise ValueError(
+            "--semantic-adapter requires --e2e-data (online Qwen path only; "
+            "the precomputed-feature path has no online Qwen)"
+        )
+    if args.semantic_adapter and args.lora_rank != 0:
+        raise ValueError(
+            "--semantic-adapter is mutually exclusive with --lora-rank > 0 "
+            "(top-layer LoRA only)"
+        )
+    if args.semantic_adapter and args.qwen_unfreeze_blocks > 0:
+        raise ValueError(
+            "--semantic-adapter is mutually exclusive with --qwen-unfreeze-blocks"
+        )
+    if args.semantic_adapter and args.semantic_top_layers <= 0:
+        raise ValueError("--semantic-top-layers must be positive with --semantic-adapter")
+    if args.semantic_anchor_weight < 0.0 or args.semantic_geometry_weight < 0.0:
+        raise ValueError("semantic anchor/geometry weights must be non-negative")
+    # 第二轮架构重构（2026-08-08）参数校验；role-query/dual-attention/
+    # flow-semantic 与 --compile-task 无强制依赖（可独立开）。
+    if args.role_query_tokens < 1:
+        raise ValueError("--role-query-tokens must be >= 1")
+    if args.compile_n_readout < 1:
+        raise ValueError("--compile-n-readout must be >= 1")
+    if args.language_max_length < 1:
+        raise ValueError("--language-max-length must be >= 1")
+    if args.semantic_act_grad_scale < 0.0:
+        raise ValueError("--semantic-act-grad-scale must be non-negative")
+    if not [s.strip() for s in args.semantic_lora_suffixes.split(",") if s.strip()]:
+        raise ValueError(
+            "--semantic-lora-suffixes must be a non-empty comma-separated list"
+        )
+    if args.dual_attention and args.sequential_coupling > 0:
+        print(
+            "warning: --dual-attention only splits the non-sequential VA layers; "
+            "sequential layers keep the legacy shared path"
+        )
+
+
+def scale_semantic_lora_grads(text_backbone: nn.Module, scale: float) -> None:
+    """η_act 梯度缩放（第二轮架构重构 2026-08-08）。
+
+    SemanticAdapter 的 LoRA 参数承担语言→动作的语义适配，η_act < 1 抑制其对
+    指令嵌入几何的过快扰动；非 LoRA 参数（门控/编译器/策略）不受影响。
+    ``scale == 1.0`` 时为空操作。SAM 路径的两次 backward 后都调用（第一次
+    缩放只改变扰动 e_w 的范数而非方向——ρ·g/‖g‖ 与缩放无关；实际步长由
+    第二次缩放后的梯度决定，因此两次缩放才使 η_act 对 SAM 生效）。
+    """
+    if scale == 1.0:
+        return
+    for name, parameter in text_backbone.named_parameters():
+        if (
+            parameter.requires_grad
+            and parameter.grad is not None
+            and ("lora_a" in name or "lora_b" in name)
+        ):
+            parameter.grad.mul_(scale)
 
 
 def save_checkpoint(args, config, model, e2e_model, scene_teacher=None) -> None:
@@ -1090,7 +1359,9 @@ def save_checkpoint(args, config, model, e2e_model, scene_teacher=None) -> None:
             "config": config.__dict__,
             "model": e2e_model.policy.state_dict(),
             "lora": {
-                name.removeprefix("text_model."): parameter.detach().cpu()
+                # semantic 模式下参数名带 "text_backbone." 前缀（QwenSemanticBackbone
+                # 包装 QwenTextBackbone），一并剥离使 resume 能按 text_model 相对名匹配。
+                name.removeprefix("text_backbone.").removeprefix("text_model."): parameter.detach().cpu()
                 for name, parameter in e2e_model.text_backbone.named_parameters()
                 if "lora_a" in name or "lora_b" in name
             },
@@ -1100,6 +1371,7 @@ def save_checkpoint(args, config, model, e2e_model, scene_teacher=None) -> None:
                 if parameter.requires_grad
                 and "lora_a" not in name
                 and "lora_b" not in name
+                and not name.startswith("gate.")
             },
             "vjepa_state_dict": e2e_model.vision_backbone.model.state_dict(),
             "training_contract": {
@@ -1117,6 +1389,18 @@ def save_checkpoint(args, config, model, e2e_model, scene_teacher=None) -> None:
                 ),
             },
         }
+        gate = getattr(e2e_model.text_backbone, "gate", None)
+        if gate is not None:
+            payload["semantic_gate"] = gate.state_dict()
+        compiler = getattr(e2e_model, "compiler", None)
+        payload["semantic_compiler"] = (
+            {
+                key: value.detach().cpu()
+                for key, value in compiler.state_dict().items()
+            }
+            if compiler is not None
+            else None
+        )
     else:
         payload = {
             "config": config.__dict__,
@@ -1200,48 +1484,12 @@ class SAM(torch.optim.Optimizer):
 
 def main() -> None:
     args = parse_args()
-    if args.steps <= 0 or args.flow_steps <= 0 or args.lr <= 0.0:
-        raise ValueError("training steps, flow steps, and learning rate must be positive")
-    if args.pair_loss_weight < 0.0:
-        raise ValueError("pair loss weight must be non-negative")
-    if not args.single_task and (args.batch_size < 2 or args.batch_size % 2):
-        raise ValueError("paired batch size must be even")
-    if args.single_task and args.batch_size < 1:
-        raise ValueError("batch size must be positive")
-    if args.evsm and not (args.memory_split and args.future_predict):
-        raise ValueError("--evsm requires --memory-split and --future-predict")
-    if args.evsm and args.future_predict_weight <= 0.0:
-        raise ValueError("--evsm requires a positive --future-predict-weight")
-    if args.evsm and args.evsm_temp <= 0.0:
-        raise ValueError("--evsm-temp must be positive")
-    if args.plan_resampler and args.scene_teacher:
-        raise ValueError("--plan-resampler and --scene-teacher are mutually exclusive")
-    if args.plan_resampler and args.e2e_data:
-        raise ValueError("--plan-resampler is not supported with --e2e-data")
-    if args.scene_teacher and (args.e2e_data or not args.data):
-        raise ValueError("--scene-teacher requires --data with precomputed features (needs metadata.tasks)")
-    if args.direct_head and args.e2e_data:
-        raise ValueError("--direct-head is not supported with --e2e-data (e2e rollout is flow-specific)")
-    if args.c2_controller and not args.direct_head:
-        raise ValueError("--c2-controller requires --direct-head")
-    if args.c2_controller and not args.single_task:
-        raise ValueError("--c2-controller requires --single-task (v6a/v6b 为按钮任务单任务数据)")
-    if args.c2_controller and not args.data:
-        raise ValueError("--c2-controller requires --data (precomputed features)")
-    if args.c2_controller and (
-        args.future_predict or args.evsm or args.plan_resampler or args.scene_teacher
-    ):
-        raise ValueError(
-            "--c2-controller 与 --future-predict/--evsm/--plan-resampler/--scene-teacher "
-            "互斥（Codex 修正 10：Stage B 不接其他结构；768D future head 与 L_f 重复）"
+    validate_args(args)
+    if args.training_stage == "c" and not args.vision_unfreeze_all:
+        print(
+            "hint: --training-stage c recommends --vision-unfreeze-all "
+            "(not enforced)"
         )
-    if args.c2_controller and args.c2_lambda_c > 0.0:
-        raise ValueError(
-            "--c2-lambda-c 必须为 0：固定离线 successor 下收缩项对 K 无梯度"
-            "（Codex 判决），收缩只作为 held-out 指标记录"
-        )
-    if args.c2_controller and not (0.0 <= args.c2_recovery_ratio < 1.0):
-        raise ValueError("--c2-recovery-ratio must be in [0, 1)")
 
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
@@ -1276,8 +1524,18 @@ def main() -> None:
             plan_resampler=args.plan_resampler,
             scene_teacher=args.scene_teacher,
             direct_head=args.direct_head,
+            role_query=args.role_query,
+            role_query_tokens=args.role_query_tokens,
+            dual_attention=args.dual_attention,
+            flow_semantic=args.flow_semantic,
         )
-        loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+        if args.single_task:
+            loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+        else:
+            loader = DataLoader(
+                dataset,
+                batch_sampler=PairedBatchSampler(dataset, args.batch_size, args.seed),
+            )
         iterator = iter(loader)
         smoke_batch = None
     elif args.data:
@@ -1333,6 +1591,10 @@ def main() -> None:
             scene_teacher=args.scene_teacher,
             direct_head=args.direct_head,
             c2_controller=args.c2_controller,
+            role_query=args.role_query,
+            role_query_tokens=args.role_query_tokens,
+            dual_attention=args.dual_attention,
+            flow_semantic=args.flow_semantic,
         )
         if args.single_task:
             loader = DataLoader(
@@ -1371,6 +1633,10 @@ def main() -> None:
             plan_resampler=args.plan_resampler,
             scene_teacher=args.scene_teacher,
             direct_head=args.direct_head,
+            role_query=args.role_query,
+            role_query_tokens=args.role_query_tokens,
+            dual_attention=args.dual_attention,
+            flow_semantic=args.flow_semantic,
         )
         smoke_batch = synthetic_sequence(
             config,
@@ -1382,6 +1648,11 @@ def main() -> None:
     if args.e2e_data:
         from va_compound.end_to_end import build_e2e_policy, parameter_groups
 
+        semantic_anchor_layers = None
+        if args.semantic_anchor_layers:
+            semantic_anchor_layers = tuple(
+                int(value) for value in args.semantic_anchor_layers.split(",")
+            )
         e2e_model, counts = build_e2e_policy(
             config=config,
             device=device,
@@ -1393,6 +1664,18 @@ def main() -> None:
             qwen_unfreeze_blocks=args.qwen_unfreeze_blocks,
             pooling=args.e2e_pooling,
             vision_unfreeze_all=args.vision_unfreeze_all,
+            semantic_adapter=args.semantic_adapter,
+            semantic_lora_rank=args.semantic_lora_rank,
+            semantic_top_layers=args.semantic_top_layers,
+            semantic_anchor_layers=semantic_anchor_layers,
+            semantic_lora_suffixes=tuple(
+                s.strip() for s in args.semantic_lora_suffixes.split(",") if s.strip()
+            ),
+            language_max_length=args.language_max_length,
+            compile_task=args.compile_task,
+            compile_every=args.compile_every,
+            n_scene_tokens=args.compile_n_scene,
+            compile_n_readout=args.compile_n_readout,
         )
         e2e_model.train()
         # 冻结参数保持 eval()（2026-08-05 Codex v2）：nn.Module.train() 会把冻结的
@@ -1411,11 +1694,24 @@ def main() -> None:
             ),
             weight_decay=1e-4,
         )
+        semantic_log = ""
+        if args.semantic_adapter:
+            semantic_log = (
+                f"semantic=top{counts['semantic_top_layers']}"
+                f"(lora={counts['semantic_lora_layers']}) "
+            )
+        compile_log = ""
+        if args.compile_task:
+            compile_log = f"compile={counts['compile_every']} "
+            if args.training_stage:
+                compile_log += f"stage={args.training_stage} "
         print(
-            f"e2e: lora_layers={counts['lora_layers']} "
+            f"e2e: {semantic_log}{compile_log}"
+            f"lora_layers={counts['lora_layers']} "
             f"unfrozen_vjepa_blocks={counts['unfrozen_vjepa_blocks']} "
             f"unfrozen_qwen_blocks={counts['unfrozen_qwen_blocks']} "
-            f"pooling={args.e2e_pooling} contract=single_task"
+            f"pooling={args.e2e_pooling} "
+            f"contract={'single_task' if args.single_task else 'paired'}"
         )
     elif args.single_task:
         model = VACompoundPolicy(config).to(device)
@@ -1511,6 +1807,16 @@ def main() -> None:
                     clean = name.removeprefix("text_model.")
                     if clean in own:
                         own[clean].data.copy_(value)
+            if resume_ckpt.get("semantic_gate"):
+                gate = getattr(e2e_model.text_backbone, "gate", None)
+                if gate is not None:
+                    gate.load_state_dict(resume_ckpt["semantic_gate"])
+            if resume_ckpt.get("semantic_compiler"):
+                own_compiler = getattr(e2e_model, "compiler", None)
+                if own_compiler is not None:
+                    own_compiler.load_state_dict(
+                        resume_ckpt["semantic_compiler"], strict=False
+                    )
             print(f"e2e resumed from {args.resume}")
         else:
             if args.c2_controller:
@@ -1641,11 +1947,26 @@ def main() -> None:
                     mb["previous_action"],
                     noisy_actions,
                     flow_time,
+                    compile_every=args.compile_every,
                 )
                 flow_loss = e2e_model.policy.flow_matching_loss(predicted_velocity, target_velocity)
-                pair_loss = flow_loss.new_zeros(())
-                pred_delta = flow_loss.new_zeros(())
-                tgt_delta = flow_loss.new_zeros(())
+                if args.single_task:
+                    pair_loss = flow_loss.new_zeros(())
+                    pred_delta = flow_loss.new_zeros(())
+                    tgt_delta = flow_loss.new_zeros(())
+                else:
+                    # 配对 E2E（2026-08-07）：与 feature 路径同构的共享源
+                    # 反事实干预——语言是 pair 内唯一输入差，速度场差即语言贡献。
+                    partner = paired_partner_indices(batch["pair_id"], batch["instruction_id"])
+                    pair_noise, pair_time, pair_target_velocity = sample_pair_intervention(
+                        batch["actions"], partner, probe_tau_max=args.pair_probe_tau_max
+                    )
+                    pair_predicted_velocity = e2e_model.policy.flow_velocity(
+                        action_conditions[:, 0], pair_noise, pair_time
+                    )
+                    pair_loss, pred_delta, tgt_delta = semantic_pair_loss(
+                        pair_predicted_velocity, pair_target_velocity, partner
+                    )
                 future_loss = flow_loss.new_zeros(())
             else:
                 rollout = rollout_policy(
@@ -1743,19 +2064,58 @@ def main() -> None:
                     )
                 else:
                     future_loss = flow_loss.new_zeros(())
+            semantic_anchor_loss = flow_loss.new_zeros(())
+            semantic_geom_loss = flow_loss.new_zeros(())
+            if args.semantic_adapter:
+                # 第三种方案（2026-08-07）：anchor/geometry 约束。prior 侧永远
+                # no_grad（encode_prior_states 带 @torch.no_grad）；adapted 单次
+                # 前向取 output_hidden_states 复用给 anchor + geometry。
+                semantic = e2e_model.text_backbone  # QwenSemanticBackbone
+                unique = list(dict.fromkeys(mb["instruction"]))
+                need_anchor = args.semantic_anchor_weight > 0.0 and bool(
+                    semantic.anchor_layers
+                )
+                need_geom = args.semantic_geometry_weight > 0.0
+                if need_anchor or need_geom:
+                    layers_needed = list(semantic.anchor_layers)
+                    if need_geom and (semantic.num_layers - 1) not in layers_needed:
+                        layers_needed.append(semantic.num_layers - 1)
+                    prior_layers, prior_mask = semantic.encode_prior_states(unique, layers_needed)
+                    adapted_layers, _ = semantic.encode_adapted_states(unique, layers_needed)
+                    if need_anchor:
+                        semantic_anchor_loss = semantic.anchor_loss(
+                            prior_layers, adapted_layers
+                        )
+                    if need_geom:
+                        semantic_geom_loss = semantic.geometry_loss(
+                            prior_layers[semantic.num_layers - 1],
+                            adapted_layers[semantic.num_layers - 1],
+                            prior_mask,
+                        )
             evsm_gate_mean = (
                 sum(evsm_gates) / len(evsm_gates) if evsm_gates else None
             )
-            return (
+            total = (
                 flow_loss
                 + args.pair_loss_weight * pair_loss
-                + args.future_predict_weight * future_loss,
+                + args.future_predict_weight * future_loss
+            )
+            if args.semantic_adapter:
+                total = (
+                    total
+                    + args.semantic_anchor_weight * semantic_anchor_loss
+                    + args.semantic_geometry_weight * semantic_geom_loss
+                )
+            return (
+                total,
                 flow_loss,
                 pair_loss,
                 pred_delta,
                 tgt_delta,
                 future_loss,
                 evsm_gate_mean,
+                semantic_anchor_loss,
+                semantic_geom_loss,
             )
 
         (
@@ -1766,10 +2126,16 @@ def main() -> None:
             target_delta,
             future_loss,
             evsm_gate_mean,
+            semantic_anchor_loss,
+            semantic_geom_loss,
         ) = compute_loss(batch, noisy_actions, flow_time)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        if e2e_model is not None and args.semantic_adapter:
+            scale_semantic_lora_grads(
+                e2e_model.text_backbone, args.semantic_act_grad_scale
+            )
         clip_params = (
             e2e_model.parameters()
             if e2e_model is not None
@@ -1781,10 +2147,17 @@ def main() -> None:
         )
         gradient_norm = torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
         if args.sam_rho > 0:
-            # SAM：先沿梯度方向扰动权重（worst-case 邻域），重算 loss 后走真实步
+            # SAM：先沿梯度方向扰动权重（worst-case 邻域），重算 loss 后走真实步。
+            # η_act 对两次 backward 的梯度都缩放（见 scale_semantic_lora_grads
+            # 文档：first_step 的扰动方向与缩放无关，实际步长由第二次缩放后的
+            # 梯度决定，因此两次缩放才使 η_act 对 SAM 生效）。
             optimizer.first_step(zero_grad=True)
-            loss2, _, _, _, _, _, _ = compute_loss(batch, noisy_actions, flow_time)
+            loss2, _, _, _, _, _, _, _, _ = compute_loss(batch, noisy_actions, flow_time)
             loss2.backward()
+            if e2e_model is not None and args.semantic_adapter:
+                scale_semantic_lora_grads(
+                    e2e_model.text_backbone, args.semantic_act_grad_scale
+                )
             torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
             optimizer.second_step(zero_grad=True)
         else:
@@ -1792,6 +2165,17 @@ def main() -> None:
         gate_log = (
             f" evsm_gate={evsm_gate_mean:.3f}" if evsm_gate_mean is not None else ""
         )
+        semantic_log = ""
+        if args.semantic_adapter:
+            semantic_log = (
+                f" anchor={semantic_anchor_loss.item():.6f} "
+                f"geom={semantic_geom_loss.item():.6f}"
+            )
+        compile_step_log = ""
+        if args.compile_task:
+            compile_step_log = f" compile={args.compile_every}"
+            if args.training_stage:
+                compile_step_log += f" stage={args.training_stage}"
         print(
             f"step={step} mode={args.mode} contract="
             f"{'e2e_single' if e2e_model is not None else ('single' if args.single_task else 'paired')} "
@@ -1800,7 +2184,7 @@ def main() -> None:
             f"pair={pair_loss.item():.6f} future={future_loss.item():.6f} "
             f"goal_delta={predicted_delta.item():.6f}/"
             f"{target_delta.item():.6f} grad={float(gradient_norm):.6f}"
-            f"{gate_log}"
+            f"{gate_log}{semantic_log}{compile_step_log}"
         )
 
     if args.save:
