@@ -1,0 +1,93 @@
+{
+  "file": "artifacts/va_compound_architecture/va_compound_actual_architecture.drawio",
+  "summary": {
+    "total_findings": 4,
+    "fail": 0,
+    "warn": 4,
+    "passed": true,
+    "clean": false
+  },
+  "fails": [],
+  "warns": [
+    {
+      "rule": "font-box-cavernous",
+      "element_id": "va_policy",
+      "message": "Box 'va_policy' is 290px tall with effective fontSize=14.0 (ratio 20.7:1). Text will look tiny and lost. Either shrink box or increase font.",
+      "detail": {
+        "box_height": 290.0,
+        "font_size": 14.0,
+        "ratio": 20.7
+      }
+    },
+    {
+      "rule": "spacing-inconsistent-h",
+      "element_id": "robot_state",
+      "message": "Row at y≈335: horizontal gaps vary (gaps=['40', '50', '580', '60'], mean=182, cv=1.26). Use uniform spacing.",
+      "detail": {
+        "row_y": 335,
+        "gaps": [
+          40.0,
+          50.0,
+          580.0,
+          60.0
+        ],
+        "mean": 182.5,
+        "cv": 1.26,
+        "element_ids": [
+          "robot_state",
+          "state_init",
+          "action_tokens",
+          "visual_memory",
+          "controller"
+        ]
+      }
+    },
+    {
+      "rule": "spacing-inconsistent-h",
+      "element_id": "query_streams",
+      "message": "Row at y≈560: horizontal gaps vary (gaps=['60', '1060'], mean=560, cv=0.89). Use uniform spacing.",
+      "detail": {
+        "row_y": 560,
+        "gaps": [
+          60.0,
+          1060.0
+        ],
+        "mean": 560.0,
+        "cv": 0.89,
+        "element_ids": [
+          "query_streams",
+          "query_projection",
+          "layer_memory"
+        ]
+      }
+    },
+    {
+      "rule": "spacing-inconsistent-v",
+      "element_id": "instruction",
+      "message": "Column at x≈60: vertical gaps vary (gaps=['30', '25', '145', '40', '100'], mean=68, cv=0.69). Use uniform spacing.",
+      "detail": {
+        "col_x": 60,
+        "gaps": [
+          30.0,
+          25.0,
+          145.0,
+          40.0,
+          100.0
+        ],
+        "mean": 68.0,
+        "cv": 0.69,
+        "element_ids": [
+          "instruction",
+          "video_window",
+          "robot_state",
+          "query_streams",
+          "context_streams",
+          "training_features"
+        ]
+      }
+    }
+  ],
+  "vertex_count": 37,
+  "edge_count": 29,
+  "canvas": "1900x1080"
+}

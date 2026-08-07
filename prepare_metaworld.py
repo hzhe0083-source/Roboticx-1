@@ -1,0 +1,376 @@
+"""Prepare MetaWorld MT50 (lerobot format) as frozen features for the VA pipeline.
+
+49 tasks x 50 demos, 80 FPS, 480x480 PNG bytes inside parquet.  Task language
+is the English task description (SmolVLA protocol); the dataset carries
+next.success flags so per-sample success is available for diagnostics.
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import io
+import json
+from pathlib import Path
+
+import numpy as np
+import pyarrow.parquet as pq
+import torch
+from PIL import Image
+from torch import Tensor
+from torch.nn import functional as F
+
+from prepare_pnpw_features import (
+    QwenTextBackbone,
+    VJEPA21Backbone,
+    clip_frame_indices,
+    robust_normalize,
+)
+
+# 80 FPS: 4 frames with stride 2 covers 0.05s (LIBERO 30FPS stride-2 covers 0.06s).
+VISION_WINDOW = 4
+VISION_STRIDE = 2
+CONTROL_STRIDE = 6  # 80 FPS decision every 6 frames = 13.3 Hz cadence
+SEQUENCE_LENGTH = 4
+ACTION_HORIZON = 8
+
+
+def decode_bytes(row: dict, image_size: int = 384) -> np.ndarray:
+    raw = row.get("bytes")
+    if raw is None or len(raw) == 0:
+        raise RuntimeError(f"missing image bytes at path={row.get('path')}")
+    image = Image.open(io.BytesIO(raw)).convert("RGB")
+    image = image.resize((image_size, image_size), Image.BICUBIC)
+    return np.asarray(image)
+
+
+def preprocess_batch(clips: list[list[np.ndarray]], image_size: int) -> Tensor:
+    """uint8 clips -> ImageNet-normalized [B,W,3,S,S]."""
+    frames = [frame for clip in clips for frame in clip]
+    video = torch.from_numpy(np.stack(frames)).permute(0, 3, 1, 2).float().div_(255.0)
+    batch, channels, height, width = video.shape
+    if height < width:
+        resized_height = image_size
+        resized_width = round(width * image_size / height)
+    else:
+        resized_width = image_size
+        resized_height = round(height * image_size / width)
+    flat = F.interpolate(
+        video,
+        size=(resized_height, resized_width),
+        mode="bicubic",
+        align_corners=False,
+        antialias=True,
+    )
+    top = (resized_height - image_size) // 2
+    left = (resized_width - image_size) // 2
+    flat = flat[:, :, top : top + image_size, left : left + image_size]
+    mean = torch.tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1)
+    std = torch.tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1)
+    flat = (flat - mean) / std
+    return flat.reshape(len(clips), VISION_WINDOW, channels, image_size, image_size)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Prepare MetaWorld MT50 frozen features")
+    parser.add_argument("--dataset", type=Path, default=Path(
+        "/home/ryan/Documents/robot/benchmark_data/raw/metaworld/lerobot_metaworld_mt50"
+    ))
+    parser.add_argument("--output", type=Path, default=Path("data/metaworld_features.pt"))
+    parser.add_argument("--max-tasks", type=int, default=49)
+    parser.add_argument("--task-start", type=int, default=0, help="first task index (for batch extraction)")
+    parser.add_argument("--sequences-per-episode", type=int, default=1)
+    parser.add_argument("--image-size", type=int, default=384)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--model-dtype", choices=("float16", "bfloat16", "float32"), default="float16")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--video-output",
+        type=Path,
+        default=None,
+        help="also write e2e video data (video_frames.npy uint8 memmap + meta.pt) "
+        "to this directory (2026-08-06 user: V-JEPA full + Qwen top-layer e2e)",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    root = args.dataset.resolve()
+    info = json.load(open(root / "meta/info.json"))
+    tasks = pq.read_table(root / "meta/tasks.parquet").to_pylist()
+    task_texts = [
+        t["__index_level_0__"]
+        for t in tasks[args.task_start : args.task_start + args.max_tasks]
+    ]
+    episodes = pq.read_table(root / "meta/episodes/chunk-000/file-000.parquet").to_pylist()
+
+    # Group episodes by task text; sample plans.
+    by_task: dict[str, list[dict]] = {}
+    for episode in episodes:
+        raw_task = episode.get("tasks") or episode.get("task") or ""
+        if isinstance(raw_task, list):
+            raw_task = raw_task[0] if raw_task else ""
+        by_task.setdefault(str(raw_task).strip(), []).append(episode)
+
+    plans = []  # (episode, task_text, start)
+    for task_text in task_texts:
+        for episode in by_task.get(task_text, [])[:]:
+            length = int(episode["length"])
+            required_span = (SEQUENCE_LENGTH - 1) * CONTROL_STRIDE + (ACTION_HORIZON - 1)
+            last_start = length - 1 - required_span
+            if last_start < 0:
+                continue
+            stride = max(1, last_start // max(args.sequences_per_episode, 1))
+            for start in range(0, last_start + 1, stride)[: args.sequences_per_episode]:
+                plans.append((episode, task_text, start))
+    if not plans:
+        raise ValueError("no plans produced")
+    print(f"tasks={len(task_texts)} samples={len(plans)}")
+    if args.dry_run:
+        return
+
+    data_files = sorted(glob.glob(str(root / "data/chunk-000/*.parquet")))
+    file_meta = []
+    for path in data_files:
+        table = pq.read_table(path, columns=["index"])
+        meta = table.column("index").to_pylist()
+        file_meta.append((path, meta))
+
+    def global_row(episode: dict, local_frame: int) -> int:
+        return int(episode["dataset_from_index"]) + local_frame
+
+    needed_rows: dict[str, set[int]] = {}
+    for episode, _task, start in plans:
+        for offset in range(SEQUENCE_LENGTH):
+            decision = start + offset * CONTROL_STRIDE
+            indices = clip_frame_indices(
+                decision, video_start_frame=0, window=VISION_WINDOW, stride=VISION_STRIDE
+            )
+            for frame in indices:
+                row = global_row(episode, max(0, frame))
+                for path, meta in file_meta:
+                    if meta[0] <= row <= meta[-1]:
+                        needed_rows.setdefault(path, set()).add(row)
+                        break
+            for step in range(ACTION_HORIZON):
+                row = global_row(episode, decision + step)
+                for path, meta in file_meta:
+                    if meta[0] <= row <= meta[-1]:
+                        needed_rows.setdefault(path, set()).add(row)
+                        break
+            previous_row = max(0, global_row(episode, decision - 1))
+            for path, meta in file_meta:
+                if meta[0] <= previous_row <= meta[-1]:
+                    needed_rows.setdefault(path, set()).add(previous_row)
+                    break
+
+    from collections import OrderedDict
+
+    MAX_CACHE_FRAMES = 26000  # 有界帧缓存：~26k 帧 × 384×384×3 ≈ 11GB，防 v2 全量数据 OOM
+    frame_cache: "OrderedDict[int, np.ndarray]" = OrderedDict()
+    for path, rows in needed_rows.items():
+        table = pq.read_table(path, columns=["index", "observation.image"])
+        index_col = table.column("index").to_pylist()
+        arr = table.column("observation.image").combine_chunks().to_pylist()
+        position = {g: local for local, g in enumerate(index_col)}
+        for row in rows:
+            frame_cache[row] = decode_bytes(arr[position[row]], args.image_size)
+            if len(frame_cache) > MAX_CACHE_FRAMES:
+                frame_cache.popitem(last=False)
+    print(f"frames decoded: {len(frame_cache)} (capped {MAX_CACHE_FRAMES})")
+
+    # Language encoding (one pass per task).
+    text_backbone = QwenTextBackbone.from_pretrained(
+        device=args.device, dtype=args.model_dtype, local_files_only=True
+    )
+    language_hidden, language_mask = text_backbone.encode(task_texts)
+    language_hidden = language_hidden.to(device="cpu", dtype=torch.float16)
+    language_mask = language_mask.cpu()
+    del text_backbone
+    import gc
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # Vision features.
+    vision_backbone = VJEPA21Backbone.from_pretrained(
+        device=args.device,
+        dtype=args.model_dtype,
+        max_tokens=64,
+        local_files_only=True,
+    )
+    flat_features: dict[int, Tensor] = {}
+    batch_keys: list[int] = []
+    batch_clips: list[list[np.ndarray]] = []
+
+    def encode_pending() -> None:
+        if not batch_keys:
+            return
+        inputs = preprocess_batch(batch_clips, args.image_size).to(args.device)
+        with torch.inference_mode():
+            flat, _ = vision_backbone.forward_variants(inputs)
+        flat = flat.to(device="cpu", dtype=torch.float16)
+        for key, token in zip(batch_keys, flat, strict=True):
+            flat_features[key] = token.contiguous()
+        batch_keys.clear()
+        batch_clips.clear()
+
+    seen = set()
+    decode_tables: dict[str, tuple] = {}  # path -> (position, arr) 惰性重解码
+
+    def get_frame(row: int) -> np.ndarray:
+        """LRU 缓存读帧；被弹出时从 parquet 惰性重解码（按文件缓存解码表）。"""
+        hit = frame_cache.get(row)
+        if hit is not None:
+            frame_cache.move_to_end(row)
+            return hit
+        for path, meta in file_meta:
+            if meta[0] <= row <= meta[-1]:
+                if path not in decode_tables:
+                    table = pq.read_table(path, columns=["index", "observation.image"])
+                    pos = {g: local for local, g in enumerate(table.column("index").to_pylist())}
+                    arr = table.column("observation.image").combine_chunks().to_pylist()
+                    decode_tables[path] = (pos, arr)
+                pos, arr = decode_tables[path]
+                frame = decode_bytes(arr[pos[row]], args.image_size)
+                frame_cache[row] = frame
+                if len(frame_cache) > MAX_CACHE_FRAMES:
+                    frame_cache.popitem(last=False)
+                return frame
+        raise KeyError(row)
+
+    for episode, _task, start in plans:
+        for offset in range(SEQUENCE_LENGTH):
+            decision = start + offset * CONTROL_STRIDE
+            key = global_row(episode, decision)
+            if key in seen:
+                continue
+            seen.add(key)
+            indices = clip_frame_indices(
+                decision, video_start_frame=0, window=VISION_WINDOW, stride=VISION_STRIDE
+            )
+            batch_keys.append(key)
+            batch_clips.append([get_frame(global_row(episode, max(0, idx))) for idx in indices])
+            if len(batch_keys) == args.batch_size:
+                encode_pending()
+    encode_pending()
+    del decode_tables
+    del vision_backbone
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print(f"vision features: {len(flat_features)}")
+
+    # Actions/states with cross-task normalization.
+    stat_actions, stat_states = [], []
+    for path, _rows in needed_rows.items():
+        table = pq.read_table(path, columns=["action", "observation.state"])
+        stat_actions.append(np.asarray(table.column("action").to_pylist(), dtype=np.float32))
+        stat_states.append(np.asarray(table.column("observation.state").to_pylist(), dtype=np.float32))
+    raw_actions = np.concatenate(stat_actions)
+    raw_states = np.concatenate(stat_states)
+    action_low, action_high = np.quantile(raw_actions, (0.01, 0.99), axis=0)
+    state_low, state_high = np.quantile(raw_states, (0.01, 0.99), axis=0)
+
+    norm_action: dict[int, np.ndarray] = {}
+    norm_state: dict[int, np.ndarray] = {}
+    for path, rows in needed_rows.items():
+        table = pq.read_table(path, columns=["index", "action", "observation.state"])
+        index_col = table.column("index").to_pylist()
+        acts = np.asarray(table.column("action").to_pylist(), dtype=np.float32)
+        states = np.asarray(table.column("observation.state").to_pylist(), dtype=np.float32)
+        position = {g: local for local, g in enumerate(index_col)}
+        for row in rows:
+            local = position[row]
+            norm_action[row] = robust_normalize(acts[local][None], action_low, action_high)[0]
+            norm_state[row] = robust_normalize(states[local][None], state_low, state_high)[0]
+
+    task_to_id = {task: index for index, task in enumerate(task_texts)}
+    vision_sequences = []
+    proprio_sequences = []
+    previous_sequences = []
+    action_sequences = []
+    language_sequences = []
+    mask_sequences = []
+    instruction_ids = []
+    for episode, task, start in plans:
+        task_id = task_to_id[task]
+        vision_sequences.append(
+            torch.stack(
+                [flat_features[global_row(episode, start + offset * CONTROL_STRIDE)] for offset in range(SEQUENCE_LENGTH)]
+            )
+        )
+        proprio_sequences.append(
+            torch.from_numpy(
+                np.stack(
+                    [norm_state[global_row(episode, start + offset * CONTROL_STRIDE)] for offset in range(SEQUENCE_LENGTH)]
+                )
+            )
+        )
+        previous_sequences.append(
+            torch.from_numpy(
+                np.stack(
+                    [
+                        # 修复 P0-A（2026-08-05 审查）：episode 首决策 prev 用 0（归一化中点，
+                        # 与闭环评估 last_norm 初值一致），避免跨 episode 泄漏/自泄漏
+                        np.zeros_like(norm_action[global_row(episode, start)])
+                        if start + offset * CONTROL_STRIDE == 0
+                        else norm_action[global_row(episode, start + offset * CONTROL_STRIDE) - 1]
+                        for offset in range(SEQUENCE_LENGTH)
+                    ]
+                )
+            )
+        )
+        action_sequences.append(
+            torch.from_numpy(
+                np.stack(
+                    [
+                        np.stack(
+                            [
+                                norm_action[global_row(episode, start + offset * CONTROL_STRIDE) + step]
+                                for step in range(ACTION_HORIZON)
+                            ]
+                        )
+                        for offset in range(SEQUENCE_LENGTH)
+                    ]
+                )
+            )
+        )
+        language_sequences.append(language_hidden[task_id])
+        mask_sequences.append(language_mask[task_id])
+        instruction_ids.append(task_id)
+
+    payload = {
+        "vision_tokens": torch.stack(vision_sequences),
+        "language_hidden": torch.stack(language_sequences),
+        "language_mask": torch.stack(mask_sequences),
+        "proprio": torch.stack(proprio_sequences),
+        "previous_action": torch.stack(previous_sequences),
+        "actions": torch.stack(action_sequences),
+        "pair_id": torch.arange(len(plans), dtype=torch.long),
+        "instruction_id": torch.tensor(instruction_ids, dtype=torch.long),
+        "episode_id": torch.arange(len(plans), dtype=torch.long),
+        "normalization": {
+            "action_q01": torch.from_numpy(action_low.astype(np.float32)),
+            "action_q99": torch.from_numpy(action_high.astype(np.float32)),
+            "state_q01": torch.from_numpy(state_low.astype(np.float32)),
+            "state_q99": torch.from_numpy(state_high.astype(np.float32)),
+        },
+        "metadata": {
+            "contract": "language_conditioned_mt50",
+            "tasks": task_texts,
+            "fps": int(info["fps"]),
+            "control_stride": CONTROL_STRIDE,
+            "action_horizon": ACTION_HORIZON,
+        },
+    }
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, args.output)
+    size_gib = args.output.stat().st_size / (1024**3)
+    print(f"saved={args.output.resolve()} size={size_gib:.2f}GiB shape={payload['vision_tokens'].shape}")
+
+
+if __name__ == "__main__":
+    main()

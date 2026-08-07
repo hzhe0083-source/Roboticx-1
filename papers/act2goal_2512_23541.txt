@@ -1,0 +1,682 @@
+                                                       Act2Goal: From World Model To General
+                                                              Goal-conditioned Policy
+                                                                          Pengfei Zhou1,* , Liliang Chen1,* , Shengcong Chen1 , Di Chen1 ,
+                                                                           Wenzhi Zhao1 , Rongjun Jin1 , Guanghui Ren1 , Jianlan Luo1,†
+                                                                                                  1
+                                                                                                    Agibot Research
+
+
+                                            Abstract—Specifying robotic manipulation tasks in a manner
+                                         that is both expressive and precise remains a central challenge.
+                                         While visual goals provide a compact and unambiguous task
+arXiv:2512.23541v1 [cs.RO] 29 Dec 2025
+
+
+
+
+                                         specification, existing goal-conditioned policies often struggle with
+                                         long-horizon manipulation due to their reliance on single-step
+                                         action prediction without explicit modeling of task progress.
+                                         We propose Act2Goal, a general goal-conditioned manipulation                                            Plan
+                                         policy that integrates a goal-conditioned visual world model
+                                         with multi-scale temporal control. Given a current observation
+                                         and a target visual goal, the world model generates a plausible
+                                         sequence of intermediate visual states that captures long-horizon
+                                         structure. To translate this visual plan into robust execution,
+                                         we introduce Multi-Scale Temporal Hashing (MSTH), which
+                                         decomposes the imagined trajectory into dense proximal frames
+                                         for fine-grained closed-loop control and sparse distal frames                       Goal
+                                         that anchor global task consistency. The policy couples these                                                    Action
+                                         representations with motor control through end-to-end cross-
+                                         attention, enabling coherent long-horizon behavior while remain-
+                                         ing reactive to local disturbances. Act2Goal achieves strong zero-
+                                         shot generalization to novel objects, spatial layouts, and environ-
+                                         ments. We further enable reward-free online adaptation through
+                                         hindsight goal relabeling with LoRA-based finetuning, allowing
+                                         rapid autonomous improvement without external supervision.
+                                         Real-robot experiments demonstrate that Act2Goal improves
+                                         success rates from 30% to 90% on challenging out-of-distribution
+                                         tasks within minutes of autonomous interaction, validating that         Fig. 1: Method Overview. The model receives a visual goal
+                                         goal-conditioned world models with multi-scale temporal control         (left), imagines how to achieve it via a goal-conditioned world
+                                         provide structured guidance necessary for robust long-horizon           model (top), and executes the planned actions in the real world
+                                         manipulation. Project page: https://act2goal.github.io/                 (right).
+
+                                                                     I. I NTRODUCTION
+                                                                                                                 an explicit representation of task progress, intermediate feasi-
+                                            Learning robotic manipulation policies requires task spec-           bility, or long-horizon consistency. This issue is further exac-
+                                         ifications that are both expressive and precise. While natural          erbated when GCPs are trained on narrowly scoped demon-
+                                         language offers a flexible interface for diverse tasks, it often        stration data. Without an explicit model of visual transitions
+                                         lacks the necessary granularity for fine-grained manipulation,          toward the goal, such policies tend to overfit demonstrated
+                                         a limitation that is more pronounced in complex, multi-stage            state–action mappings and must rely on dense supervision to
+                                         scenarios. Visual goals offer a more precise alternative by             compensate for the lack of structured intermediate guidance.
+                                         directly encoding object configurations, spatial relations, and         This limitation becomes particularly pronounced in long-
+                                         terminal constraints, avoiding linguistic ambiguity and explicit        horizon or out-of-distribution settings, where maintaining co-
+                                         reward engineering.                                                     herent progress toward the goal requires reasoning beyond
+                                            Goal-conditioned policies (GCPs) map the current observa-            locally observed transitions.
+                                         tion and a target visual goal directly to actions [1, 2, 3, 4].            To generalize beyond demonstrations, GCPs must therefore
+                                         While these methods perform well in short-horizon settings              explicitly model the visual dynamics required to reach a
+                                         and exhibit reasonable generalization [5, 6], their performance         desired goal. Without such mechanism, the policy cannot
+                                         degrades in long-horizon tasks. This limitation arises because          distinguish between actions that make meaningful progress
+                                         standard GCPs operate via direct action prediction [7], lacking         toward the goal and those that merely match local state–action
+                                                                                                                 correlations observed in demonstrations.
+                                           * Equal contribution.                                                    Recent advances in world models provide a promising path-
+                                           † Corresponding author.                                               way to address these limitations [8, 9, 10]. Vision–language
+                              Goal-Conditioned                           Action
+                                World Model                              Expert
+
+                                                                                                Proximal Action     Distal Action
+  Current Observation
+                                    Proximal Frame Feature                                       Distal Frame Feature
+
+
+
+
+       Goal Image
+
+
+                                                                              Goal Relabel
+                                  Average Success Rate
+
+                                                                                             Rollout
+           Large-Scale                                                       Optimize
+            Imitation
+            Learning                                                                                                      Success
+                                                                                                                           Rate
+                                     Sim Bench          Real World
+                                  DP-GC          �0.5 -GC     Act2Goal         Reward-Free Autonomous Improvement
+
+Fig. 2: System Overview. We propose Act2Goal, a goal-conditioned policy that integrates a visual world model with multi-
+scale temporal control to address long-horizon manipulation. After large-scale offline imitation learning, the model shows high
+performance on seen settings and strong generalization to unseen scenarios. The reward-free online autonomous improvement
+stage further improve model’s performance through rollout-goal relabel-optimize loop.
+
+
+world models demonstrate that generative prediction of future          To bridge this gap, we introduce Act2Goal, a general goal-
+visual states—conditioned on task instructions—can effec-           conditioned policy that integrates a goal-conditioned world
+tively support planning and decision-making [11, 12, 13].           model and a novel temporal decomposition mechanism termed
+Building on this insight, we consider a goal-conditioned            Multi-Scale Temporal Hashing (MSTH). MSTH decomposes
+analogue: goal-conditioned world model. Instead of predicting       the generated visual trajectory into dense proximal frames
+the future from high-level language, a goal-conditioned world       for fine-grained control and sparse, horizon-adaptive distal
+model produces a plausible sequence of intermediate states          frames that anchor the global plan. This multi-scale structure
+bridging the gap between the current observation and a desired      enables the policy to reason over long-horizon objectives
+visual goal. This capability remedies a fundamental limitation      while reacting quickly to local disturbances during closed-
+of conventional GCPs by introducing an explicit representation      loop execution. We further couple the goal-conditioned world
+of scene evolution over time, enabling a visually grounded and      model with an action expert via layer-wise cross-attention,
+task-consistent trajectory toward the specified goal.               allowing intermediate visual representations to guide low-level
+                                                                    motor control in an end-to-end differentiable architecture.
+   However, predicting a plausible visual path is only part of
+the solution. Executing long-horizon manipulation tasks reli-          Initialized from large-scale human demonstration data,
+ably requires addressing a deeper control challenge. A general      Act2Goal demonstrates strong zero-shot generalization across
+GCP must balance global consistency—maintaining fidelity            unseen objects, rearrangements, and environments. Beyond
+to the long-term goal—with local reactivity—responding ro-          offline training, Act2Goal supports reward-free online au-
+bustly to perturbations and correcting errors in closed-loop        tonomous improvement via Hindsight Experience Replay
+execution. Full-trajectory planning provides global coherence       (HER) [14]. By relabeling its own rollouts as additional
+but is brittle under deviations; short-horizon control improves     goal-achieving trajectories and updating the policy efficiently
+robustness but easily loses directional alignment in extended       through LoRA-based finetuning [15], the system rapidly adapts
+tasks. This inherent tension poses a fundamental barrier to         to new real-world scenarios without external supervision. In
+deploying GCPs as general-purpose robotic controllers.              real-robot experiments, this enables Act2Goal to substantially
+improve performance on challenging long-horizon, out-of-              where the world model provides future state feature and the
+distribution tasks, increasing success rates from 0.30 to 0.90        AE predicts actions accordingly.
+within minutes of autonomous interaction. These results val-             Among these, GE-Act [13] adopts a bi-model architecture
+idate the central premise of this work: that goal-conditioned         with a world model predicting future visual feature based
+world models, combined with multi-scale temporal reasoning,           on language instruction and a transformer-based planner gen-
+provide the structured intermediate guidance necessary for ro-        erating actions. WorldVLA [35] jointly predicts vision and
+bust generalization and closed-loop execution in long-horizon         action in a unified latent space, aiming for tighter vision-action
+manipulation.                                                         alignment.
+   Our main contributions are threefold. First, we present               Different from prior works, Act2Goal leverages a purely
+a novel end-to-end goal-conditioned policy that integrates a          vision-based goal-conditioned world model to guide policy
+visual world model with motor control, enabling robust zero-          learning with structured visual trajectories. To the best of our
+shot generalization across unseen objects, environments, and          knowledge, this is the first work to integrate a world model
+goals. Second, we introduce Multi-Scale Temporal Hashing              into goal-conditioned policy learning.
+(MSTH), a temporal representation that decomposes trajecto-           C. Online Autonomous Improvement
+ries into proximal and distal frames to balance long-horizon
+                                                                         To enhance policy adaptability during deployment, recent
+planning with closed-loop local control. Third, we develop a
+                                                                      studies explore online improvement via either interactive im-
+reward-free online adaptation mechanism based on HER-style
+                                                                      itation learning such as DAgger [36, 37, 38] or in-context
+goal relabeling with LoRA-based finetuning, enabling rapid
+                                                                      learning (ICL) [39, 40]. However, DAgger-style methods re-
+autonomous improvement on out-of-distribution tasks.
+                                                                      quire frequent expert intervention, while ICL methods do not
+                     II. R ELATED W ORKS                              update model weights and often show limited performance on
+                                                                      complex tasks.
+  Our Act2Goal policy combines a goal-conditioned world
+                                                                         An alternative line of work leverages Hindsight Experience
+model with an action expert capable of online autonomous
+                                                                      Replay (HER) [14] and its extensions [41, 42, 43], which
+improvement. Accordingly, we review related work in goal-
+                                                                      relabel transitions by replacing original goals with achieved
+conditioned policies, world models for robotic control, and
+                                                                      states, then optimize the policy using reinforcement or im-
+online autonomous improvement.
+                                                                      itation learning. While these methods reduce the need for
+A. Goal-conditioned Policy                                            explicit rewards, they still rely on complex reward relabeling
+                                                                      or external reward signals.
+   Goal-conditioned policy learning aims to train agents to
+                                                                         Act2Goal takes a further step toward fully autonomous
+reach diverse formats of goals, e.g., visual goals [2, 3, 4,
+                                                                      online improvement. By combining HER-style relabeling with
+16, 17, 18, 19], tracking points [20, 21] and motion field
+                                                                      efficient LoRA-based finetuning, it enables direct policy adap-
+[22]. Early works enhance imitation learning by relabeling
+                                                                      tation from self-collected rollouts, without any task rewards
+goals [3, 14], while others extend reinforcement learning with
+                                                                      or human annotations. This yields a lightweight, fully self-
+structured goal representations [4, 23]. Recent advances further
+                                                                      supervised update mechanism suitable for real-world deploy-
+explore long-horizon reasoning [24], keyframe-based plan-
+                                                                      ment.
+ning [24], and goal generation via program synthesis [23, 25].
+   Among them, GoalGAIL [3] incorporates HER to learn                           III. F ROM W ORLD M ODEL T O G ENERAL
+from suboptimal or state-only demonstrations, improving sam-                           G OAL - CONDITIONED P OLICY
+ple efficiency in imitation settings. CoA [24] proposes gen-             Our framework is designed to address two key challenges
+erating action sequences in reverse from goal keyframes to            in long-horizon goal-conditioned manipulation: aligning the
+maintain long-horizon consistency in manipulation.                    action policy with high-level goal semantics, and maintaining
+   These methods, however, typically rely on explicit goal            planning efficiency over extended time scales. As shown in
+supervision or struggle to align current observations with            Figure 2, we tackle the first challenge by introducing a Goal-
+distant goals. Act2Goal addresses these limitations by intro-         Conditioned World Model (GCWM) to guide the policy with
+ducing a goal-conditioned world model to simulate structured          imagined visual futures, providing rich, temporally coherent
+visual trajectories and proposing Multi-Scale Temporal Hash-          representations. To address the second challenge, we propose
+ing (MSTH) to support consistent and efficient long-horizon           Multi-Scale Temporal Hashing (MSTH), which enables the
+planning, enabling better generalization in unseen tasks.             policy to focus on both short-term execution and long-term
+                                                                      goal awareness through structured temporal abstraction.
+B. World Model for Robotic Control                                       Our learning process consists of three stages. Stage 1 per-
+   World models have become a powerful tool in robotic                forms joint training of the GCWM and action expert to align
+control, enabling agents to simulate environmental dynam-             their representations. Stage 2 focuses on action adaptation,
+ics [26, 27, 28], generate synthetic data for training [29, 30], or   further improving the policy’s performance. Stage 3 introduces
+serve as learned simulators to guide policy learning [31, 32].        optional autonomous improvement, allowing the model to self-
+Recent works further combine world models with action                 adapt in novel scenarios during deployment. We describe each
+experts (AEs) to form policy planning systems [33, 34, 12, 11],       component in detail below.
+         Multi-view Input Frames            Robot State                                  predicted using a flow matching process conditioned on both
+                                                                                         the proprioceptive state cp and the multi-scale features cw from
+             Video Encoder
+                                                                                         the world model.
+         Noised Latent Features                            Noised Actions
+                                                                                            The action prediction process can then be formulated as:
+
+  1.6B                                            Action Expert                                               apred = gϕ (cw , cp , ζ),                 (3)
+                                                  160M
+                                ×28                                          ×28         where gϕ is the action flow matching model, ζ are noise inputs
+            Video DiT Block                               Action DiT Block
+                                         Cross                                           for action generation, cw = {h1world , . . . , hL
+                                                                                                                                         world } represents
+                                         Atten.
+                                                                                         the layered transition features, and cp is the proprio state
+              Norm. & Out                                    Norm. & Out                 condition. The flow matching process during inference for
+                                                                                         actions follows an iterative refinement:
+          MSTH Latent Frames                                MSTH Actions
+                                                                                                                         1
+Fig. 3: Model Architecture. This figure presents the network                                          a(n+1) = a(n) + uϕ (a(n) , cw , cp ),             (4)
+                                                                                                                        N
+architecture of Act2Goal model. On the left, multi-view input
+                                                                                         where uϕ is the learned vector field for action generation.
+frames, including current observation and goal, are encoded
+into latents via a video encoder and concatenated with noisy                             B. Multi-Scale Temporal Hashing for Visual State and Action
+latents, then refined into MSTH latent frames through Video
+                                                                                            In our framework, the Multi-Scale Temporal Hashing
+DiT blocks. On the right, the robot state and multi-scale
+                                                                                         (MSTH) mechanism jointly guides the goal-conditioned world
+features from the world model are fed via cross-attention into
+                                                                                         model and the action expert, enabling a consistent yet flexi-
+isomorphic Action DiT blocks, generating MSTH-structured
+                                                                                         ble multi-scale temporal abstraction. Given a total imagined
+actions.
+                                                                                         trajectory length K, a proximal horizon P , and a vision
+                                                                                         sampling stride r, MSTH partitions the future trajectory into
+A. Goal-Conditioned World Model-Guided Policy                                            two segments.
+   As illustrated in Fig. 3, our goal-conditioned world model                               The proximal segment consists of high-frequency short-
+                                                                                                                             P/r
+builds upon the Genie Envisioner architecture with key modi-                             horizon visual states {st+kr }k=1 , which capture fine-grained
+fications tailored for goal-conditioned policy learning [13]. We                         local dynamics. The distal segment contains M sparsely
+introduce a goal visual condition that is concatenated with the                          sampled visual states {st+dm }M      m=1 , where the indices dm are
+current observation along the hidden states sequence, while                              determined by logarithmic spacing:
+removing all language-conditioning components to create a                                               
+                                                                                                               K −P
+                                                                                                                                      
+purely vision-based model.                                                                 dm = P +                       · log(m + 1) , m = 1, . . . , M.
+                                                                                                           log(M + 1)
+   Our goal-conditioned world model employs a continuous                                                                                                 (5)
+flow matching approach for generative modeling. The process                              This logarithmic sampling results in increasing temporal inter-
+can be abstracted as learning a transformation from random                               vals as the horizon extends, providing coarse but goal-aligned
+noise to structured visual sequences conditioned on both                                 long-term guidance.
+current observations and goal states:                                                       The predicted action sequence follows the same multi-
+                                                                                         scale structure, with an important distinction from vi-
+                            zpred = fθ (zt , zg , ϵ),                              (1)
+                                                                                         sion. Proximal actions are predicted at every timestep,
+where zt and zg are VAE-compressed latents of the current                                {at+1 , at+2 , . . . , at+P }, enabling dense motor control even
+observation and goal respectively, ϵ represents random noise                             when visual states are subsampled by stride r. In contrast,
+inputs, which have the same shape as zpred , and fθ is the                               distal actions {at+dm }M     m=1 are aligned with the distal visual
+flow matching model that generates the latent frames between                             states and serve as long-horizon guidance. During deployment,
+current observation and goal.                                                            only the proximal actions are executed, while distal predictions
+   During inference, the model progressively refines the noisy                           remain latent and guide long-term goal adherence.
+latents through a deterministic flow process:
+                                                                                         C. Two-Stage Offline Training
+                   (n+1)      1
+              z     = z + vθ (z (n) , zt , zg ),
+                                   (n)
+                                                           (2)                              To endow Act2Goal with strong generalization capabilities,
+                              N                                                          we first train the model through large-scale offline imitation
+where vθ is the learnt vector field that guides the denoising                            learning. The training process consists of two main stages,
+process over multiple steps n = 0, 1, . . . , N − 1. The com-                            designed to ensure that the transition trajectory prediction
+pleted latent frames can be decoded into visual states using                             objective aligns closely with the ultimate goal of guiding
+the VAE decoder.                                                                         action planning.
+   Following the GE-Act implementation, our action expert                                   In the first stage, we fine-tune a pre-trained world model to
+employs a network architecture that is isomorphic to the                                 adapt it for the transition trajectory prediction task of generat-
+world model, featuring the same number of DiT blocks but                                 ing multi-view video frames following the MSTH distribution
+with reduced network width [13]. The action trajectory is                                between initial observation and goal condition. To enhance
+Algorithm 1 Act2Goal Online Autonomous Improvement                                 common limitation of imitation learning-based policies. To
+  1) Initialize replay buffer B and LoRA parameters ϕ                              address this, we introduce an online autonomous improvement
+  2) While performance not converged:                                              framework based on Hindsight Experience Replay (HER),
+        a) Execute policy for one episode, storing (o, cp , a, o′ ) at each step
+       b) For each transition (o, cp , a, o′ ) in episode:
+                                                                                   enabling autonomous performance enhancement during de-
+             i) B ← B ∪ {(o, cp , a, o′ )}                                         ployment [14].
+        c) If |B| ≥ N :                                                               As illustrated in Algorithm 1, the system operates as
+             i) For k = 1 to K:                                                    follows: for a given expected goal condition, the model
+                A) Sample batch {(o, cp , a, o′ )} ∼ B                             infers and executes actions. Each inference step—consisting
+                B) g ′ ← o′ // Relabel achieved visual state as goal               of the starting observation latent, initial pripro state, output
+                C) L = E[∥πθ (o, cp , g ′ ) − a∥2 ]
+                D) ϕ ← ϕ − α∇ϕ L                                                   action, and resulting observation latent after execution—is
+            ii) B ← ∅                                                              automatically collected in a replay buffer on the edge device.
+                                                                                   Crucially, regardless of whether the transition successfully
+                                                                                   achieves the intended goal, we automatically relabel the goal
+the alignment between transition trajectory prediction and                         condition as the robot’s observation at the end of the inference
+action planning objectives, we jointly train both the transition                   step, eliminating the need for manual labeling of transitions.
+trajectory prediction task and the action generation task using                    When the replay buffer reaches a predetermined capacity
+flow matching.                                                                     threshold, we perform a fixed number of end-to-end training
+   The training objective for the visual generation component                      iterations using the buffer transitions, following the same
+follows the flow matching loss formulation:                                        approach as Stage 2 of offline imitation learning. To ensure
+                                                                                   efficient on-device training, only the additionally introduced
+                                                                                  LoRA layers in the Act2Goal model are updated, while the
+         Lv = Et∼U (0,1),z0 ,z1 ,zt ,zg ∥vθ (t, ϕt (z), zt , zg )                  base model parameters remain frozen [15]. After completing
+                                                                            (6)
+                                             −(z1 − z0 )∥2
+                                                                
+                                                                                   the fixed iteration training, the replay buffer is cleared, and
+                                                                                   the system continues collecting new data through rollouts,
+                                                                                  repeating this cycle until performance meets expectations. We
+       La = Et∼U (0,1),a0 ,a1 ,cw ,cp ∥uϕ (t, ψt (a), cw , cp )
+                                                                            (7)    set maximum inference counts for different tasks; exceeding
+                                           −(a1 − a0 )∥2 .
+                                                            
+                                                                                   this threshold triggers an automatic robot reset. During real-
+  The joint training objective combines both losses with a                         robot experiments, the only required human intervention is
+balancing coefficient λ. In our experiment, we set λ = 0.1:                        manually restoring or modifying the experimental setup when
+                                                                                   necessary.
+                        Lstage1 = Lv + λ · La .                             (8)
+                                                                                                         IV. E XPERIMENTS
+   This joint optimization ensures that the goal-conditioned
+                                                                                      Our experiments aim to systematically evaluate the effec-
+world model learns to generate visual trajectories that are not
+                                                                                   tiveness of the proposed ACT 2G OAL model across both offline
+only visually plausible but also actionable, creating a strong
+                                                                                   and online settings. We assess the model’s ability to generalize
+foundation for the subsequent policy learning stage.
+                                                                                   to novel scenarios, and to autonomously improve itself through
+   In the second training stage, we employ behavioral cloning
+                                                                                   interactions during deployment. Specifically, we study three
+to fine-tune the entire model end-to-end using only the action
+                                                                                   key aspects: (1) the generalization capability of policies trained
+flow matching loss Lstage2 = La , further strengthening its
+                                                                                   offline using imitation learning, measured under both in-
+action planning capabilities. This stage focuses on align-
+                                                                                   domain (ID) and out-of-domain (OOD) scenarios; (2) the
+ing the complete pipeline—from visual perception to action
+                                                                                   model’s capacity for online autonomous improvement, enabled
+execution—with expert demonstrations. The gradients from
+                                                                                   by lightweight on-device fine-tuning of LoRA layers with self-
+the action loss propagate through both the action generation
+                                                                                   relabelled transitions; and (3) the contribution of our proposed
+components and the goal-conditioned world model, allowing
+                                                                                   Multi-Scale Temporal Hashing (MSTH) mechanism, evaluated
+the visual representations to be optimized specifically for
+                                                                                   through qualitative analysis and ablations on both ID and OOD
+action planning.
+                                                                                   tasks.
+   This two-stage offline training approach enables Act2Goal
+to acquire robust world understanding and action generation
+                                                                                   A. Generalization Capability Evaluation
+capabilities that transfer effectively to unseen environments
+and tasks.                                                                            To comprehensively evaluate the generalization capability
+                                                                                   and versatility of Act2Goal after offline imitation training,
+D. Online Autonomous Improvement                                                   we conducted extensive experiments in both simulated bench-
+   While the model exhibits strong generalization capabilities                     marks and real-world robotic tasks. We selected four distinct
+after offline imitation learning, achieving high performance on                    tasks (Move can pot, Pick dual bottles, Place empty cup, Place
+novel tasks, environments, objects, and motion control chains                      shoe) from the Robotwin 2.0 simulation benchmark [44]. For
+remains challenging when deployed on physical robots—a                             each test episode in the simulator, the final goal image was
+Head View Goal                    Model Rollouts                   Head View Goal                  Model Rollouts
+
+
+
+
+                        In-domain Tasks                                                      Out-of-domain Tasks
+Fig. 4: Real World Evaluation. This figure illustrates in-domain and out-of-domain test configurations for three real-world
+tasks: Whiteboard Word Writing, Dessert Plating, and Plug-In Operation. For each task, Head View Goal displays the target,
+while Model Rollouts shows the robot’s execution process; these setups are used to evaluate the model’s generalization ability
+using the success rate as the metric.
+
+
+TABLE I: Comparison of Performance on Robotwin 2.0                  TABLE II: Comparison of Performance on Real-World Ma-
+Simulation Benchmark. Act2Goal outperforms baselines in             nipulation Tasks. Act2Goal demonstrates remarkable perfor-
+all Easy-mode tasks and 3 Hard-mode tasks, showing superior         mance across all real-world tasks, significantly outperforming
+generalization.                                                     all baseline methods. The robust performance in OOD settings
+                                                                    strongly validates its superior generalization ability. All results
+                           Move       Pick      Place     Place
+         Model/Task
+                           Can       Bottles    Cup       Shoe
+                                                                    are obtained without any online autonomous improvement,
+                                                                    using only offline imitation learning.
+         DP-GC             0.18       0.04       0.03      0.04
+         π0.5 -GC          0.54       0.13       0.16      0.30                                  Whiteboard      Dessert      Plug-In
+Easy                                                                          Model/Task
+         HyperGoalNet      0.11       0.08       0.08      0.01                                 Word Writing     Plating     Operation
+         Act2Goal          0.62       0.80       0.64      0.52
+                                                                              DP-GC                 0.00           0.10        0.00
+         DP-GC             0.00       0.00       0.00      0.00               π0.5 -GC              0.23           0.18        0.00
+         π0.5 -GC          0.42       0.06       0.04      0.06     ID
+Hard                                                                          HyperGoalNet          0.00           0.08        0.00
+         HyperGoalNet      0.00       0.00       0.00      0.00               Act2Goal              0.93           0.75        0.45
+         Act2Goal          0.13       0.43       0.13      0.15
+                                                                              DP-GC                 0.00           0.00        0.00
+obtained via fixing the environment seed to ensure the repro-                 π0.5 -GC              0.20           0.05        0.00
+                                                                    OOD
+                                                                              HyperGoalNet          0.00           0.00        0.00
+ducibility and consistency of the goal configuration across all               Act2Goal              0.90           0.48        0.30
+test episodes, extracting it from successfully executed trajec-
+tories under this seed, and used as the goal condition for our      in realistic scenarios, we conducted real-world experiments on
+model. The Robotwin 2.0 benchmark is particularly suitable          an AgiBot Genie-01 robot using three challenging manipula-
+for assessing generalization as it includes both seen scenarios     tion tasks. These tasks are characterized by objectives that
+(Easy mode) and highly challenging unseen scenarios (Hard           are difficult to precisely specify via language, making them
+mode).                                                              particularly suitable for goal-conditioned policies, and they
+   We compare Act2Goal with several state-of-the-art policy         require fine-grained control for successful execution. The data
+architectures, including: (1) DP-GC, which conveys the SigLIP       for these test tasks are part of the full dataset used for offline
+features of both the current observation and the goal image to a    imitation training, and we did not perform any task-specific
+DiT-style Action Expert via cross-attention; (2) HyperGoalNet,      supervised fine-tuning (SFT). For each task, we designed both
+a recent high-performing open-source goal-conditioned policy;       in-domain (ID) and out-of-domain (OOD) test configurations
+and (3) the π0.5 -GC baseline, which uses a fixed language          to thoroughly assess the model’s generalization ability, using
+condition for all data while incorporating both a goal image        success rate as the evaluation metric. The three real-world
+and the current raw observation as visual inputs to π0.5 [3, 19,    tasks are designed as follows:
+45, 46].                                                               • Task 1: Whiteboard Word Writing. The robot writes
+   The results in Table I demonstrate that Act2Goal signif-              English words on a whiteboard. The ID test involves
+icantly outperforms all these baselines. Notably, it exhibits            writing words seen in the training data (which includes
+an overwhelming advantage in the Hard mode, particularly                 200 words), whereas the OOD test requires writing un-
+in unseen scenarios, highlighting its superior generalization            seen words with novel character combinations, testing the
+capability.                                                              model’s compositional generalization.
+   To further validate the generalization capability of Act2Goal       • Task 2: Dessert Plating. The robot arranges desserts
+                                                                                   1.0         A                                          1.0             Successful Rollouts
+        Scenario A    Scenario B    Scenario C     Scenario D
+                                                                                               B                                                          Failed Rollouts
+                                                                                   0.8         C                                          0.8             All Rollouts
+                                                                                               D
+
+
+
+
+                                                                    Success Rate
+ Init                                                                              0.6                                                    0.6
+                                                                                   0.4                                                    0.4
+                                                                                   0.2                                                    0.2
+Goal                                                                               0.0                                                    0.0
+                                                                                      Iter 0             Iter 100             Iter 200          Iter 0         Iter 100     Iter 200     Iter 300
+                                                                                               Round 1              Round 2                              Round 1      Round 2      Round 3
+
+Fig. 5: Online Autonomous Improvement Scenarios. This                  Fig. 6: Online Training Performance in Robotwin 2.0. This
+figure illustrates four OOD scenarios from the RoboTwin 2.0            figure presents two key findings from Robotwin 2.0 simu-
+benchmark, corresponding to the hard testing modes of Move             lations: (Left) Multi-round success rates of four hard-mode
+Can Pot, Pick Dual Bottles, Place Empty Cup, and Place                 scenarios, showing consistent improvement over 3 rounds be-
+Shoe. These scenarios serve as the testbed for verifying the           fore convergence. (Right) Performance of three data selection
+effectiveness of autonomous improvement.                               strategies for rollouts: using all rollouts yields optimal results,
+                                                                       while even failed-only rollouts enable noticeable improvement.
+    on a plate according to a visual example. The ID test
+    uses dessert types, plate styles, and backgrounds seen                         Zero-shot
+    during offline imitation training, while the OOD test in-
+    troduces significant visual variations. This task evaluates
+    the policy’s goal-following capability under strong visual
+    distractions.
+  • Task 3: Plug-In Operation. The robot performs insertion                                        Round 0                                                                Round 1
+    tasks. The ID test involves inserting a metal workpiece                                                                              Goal
+    into a corresponding hole, as seen in training. The OOD
+    test requires inserting a cylindrical drink bottle into a cup
+    holder—an unseen task that assesses the model’s skill
+    transfer capability.
+   As summarized in Fig. 4 and Table II, Act2Goal demon-
+                                                                                                   Round 2                                                                Round 3
+strates remarkable performance across all real-world tasks,
+significantly outperforming all baseline methods. Its robust           Fig. 7: Online Training Performance in Real-World Unseen
+performance in OOD settings strongly validates the superior            Scenarios. When tasked with drawing an unseen pattern, the
+generalization ability of the proposed approach.                       model initially performs poorly. However, as online training
+                                                                       progresses (from left to right, top to bottom), the drawing
+B. Analysis of Online Autonomous Improvement                           quality improves steadily.
+   We validated the effectiveness of online autonomous im-
+provement in both simulated and real-world environments,               robot manipulation. The corresponding results can be find in
+and systematically analyzed best practices for enhancing robot         the right part of Fig. 6.
+manipulation performance using Hindsight Experience Replay                In real-world experiments, we tasked the robot with white-
+(HER).                                                                 board writing (Task 1 in Sec. 4.3). While the model exhibits
+   In the Robotwin 2.0 simulation environment, we selected             strong generalization in whiteboard word writing, we assessed
+one hard-mode scenario from each of the four tasks described           its capability to draw novel patterns that are substantially
+in Section 4.2 (shown in Fig. 5) for multi-round online train-         different from writing. As shown in Fig. 7, the model’s initial
+ing, evaluating the success rate after each round. As shown            performance on this unfamiliar case was limited. Neverthe-
+in the left part of Fig. 6, the model’s performance improved           less, through online fine-tuning, it demonstrated consistent
+consistently over approximately three rounds of training before        improvements in drawing quality in 15 minutes. On the OOD
+converging, with a maximum success rate improvement of up              Plug-In task, the model also demonstrates a consistent increase
+to 8× compared to the pre-trained baseline. We also compared           in success rate throughout online training (from 0.30 to 0.90).
+three data selection strategies for rollout usage: (1) using           Detailed information can be found in our project page.
+only successful rollouts, (2) using all rollouts regardless of
+success, and (3) using only failed rollouts. We found that             C. Effectiveness of MSTH
+utilizing all rollouts yielded the best performance. Notably,             Fig. 8 presents three representative examples of video clips
+even using only failed rollouts still led to clear improvement,        generated by our goal-conditioned world model. As illustrated,
+demonstrating that the HER-based strategy—extracting useful            the model is capable of producing both fine-grained proximal
+experience from failures—is effective for goal-conditioned             frames, which offer detailed short-term guidance essential for
+   Cur Obs                 Proximal Frames (selected)                     Distal Frames (selected)                Goal Image
+
+
+
+
+Fig. 8: Examples of generated videos. This figure illustrates the generation capability of our goal-conditioned world model
+through three head-view video clips. The left and right sides show the current observation and the target goal, respectively.
+For each sequence, we uniformly sample three proximal and three distal frames. The second row provides a zoomed-in view
+of the red-highlighted regions in the first row. Red arrows in the third and fourth rows highlight the motion of key objects.
+The distal frames in the bottom row correspond to longer temporal horizons compared to those in the third row.
+
+
+TABLE III: Effectiveness of MSTH. Values denote the suc-           horizon baseline exhibits a drastic performance drop as the
+cess rate of the real-world whiteboard word writing task. The      planning horizon increases, particularly in long and OOD
+word length definitions: Short (3 letters or fewer), Medium (4     scenarios. This degradation is primarily due to compounding
+to 6 letters), Long (7 letters or more).                           goal misalignment over extended sequences, where the model
+             Model            Short       Medium        Long
+                                                                   struggles to maintain consistent intent.
+                                                                      In contrast, MSTH maintains high success rates across all
+             w/o MSTH         0.95          0.35         0.10
+  ID
+             w/ MSTH          0.95          0.90         0.90      word lengths and generalizes well to OOD words, indicating
+                                                                   its robustness and effectiveness in handling long-horizon de-
+             w/o MSTH         0.60          0.20         0.00
+  OOD                                                              pendencies. By dynamically adjusting the temporal abstrac-
+             w/ MSTH          0.93          0.90         0.88
+                                                                   tion level and enabling better temporal anchoring to final
+the action expert to generate accurate and executable actions,     goal, MSTH provides a simple yet principled mechanism for
+and sparser distal frames, which capture the long-horizon          improving long-horizon goal-conditioned manipulation. These
+structure of the task and effectively guide the model toward the   results highlight MSTH as a critical design component for
+intended long-term goal. This hierarchical visual forecasting      scaling visual policy models to complex, temporally extended
+enables the model to reason across multiple temporal scales,       tasks.
+facilitating both precise control and goal-directed planning.                             V. C ONCLUSION
+   We also conducted an ablation study to investigate the             We propose Act2Goal, a goal-conditioned policy that com-
+effectiveness of the proposed Multi-Scale Temporal Hash-           bines a visual world model with multi-scale temporal control
+ing (MSTH) mechanism in a real-world whiteboard word               to tackle long-horizon manipulation. The model generates
+writing task, which requires long-horizon, visually grounded       both fine-grained short-term executable control signals and
+planning. As shown in Table III, we compare the success            coarse long-term trajectories, enabling effective planning and
+rates across words of varying lengths—short (no more than          control. Trained fully offline, Act2Goal achieves high success
+3 letters), medium (4–6 letters), and long (no fewer than 7        rates in seen tasks and shows strong generalization to unseen
+letters)—under both in-domain (ID) and out-of-domain (OOD)         scenarios. To enhance adaptability, we incorporate Hindsight
+settings.                                                          Experience Replay (HER) and LoRA-based finetuning, en-
+   The MSTH-based policy demonstrates a substantial im-            abling efficient, reward-free online autonomous improvement
+provement over the baseline strategy that relies on fixed-         within minutes. Together, these components contribute to a
+horizon action chunking. While both methods perform com-           scalable and generalizable visuomotor policy for open-ended,
+parably on short-horizon tasks (e.g., short words), the fixed-     real-world manipulation tasks.
+                        R EFERENCES                                    fied world foundation platform for robotic manipulation.
+                                                                       arXiv preprint arXiv:2508.05635, 2025.
+ [1] Leslie Pack Kaelbling. Learning to achieve goals. In         [14] Marcin Andrychowicz, Filip Wolski, Alex Ray, Jonas
+     IJCAI, volume 2, pages 1094–8, 1993.                              Schneider, Rachel Fong, Peter Welinder, Bob Mc-
+ [2] Minghuan Liu, Menghui Zhu, and Weinan Zhang. Goal-                Grew, Josh Tobin, OpenAI Pieter Abbeel, and Wojciech
+     conditioned reinforcement learning: Problems and solu-            Zaremba. Hindsight experience replay. Advances in
+     tions. arXiv preprint arXiv:2201.08299, 2022.                     neural information processing systems, 30, 2017.
+ [3] Yiming Ding, Carlos Florensa, Pieter Abbeel, and Mar-        [15] Edward J Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-
+     iano Phielipp. Goal-conditioned imitation learning. Ad-           Zhu, Yuanzhi Li, Shean Wang, Lu Wang, Weizhu Chen,
+     vances in neural information processing systems, 32,              et al. Lora: Low-rank adaptation of large language
+     2019.                                                             models. ICLR, 1(2):3, 2022.
+ [4] Xudong Gong, Dawei Feng, Kele Xu, Bo Ding, and               [16] Abhinav Jain and Vaibhav Unhelkar. Go-dice: Goal-
+     Huaimin Wang. Goal-conditioned on-policy reinforce-               conditioned option-aware offline imitation learning via
+     ment learning. Advances in neural information process-            stationary distribution correction estimation. In Proceed-
+     ing systems, 37:45975–46001, 2024.                                ings of the AAAI conference on artificial intelligence,
+ [5] Kevin Black, Mitsuhiko Nakamoto, Pranav Atreya,                   volume 38, pages 12763–12772, 2024.
+     Homer Walke, Chelsea Finn, Aviral Kumar, and Sergey          [17] Heecheol Kim, Yoshiyuki Ohmura, and Yasuo Ku-
+     Levine.     Zero-shot robotic manipulation with pre-              niyoshi. Goal-conditioned dual-action imitation learning
+     trained image-editing diffusion models. arXiv preprint            for dexterous dual-arm robot manipulation. IEEE Trans-
+     arXiv:2310.10639, 2023.                                           actions on Robotics, 40:2287–2305, 2024.
+ [6] Yang Tian, Sizhe Yang, Jia Zeng, Ping Wang, Dahua            [18] Chen Wang, Linxi Fan, Jiankai Sun, Ruohan Zhang,
+     Lin, Hao Dong, and Jiangmiao Pang. Predictive inverse             Li Fei-Fei, Danfei Xu, Yuke Zhu, and Anima Anand-
+     dynamics models are scalable learners for robotic ma-             kumar. Mimicplay: Long-horizon imitation learning by
+     nipulation. arXiv preprint arXiv:2412.15109, 2024.                watching human play. arXiv preprint arXiv:2302.12422,
+ [7] Moritz Reuss, Maximilian Li, Xiaogang Jia, and Rudolf             2023.
+     Lioutikov.    Goal-conditioned imitation learning us-        [19] Pei Zhou, Wanting Yao, Qian Luo, Xunzhe Zhou, and
+     ing score-based diffusion policies.       arXiv preprint          Yanchao Yang. Hyper-goalnet: Goal-conditioned ma-
+     arXiv:2304.02532, 2023.                                           nipulation policy learning with hypernetworks. In The
+ [8] Yixin Liu, Kai Zhang, Yuan Li, Zhiling Yan, Chujie Gao,           Thirty-ninth Annual Conference on Neural Information
+     Ruoxi Chen, Zhengqing Yuan, Yue Huang, Hanchi Sun,                Processing Systems.
+     Jianfeng Gao, et al. Sora: A review on background,           [20] Chuan Wen, Xingyu Lin, John So, Kai Chen, Qi Dou,
+     technology, limitations, and opportunities of large vision        Yang Gao, and Pieter Abbeel.            Any-point trajec-
+     models. arXiv preprint arXiv:2402.17177, 2024.                    tory modeling for policy learning.         arXiv preprint
+ [9] Yoav HaCohen, Nisan Chiprut, Benny Brazowski, Daniel              arXiv:2401.00025, 2023.
+     Shalem, Dudu Moshe, Eitan Richardson, Eran Levin,            [21] Homanga Bharadhwaj, Roozbeh Mottaghi, Abhinav
+     Guy Shiran, Nir Zabari, Ori Gordon, et al. Ltx-                   Gupta, and Shubham Tulsiani. Track2act: Predicting
+     video: Realtime video latent diffusion. arXiv preprint            point tracks from internet videos enables generalizable
+     arXiv:2501.00103, 2024.                                           robot manipulation. In European Conference on Com-
+[10] Niket Agarwal, Arslan Ali, Maciej Bala, Yogesh Bal-               puter Vision, pages 306–324. Springer, 2024.
+     aji, Erik Barker, Tiffany Cai, Prithvijit Chattopadhyay,     [22] Zhao-Heng Yin, Sherry Yang, and Pieter Abbeel. Object-
+     Yongxin Chen, Yin Cui, Yifan Ding, et al. Cosmos world            centric 3d motion field for robot learning from human
+     foundation model platform for physical ai. arXiv preprint         videos. arXiv preprint arXiv:2506.04227, 2025.
+     arXiv:2501.03575, 2025.                                      [23] Guy Davidson, Graham Todd, Julian Togelius, Todd M
+[11] Yucheng Hu, Yanjiang Guo, Pengchao Wang, Xiaoyu                   Gureckis, and Brenden M Lake. Goals as reward-
+     Chen, Yen-Jen Wang, Jianke Zhang, Koushil Sreenath,               producing programs. Nature Machine Intelligence, 7(2):
+     Chaochao Lu, and Jianyu Chen. Video prediction policy:            205–220, 2025.
+     A generalist robot policy with predictive visual represen-   [24] Wenbo Zhang, Tianrun Hu, Yanyuan Qiao, Hanbo Zhang,
+     tations. arXiv preprint arXiv:2412.14803, 2024.                   Yuchu Qin, Yang Li, Jiajun Liu, Tao Kong, Lingqiao Liu,
+[12] Youpeng Wen, Junfan Lin, Yi Zhu, Jianhua Han, Hang                and Xiao Ma. Chain-of-action: Trajectory autoregres-
+     Xu, Shen Zhao, and Xiaodan Liang. Vidman: Exploiting              sive modeling for robotic manipulation. arXiv preprint
+     implicit dynamics from video diffusion model for effec-           arXiv:2506.09990, 2025.
+     tive robot manipulation. Advances in Neural Information      [25] Lance Ying, Katherine M Collins, Prafull Sharma, Cedric
+     Processing Systems, 37:41051–41075, 2024.                         Colas, Kaiya Ivy Zhao, Adrian Weller, Zenna Tavares,
+[13] Yue Liao, Pengfei Zhou, Siyuan Huang, Donglin Yang,               Phillip Isola, Samuel J Gershman, Jacob D Andreas, et al.
+     Shengcong Chen, Yuxin Jiang, Yue Hu, Jingbin Cai,                 Assessing adaptive world models in machines with novel
+     Si Liu, Jianlan Luo, et al. Genie envisioner: A uni-              games. arXiv preprint arXiv:2507.12821, 2025.
+[26] David Ha and Jürgen Schmidhuber. World models. arXiv             in-the-loop reinforcement learning. Science Robotics, 10
+     preprint arXiv:1803.10122, 2(3), 2018.                            (105):eads5033, 2025.
+[27] Danijar Hafner, Timothy Lillicrap, Jimmy Ba, and Mo-         [39] Rutav Shah, Shuijing Liu, Qi Wang, Zhenyu Jiang,
+     hammad Norouzi. Dream to control: Learning behaviors              Sateesh Kumar, Mingyo Seo, Roberto Martı́n-Martı́n, and
+     by latent imagination. arXiv preprint arXiv:1912.01603,           Yuke Zhu. Mimicdroid: In-context learning for humanoid
+     2019.                                                             robot manipulation from human play videos. arXiv
+[28] Danijar Hafner, Jurgis Pasukonis, Jimmy Ba, and Timo-             preprint arXiv:2509.09769, 2025.
+     thy Lillicrap. Mastering diverse domains through world       [40] Kaustubh Sridhar, Souradeep Dutta, Dinesh Jayaraman,
+     models. arXiv preprint arXiv:2301.04104, 2023.                    and Insup Lee. Ricl: Adding in-context adaptability
+[29] Haoyu Zhao, Cheng Zeng, Linghao Zhuang, Yaxi Zhao,                to pre-trained vision-language-action models. arXiv
+     Shengke Xue, Hao Wang, Xingyue Zhao, Zhongyu Li,                  preprint arXiv:2508.02062, 2025.
+     Kehan Li, Siteng Huang, et al. High-fidelity simulated       [41] Rui Yang, Meng Fang, Lei Han, Yali Du, Feng Luo, and
+     data generation for real-world zero-shot robotic manip-           Xiu Li. Mher: Model-based hindsight experience replay.
+     ulation learning with gaussian splatting. arXiv preprint          arXiv preprint arXiv:2107.00306, 2021.
+     arXiv:2510.10637, 2025.                                      [42] Liam Schramm, Yunfu Deng, Edgar Granados, and
+[30] Liu Liu, Xiaofeng Wang, Guosheng Zhao, Keyu Li,                   Abdeslam Boularias. Usher: Unbiased sampling for
+     Wenkang Qin, Jiaxiong Qiu, Zheng Zhu, Guan Huang,                 hindsight experience replay. In Conference on Robot
+     and Zhizhong Su. Robotransfer: Geometry-consistent                Learning, pages 2073–2082. PMLR, 2023.
+     video diffusion for robotic visual policy transfer. arXiv    [43] Yongle Luo, Yuxin Wang, Kun Dong, Qiang Zhang,
+     preprint arXiv:2505.23171, 2025.                                  Erkang Cheng, Zhiyong Sun, and Bo Song. Relay
+[31] Yuxin Jiang, Shengcong Chen, Siyuan Huang, Liliang                hindsight experience replay: Self-guided continual re-
+     Chen, Pengfei Zhou, Yue Liao, Xindong He, Chiming                 inforcement learning for sequential object manipulation
+     Liu, Hongsheng Li, Maoqing Yao, et al. Enerverse-ac:              tasks with sparse rewards. Neurocomputing, 557:126620,
+     Envisioning embodied environments with action condi-              2023.
+     tion. arXiv preprint arXiv:2505.09723, 2025.                 [44] Tianxing Chen, Zanxin Chen, Baijun Chen, Zijian Cai,
+[32] Yanjiang Guo, Lucy Xiaoyang Shi, Jianyu Chen, and                 Yibin Liu, Zixuan Li, Qiwei Liang, Xianliang Lin, Yi-
+     Chelsea Finn. Ctrl-world: A controllable generative               heng Ge, Zhenyu Gu, et al. Robotwin 2.0: A scalable data
+     world model for robot manipulation. arXiv preprint                generator and benchmark with strong domain random-
+     arXiv:2510.10125, 2025.                                           ization for robust bimanual robotic manipulation. arXiv
+[33] Siyuan Huang, Liliang Chen, Pengfei Zhou, Shengcong               preprint arXiv:2506.18088, 2025.
+     Chen, Zhengkai Jiang, Yue Hu, Yue Liao, Peng Gao,            [45] Physical Intelligence, Kevin Black, Noah Brown, James
+     Hongsheng Li, Maoqing Yao, et al. Enerverse: Envi-                Darpinian, Karan Dhabalia, Danny Driess, Adnan Es-
+     sioning embodied future space for robotics manipulation.          mail, Michael Equi, Chelsea Finn, Niccolo Fusai,
+     arXiv preprint arXiv:2501.01895, 2025.                            Manuel Y. Galliker, Dibya Ghosh, Lachy Groom, Karol
+[34] Junbang Liang, Pavel Tokmakov, Ruoshi Liu, Sruthi                 Hausman, Brian Ichter, Szymon Jakubczak, Tim Jones,
+     Sudhakar, Paarth Shah, Rares Ambrus, and Carl Von-                Liyiming Ke, Devin LeBlanc, Sergey Levine, Adrian
+     drick. Video generators are robot policies. arXiv preprint        Li-Bell, Mohith Mothukuri, Suraj Nair, Karl Pertsch,
+     arXiv:2508.00795, 2025.                                           Allen Z. Ren, Lucy Xiaoyang Shi, Laura Smith, Jost To-
+[35] Jun Cen, Chaohui Yu, Hangjie Yuan, Yuming Jiang,                  bias Springenberg, Kyle Stachowicz, James Tanner, Quan
+     Siteng Huang, Jiayan Guo, Xin Li, Yibing Song, Hao                Vuong, Homer Walke, Anna Walling, Haohuan Wang,
+     Luo, Fan Wang, et al. Worldvla: Towards autoregressive            Lili Yu, and Ury Zhilinsky. π0.5 : a vision-language-
+     action world model. arXiv preprint arXiv:2506.21539,              action model with open-world generalization, 2025. URL
+     2025.                                                             https://arxiv.org/abs/2504.16054.
+[36] Stéphane Ross, Geoffrey Gordon, and Drew Bagnell. A         [46] Xiaohua Zhai, Basil Mustafa, Alexander Kolesnikov, and
+     reduction of imitation learning and structured prediction         Lucas Beyer. Sigmoid loss for language image pre-
+     to no-regret online learning. In Proceedings of the               training. In Proceedings of the IEEE/CVF international
+     fourteenth international conference on artificial intelli-        conference on computer vision, pages 11975–11986,
+     gence and statistics, pages 627–635. JMLR Workshop                2023.
+     and Conference Proceedings, 2011.                            [47] Qingwen Bu, Jisong Cai, Li Chen, Xiuqi Cui, Yan Ding,
+[37] Michael Kelly, Chelsea Sidrane, Katherine Driggs-                 Siyuan Feng, Shenyuan Gao, Xindong He, Xuan Hu,
+     Campbell, and Mykel J Kochenderfer. Hg-dagger: Inter-             Xu Huang, et al. Agibot world colosseo: A large-
+     active imitation learning with human experts. In 2019             scale manipulation platform for scalable and intelligent
+     International Conference on Robotics and Automation               embodied systems. arXiv preprint arXiv:2503.06669,
+     (ICRA), pages 8077–8083. IEEE, 2019.                              2025.
+[38] Jianlan Luo, Charles Xu, Jeffrey Wu, and Sergey Levine.
+     Precise and dexterous robotic manipulation via human-
+                          A PPENDIX
+A. Implementation Details
+   Model. The goal-conditioned world model predicts 4 latent
+frames (2 proximal, 2 distal), decoded by a 3D VAE into 9
+proximal and 9 distal visual frames. The action expert outputs
+54 proximal actions (execute 50) and 9 distal actions (for
+guidance only; not executed). At inference, only actions are
+generated.
+   Training. We train the model on the AgiBot World dataset
+and a small proprietary dataset [47]. Stage 1 fine-tunes a
+pre-trained 1.6B-parameter Genie Envisioner (7×24 hours,
+16×A800). Stage 2 performs end-to-end behavioral cloning
+(48 hours, 16×A800).
+   Deployment and Online Learning. The policy is deployed
+on an AgiBot Genie-01 robot with an NVIDIA RTX 4090.
+Online autonomous improvement fine-tunes only the LoRA
+layers (rank 64) using a replay buffer of size 20. Each
+training round (10 epochs) takes 5 minutes including rollout,
+backpropgation and environment resetting. Inference latency
+is 200ms for 50 executable actions.
+B. Real World Task Setup
+   Writing and Painting Tasks. For the tasks of writing and
+drawing on a whiteboard, the robot gripper was first manually
+positioned to grasp the marker before task execution. During
+extended writing trials, the smooth surface of the marker
+occasionally caused it to slip from the gripper. To ensure
+reliability and reduce resetting time during batch testing, we
+used tape to further secure the marker in place.
+   Bearing Insertion Task. In the demonstrated bearing inser-
+tion task, each bearing weighs over 2 kg, with a base diameter
+of approximately 1 cm. The bearing is inserted into a hole with
+a diameter of about 1.5 cm.
+   Dessert Plating Task. To ensure experimental repeatability,
+we used silicone-made toy desserts for the dessert plating task.
+C. Testing Metric
+  We employ task execution success rate as the performance
+metric for evaluating the models. Specifically, the real-world
+success rates reported in Section IV are obtained by man-
+ually labeling success or failure over 40 model rollouts per
+experiment. The success rates in simulation are automatically
+computed from 90 rollouts. For models in Section IV.B that
+underwent autonomous improvement, we saved the model
+weights after each training round and evaluated them in-
+dividually once the autonomous improvement process was
+completed.
+                    ACKNOWLEDGMENTS
+   We gratefully acknowledge the technical support and in-
+sightful discussions provided by Yifei Wei, Xindong He,
+Jingbin Cai, Yuxin Jiang, Siyuan Huang, Qi Qin, Yue Liao,
+Qi Lv, Sukai Wang, Ruofei Niu, Xiongfeng Cai, Hanwen Shi
+and Xuan Hu. We also thank Haoyu Cao, Cheng Jing, Rui
+Wu, Dan Liu and Jia Zeng for their diligent work in data
+preparation.
+

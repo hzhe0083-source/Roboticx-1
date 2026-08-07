@@ -1,0 +1,1695 @@
+                                           CheckVLA: Execution-Time Verification with Action-Conditioned World Model
+                                                            for Long-Horizon Mobile Manipulation
+                                                 Yushan Liu1 , Peibo Sun2 , Xintao Chao1 , Zhenyang Yang3 , Yifan Xie1 , Lingfeng Zhang1 ,
+                                                      Shoujie Li4 , Chenyu Tang3 , Fang Chen2 , Xiao-Ping Zhang1 , Wenbo Ding1,5∗
+                                                                    1
+                                                                        Tsinghua University 2 Shanghai Jiao Tong University 3 Peking University
+                                                                                   4
+                                                                                     Nanyang Technological University 5 Xspark AI
+
+
+                                                                        Abstract                                  A post-dispatch deviation can violate this prediction with-
+                                                                                                               out prompting replanning: an object may slip while sub-
+                                           Vision-language-action (VLA) policies commonly execute              sequent actions still assume a secure grasp, or a displaced
+                                           long-horizon mobile manipulation through open-loop action           base may continue smooth but incorrect motion. Because
+                                           chunks, issuing multiple actions without receiving new high-        the remaining actions can stay locally plausible after their
+                                           level visual input. A committed chunk therefore implies how         premise fails, commit-time policy scores may miss this con-
+                                           observations should evolve, but accidental deviations can vi-       fidently wrong regime. The resulting errors compound over
+arXiv:2607.26789v1 [cs.RO] 29 Jul 2026
+
+
+
+
+                                           olate this expectation while the remaining actions continue         long horizons (Ross and Bagnell 2010; Ross, Gordon, and
+                                           to propagate the error: commit-time policy confidence cannot        Bagnell 2011; Spencer et al. 2021), motivating an execution-
+                                           react to a deviation that occurs after dispatch, and observation-
+                                           only anomaly scores lack an action-conditioned reference for
+                                                                                                               time test of whether committed actions produce their ex-
+                                           separating expected effects from unexplained changes. We            pected consequences.
+                                           propose CheckVLA, which verifies execution with a sepa-                Existing signals cover only parts of this problem. Commit-
+                                           rately trained, frozen action-conditioned world model. A con-       time uncertainty (Liu et al. 2024; Jing et al. 2025; Wang et al.
+                                           formally calibrated risk threshold bounds the episode-level         2026a) cannot use observations arriving after dispatch with-
+                                           probability of an unnecessary first intervention and determines     out another policy call. Post-dispatch monitors use observa-
+                                           when to intervene, its exceedance controls how strongly the         tions, policy features, or world-model scores (Liu, Bahety,
+                                           rewritten suffix retains the superseded chunk, latency-aware        and Song 2023; Guo et al. 2023; Gu et al. 2025; Zhang
+                                           hard prefixing restricts replacement to actions that remain
+                                                                                                               et al. 2026; Ho et al. 2026), but observation-only variants
+                                           deployable, and an event-driven keyframe bank preserves ev-
+                                           idence of prior progress across repairs. On RoboCasa365, un-        lack an action-conditioned reference. Adaptive execution and
+                                           der a common training recipe and a matched invocation bud-          asynchronous continuity methods (Physical Intelligence et al.
+                                           get, CheckVLA attains a 36.1% average success rate against          2025a, 2026; Wang et al. 2026c; Black, Galliker, and Levine
+                                           27.6% for periodic replanning (+8.5 points). At a matched           2025; Wang et al. 2026b) address when to refresh a chunk
+                                           5% episode-level false-alarm target, action conditioning raises     or how to preserve continuity, yet do not generally combine
+                                           timely recall to 77.9%, against 48.6% for an observation-only       an episode-calibrated online test with latency-aware suffix
+                                           control and 37.9% for an action-shuffled control. These simu-       repair. This leaves open how to turn action-conditioned con-
+                                           lation results support action-conditioned verification as a way     sequence predictions into a calibrated intervention and a de-
+                                           to restore feedback during chunked execution while keeping          ployable correction.
+                                           the repair consistent with inference latency.
+                                                                                                                  We present CheckVLA, which tests committed actions
+                                                                                                               against observed consequences during execution (Figure 1).
+                                                                                                               A separately trained, frozen world model predicts short-
+                                                                 Introduction                                  horizon features from the latest observation and remaining
+                                                                                                               actions; a causal risk head aggregates prediction–observation
+                                         Long-horizon mobile manipulation interleaves navigation               discrepancies. On exchangeable nominal successes, a func-
+                                         with contact-rich interaction, making it a demanding testbed          tional conformal threshold bounds the probability of an un-
+                                         for embodied intelligence. Recent VLA systems support mo-             necessary first intervention. The first crossing sets repair tim-
+                                         bile whole-body control across increasingly diverse tasks             ing, while a validation-selected exceedance map sets refer-
+                                         (Physical Intelligence et al. 2025b; Torne et al. 2026; Phys-         ence retention. The same VLA rewrites only the latency-
+                                         ical Intelligence et al. 2026; Chen et al. 2026; Jiang et al.         feasible suffix, and a keyframe bank preserves episodic con-
+                                         2025; Fan et al. 2026). Many execute a fixed-length action            text.
+                                         chunk without re-querying the policy on updated observa-                 On RoboCasa365 (Nasiriany et al. 2026), CheckVLA
+                                         tions (Zhao et al. 2023; Chi et al. 2023; Black et al. 2024).         achieves 36.1% average success, setting the state of the
+                                         Chunking amortizes inference and improves temporal consis-            art among published Human300 policy-pretraining results
+                                         tency, but each issued chunk also predicts that observations          (Table 2). Under a common internal training recipe and
+                                         will evolve consistently with its committed actions.                  paired seeds, it exceeds invocation-matched periodic replan-
+                                               Open-Loop VLA
+                                               Instruction
+                                                                                                slip
+
+
+                                                                    VLA                                                ...
+
+                                                                                                           open-loop          failed
+
+
+ Take the bowl from the counter to the sink.   CheckVLA (Ours) Memory                                                   ...
+                                                                            Replan
+                                               Instruction                                      slip
+                                                                    VLA
+                                                                                                                       ...
+
+                                                             World Model     Predict
+                                                                                                       regenerated            success
+ Long Horizon   Contact-Rich    Mobile Base
+
+
+
+Figure 1: Overview of CheckVLA. Open-loop chunks can propagate in-chunk failures such as slippage. CheckVLA compares
+action-conditioned predictions with arriving observations, uses an episode-calibrated threshold to trigger intervention, and
+rewrites the repairable suffix while preserving episodic context.
+ning by 8.5 percentage points. At a common target episode-            2025a; Chen et al. 2026; Physical Intelligence et al. 2026).
+level family-wise error rate (FWER), removing action con-             CheckVLA instead verifies a chunk during execution and
+ditioning reduces timely recall from 77.9% to 48.6% for an            rewrites its remaining suffix.
+observation-only control and 37.9% for an action-shuffled
+control.                                                              World Models for Robotics
+   Our contributions are as follows:                                  Action-conditioned world models support policy condition-
+ • We cast an open-loop action chunk as a testable prediction         ing, data generation, and planning (Zhang et al. 2025; Cen
+   of near-future observations, linking failure detection to          et al. 2025; Zhou et al. 2024b; Assran et al. 2025; Liu et al.
+   action-conditioned consequence prediction and repair to            2026b); several predict frozen-space features without pixel
+   rewriting the latency-feasible suffix.                             decoding (Zhou et al. 2024b; Liu et al. 2026c), building on
+ • We develop CheckVLA with an episode-calibrated trig-               latent imagination (Hafner et al. 2018, 2019; Rao et al. 2026).
+   ger, validation-selected risk-adaptive retention, a latency-       Related systems condition a VLA on predicted features (Sun
+   aware hard prefix, and event-driven episodic memory.               et al. 2026a), couple imagination to action generation (Chen
+                                                                      et al. 2026; Zhong et al. 2026), verify world-model predic-
+ • CheckVLA reaches state-of-the-art average success
+                                                                      tions (Liu et al. 2026a), or adapt execution length by com-
+   among RoboCasa365 Human300 policy-pretraining
+                                                                      paring predicted and realized futures (Wang et al. 2026c).
+   methods and exceeds invocation-matched periodic re-
+                                                                      CheckVLA uses consequence predictions as a calibrated
+   planning under a common recipe; controlled studies audit
+                                                                      execution-time test, separates the verifier from the policy
+   detection, repair, memory, latency, robustness, runtime,
+                                                                      path, and converts an alarm into latency-aware suffix repair.
+   and failures.
+                                                                      Execution Monitoring and Intervention
+                        Related Work
+                                                                      Adaptive chunking changes the execution window using la-
+VLA for Mobile Manipulation                                           tency or policy-side uncertainty and preserves continuity
+VLA models jointly predict base, arm, and gripper actions for         under asynchronous inference (Black, Galliker, and Levine
+mobile platforms (Fu, Zhao, and Finn 2024; Black et al. 2024;         2025; Liu et al. 2024; Jing et al. 2025; Wang et al. 2026a,b).
+Physical Intelligence et al. 2025b; Jiang et al. 2025; Liu et al.     Monitoring uses constraints, generated checks, policy fea-
+2025); cross-embodiment training, subtask decoding, video             tures, or world-model scores (Guo et al. 2023; Zhou et al.
+memory, and action-subspace decoupling broaden their cov-             2024a; Gu et al. 2025; Zhang et al. 2026; Ho et al. 2026),
+erage (Physical Intelligence et al. 2025b; Torne et al. 2026;         while pre-dispatch screening, backup policies, guided re-
+Physical Intelligence et al. 2026; Chen et al. 2026; Wang             generation, and keyframe memory address complementary
+et al. 2026d; Chao et al. 2025). Because these systems com-           stages (Sun et al. 2026b; Chen 2026; Pan et al. 2026;
+monly commit fixed-length chunks (Zhao et al. 2023; Chi               Zeng et al. 2026; Torne et al. 2026). CheckVLA com-
+et al. 2023), long-horizon extensions have mainly changed             bines an episode-calibrated action-conditioned trigger with
+training or boundary-time context (Physical Intelligence et al.       a validation-selected exceedance map for latency-feasible
+                        Act.-cond. Calib. In-chunk Latency Epis.   observations should agree with the action-conditioned pre-
+Method                   signal trigger repair aware memory        dictions of the committed actions.
+SAFE                       –       ✓       –       –       –          Let zt′ = ϕ(ot′ ) be the latest observation feature under
+Foresight                  ✓       ✓       –       –       –       a separately pretrained, frozen monitoring encoder ϕ. Con-
+Pre-VLA                    ✓       –       –       –       –       ditioned on the still-valid committed actions and nominal
+Future–reality verif.      ✓       –       ∼       –       –       proprioceptive rollout ŝt′ +i = f (st′ , āt′ :t′ +i−1 ), the world
+RTC                        –       –       ∼       ✓       –       model Ψ predicts only the next k steps (k ≪ H):
+CheckVLA (ours)            ✓       ✓       ✓       ✓       ✓
+                                                                      ẑt′ +i+1 = Ψ zt′ , ẑt′ +1:t′ +i ,
+                                                                                                                                              (2)
+Table 1: Execution-time capability comparison with SAFE                                āt′ :t′ +i , ŝt′ :t′ +i ,     i = 0, . . . , k − 1.
+(Gu et al. 2025), Foresight (Zhang et al. 2026), Pre-VLA
+(Sun et al. 2026b), future–reality verification (Wang et al.       Each observation re-anchors the rollout. Predictions crossing
+2026c), and RTC (Black, Galliker, and Levine 2025). ✓:             a chunk boundary are generated only after the next chunk is
+core mechanism; ∼: partial (execution-length adaptation;           committed; after a rewrite, predictions conditioned on su-
+switch-time continuity rather than deviation-triggered re-         perseded actions are invalidated, and retrieval uses the latest
+pair); –: absent. Marks reflect published mechanisms, not          valid anchor. Short rollouts limit autoregressive drift, while
+re-implementations.                                                span-specific statistics below handle residual scale differ-
+                                                                   ences.
+                                                                      Ψ is trained first by teacher forcing and then on its own
+repair and persistent episodic context; Table 1 positions it       rollouts, matching the online autoregressive context (Hafner
+against the closest execution-time systems.                        et al. 2018, 2019; Rao et al. 2026); training and prediction
+                                                                   remain in feature space (supplementary Sec. D). The frozen
+                               Method                              encoder isolates monitoring from policy optimization. Al-
+We introduce CheckVLA, a closed-loop execution frame-              though πθ is stochastic, Ψ provides a deterministic refer-
+work that verifies the expected consequences of committed          ence; empirical residual variation is absorbed by the fixed
+action chunks and repairs deviations while recovery remains        standardization and calibration pipeline.
+feasible. As shown in Figure 2, four coupled components—
+action-conditioned rolling prediction, calibrated risk trigger-    Calibrated Risk Triggering
+ing, latency-aware suffix rewriting, and episodic context—         As zt arrives, the monitor retrieves the prediction from
+implement the loop.                                                the latest valid anchor   with span ℓ(t) ≤ k, computes
+Problem Formulation                                                dt = dist ẑt|t−ℓ(t) , zt on pooled, normalized features, and
+                                                                   standardizes it with held-out-success discrepancy statistics:
+At a chunk boundary t, the policy πθ encodes the instruction
+L, multi-view observation ot , and episodic context ρt as                                                            (ℓ)
+                                                                                                        dt − µ d
+ct = VLM(L, ot ; ρt ) and commits                                                           d˜t =               (ℓ)
+                                                                                                                           .                   (3)
+                                                                                                    max(σd , ε)
+         At = (at,0 , . . . , at,H−1 ) ∼ πθ · | ct , st , (1)
+                                                                   The distance metric is selected on validation data; each obser-
+where st is proprioception and At ∈ RH×M spans mobility            vation then becomes a new anchor, and monitoring resumes
+and manipulation. We use h for a candidate position, hτ for        at span one after a chunk switch.
+the active in-chunk index at control time τ , and āτ for the         A single-step discrepancy is weak evidence on its own,
+action then committed for execution. The latest observation        because contact, occlusion, and sensing noise all produce
+time t′ is an anchor, ℓ ≤ k is a prediction span, and u ∈          transient residuals. A temporally causal risk head R therefore
+[0, 1] is flow-integration time. During a chunk, the high-level    aggregates persistent and increasing patterns (Ho et al. 2026)
+policy receives no new visual input (Zhao et al. 2023; Chi         over the window xt−w+1:t of per-step tuples:
+et al. 2023; Black et al. 2024), whereas the monitor does;
+repair is possible only while a useful suffix remains.                           xτ = (d˜τ , ℓ(τ )/k, hτ /H, ∆sw,τ ),                          (4)
+   Suppose the first trigger occurs at t∗ with next old-chunk
+index j = ht∗ . The fixed schedule allocates dlat control          where hτ is the action index within the current chunk and
+steps to inference, while deff denotes the elapsed steps           ∆sw,τ is the number of control steps since the most re-
+when the replacement actually becomes deployable. Nor-             cent chunk switch. The risk head additionally receives the
+mally deff = dlat ; an early call waits, whereas an overrun        episodic summary m(ρt ) introduced below, yielding
+makes deff > dlat and its elapsed replacement positions are                                             
+                                                                              rt = R xt−w+1:t , m(ρt ) ∈ [0, 1].          (5)
+discarded. Candidate positions h < deff are therefore irre-
+versible, and only h ≥ deff can be deployed (supplementary         The risk head is trained on nominally successful episodes,
+Secs. A–B).                                                        natural failures of the open-loop backbone, and onset-
+                                                                   annotated physical perturbations; successes and benign de-
+Action-Conditioned Rolling Prediction                              viations serve as negatives, and supervision is restricted to
+While the chunk executes, each arriving observation restarts       pre-failure evidence (objective and perturbation details in
+a short verification cycle: if the plan remains valid, future      supplementary Sec. D).
+     Open the cabinet, pick
+     up the bread from the          Instruction
+     cabinet and place it in       Tokenization
+     the basket.
+                                                                                                    Action
+      Task Instruction
+                                                                                                    Experts
+                                      Vision
+                                     Encoder                  VLM
+                                                            Backbone
+                                         Memory
+                                          Buffer
+                                                                                  Replanning                        Execution
+
+
+                                                                                                     Risk
+                                                                                                     Head
+                                       World
+                                      Encoder                                              Memory
+
+
+                                                                                                                    Explicit
+                                                                       World Model                                  Distance
+         Multi-view
+        Observation
+
+Figure 2: The CheckVLA framework. A separately trained, frozen encoder supplies monitoring features; the world model
+predicts near-term consequences of the committed actions; the causal risk head compares aggregated risk rt with the calibrated
+threshold δt ; upon a declared failure, the same VLA rewrites the repairable suffix under the hard-prefix constraint with risk-
+graded guidance.
+                                                                                 (i)
+                                                                   scores supt (rt − µr,t )/σ̃r,t and their finite-sample quantile
+                                                                   q̂α at miscoverage α (Zhang et al. 2026). The online threshold
+                                                                   is
+                                                                                        δt = µr,t + q̂α σ̃r,t ,               (6)
+                                                                   and, for a new nominal-success trajectory exchangeable
+                                                                   with calibration under this same fixed pipeline, satisfies the
+                                                                   trajectory-marginal guarantee
+                                                                                                                   
+                                                                             Pr ∃ t : rt > δt | nominal success ≤ α.          (7)
+                                                                   This is only a first-intervention guarantee: it covers neither
+                                                                   failure recall, post-repair safety, repeated interventions, nor
+                                                                   distribution shift. Those properties are evaluated empirically
+                                                                   (supplementary Table S17). The first crossing t∗ = min{t :
+                                                                   rt > δt } triggers repair.
+Figure 3: Composite RoboCasa365 episodes (Arrange Bread
+Basket, top; Gather Tableware, bottom): subtask prompts            Suffix Rewriting
+aligned with third- and first-person keyframes; blue denotes       At t∗ , execution continues while the same VLA generates a
+manipulation and orange base motion.                               candidate indexed relative to the trigger. Its old-chunk refer-
+                                                                   ence is Aref,h = āold
+                                                                                       t∗ +h for 0 ≤ h < H − j. At every flow-
+   Because one unnecessary intervention can spoil an other-        integration step, candidate positions h < dlat are clamped
+wise successful episode, CheckVLA controls the probability         to this executing prefix. Under nominal timing deployment
+of an unnecessary first intervention over the episode. After       starts at h = dlat ; after an overrun it starts at h = deff ,
+fixing the policy, monitor, retrieval, discrepancy standard-       discarding the extra elapsed positions. The hard clamp is an
+ization, and memory rules, we fit risk statistics (µr,t , σr,t )   empirical projection, not exact conditional sampling (sup-
+on nominal-success shadow-mode trajectories disjoint from          plementary Sec. J).
+conformal calibration and set σ̃r,t = max(σr,t , ε). Split            The retention strength of the superseded chunk is deter-
+functional conformal calibration uses the per-trajectory           mined by the exceedance of the same calibrated threshold that
+     Method                                          Atomic-Seen     Composite-Seen        Composite-Unseen         Average
+     Diffusion Policy (Chi et al. 2023)                  15.7               0.2                     1.3                6.1
+     π0 (Black et al. 2024)                              34.6               6.1                    1.1                14.8
+     π0.5 (Physical Intelligence et al. 2025b)           39.6               7.1                    1.2                16.9
+     GigaWorld-Policy 0.1 (Ye et al. 2026)               44.4              11.8                     2.9               20.7
+     GR00T-N1.5 (Bjorck et al. 2025)                     50.7              14.8                     2.7               23.9
+     GR00T-N1.6 (GEAR Team et al. 2025)                  51.1               9.4                     1.7               21.9
+     RLDX-1 (Kim et al. 2026)                            63.0              27.5                    5.4                33.2
+     Qwen-RobotManip (Yuan et al. 2026)                  68.6              20.1                    14.9               35.9
+     WorldDreamer (Wang et al. 2024)                     66.3              26.7                    9.0                35.3
+     CheckVLA (ours)                                     63.7              30.9                    10.2               36.1
+
+Table 2: RoboCasa365 mean task success (%) with policy pretraining limited to Human300, over 18 A-S, 16 C-S, and 16
+C-U tasks. Average is task-count weighted; bold/underline denote the best/second-best. Published results provide descriptive
+positioning rather than paired comparison; CheckVLA additionally trains its verifier on training-side rollouts, and Table 3 gives
+the controlled comparison.
+
+produced the trigger. The remaining actions of that chunk          have separate parameters but exchange information through
+provide a channel-wise reference, weighted by the standard-        joint self-attention over the shared VLM prefix (Chen et al.
+ized exceedance                                                    2026); stop-gradient blocks their training signal from the
+                                                               VLM backbone (Driess et al. 2025). Monitoring uses a frozen
+           et∗ = rt∗ − µr,t∗ σ̃r,t∗ − q̂α ,             (8)        V-JEPA 2-AC encoder (Assran et al. 2025). Supplementary
+                                                 +
+                                                                   Secs. C–E describe the decoupled action experts, verifier
+the amount by which the standardized risk exceeds the thresh-      training and calibration, and memory fusion.
+old; the mapping from exceedance to retention below is se-
+lected on validation data and carries no conformal guarantee.                             Experiments
+A base weight w0 (e) = wmin + (1 − wmin ) exp(−βe), with
+wmin ∈ [0, 1) and β > 0, decreases monotonically in e: a           Protocol and Public Benchmark
+small exceedance retains strong reference guidance, while a        We evaluate on RoboCasa365 (Nasiriany et al. 2026), com-
+large one yields weaker retention and permits a larger correc-     prising 365 household mobile-manipulation tasks in 2,500
+tion. The weight decays with position at a channel-specific        kitchens; Figure 3 shows two composite episodes. Following
+rate,                                                              the official protocol, the action policy uses only Human300
+         Wh,m = w0 (et∗ ) exp − λm (h − dlat ) .
+                                                   
+                                                           (9)     (300 tasks, 100 human demonstrations each) and is tested
+                                                                   on 18 Atomic-Seen (A-S), 16 Composite-Seen (C-S), and 16
+This applies for dlat ≤ h < H − j and W = 0 otherwise,             Composite-Unseen (C-U) tasks. The verifier uses auxiliary
+with rates λm > 0 for the mobility and manipulation chan-          nominal, natural-failure, and physics-perturbed rollouts from
+nels. Guidance mixes the reference into the flow velocity,         training-side tasks and scenes. Neither target-suite scenes nor
+              v = (1 − W ) ⊙ vθ + W ⊙ vref ,               (10)    C-U tasks train any component (splits and leakage guards in
+                                                                   supplementary Sec. F).
+where y is the current flow state, ∆u the integration step, and       Table 2 lists published Human300 flagship results. Check-
+vref = (Aref − y)/ max(1 − u, ∆u). After switching, the            VLA achieves 36.1% average success, establishing a new
+loop resumes from the next observation (regular-transition         state of the art among the methods considered: 19.2 percent-
+guidance and suppression in supplementary Sec. D).                 age points above the published π0.5 and 0.2 above Qwen-
+                                                                   RobotManip. It ranks first on C-S and second on C-U while
+Episodic Context                                                   remaining competitive on A-S, consistent with execution ver-
+A repair conditioned only on the current view may forget           ification benefiting tasks that chain subgoals. Because public
+completed subgoals. CheckVLA therefore sets ρt ≡ Bt =              systems differ beyond policy-pretraining data, this state-of-
+{(Fj , tj )}m t
+            j=1 , an event-driven bank of pooled policy features
+                                                                   the-art positioning is descriptive; the controlled attribution
+from real observations. Pause and diversity criteria govern        follows.
+writes across chunks and repairs. The policy reads the full
+bank through gated cross-attention, whereas the risk head          Fair Internal Controls
+receives only the compact summary m(ρt ); these policy fea-        Table 3 builds the system under common splits, optimization,
+tures Fj are distinct from the monitor features zt (supple-        and paired evaluation seeds, first controlling action-model
+mentary Sec. E).                                                   capacity and then adding transition guidance, periodic re-
+                                                                   planning, verified timing, adaptive guidance, and memory.
+Implementation                                                     Changed policy inputs are retrained and affected monitors
+CheckVLA uses the π0.5 flow-matching backbone (Physical            recalibrated. Validation selects the periodic interval, yielding
+Intelligence et al. 2025b). Mobility and manipulation experts      10.1 calls per episode versus 10.2 for CheckVLA. Replacing
+               Variant                                        A-S    C-S    C-U     Average      Calls/ep.    ∆ Avg.
+               Reproduced π0.5                                39.8   7.4    1.5       17.2         7.8          –
+               Capacity-matched monolithic expert             45.9   10.8    2.8      20.9          7.8        +3.7
+               Decoupled action backbone, open loop           46.8   11.9   3.1       21.6          7.8        +0.7
+               + regular-transition guidance                  48.7   13.6   3.8       23.1          7.8        +1.5
+               + invocation-matched periodic replan           53.9   19.8   5.8       27.6         10.1        +4.5
+               + verified trigger, fixed suffix guidance      58.8   24.7   7.5       31.5         10.0        +3.9
+               + risk-adaptive guidance, no memory            61.5   28.3   9.0       34.1         10.0        +2.6
+               Full CheckVLA                                  63.7   30.9   10.2      36.1         10.2        +2.0
+
+Table 3: Sequential build-up on RoboCasa365 under a common training recipe and paired seeds. Average is task-count weighted;
+Calls/ep. reports the invocation budget. Supplementary Secs. H–P provide detector, binding, repair, robustness, memory, runtime,
+and failure audits.
+
+
+
+
+Figure 4: Closed-loop diagnostics. (a) Episode-level unnecessary-first-intervention frequency versus target conformal level.
+(b) Perturbation recovery across inference latency. (c) Paired gain over open loop across horizon quartiles, with and without
+memory. Bars and bands are 95% intervals: exact binomial in (a), hierarchical paired bootstrap in (b) and (c).
+
+                              Episode   Timely       Perturbed        FWER, detector comparisons replay identical shadow tra-
+Detector                     FWER (%) recall (%) ↑ success (%) ↑      jectories, and rewrite variants branch from the same first-
+MC action entropy               5.0        58.7        38.9           trigger snapshot with shared randomness. Episode FWER
+Flow-path variance              5.2        61.4        40.2           is the fraction of nominal successes with an unnecessary
+Sampling disagreement           4.9        64.8        41.5           first intervention. A detection is timely when it crosses after
+Policy-feature probe            5.1        68.6        43.7           annotated onset and deploys before the end of the empiri-
+Obs.-only world predictor       5.3        48.6        35.2
+                                                                      cally estimated recovery window under the tested repair set.
+Action-shuffled predictor       5.1        37.9        31.0           Rescue and harm are paired outcome changes from the trig-
+                                                                      ger snapshot (supplementary Sec. G); the constant-threshold
+No rolling re-anchor            5.4        62.8        38.7           control is deliberately nonconformal.
+Instantaneous score             5.0        66.1        41.2
+Constant threshold              7.1        71.5        45.0           Action conditioning. To separate action–consequence evi-
+Full action-cond. verifier      4.8        77.9        47.6           dence from observation novelty, we retrain an action-shuffled
+                                                                      world model that preserves action-token marginals and an
+                                                                      observation-only predictor. Timely recall falls from 77.9%
+Table 4: Trigger comparison at target episode FWER α =
+                                                                      to 37.9% and 48.6%, and perturbed success from 47.6% to
+0.05 with a shared rewriter and latency. Policy-side scores
+                                                                      31.0% and 35.2% (Table 4). These controls support the joint
+are evaluated at commit time; the constant threshold is
+                                                                      action-conditioned pathway; a frozen-model counterfactual
+validation-tuned, not conformally calibrated; the third block
+                                                                      audit confirms action–future binding without separating ac-
+ablates verifier mechanisms.
+                                                                      tion tokens from their deterministic proprioceptive rollout
+periodic timing with the verified trigger under fixed guid-           (supplementary Sec. I).
+ance adds +3.9 points; risk-adaptive guidance and memory              Verifier mechanisms. Removing rolling re-anchoring or
+add +2.6 and +2.0.                                                    temporal aggregation costs 15.1 and 11.8 points of timely
+                                                                      recall, respectively; a validation-tuned constant threshold
+Ablation Studies and Deployment Audits                                raises FWER from 4.8% to 7.1% (Table 4; Figure 4a). To-
+A controlled study injects physical perturbations across task         gether these ablations support the composite design: short re-
+phases in 12 composite tasks. Conformal detector variants             anchored spans and persistence aggregation improve timeli-
+are independently recalibrated at the common target episode           ness, while functional calibration sets the deployed operating
+Policy WM     Ep.      Fail.    Fail.     Timely Rescue                                           Rescue Harm Switch Success
+ unc. risk share (%) rate (%) share (%) recov. (%) (%) ↑          Rewrite rule                    (%) ↑ (%) ↓ jump ↓ (%) ↑
+Low      Low    52.0      12.0      25.2       18.0       6.0     Wait for boundary                 7.4    4.8      –       34.0
+High     Low    14.0      18.0      10.2       28.0      11.0     Unconstrained, discard prefix    10.1    8.9    0.284     39.8
+Low      High   25.0      48.0      48.4       76.0      31.0     Hard prefix, full rewrite        13.2    6.8    0.171     42.4
+High     High    9.0      45.0      16.2       73.0      29.0     RTC inpainting                   13.7    4.1    0.091     45.6
+                                                                  Fixed guidance W                 12.8    3.7    0.104     46.0
+                                                                  Shuffled exceedance              14.4    3.6    0.103     44.3
+Table 5: Commit-time policy uncertainty versus world-model
+risk on held-out natural executions assignable at the prereg-     Adaptive W (e)                   16.9    2.8    0.072     47.6
+istered decision window (supplementary Sec. L), each sig-
+nal split at its independently calibrated threshold; the low-     Table 6: Fixed-trigger repair at nominal latency (dlat =3),
+uncertainty, high-risk cell is the confidently-wrong quadrant.    branched from identical first-trigger snapshots. Rescue,
+                                                                  harm, and switch jump are one-shot outcomes with sub-
+point.                                                            sequent triggers disabled; success continues the closed loop
+                                                                  (full latency sweep in supplementary Sec. J).
+Policy-side alternatives. We calibrate four commit-time
+detectors under the same protocol: Monte Carlo action en-
+tropy, flow-path variance, sampling disagreement, and a           episodes and harms 2.1% of otherwise successful clean con-
+frozen policy-feature probe. The full verifier exceeds the        tinuations; on held-out natural executions, success rises from
+strongest by 9.3 points in timely recall and 3.9 in perturbed     61.4% to 68.9% at 2.7% harm (supplementary Tables S8,
+success; refreshing policy scores at the observation rate         S17, and S18). A blinded audit assigns residual failures to
+would add 382.2 VLA evaluations per episode (supplemen-           detection, physics, policy, or repair causes (supplementary
+tary Sec. H). Thus post-dispatch action-conditioned evidence      Sec. P).
+adds information at monitor rather than policy cost.
+Confidently-wrong quadrant. Table 5 splits held-out nat-                                   Discussion
+ural executions by independently calibrated commit-time un-
+certainty and world-model risk. The low-uncertainty, high-        Our findings suggest that an action chunk is both a control
+risk quadrant contains 25.0% of episodes but 48.4% of fail-       command and a testable prediction of future observations.
+ures; 76.0% remain timely recoverable and 31.0% are res-          A separately trained action-conditioned verifier can restore
+cued by the fixed rule. This operational pattern supports         feedback during open-loop execution by deciding when an-
+complementarity between the signals. Natural-failure and          other policy call is warranted. Threshold exceedance then
+benign-shift tests probe distribution sensitivity, while leave-   determines how strongly to revise the committed suffix. This
+one-family-out, severity, and data-scale studies probe moni-      is not a general safety guarantee, because functional confor-
+tor generalization (supplementary Secs. L and N).                 mal calibration controls only the probability of an unnec-
+                                                                  essary first intervention on exchangeable nominal-success
+Repair rules. Six rewrite rules and a wait-for-boundary           episodes. It does not guarantee recall, post-repair safety, or
+baseline branch from identical first-trigger snapshots: uncon-    coverage under distribution shift. Repair is also constrained
+strained generation with post-hoc prefix disposal, hard-prefix    by latency and policy capability: if too little deployable suffix
+full rewrite, RTC inpainting (Black, Galliker, and Levine         remains or no viable replacement exists, even a correct warn-
+2025), fixed guidance, adaptive guidance with shuffled ex-        ing cannot recover the episode. Evidence is currently limited
+ceedance, and correctly paired adaptive guidance (Table 6).       to RoboCasa365 simulation, a finite perturbation family, and
+The paired rule reaches 16.9% rescue at 2.8% harm, ver-           a frozen representation. Changes in sensing, hardware tim-
+sus 12.8%/3.7% for fixed guidance and 14.4%/3.6% when             ing, or task distribution require recalibration and retesting.
+exceedance is shuffled (Figure 4b; supplementary Secs. J–         Dynamic latency-aware scheduling and hardware validation
+K). The pairing, not merely variable weights, improves both       are therefore the natural next steps.
+outcomes.
+Episodic memory. A fully retrained and, where needed,
+recalibrated policy-bank × risk-summary factorial avoids                                  Conclusion
+the confounding of test-time zeroing. The full design
+                                                                  We propose CheckVLA, which reframes a committed ac-
+cuts completed-subgoal regressions from 1.34 to 0.18 per
+                                                                  tion chunk as a testable prediction and verifies it during
+episode, with success gains increasing over the horizon (Fig-
+                                                                  execution with a separately trained action-conditioned world
+ure 4c). The policy reader drives most progress retention; the
+                                                                  model, restoring feedback during chunked execution. At a
+smaller risk-summary effect brings empirical FWER closer
+                                                                  matched policy-call budget on RoboCasa365, it improves
+to target.
+                                                                  average success by 8.5 percentage points over periodic re-
+Deployment cost. The full system adds 88.4M monitor               planning; a fixed-guidance ablation attributes 3.9 points to
+parameters and 16.9 GFLOPs per step, runs at 1.18× the            verified timing. These results suggest that execution-time ver-
+open-loop wall-clock cost, and keeps monitor p95 latency          ification complements policy scaling by restoring feedback
+below one control period. It intervenes in 4.8% of clean          that a stronger open-loop policy alone does not provide.
+                         References                                  Jiang, H.; Chen, J.; Bu, Q.; Chen, L.; Shi, M.; Zhang, Y.; Li,
+Assran, M.; Bardes, A.; Fan, D.; Garrido, Q.; Howes, R.;             D.; Suo, C.; Wang, C.; Peng, Z.; and Li, H. 2025. Whole-
+Komeili, M.; Muckley, M.; Rizvi, A.; Roberts, C.; Sinha, K.;         BodyVLA: Towards Unified Latent VLA for Whole-Body
+et al. 2025. V-JEPA 2: Self-Supervised Video Models Enable           Loco-Manipulation Control. arXiv:2512.11047.
+Understanding, Prediction and Planning. arXiv:2506.09985.            Jing, D.; Wang, G.; Liu, J.; Tang, W.; Sun, Z.; Yao, Y.; Wei,
+Black, K.; Brown, N.; Driess, D.; Esmail, A.; Equi, M.; Finn,        Z.; Liu, Y.; Lu, Z.; and Ding, M. 2025. Mixture of Horizons
+C.; Fusai, N.; Groom, L.; Hausman, K.; Ichter, B.; et al.            in Action Chunking. arXiv:2511.19433.
+2024. π0 : A Vision-Language-Action Flow Model for Gen-              Kim, D.; Jang, H.; Koo, M.; Jang, S.; Kim, T.; Kim, B.;
+eral Robot Control. arXiv:2410.24164.                                Yoon, B.; Jang, C.; Choi, D.; Han, D.; et al. 2026. RLDX-1
+Black, K.; Galliker, M. Y.; and Levine, S. 2025. Real-               Technical Report. arXiv:2605.03269.
+Time Execution of Action Chunking Flow Policies.                     Liu, Y.; Feng, F.; Kong, L.; Lu, W.; Tang, J.; Zhang, K.;
+arXiv:2506.07339.                                                    Murphy, K.; Finn, C.; and Du, Y. 2026a. World Action
+Cen, J.; Yu, C.; Yuan, H.; Jiang, Y.; Huang, S.; Guo, J.; Li, X.;    Verifier: Self-Improving World Models via Forward-Inverse
+Song, Y.; Luo, H.; Wang, F.; Zhao, D.; and Chen, H. 2025.            Asymmetry. arXiv:2604.01985.
+WorldVLA: Towards Autoregressive Action World Model.                 Liu, Y.; Hamid, J. I.; Xie, A.; Lee, Y.; Du, M.; and Finn, C.
+arXiv:2506.21539.                                                    2024. Bidirectional Decoding: Improving Action Chunking
+Chao, X.; Mu, S.; Liu, Y.; Li, S.; Lyu, C.; Zhang, X.-P.;            via Guided Test-Time Sampling. arXiv:2408.17355.
+and Ding, W. 2025. Exo-ViHa: A Cross-Platform Exoskele-              Liu, Y.; Lv, T.; Wang, B.; Fan, H.; Zhao, C.; Zheng, H.;
+ton System with Visual and Haptic Feedback for Efficient             Zhong, X.; Xie, Y.; Zhao, C.; Liao, Z.; Luo, L.; Cai, Y.;
+Dexterous Skill Learning. arXiv:2503.01543.                          Zhang, X.-P.; and Ding, W. 2026b. PerceptDrive: Perception
+Chen, J. 2026. AEGIS: A Backup Reflex for Physical AI.               Prior World-Action Modeling with Adaptive Expert Routing
+arXiv:2606.06660.                                                    for End-to-End Autonomous Driving. arXiv:2607.20175.
+Chen, R.; Yang, Y.; Tang, Z.; Huo, D.; Lin, T.; Wu, H.; Liu,         Liu, Y.; Mu, S.; Chao, X.; Li, Z.; Mu, Y.; Chen, T.; Li, S.;
+H.; Chen, Y.; et al. 2026. ABot-M0.5: Unified Mobility-and-          Lyu, C.; Zhang, X.-P.; and Ding, W. 2025. AVR: Active
+Manipulation World Action Model. arXiv:2607.00678.                   Vision-Driven Precise Robot Manipulation with Viewpoint
+Chi, C.; Xu, Z.; Feng, S.; Cousineau, E.; Du, Y.; Burchfiel, B.;     and Focal Length Optimization. arXiv:2503.01439.
+Tedrake, R.; and Song, S. 2023. Diffusion Policy: Visuomo-           Liu, Y.; Sun, P.; Li, S.; Xie, Y.; Zhang, L.; Chao, X.; Dong,
+tor Policy Learning via Action Diffusion. arXiv:2303.04137.          S.; Chen, F.; Zhang, X.-P.; and Ding, W. 2026c. OA-WAM:
+Driess, D.; Springenberg, J. T.; Ichter, B.; Yu, L.; Li-Bell,        Object-Addressable World Action Model for Robust Robot
+A.; Pertsch, K.; Ren, A. Z.; Walke, H.; Vuong, Q.; Shi,              Manipulation. arXiv:2605.06481.
+L. X.; and Levine, S. 2025. Knowledge Insulating Vision-             Liu, Z.; Bahety, A.; and Song, S. 2023. REFLECT: Summa-
+Language-Action Models: Train Fast, Run Fast, Generalize             rizing Robot Experiences for Failure Explanation and Cor-
+Better. arXiv:2505.23705.                                            rection. arXiv:2306.15724.
+Fan, J.; Liu, Y.; Li, S.; Ren, B.; Li, S.; Zhang, X.-P.; Ding,       Nasiriany, S.; Nasiriany, S.; Maddukuri, A.; and Zhu, Y.
+W.; and Deng, Z. 2026. FUTURE-VLA: Forecasting Unified               2026. RoboCasa365: A Large-Scale Simulation Frame-
+Trajectories Under Real-time Execution. arXiv:2602.15882.            work for Training and Benchmarking Generalist Robots.
+Fu, Z.; Zhao, T. Z.; and Finn, C. 2024. Mobile ALOHA:                arXiv:2603.04356.
+Learning Bimanual Mobile Manipulation with Low-Cost                  Bjorck, J.; Blukis, V.; Castañeda, F.; Cherniadev, N.; Da,
+Whole-Body Teleoperation. arXiv:2401.02117.                          X.; Ding, R.; Fan, L.; Fang, Y.; Fox, D.; Hu, F.; et al. 2025.
+Gu, Q.; Ju, Y.; Sun, S.; Gilitschenski, I.; Nishimura,               GR00T N1.5: An Improved Open Foundation Model for Gen-
+H.; Itkina, M.; and Shkurti, F. 2025. SAFE: Multi-                   eralist Humanoid Robots. NVIDIA GEAR, 11 June 2025.
+task Failure Detection for Vision-Language-Action Models.            https://research.nvidia.com/labs/gear/gr00t-n1_5/.
+arXiv:2506.09937.                                                    GEAR Team; Azzolini, A.; Bjorck, J.; Blukis, V.; Castañeda,
+Guo, Y.; Wang, Y.-J.; Zha, L.; and Chen, J. 2023. DoReMi:            F.; Chand, R.; Chang, Y.; Chen, D.; Cherniadev, N.; Da, X.;
+Grounding Language Model by Detecting and Recovering                 et al. 2025. GR00T N1.6: An Improved Open Foundation
+from Plan-Execution Misalignment. arXiv:2307.00329.                  Model for Generalist Humanoid Robots. NVIDIA GEAR,
+Hafner, D.; Lillicrap, T.; Ba, J.; and Norouzi, M. 2019.             15 December 2025. https://research.nvidia.com/labs/gear/
+Dream to Control: Learning Behaviors by Latent Imagina-              gr00t-n1_6/.
+tion. arXiv:1912.01603.                                              Pan, Y.; Pan, M.; Lu, Q.; Huang, J.; Zhang, M.; Huang, S.;
+Hafner, D.; Lillicrap, T.; Fischer, I.; Villegas, R.; Ha, D.; Lee,   Li, X.; Zhang, J.; Shen, Y.; Zhang, X.; and Zhang, W. 2026.
+H.; and Davidson, J. 2018. Learning Latent Dynamics for              VLA-Corrector: Lightweight Detect-and-Correct Inference
+Planning from Pixels. arXiv:1811.04551.                              for Adaptive Action Horizon. arXiv:2607.01804.
+Ho, M.; Ginting, M. F.; Ward, I. R.; Reinke, A.; Kochen-             Physical Intelligence; Ai, B.; Amin, A.; Aniceto, R.; Bal-
+derfer, M. J.; Agha-Mohammadi, A.-a.; and Omidshafiei, S.            akrishna, A.; Balke, G.; Black, K.; Bokinsky, G.; Cao, S.;
+2026. World Model Failure Classification and Anomaly De-             et al. 2026. π0.7 : a Steerable Generalist Robotic Foundation
+tection for Autonomous Inspection. arXiv:2602.16182.                 Model with Emergent Capabilities. arXiv:2604.15483.
+Physical Intelligence; Amin, A.; Aniceto, R.; Balakrishna,         Zhou, Y.; Ye, Y.; Liu, Z.; and Zhu, Z. 2026. GigaWorld-
+A.; Black, K.; Conley, K.; Connors, G.; Darpinian, J.; Dha-        Policy: An Efficient Action-Centered World–Action Model.
+                               ∗
+balia, K.; et al. 2025a. π0.6     : a VLA That Learns From         arXiv:2603.17240.
+Experience. arXiv:2511.14759.                                      Yuan, H.; Liang, Z.; Chen, A.; Wang, Y.; Li, H.; Lin, P.;
+Physical Intelligence; Black, K.; Brown, N.; Darpinian, J.;        Huang, Y.; Lei, Z.; Zhang, T.; Zhang, J.; Zhang, J.; Fan, J.;
+Dhabalia, K.; Driess, D.; Esmail, A.; Equi, M.; Finn, C.;          Zhou, G.; Peng, Q.; Lv, C.; Chen, X.; Yang, A.; Huang,
+et al. 2025b. π0.5 : A Vision-Language-Action Model with           F.; Lin, J.; Liu, D.; Zhou, J.; Wu, C.; and Chen, X.-H.
+Open-World Generalization. arXiv:2504.16054.                       2026. Qwen-RobotManip Technical Report: Alignment Un-
+Rao, P.; Zhang, W.; Balestriero, R.; LeCun, Y.; and                locks Scale for Robotic Manipulation Foundation Models.
+Loianno, G. 2026. SkyJEPA: Learning Long-Horizon World             arXiv:2606.17846.
+Models for Zero-Shot Sim-to-Real Control of Quadrotors.            Zeng, Y.; Ye, M.; Chen, Y.; Shentu, Y.; Wu, P.; Yan, Z.;
+arXiv:2606.23444.                                                  and Li, Z. 2026. KEMO: Event-Driven Keyframe Memory
+Ross, S.; and Bagnell, D. 2010. Efficient Reductions for           for Long-Horizon Robot Manipulation with VLA Policies.
+Imitation Learning. In Proceedings of the Thirteenth Inter-        arXiv:2606.23589.
+national Conference on Artificial Intelligence and Statistics      Zhang, H.; Lu, Y.; Wang, B.; Kang, X.; Kuo, Y.-L.; Cheng,
+(AISTATS), 661–668. PMLR 9.                                        Z.; Wang, M.; and Jenkins, O. C. 2026. Foresight: Failure De-
+Ross, S.; Gordon, G. J.; and Bagnell, J. A. 2011. A Reduction      tection for Long-Horizon Robotic Manipulation with Action-
+of Imitation Learning and Structured Prediction to No-Regret       Conditioned World Model Latents. arXiv:2606.23085.
+Online Learning. In Proceedings of the Fourteenth Inter-           Zhang, W.; Liu, H.; Qi, Z.; Wang, Y.; Yu, X.; Zhang, J.;
+national Conference on Artificial Intelligence and Statistics      Dong, R.; He, J.; Lu, F.; Wang, H.; et al. 2025. DreamVLA:
+(AISTATS), 627–635. PMLR 15. arXiv:1011.0686.                      A Vision-Language-Action Model Dreamed with Compre-
+Spencer, J.; Choudhury, S.; Venkatraman, A.; Ziebart, B.;          hensive World Knowledge. arXiv:2507.04447.
+and Bagnell, J. A. 2021. Feedback in Imitation Learning:           Zhao, T. Z.; Kumar, V.; Levine, S.; and Finn, C. 2023. Learn-
+The Three Regimes of Covariate Shift. arXiv:2102.02872.            ing Fine-Grained Bimanual Manipulation with Low-Cost
+Sun, J.; Zhang, W.; Qi, Z.; Ren, S.; Liu, Z.; Zhu, H.; Sun,        Hardware. arXiv:2304.13705.
+G.; Jin, X.; and Chen, Z. 2026a. VLA-JEPA: Enhancing               Zhong, X.; Zheng, H.; Zhao, C.; Lv, T.; Fan, H.; Wang,
+Vision-Language-Action Model with Latent World Model.              B.; Liu, Y.; Gao, L.; Liao, Z.; Luo, L.; Zhao, C.; and Cai,
+arXiv:2602.10098.                                                  Y. 2026. ForgeDrive: Bidirectional Cross-Conditioning for
+Sun, Z.; Guo, Y.; Sun, H.; Wang, L.; Lu, W.; Ji, J.; Ji, S.;       Unified Visual-Action Generation in Autonomous Driving.
+Xiong, J.; and Meng, Z. 2026b. Pre-VLA: Preemptive Run-            arXiv:2606.31226.
+time Verification for Reliable Vision-Language-Action and          Zhou, E.; Su, Q.; Chi, C.; Zhang, Z.; Wang, Z.; Huang,
+World-Model Rollouts. arXiv:2605.22446.                            T.; Sheng, L.; and Wang, H. 2024a. Code-as-Monitor:
+Torne, M.; Pertsch, K.; Walke, H.; Vedder, K.; Nair, S.; Ichter,   Constraint-aware Visual Programming for Reactive and
+B.; Ren, A. Z.; Wang, H.; Tang, J.; Stachowicz, K.; et al. 2026.   Proactive Robotic Failure Detection. arXiv:2412.04455.
+MEM: Multi-Scale Embodied Memory for Vision Language               Zhou, G.; Pan, H.; LeCun, Y.; and Pinto, L. 2024b. DINO-
+Action Models. arXiv:2603.03596.                                   WM: World Models on Pre-trained Visual Features enable
+Wang, H.; Zhang, G.; Yan, Y.; Kompella, R. R.; and Liu, G.         Zero-shot Planning. arXiv:2411.04983.
+2026a. VLA Knows Its Limits: Adaptive Execution Horizons
+for Robot Policies. arXiv:2602.21445.
+Wang, H.; Zhang, G.; Yan, Y.; Shang, Y.; Kompella, R. R.;
+and Liu, G. 2026b. Real-Time Robot Execution with Masked
+Action Chunking. arXiv:2601.20130.
+Wang, R.; Zhang, Y.; Lin, J.; Luo, K.; Wang, J.; Wang, Z.; and
+Qi, X. 2026c. When to Trust Imagination: Adaptive Action
+Execution for World Action Models. arXiv:2605.06222.
+Wang, T.; Hou, H.; Hu, Y.; Liu, Y.; Li, Q.; Jiang, Y.; Wang,
+Y.; Ma, C.; Wang, R.; and Gao, Y. 2026d. When Does
+Legacy Data Start to Help? Emergent Transfer in Cross-
+Configuration Robot Learning. arXiv:2607.25593.
+Wang, X.; Zhu, Z.; Huang, G.; Wang, B.; Chen, X.; and
+Lu, J. 2024. WorldDreamer: Towards General World Mod-
+els for Video Generation via Predicting Masked Tokens.
+arXiv:2401.09985.
+Ye, A.; Wang, B.; Ni, C.; Huang, G.; Zhao, G.; Li, H.; Li,
+H.; Li, J.; Lv, J.; Liu, J.; Cao, M.; Li, P.; Deng, Q.; Mei, W.;
+Wang, X.; Chen, X.; Zhou, X.; Wang, Y.; Chang, Y.; Li, Y.;
+                          Appendix                                   Algorithm S1 CheckVLA execution loop (one episode)
+                                                                     Require: policy πθ , frozen encoder ϕ, world model Ψ, risk
+      A       Execution-Semantics Illustration                           head R, calibrated (µr,t , σ̃r,t , q̂α ), span k, scheduled la-
+                                                                         tency dlat , suppression length smin
+                                                                      1: commit At ∼ πθ (· | ct , st ) (main Eq. 1); anchor at the
+Figure S1 gives a schematic episode that illustrates the ex-             current observation
+ecution semantics formalized around Eq. 1 and the suffix-             2: while episode not finished do
+rewriting mechanism in Eqs. 9–10. Both panels share the               3:    on each new observation ot : zt ← ϕ(ot ); write the cor-
+same horizontal axis (control steps 0–50, one chunk length                  responding pooled policy feature Ft to the keyframe
+H) and receive the same perturbation: at step 15, the carried               bank ρt if the pause and diversity criteria hold
+object slips inside the gripper. Panel (a) shows open-loop            4:    retrieve the prediction ẑt|t−ℓ(t) issued at the latest
+chunked execution: the policy receives no new high-level vi-                valid anchor; standardize the discrepancy by span
+sual input within the chunk, the deviation accumulates from                 (main Eq. 3) and form the tuple  xt (main Eq. 4)
+step 15 onward, and the failure can surface only at the next          5:    rt ← R xt−w+1:t , m(ρt ) ; δt ← µr,t + q̂α σ̃r,t
+policy call at step 50. Panel (b) shows the same episode                    (main Eqs. 5–6)
+under CheckVLA. The world model predicts near-term fea-               6:    if rt > δt , no rewrite in progress, and no post-
+tures conditioned on the committed actions; the prediction–                 deployment suppression then
+observation discrepancies are aggregated by the temporally            7:       compute the standardized exceedance et∗ (main
+causal risk head into the risk score rt (red curve), which rises               Eq. 8); rewrite with πθ : clamp positions h < dlat
+after the perturbation and crosses the conformally calibrated,                 to the executing prefix at every integration step and
+time-varying threshold δt (gray dashed line) at t∗ (step 20),                  guide the suffix with Wh,m (main Eqs. 9–10)
+triggering a replan. A trigger does not mean immediate cor-           8:       at the scheduled tick deploy from h = dlat ; if infer-
+rection: one inference of the same policy takes dlat = 3                       ence overruns, set deff to elapsed ticks, deploy from
+control steps (amber band), during which old-chunk steps                       h = deff , and discard earlier positions; invalidate
+20–22 still execute and form the irreversible prefix. Here dlat                superseded predictions, suppress triggers for smin
+is a fixed deployment schedule chosen to cover the median                      steps, and re-anchor at the next observation
+measured latency (286 ms at the 100 ms control period; Ta-            9:    else
+ble S18): the switch is scheduled dlat ticks after the trigger,      10:       anchor at zt ; roll out ẑ for the next k steps condi-
+an earlier-finishing call waits for the scheduled tick, and a call             tioned on the remaining committed actions (main
+that overruns deploys at the first tick after completion with                  Eq. 2)
+the elapsed replacement positions discarded (the effective           11:    end if
+delay deff defined immediately after Eq. 1), so latency jitter       12:    at a regular chunk boundary: commit the next chunk
+only shortens the deployed suffix. The reported experiments                 with bank ρt (e=0 transition guidance)
+impose the nominal schedule uniformly, and the sweep in Ta-          13: end while
+ble S6 brackets slower calls up to dlat =10. The correspond-
+ing prefix positions of the new chunk are hard-constrained
+to these executed actions (hatched cells), reducing the com-
+                                                                       C     Decoupled Action Experts and Training
+mand discontinuity at the switch; the new chunk deploys                                     Details
+from h = dlat (step 23, green), and the remainder of the old         Action generation uses decoupled mobility and manipula-
+chunk (gray hatching) is replaced and never executes. The            tion experts (Figure S2). The mobility expert receives base-
+bottom decay strip shows the per-position guidance weight            state and base-action tokens, while the manipulation expert
+W on the flagged old chunk: its entry scale w0 (et∗ ) < 1 is set     receives arm–gripper state and action tokens; each expert
+by the standardized exceedance at the trigger and decays as          has separate query/key/value projections, a feed-forward net-
+exp(−λm (h − dlat )); the larger the exceedance, the smaller         work, and a denoising head. Their projected tokens interact
+w0 and the stronger the permitted correction. The first de-          in joint self-attention over the shared prefix ct , allowing co-
+ployed position therefore departs from the flagged reference         ordination without additional cross-expert connections; the
+instead of copying it. Step indices are illustrative values from     design follows evidence that action-subspace decoupling can
+the experimental configuration (H=50, dlat =3); the real dis-        reduce gradient interference (Chen et al. 2026).
+tributions of perturbation types, trigger times, and lead times         For e ∈ {mobility, manip}, we sample a flow-integration
+are reported in supplementary Sec. F.                                time u ∼ U(0, 1) and form noisy actions by linear interpo-
+                                                                     lation:
+                                                                           Ãe,u
+                                                                             t   = uAet + (1 − u) ϵe ,       ϵe ∼ N (0, I),        (S1)
+          B     Execution-Loop Pseudocode                            and training minimizes the conditional flow-matching loss
+                                                                               X                                          2
+                                                                                  Eu,ϵe vθe Ãe,u  e             e     e
+                                                                                                             
+Algorithm S1 consolidates the monitoring, triggering, sup-            LAE =                   t , st ; ct , u − At − ϵ       , (S2)
+pression, and re-anchoring rules formalized across Eqs. 1–10                    e
+into a single loop; every equation reference below resolves          where set is the corresponding proprioceptive state and u is in-
+to a labeled equation in the main text.                              jected through adaptive layer normalization. A stop-gradient
+            (a) Open-loop chunked execution (baseline)
+                                             perturbation (step 15)
+
+                      nominal execution                                       deviation persists
+
+               0                               15                                 control step                                50
+                                                                        failure surfaces only at the next policy call (step 50)
+
+            (b) CheckVLA: in-chunk verification and latency-consistent suffix rewriting
+                                                                    same policy replans concurrently (dlat = 3 steps)
+
+                      nominal execution                                          flagged remainder (replaced)
+                                         deviation grows    still executing
+                                              *
+                                      trigger t (step 20)
+                                                                                                       calibrated threshold δt
+
+                risk score rt
+
+
+
+                                                                           rewritten suffix (deployed from h = dlat )
+
+                                          hard-constrained to the executed actions             handover at step 23
+                                             reference weight W
+                                                                  Wh, m = w0 (et * ) exp(−λm (h − dlat ))
+                                                                  larger et * : smaller w0 , stronger correction
+
+
+Figure S1: Suffix rewriting under inference latency. (a) Open-loop chunked execution: a perturbation at step 15 is not observed
+at the policy level, and the deviation persists until the next policy call at the chunk boundary; the task fails. (b) CheckVLA:
+the action-conditioned risk score rt crosses the calibrated threshold δt at t∗ (step 20) and triggers replanning by the same
+policy. While inference runs (dlat =3 control steps), the flagged chunk keeps executing (irreversible prefix); the new chunk
+is hard-constrained to match these executed actions and deploys from h=dlat (step 23), replacing the flagged remainder. The
+guidance weight starts at w0 (et∗ )<1 and decays along the suffix: a larger standardized exceedance permits a stronger correction.
+
+isolates the VLM backbone from the flow-matching objec-                    period; Table S18) this is the previous observation, so the re-
+tive. At inference, the experts synchronously integrate their              trieved span is ℓ = 1; spans up to k arise when monitor com-
+vector fields under the shared prefix; a replan trigger invokes            putation overruns a control period, an observation drops, or
+the same network with the guided flow integration in Eqs. 9–               a chunk switch invalidates predictions, and the span-specific
+10.                                                                        statistics of main Eq. 3 keep these regimes on a common
+                                                                           scale.
+ D    Verifier Training and Calibration Details                               The risk head is trained on three trajectory classes: nom-
+The world model Ψ applies block-causal attention over the                  inally successful episodes, natural failures of the open-
+interleaved feature and action tokens, with block i predict-               loop backbone, and physics-level perturbations—impulses
+ing frame i+1. Training first minimizes a teacher-forcing                  to objects or the base, transient joint offsets, and object
+objective with a Huber loss against frozen encoder targets,                displacements—annotated by their onset τon . The objec-
+                    k
+                    X                                                      tive applies binary cross-entropy to the softmax-pooled risk
+             Ltf                                                           within [τon , τon +∆], penalizes risk before onset, and masks
+                                                  
+              Ψ =         ℓHuber ẑt+i , sg(zt+i ) ,         (S3)
+                    i=1                                                    gradients after task failure; nominally successful episodes
+and then replaces the prediction context with Ψ’s own roll-                and benign deviations (after which the task still succeeds)
+outs so that training matches the autoregressive context used              serve as negatives throughout. Supervision is therefore re-
+online. Predictions are stored by anchor and target time, and              stricted to pre-failure evidence, and perturbations act at the
+targets that cross a chunk boundary are generated after the                physics level; they are never injected directly into the dis-
+next chunk is committed; no pixel decoding is used at any                  crepancy sequence.
+stage. At inference, the monitor retrieves the prediction from                The functional conformal threshold in Eqs. 6–7 is con-
+the most recent anchor whose rollout is available and whose                structed as follows. Per-step risk statistics (µr,t , σr,t ) are fit-
+conditioning actions have not been superseded. Under nomi-                 ted on nominally successful shadow-mode trajectories of the
+nal timing (monitor p95 of 16.4 ms against the 100 ms control              same training seed, disjoint from the n calibration trajecto-
+                                                                     The policy needs the evidence itself to choose an action,
+                                                                  whereas the risk head needs only enough context to judge
+                    Mobility      Manipulation                    whether a discrepancy is innocuous. The policy therefore
+                                    Expert                        fuses the full bank once per invocation through gated cross-
+                    Expert
+                                                                  attention,
+                                                                                Xt′ = CrossAttn Xt , B̃t ,
+                                                                                                          
+                     FFN               FFN                                                                                (S4)
+                                                                                X̂t = Xt + σ g([Xt ; Xt′ ]) ⊙ Xt′ ,
+                                                                                                           
+
+                     Joint Self Attention               xN        where g is negatively initialized and X̂t preserves the to-
+                                                                  ken shape expected by the VLM.   The risk head reads only
+     VLM                                                          m(ρt ) = t − tlast , mt , F̄last . Both paths are trained with
+  prefix token       QKV               QKV                        real banks reconstructed offline by the same filter. Conse-
+                                                                  quently, the factorial memory study retrains each policy-
+                                                                  reader variant and independently recalibrates each changed
+                                                                  risk reader; test-time zeroing is not treated as a valid substi-
+                                                                  tute.
+Figure S2: Decoupled action experts. The mobility and ma-
+nipulation experts keep separate QKV projections, feed-            F    Evaluation Protocol and Data Separation
+forward networks, and denoising heads, and interact only          The supplementary evaluation is designed to test one claim:
+through joint self-attention over the shared VLM prefix to-       under the same action backbone and comparable intervention
+kens, repeated over N blocks. Each expert denoises its own        budgets, action-conditioned verification should identify use-
+noisy action tokens Ãe,u
+                       t   (Eq. S1) into the committed sub-       ful intervention times, and latency-consistent suffix rewriting
+space actions Aet .                                               should turn those warnings into recoveries without increas-
+                                                                  ing harm on episodes that would otherwise succeed. This
+ries, with σ̃r,t = max(σr,t , ε). Each calibration trajectory i   claim is bounded to the RoboCasa365 simulator and to the
+                                    (i)       
+receives the score κ(i) = supt rt − µr,t /σ̃r,t , and q̂α is      task, scene, and perturbation distributions described below;
+                                                                  it does not establish hardware safety.
+the ⌈(n+1)(1−α)⌉-th order statistic of these scores, set to
+                                                                     Table S1 records the separation between optimization,
++∞ when the index exceeds n. Every score-shaping statistic,
+                                                                  model selection, calibration, and final evaluation. The pol-
+including discrepancy-span statistics and temporal normal-
+                                                                  icy and its action experts are trained only on the official
+ization, and every online retrieval and memory rule is fixed
+                                                                  Human300 demonstrations. Auxiliary trajectories for the
+before the conformal quantile is computed; exchangeability
+                                                                  world model and risk head are generated from training-side
+between calibration and deployment episodes under the same
+                                                                  tasks and scenes and are accounted for separately from Hu-
+fixed pipeline then yields the first-intervention episode-level
+                                                                  man300 policy training. Splits are assigned by task–scene–
+bound in Eq. 7.
+                                                                  initialization group before rollout generation, preventing
+   During regular chunk transitions, reference guidance uses
+                                                                  near-duplicate trajectories from crossing partitions. Neither
+e = 0, hence w0 = 1, with a slower positional decay to
+                                                                  Composite-Unseen tasks nor target-suite scenes are used to
+prioritize continuity. After a repair switch, predictions con-
+                                                                  train the policy, world model, or risk head.
+ditioned on superseded actions are invalidated and the next
+                                                                     The perturbation study uses the 12 composite tasks visual-
+observation forms a new anchor; further triggers are sup-
+                                                                  ized in Figures S8–S10. It balances object or base impulses,
+pressed while a rewrite is in progress and for smin steps after
+                                                                  transient joint offsets, and moved-object interventions across
+deployment, and the reference weight W is zero beyond the
+                                                                  navigation, pre-contact, post-grasp transport, and appliance-
+end of the remaining reference actions. Table S20 lists the
+                                                                  interaction phases. Paired variants share the task, scene, ini-
+complete hyperparameter configuration.
+                                                                  tial state, perturbation type and onset, environment seed,
+                                                                  and policy-sampling seed. Detector-only comparisons replay
+       E         Episodic Context Implementation                  the same shadow-mode trajectories. Rewrite comparisons re-
+A post-replan invocation sees only the current observation,       store the same simulator snapshot at the first trigger and reuse
+while evidence of completed stages may have left the field        common random numbers, so they change the repair rule but
+of view. CheckVLA therefore maintains an event-driven             neither the evidence available at the trigger nor the pre-trigger
+keyframe bank Bt = {(Fj , tj )}m    t
+                                  j=1 of real-observation fea-    history.
+tures that persists across chunks and repairs and is cleared         The allocation uses 3 independently trained seeds, 10
+only at episode end. A non-learned two-stage filter proposes      clean episodes per task and seed, and 10 paired perturbation
+writes: delay-confirmed local
+                           Pt minima of the mean joint-space      episodes per task, perturbation family, and seed, with severity
+displacement ∆q t = w1s j=t−ws +1 ∥qj −qj−1 ∥2 mark can-          and onset phase balanced within each block. Three nominal
+didate pauses, and candidates too similar or too close in         pools serve distinct roles and never mix: 400 shadow-mode
+time to the latest stored frame are rejected. Accepted entries    nominal successes per training seed, generated by that seed’s
+store pooled policy-encoded tokens Fj with timestamps; po-        own policy and monitor, fit the conformal calibration—each
+sitional indices are rebuilt from bank order at read time.        checkpoint is calibrated independently, so exchangeability
+Table S1: Roles of the data partitions. The official clean benchmark aggregate is never mixed with the controlled perturbation
+study.
+
+  Partition                    Allowed data                           Permitted use                              Leakage guard
+  Policy training              Official Human300 demonstrations       Optimize the VLA and decoupled ac-         No target-suite trajectory or in-
+                                                                      tion experts                               jected perturbation
+  Monitor training             Training-side nominal and physics-     Optimize the rolling predictor and         No validation, calibration, or
+                               perturbed rollouts                     causal risk head                           target group
+  Validation                   Held-out training-side task–scene      Select discrepancy, span, window,          No gradient update and no final
+                               groups                                 suppression, guidance, and periodic-       conformal quantile
+                                                                      replan settings
+  Conformal calibration        Nominal successful shadow-mode         Fit span statistics, temporal normal-      Disjoint from validation and
+                               episodes                               ization, and the functional conformal      both locked tests
+                                                                      quantile
+  Locked clean test            Official 50-task target suite          Report A-S, C-S, C-U, and task-            Evaluation only; no post-test
+                                                                      weighted success                           tuning
+  Locked perturbation test     Preregistered composite-task sub-      Detector, fixed-trigger repair, latency,   Perturbation schedule fixed be-
+                               set with physical perturbations        and failure analyses                       fore unblinding variants
+
+
+is with respect to deployment of the same checkpoint—                           For each disrupted reference episode i that fails without
+a disjoint pool of 50 nominal shadow-mode episodes per                       intervention, τon,i is the annotated onset of the observable
+perturbation-study task and seed (1,800 episodes) estimates                  deviation and τirrev,i is the earliest time after which no tested
+empirical episode FWER, and the 1,500-episode locked                         suffix repair can restore task success. Only the onset is a
+clean suite reports benchmark success only. Table S2 breaks                  human annotation; τirrev,i is operational, fixed by repair out-
+the full system’s headline metrics down by training seed.                    comes under the tested rewrite rules, so timeliness is not
+Task-success uncertainty is computed by a 95% hierarchi-                     judged against an annotator’s opinion of recoverability. (In
+cal paired bootstrap over tasks and then episodes. Episode                   the natural-execution audit, where deviations are not injected,
+FWER uses an exact binomial interval, and paired success                     blinded annotators mark both times as described there.) We
+changes use an exact McNemar test. Hyperparameters are se-                   call the interval before τirrev,i the episode’s empirical recov-
+lected once on validation data; every detector variant is then               ery window; irreversibility always refers to the close of this
+independently recalibrated at target episode-level α = 0.05                  window under the tested repair set, not to physical impos-
+before the locked test is read.                                              sibility. A trigger is timely only if it occurs no earlier than
+                                                                             onset and its repaired chunk can deploy before irreversibility.
+Table S2: Per-seed results for full CheckVLA. Mean matches                   Timely recall and effective lead are therefore
+the aggregates reported in Tables 3 and 4.
+                                                                                    \ timely = 1
+                                                                                                         X h τ ≤t∗ , i
+                                                                                                                       on,i
+                                                                                    Recall                    ⊮ t∗ +dlat,i  <τirrev,i ,
+                                                                                                                              i
+                                                                                                                                          (S6)
+                                              Timely        Episode                                  |F|           i
+             Clean            Perturbed                                                                    i∈F
+Seed      Average (%)        success (%)    recall (%)     FWER (%)                             ℓi = τirrev,i − (t∗i + dlat,i ) ,              (S7)
+Seed 1         35.6             48.2           77.1            5.2
+                                                                             where F contains the disrupted reference episodes. We report
+Seed 2         36.9             46.9           79.0            4.5
+Seed 3         35.8             47.7           77.6            4.7           the median and interquartile range of ℓi among timely alarms
+                                                                             and retain premature, missed, and late alarms
+                                                                                                                        P as failures in
+Mean           36.1             47.6           77.9            4.8           Eq. S6. Premature-alarm frequency, |F|−1 i ⊮[t∗i < τon,i ],
+                                                                             is reported separately.
+                                                                                Repair quality is measured with paired counterfactual out-
+                                                                             comes. Let yi0 be success from the stored trigger snapshot
+                    G   Metric Definitions                                   under the reference continuation and yim success under repair
+Let N denote shadow-mode episodes that succeed under                         method m. Conditional rescue and harm rates are
+nominal execution, Ti their horizons, and t∗i = inf{t : ri,t >                                        P
+                                                                                                           ⊮[y 0 = 0 ∧ yim = 1]
+δi,t } the first alarm (t∗i = ∞ when no alarm occurs). The em-                         Rescue(m) = i Pi             0           ,     (S8)
+pirical episode-level family-wise error rate (episode FWER)                                                    i ⊮[yi = 0]
+                                                                                                           ⊮[y 0 = 1 ∧ yim = 0]
+                                                                                                      P
+is
+                                                                                        Harm(m) = i Pi              0           .     (S9)
+                                                                                                               i ⊮[yi = 1]
+        \ ep = 1
+                            X
+      FWER                     ⊮[∃t ≤ Ti : ri,t > δi,t ] . (S5)
+                      |N |                                                   Rescue and harm isolate a single repair: the branch executes
+                          i∈N
+                                                                             rule m once with subsequent triggers disabled. Perturbed
+This is the probability of at least one unnecessary first in-                success instead continues the full closed loop from the same
+tervention on an episode that would otherwise succeed; a                     snapshot with re-intervention enabled (audited in Table S17),
+step-wise false-positive rate is not a substitute because it                 so a rule can gain more in perturbed success than its one-
+ignores repeated testing over variable horizons.                             shot rescue–harm gap alone implies. We additionally report
+task success, policy invocations per episode, and the switch       the factual action and four physically plausible counterfactu-
+discontinuity ∥anew,dlat −aold,j+dlat ∥2 . Together, rescue and    als under a common physics seed: a circular temporal shift,
+harm distinguish useful recovery from indiscriminate replan-       a gripper-state flip, a phase-matched mobility replacement,
+ning that merely trades one set of failures for another.           and a phase-matched manipulation replacement. Each re-
+                                                                   placement receives a consistent nominal proprioceptive roll-
+  H     Action-Conditioned Detector Ablations                      out. For prediction u and realized future v, we compute the
+                                                                   span-averaged feature distance D(u, v). The assignment mar-
+We isolate the verifier with the action backbone, downstream       gin compares diagonal matching, D(0, 0) + D(v, v), with
+rewriter, test trajectories, and target episode FWER held          the crossed assignment, D(0, v) + D(v, 0). Positive mar-
+fixed. Each detector variant is retrained when applicable          gins and pairwise accuracy above 50% in Table S5 indicate
+instead of being disabled at test time, and its discrepancy        action–future binding, not observation-only sensitivity. Both
+statistics and threshold are refit on its own calibration split.   the action tokens and the nominal proprioceptive rollout ŝ
+The action-shuffled row is a training-time negative control:       (itself a deterministic function of the actions) carry action
+it preserves action-token marginals and architecture while         information, so the audit certifies binding of the combined
+breaking the correspondence between a committed action             action conditioning without separating these two pathways.
+and its predicted consequence. The constant-threshold row
+replaces the time-varying threshold of the main method with            J    Fixed-Trigger Rewriting and Latency
+a single validation-tuned scalar; unlike every other row, it       To prevent detector quality from confounding repair quality,
+is not conformally calibrated, so it measures the combined         every row in Table S6 starts from the same first-trigger simu-
+effect of removing the functional shape and the conformal          lator snapshots. Every one of the 1,080 injected episodes pro-
+calibration.                                                       duces at least one threshold crossing, so the branch set covers
+   The cross-family comparison additionally evaluates four         the full cohort; the online deployed-rewrite rate in Table S17
+policy-side signals. For the Monte Carlo entropy proxy and         (86.2%) is lower because online deployment additionally re-
+sampling disagreement, the policy draws the same Q normal-         spects the trigger-suppression window and the empty-suffix
+ized action chunks per decision; entropy is estimated with         rule. The flagged chunk, standardized exceedance, obser-
+a diagonal-Gaussian approximation, whereas disagreement            vation, episodic bank, and policy-sampling noise are shared
+is their mean pairwise squared distance. Denoising/flow-           across variants. The boundary baseline ignores the trigger un-
+path variance is computed from clean-action estimates at           til the next regular call. The unconstrained baseline generates
+validation-selected integration times. The frozen-policy fea-      a complete chunk and discards its already elapsed prefix only
+ture probe is a two-layer causal classifier trained on policy      after sampling; in contrast, hard-prefix variants overwrite the
+features without updating the VLA. The primary compari-            irreversible prefix at every flow-integration step. Because the
+son evaluates all policy signals at commit time. Observation-      overwritten values do not match the training-time noise level
+refreshed variants rerun the required policy computation after     at intermediate integration times, the clamp is an empirical
+each new observation and report the resulting compute sepa-        projection rather than exact sampling from the conditional
+rately (Table S4). An average episode lasts 390 control steps      suffix distribution; the RTC (Black, Galliker, and Levine
+at 10 Hz, so observation-rate refreshing adds 382.2 policy         2025) row provides the principled prefix-preserving inpaint-
+evaluations per episode, and its per-score p95 latency ex-         ing alternative under the same trigger, and the switch-jump
+ceeds the 100 ms control period; these variants are offline        column reports the residual discontinuity of each rule. The
+upper bounds, not deployable monitors.                             shuffled-exceedance control preserves the marginal distribu-
+   The verifier-control rows in Table S3 separate alarm cali-      tion of repair strengths but breaks its pairing with the current
+bration from alarm usefulness. Shuffling action–future train-      deviation. The validation-tuned fixed weight is W =0.5.
+ing pairs sharply degrades event ranking and timeliness.               The paired results attribute different roles to the two repair
+Rolling re-anchoring recovers lead time relative to a full-        constraints. Hard prefixing reduces the deployment disconti-
+chunk rollout, and temporal aggregation improves over an           nuity and harm relative to post-hoc prefix disposal, whereas
+instantaneous residual. The time-varying conformal rule im-        a full rewrite with W =0 discards all reference guidance
+proves timely recall while bringing empirical episode FWER         and over-corrects otherwise recoverable trajectories. A fixed
+back to the prescribed operating point, unlike the validation-     guidance weight improves this trade-off, but shuffling ex-
+tuned constant threshold. Among the policy-side rows, the          ceedance produces little additional gain; only the correctly
+frozen feature probe is strongest, yet the full verifier im-       paired W (e) improves rescue while lowering harm. Un-
+proves timely recall by 9.3 points and perturbed success by        der the shared trigger, adaptive guidance improves nominal-
+3.9 points at a comparable target FWER.                            latency success by 2.0 points over RTC and lowers harm by
+                                                                   1.3 points. Performance decreases with inference latency for
+    I    Inference-Time Action–Consequence                         every in-chunk method because a longer irreversible prefix
+                                                                   leaves fewer executable actions to change. The full method
+                      Binding                                      retains the largest advantage at the longest tested latency, but
+The training-time shuffled control does not by itself show         the remaining decline makes clear that verification cannot
+that the trained predictor uses its action input at inference.     recover an episode after the useful intervention window has
+We therefore freeze the full world model and restore held-         closed. Figure S3 plots the sweep: every in-chunk method de-
+out simulator snapshots. From each snapshot, we execute            clines as the irreversible prefix grows, and adaptive guidance
+Table S3: Detector comparison at a common target episode FWER of α = 0.05. Each detector is calibrated independently on
+nominal successful episodes and evaluated on the same shadow trajectories. Event AUPRC treats each injected deviation as one
+event; effective lead includes deployment latency, and perturbed success uses the same downstream rewriter for every detector.
+
+                                                    Episode FWER  Event  Timely recall              Effective lead Perturbed success
+      Detector variant                                   (%)     AUPRC ↑    (%) ↑                     (steps) ↑          (%) ↑
+      Panel A: Cross-family detector comparison
+      Policy MC action-entropy proxy, commit-           5.0            0.512          58.7              7.8              38.9
+      time
+      Policy    denoising/flow-path     variance,       5.2            0.548          61.4              8.4              40.2
+      commit-time
+      Policy sampling disagreement, commit-time         4.9            0.586          64.8               9.1             41.5
+      Frozen-policy feature probe, commit-time          5.1            0.621          68.6              10.0             43.7
+      Observation-only world predictor                  5.3            0.442          48.6               6.1             35.2
+      Action-shuffled world model, retrained            5.1            0.318          37.9               4.2             31.0
+      Full action-conditioned verifier                  4.8            0.764          77.9              13.2             47.6
+      Panel B: Internal verifier mechanisms
+      Observation-only world predictor                  5.3            0.442          48.6              6.1              35.2
+      Action-shuffled world model, retrained            5.1            0.318          37.9               4.2             31.0
+      Action conditioned, no rolling re-anchor          5.4            0.561          62.8               9.2             38.7
+      Rolling predictor, instantaneous score            5.0            0.634          66.1              10.1             41.2
+      Causal risk head, constant threshold              7.1            0.701          71.5              11.4             45.0
+      Full: time-varying conformal threshold            4.8            0.764          77.9              13.2             47.6
+
+Table S4: Sensitivity to refreshing policy-side signals after new observations. Commit-time variants reuse the score produced
+with the dispatched chunk. Observation-refreshed variants rerun the required policy computation at the monitoring rate, with
+the added VLA evaluations and p95 score latency reported explicitly.
+
+                                                           Extra VLA evals Score p95 Episode FWER Timely recall Perturbed success
+ Signal                           Update mode                    / ep.       (ms)         (%)        (%) ↑            (%) ↑
+ MC action-entropy proxy       Commit-time                      0.0            338            5.0              58.7             38.9
+ MC action-entropy proxy       Observation-refreshed           382.2           338            5.2              69.5             44.0
+ Sampling disagreement         Commit-time                      0.0            338            4.9              64.8             41.5
+ Sampling disagreement         Observation-refreshed           382.2           338            5.1              72.3             45.0
+ Frozen policy-feature probe   Commit-time                      0.0            6.8            5.1              68.6             43.7
+ Frozen policy-feature probe   Observation-refreshed           382.2           344            5.0              73.1             45.4
+ Full action-conditioned veri- Observation-rate moni-           0.0            16.4           4.8              77.9             47.6
+ fier                          tor
+
+Table S5: Inference-time action–consequence binding of the frozen world model. Each candidate is generated from the same
+simulator snapshot and rolled out under a common physics seed. Accuracy is the fraction of pairs whose diagonal action–future
+assignment has lower cost than the crossed assignment.
+
+                                                    Anchor Predicted-future Realized-future Assignment 2AFC binding
+          Counterfactual action                      pairs   separation ↑    separation ↑    margin ↑  accuracy (%) ↑
+          Within-chunk circular temporal shift       720           0.214              0.237            0.118           78.6
+          Gripper open/close flip                    412           0.181              0.205            0.094           74.8
+          Phase-matched mobility-action replace-     720           0.268              0.301            0.143           82.1
+          ment
+          Phase-matched manipulation-action re-      720           0.246              0.279            0.131           80.4
+          placement
+          Pooled counterfactuals                     2572          0.233              0.262            0.125           79.5
+Table S6: Fixed-trigger repair comparison. Rescue, harm, and switch jump are one-shot paired outcomes at the nominal latency
+of three control steps, with subsequent triggers disabled; perturbed success continues the full closed loop from the same snapshot
+with re-intervention enabled. The latency sweep varies the executable suffix while all methods start from the same first-trigger
+snapshots.
+
+                                                                                                                                            Perturbed success (%) ↑
+                                                                                 Rescue Harm Switch
+                                     Rewrite rule                                (%) ↑ (%) ↓ jump ↓ dlat =0 dlat =1 dlat =3 dlat =5 dlat =10
+                                     Wait for next chunk boundary                 7.4         4.8     –                           34.0       34.0         34.0     34.0      34.0
+                                     Unconstrained generation, discard            10.1        8.9   0.284                         48.9       46.0         39.8     33.2      23.4
+                                     prefix
+                                     Hard prefix, full rewrite (W =0)             13.2        6.8   0.171                         49.5       47.0         42.4     36.0      25.8
+                                     RTC prefix-preserving inpainting             13.7        4.1   0.091                         53.0       50.6         45.6     39.7      29.1
+                                     Hard prefix, validation-tuned fixed W        12.8        3.7   0.104                         53.5       51.0         46.0     39.9      29.6
+                                     Hard prefix, adaptive W , shuffled ex-       14.4        3.6   0.103                         51.9       49.2         44.3     38.5      27.6
+                                     ceedance
+                                     Hard prefix, adaptive W (e)                  16.9        2.8   0.072                         55.8       53.2         47.6     42.0       31.4
+
+
+keeps the largest margin at every tested latency.                                                    46.0% perturbed success, the frozen continuous mapping
+                                                                                                     47.6%, and bin-wise validation-selected weights 48.8%:
+                                                                                                     exceedance-conditioned retention carries the gain, the con-
+                                                                                                     tinuous mapping captures most of it without bin edges or
+                        50
+                                                                                                     per-bin tuning, and the shift of the per-bin optimum toward
+                                                                                                     smaller weights at larger exceedance is the monotonicity that
+Perturbed success (%)
+
+
+
+
+                                                                                                     w0 (e) encodes. Figure S4 plots the same grid: the best fixed
+                                                                                                     weight shifts from 0.75 toward 0 as the exceedance bin rises,
+                        40                                                                           and the frozen adaptive mapping stays within 1.5 points of
+                                                                                                     the per-bin envelope without bin-specific tuning.
+
+                        30                                                                                                   50
+                                                                                                     Perturbed success (%)
+
+
+
+
+                                                                                                                             45
+                        20
+                             0   1             3            5                            10
+                                        Inference latency dlat (control steps)
+                                                                                                                             40
+
+                                 Wait for chunk boundary          Fixed guidance W = 0.5
+                                 Unconstrained, discard prefix    Shuffled exceedance                                                    B1 (lowest e)
+                                 Hard prefix, full rewrite        Adaptive W(e)                                              35          B2
+                                 RTC inpainting                                                                                          B3
+                                                                                                                                         B4 (highest e)
+                                                                                                                                         Frozen adaptive W(e)
+Figure S3: Perturbed success across inference latency for                                                                    30
+the fixed-trigger repair rules of Table S6. All rules branch
+                                                                                                                                  0.00              0.25             0.50             0.75   1.00
+from the same first-trigger snapshots; the boundary baseline
+                                                                                                                                                           Fixed retention weight W
+ignores the trigger and is latency-independent.
+                                                                                                     Figure S4: Perturbed success under fixed retention weights,
+                                                                                                     evaluated separately in each exceedance bin of Table S7.
+                        K    Exceedance-to-Retention Mechanism                                       Stars mark the frozen adaptive mapping W (e) at each bin’s
+To test the mapping from standardized exceedance to refer-                                           median exceedance.
+ence retention, we partition positive exceedances into four
+equal-frequency bins using validation data and freeze the bin
+edges before evaluating the locked snapshots. Every snapshot
+(all 1,080 first-crossing snapshots, 270 per bin) is branched                                                         L           Natural Failures and Distribution Shifts
+with the same policy noise under W ∈ {0, 0.25, 0.5, 0.75, 1}                                         The controlled perturbation study provides known onsets and
+and under the frozen adaptive mapping. The validation-                                               paired snapshots, but it does not establish performance on
+selected fixed weight decreases across exceedance bins,                                              naturally occurring failures or benign observation shifts. We
+while the test set is used only to evaluate the frozen choices.                                      therefore evaluate a held-out natural-execution cohort drawn
+Averaged over bins, the best single fixed weight attains                                             from training-side task–scene groups excluded from monitor
+Table S7: Exceedance-conditioned reference retention. Panel A reports perturbed success from common first-trigger snapshots
+under a fixed weight grid and the frozen adaptive mapping. Panel B summarizes the validation-selected weight and adaptive
+repair outcomes.
+
+                                                      Perturbed success under fixed W (%) ↑          Frozen mappings
+                Exceedance bin          Triggers W =0 W =0.25 W =0.50 W =0.75 W =1 Adaptive W (e) Wval
+                B1 (lowest)                270     39.2     42.8      45.6        48.3   47.5           47.2         0.75
+                B2                         270     41.0     44.6      48.7        47.9   45.0           47.6         0.50
+                B3                         270     44.2     49.1      47.6        44.0   39.8           48.0         0.25
+                B4 (highest)               270     49.1     47.2      42.0        36.7   31.8           47.6         0.00
+
+                                         Median      Success at Median adaptive Adaptive rescue Adaptive harm
+                 Exceedance bin            e    Wval Wval (%)       W (e)           (%) ↑          (%) ↓
+                 B1                        0.18    0.75     48.3          0.78                12.4             2.3
+                 B2                        0.46    0.50     48.7          0.53                15.8             2.5
+                 B3                        0.91    0.25     49.1          0.29                18.7             2.8
+                 B4                        1.74    0.00     49.1          0.08                23.1             3.2
+
+
+training and validation. Two annotators, blinded to detector          family stays far above the action-shuffled control, and heav-
+scores, mark the first observable deviation, last recoverable         ier held-out severities are detected more reliably while being
+time, failure type, and whether a nonempty suffix could plau-         physically harder to repair.
+sibly repair the episode. We report both all failures and the
+actionable subset, without excluding failures that the policy           M        Episodic-Memory Interaction Ablation
+cannot repair. The audit set is case–control: it contains every
+                                                                      The policy reads the full keyframe bank, whereas the risk
+annotated failure and a matched sample of natural successes,
+                                                                      head reads only its compact summary. We therefore run a
+so no success rate is defined on it. The execution-mode panel
+                                                                      fully retrained 2 × 2 factorial ablation (Table S11) and do
+of Table S8 instead re-executes the same 606 task–scene–
+                                                                      not rely on test-time zeroing. When the risk-summary reader
+initialization configurations under each mode with fresh ran-
+                                                                      changes, its threshold is independently recalibrated; when
+domness, so its success rates estimate the population rate
+                                                                      the policy reader changes, the action model is retrained with
+rather than the case–control composition.
+                                                                      the corresponding input path. Completed-subgoal regression
+   The confidently-wrong analysis uses the strongest policy-          counts an already satisfied task predicate that becomes un-
+side detector selected on validation data. Both policy un-            satisfied after a replan and remains unsatisfied at episode
+certainty and world-model risk are centered at their inde-            end.
+pendently calibrated thresholds; no median split or trigger-             The interaction distinguishes the two consumers. The pol-
+conditioned selection is used. Each episode is assigned at            icy reader accounts for most of the reduction in completed-
+a preregistered decision window before irreversibility, and           subgoal regression and contributes most strongly on com-
+rescue uses the same fixed repair rule in all quadrants. The          posite tasks, where evidence of earlier stations has often left
+resulting quadrant decomposition is reported in Table 5: the          the current field of view. The risk summary has a smaller
+low-uncertainty, high-risk cell concentrates 48.4% of all fail-       direct effect on task success but brings empirical episode
+ures and remains the most recoverable.                                FWER closer to its calibrated target. Their combination gives
+   The benign-shift test keeps the nominal conformal thresh-          the strongest clean-suite average and the fewest regressions,
+old fixed. Shift families and severities are selected on valida-      consistent with preserving both action-level progress and the
+tion data, and at least two held-out families are absent from         context used to judge whether a discrepancy is anomalous.
+the benign negatives used for risk-head training. We report              To separate persistent context from storage capacity, we
+all predefined injections and separately require the paired           additionally compare memory forms under the same maxi-
+no-intervention continuation to remain successful when es-            mum frame budget K. Each policy-reader variant is retrained
+timating unnecessary intervention and harm.                           with its corresponding memory path, and every changed risk
+   Leave-one-family-out (LOFO) training distinguishes two             reader is independently recalibrated; no row is created by
+scopes. Risk-head-only LOFO tests whether the head mem-               masking memory only at test time.
+orizes perturbation labels while retaining a world model ex-
+posed to that family. Full-verifier LOFO excludes the family             N       Calibration, Data Scale, and Repeated
+from both world-model and risk-head optimization. Every
+changed detector is independently recalibrated on the same                                   Interventions
+nominal population. Severity extrapolation is evaluated sep-          Calibration-size sensitivity changes only the nominal cali-
+arately because high-severity events can be easier to detect          bration sample, not detector weights, validation choices, or
+but harder to repair. Figure S5 visualizes both panels: family        locked test episodes. We repeatedly subsample the same cali-
+exclusion lowers timely recall by roughly five points for the         bration pool and retain only sizes for which the finite-sample
+risk head and eight points for the full verifier, every held-out      conformal quantile is defined at α = 0.05. Monitor-data
+Table S8: Held-out natural-failure audit; natural executions contain no injected perturbation, and onset and last recoverable time
+are annotated blind to detector output. The upper panel’s audit set is case–control (all annotated failures plus matched success
+controls), so no success rate is defined on it; the lower panel re-executes the same configurations under each execution mode
+with fresh randomness.
+
+                                                                                                  Failure Success   Event  Timely recall                                      Effective lead
+                              Evaluation subset                                                  episodes controls AUPRC ↑    (%) ↑                                             (steps) ↑
+                              All annotated natural failures                                           186               420           0.683              70.4                    10.6
+                              Failures with a nonempty actionable suffix                               139               420           0.721              78.4                    12.1
+
+                                                                             Overall task Natural-failure Natural-success                               Deployed rewrites Subgoal regressions
+Execution mode                                                              success (%) ↑ rescue (%) ↑     harm (%) ↓                                     per episode ↓      per episode ↓
+Open-loop action backbone                                                         61.4                        –                           –                           0.0                          0.74
+Invocation-matched periodic replanning                                            64.8                       12.3                        4.6                          2.3                          0.62
+Full CheckVLA                                                                     68.9                       21.6                        2.7                          0.44                         0.31
+
+Table S9: Benign-deviation stress test with the nominal threshold kept fixed. Excess intervention is measured in percentage
+points relative to matched nominal episodes; harm is conditioned on paired no-intervention continuations that succeed.
+
+                                                                                   Reference    Unnecessary first Excess vs. nominal Harm CheckVLA task
+   Benign shift                                                         Episodes success (%) ↑ intervention (%) ↓     (points) ↓     (%) ↓ success (%) ↑
+   Small camera jitter                                                      360                 98.1                           6.1                        1.3                    1.1               97.2
+   Brief partial occlusion                                                  360                 96.9                           7.4                        2.6                    1.5               95.8
+   Task-irrelevant background change                                        360                 98.6                           5.6                        0.8                    0.7               98.1
+   Small self-correcting object/base dis-                                   360                 95.8                           6.7                        1.9                    1.3               94.9
+   placement
+   Pooled benign shifts                                                     1440                97.4                           6.5                        1.7                    1.2               96.5
+
+                               All-family training             Full-verifier LOFO
+                               Risk-head-only LOFO             Action-shuffled control (37.9)                                    Timely recall        Recoverable fraction             Perturbed success
+                                                                                                                        100
+                               80.4                                                                                                     90.4
+                         80                            77.1                       76.2
+                                      74.1                    72.6                                                                                                                82.0
+                                              70.8                   69.4                71.0                                                           78.3
+                                                                                                68.7
+                                                                                                                                                               74.2
+                                                                                                                        75      71.2
+     Timely recall (%)
+
+
+
+
+                         60
+                                                                                                             Rate (%)
+
+
+
+
+                                                                                                                                               50.1
+                                                                                                                        50                                             47.8
+                         40                                                                                                                                                              42.1
+                                                                                                                                                                                                34.2
+
+
+                                                                                                                        25
+                         20
+
+
+
+                         0                                                                                               0
+                                Object/base               Transient               Moved-object                                          Light              Medium                     Heavy
+                                 impulse                 joint offset              intervention                                      (in-range)           (in-range)                (held out)
+                                             (a) Leave-one-family-out training                                                                    (b) Severity extrapolation
+
+Figure S5: Generalization beyond monitor-training perturbations, from Table S10. (a) Timely recall under leave-one-family-out
+training; the dashed line is the action-shuffled control. (b) Severity extrapolation with the heavy range excluded from monitor
+training.
+Table S10: Generalization beyond monitor-training perturbations. Panel A compares all-family training, risk-head-only LOFO,
+and full-verifier LOFO. Panel B evaluates severity extrapolation with the heavy range excluded from monitor training and model
+selection.
+
+                                                                  Episode  Event Timely recall Effective lead Perturbed success
+  Test family                 Training exclusion                 FWER (%) AUPRC ↑   (%) ↑        (steps) ↑          (%) ↑
+  Object/base impulse         None; all-family reference                4.8        0.781          80.4              13.8          49.2
+  Object/base impulse         Risk head only                            5.1        0.728          74.1              12.2          46.1
+  Object/base impulse         World model and risk head                 5.0        0.694          70.8              11.4          44.8
+  Transient joint offset      None; all-family reference                4.7        0.752          77.1              12.9          47.4
+  Transient joint offset      Risk head only                            4.9        0.711          72.6              11.6          45.3
+  Transient joint offset      World model and risk head                 5.2        0.681          69.4              10.8          43.9
+  Moved-object intervention   None; all-family reference                4.9        0.759          76.2              12.8          46.2
+  Moved-object intervention   Risk head only                            5.0        0.702          71.0              11.3          44.0
+  Moved-object intervention   World model and risk head                 4.8        0.673          68.7              10.5          42.6
+
+                                                               Episode  Event Timely recall Recoverable Perturbed success
+    Test severity                   Seen in monitor training? FWER (%) AUPRC ↑   (%) ↑      fraction (%)      (%) ↑
+    Light, in-range                 Yes                             4.7            0.721          71.2            90.4       50.1
+    Medium, in-range                Yes                             4.9            0.772          78.3            74.2       47.8
+    Heavy, held out                 No                              5.1            0.801          82.0            42.1       34.2
+
+Table S11: 2×2 memory ablation. A-S, C-S, C-U, and Average are clean-suite task success rates (%); Average uses the official
+18/16/16 task weighting. Every variant is retrained, and every risk-reader variant is recalibrated.
+
+                       Policy  Risk                                             Subgoal regressions      Episode FWER
+                        bank summary        A-S    C-S     C-U    Average            / ep. ↓                 (%) ↓
+                       No       No          61.5 28.3 9.0           34.1                1.34                  5.6
+                       Yes      No          63.0 29.7 9.8           35.3                0.55                  5.5
+                       No       Yes         62.4 29.3 9.4           34.8                1.08                  4.9
+                       Yes      Yes         63.7 30.9 10.2          36.1                0.18                  4.8
+
+Table S12: Memory-form comparison at a matched maximum frame budget K. Recent-K and uniformly spaced memories
+control for storage capacity, whereas the event-driven bank writes frames only at validated pause-and-diversity events.
+
+                                           Maximum stored                                          Subgoal regressions Episode FWER
+       Memory form                             frames     A-S             C-S    C-U Average          per episode ↓         (%)
+       No persistent memory                        –             61.5    28.3 9.0          34.1            1.34             5.6
+       Recent-K FIFO frames                        K             62.3    29.0 9.5          34.7            0.92             5.2
+       Uniformly spaced K frames                   K             62.7    29.4 9.7          35.1            0.71             5.0
+       Event-driven keyframe bank                  K             63.7    30.9 10.2         36.1            0.18             4.8
+
+
+sensitivity instead retrains the world model and risk head on                 get operating point. Although both variants are recalibrated
+nested task–scene–initialization groups, followed by an inde-                 on the same nominal pool, the head trained without benign
+pendent nominal calibration for each row. Figure S6 summa-                    negatives reacts to harmless appearance variation that the cal-
+rizes both sensitivities: detection metrics saturate as either                ibration pool covers only sparsely, which shifts its deployed
+resource grows, while the empirical episode FWER stays                        error rate above the target; benign-aware training keeps the
+near the 5% target at every size.                                             deployed operating point at the prescribed 4.8%.
+   Benign negatives can lower false interventions under                          Detection performance is also decomposed by task phase
+harmless shifts, but they could also suppress sensitivity to                  in Table S16, so that aggregate recall cannot hide late or
+real deviations. We therefore retrain the risk head with and                  weak performance around contact. Phase labels and negative
+without benign negatives while holding the world model,                       nominal windows are fixed before detector outputs are read.
+policy, data budget, and nominal calibration protocol fixed                   Step-wise false-positive rate is reported only as a diagnostic
+(Table S15). Benign negatives leave sensitivity to real devi-                 alongside episode FWER, not as a replacement for repeated-
+ations essentially unchanged while cutting benign first inter-                testing control.
+ventions from 14.8% to 6.5% and benign harm from 4.7%                            The conformal statement covers the first intervention only.
+to 1.2%; the 1.1-point higher timely recall of the benign-free                We therefore audit repeated deployment after the first repair,
+head is obtained at a 6.2% empirical FWER, not at the tar-                    counting a rewrite only when its suffix is actually deployed.
+                                                        Timely recall            Perturbed success           Episode FWER
+
+
+
+
+                 80
+      Rate (%)
+
+
+
+
+                 60
+
+
+
+
+                 40
+     FWER (%)
+
+
+
+
+                 5.5
+                                                                           5% target
+                 5.0
+
+                 4.5
+                       25               50                   75                  100              25                    50                75                100
+                                (a) Nominal calibration episodes (%)                                           (b) Auxiliary monitor-training data (%)
+
+Figure S6: Sensitivity to (a) the number of nominal calibration episodes and (b) the auxiliary monitor-training budget, from
+Tables S13 and S14. Solid lines use the left axis; the dashed line is the empirical episode FWER on the right axis, with the
+dotted line at the 5% target.
+
+Table S13: Sensitivity to the number of nominal calibration episodes. Values for subsampled rows are averages across 20
+resamples; event AUPRC is threshold-independent and is therefore unchanged because detector weights and event scores are
+fixed.
+
+                                                             Finite q̂α Episode   Event Timely recall Effective lead Perturbed success
+                Calibration fraction    ncal Resamples         (%)      FWER (%) AUPRC      (%)          (steps)            (%)
+                25%                     100       20              100            5.4           0.764           74.1             12.1              45.8
+                50%                     200       20              100            5.0           0.764           76.3             12.7              46.7
+                75%                     300       20              100            4.9           0.764           77.1             13.0              47.1
+                100%                    400       –               100            4.8           0.764           77.9             13.2              47.6
+
+Table S14: Sensitivity to auxiliary monitor-training data. Training subsets are nested by task–scene–initialization group; the
+action backbone is fixed, each monitor is retrained from scratch, and each row receives an independent nominal conformal
+calibration.
+
+                                                 Training          Episode  Event  Timely recall Effective lead                         Perturbed success
+                   Monitor-training fraction     rollouts         FWER (%) AUPRC ↑    (%) ↑        (steps) ↑                                  (%) ↑
+                   25%                              900              5.3               0.638            65.2                  9.8              41.3
+                   50%                             1800              5.1               0.701            71.4                 11.4              44.2
+                   75%                             2700              4.9               0.742            75.6                 12.6              46.1
+                   100%                            3600              4.8               0.764            77.9                 13.2              47.6
+
+Table S15: Ablation of benign negatives in risk-head training. The benign intervention and harm columns use the held-out shift
+families in Table S9; detector metrics use the unchanged controlled perturbation test.
+
+                                                   Episode     Benign first   Benign harm  Event  Timely recall                                   Perturbed success
+ Risk-head training                               FWER (%) intervention (%) ↓    (%) ↓    AUPRC ↑    (%) ↑                                              (%) ↑
+ Without benign negatives                              6.2                    14.8                     4.7            0.772            79.0              47.4
+ With benign negatives                                 4.8                     6.5                     1.2            0.764            77.9              47.6
+Table S16: Task-phase and false-alarm decomposition. Panel A reports event-level detector behavior by perturbation onset phase.
+Panel B reports nominal false alarms at both episode and step levels under the same target episode FWER.
+
+                                                   Event  Timely recall Effective lead Premature alarm Perturbed success
+           Perturbation onset phase        Events AUPRC ↑    (%) ↑        (steps) ↑        (%) ↓             (%) ↑
+           Navigation                        270      0.731          73.7            14.8            2.2              46.1
+           Pre-contact alignment             270      0.748          75.9            13.9            2.6              46.9
+           Post-grasp transport              270      0.792          82.2            12.7            3.0              49.8
+           Appliance interaction             270      0.761          79.6            11.4            3.3              47.6
+
+                                                     Nominal Episode False alarms per Median first-alarm Policy calls
+              Detector                               episodes FWER (%)  1000 steps      time (steps)     per episode
+              Observation-only world predictor        1800           5.3            1.31               84             10.0
+              Action-shuffled world model             1800           5.1            1.27               86              9.8
+              Full action-conditioned verifier        1800           4.8            1.12               91             10.2
+
+
+Re-alarms during inference or cooldown are logged sepa-                     18.6% to world-model ambiguity under occlusion or contact,
+rately and do not count as additional interventions.                        14.3% to a semantic or action-generation error that a correct
+                                                                            trigger could not repair, 7.1% to repair-induced state regres-
+             O     Runtime and Complexity                                   sion or repeated triggering, and 5.0% to an unnecessary in-
+                                                                            tervention on an otherwise successful continuation. These
+Runtime is measured end to end with low-level control ac-                   mutually exclusive shares sum to 100.0% after adjudication.
+tive, after warm-up, on the same workstation and batch size                    The distribution separates two distinct limiting factors.
+for every variant. The periodic baseline runs the verifier in               Late alarms and long inference latency reduce the suffix
+shadow mode and is tuned on validation data to match the                    that remains physically modifiable; better rewriting cannot
+full method’s mean number of VLA invocations; it therefore                  recover this group. Conversely, policy-semantic errors and
+controls for both monitoring compute and extra policy calls.                ambiguous world-model features may be detected on time
+Added trainable parameters and monitor FLOPs are mea-                       but still lack a competent replacement action. This distinc-
+sured relative to the same decoupled action backbone and                    tion motivates reporting timely recall, rescue, and harm sep-
+exclude the frozen world encoder, whose memory footprint                    arately; final success alone is not a detector metric. It also
+is nevertheless included in peak VRAM.                                      bounds the current claim: functional conformal calibration
+   The VLA latency is 286 / 338 ms at p50/p95 under a 10                    controls only the unnecessary first intervention on exchange-
+Hz controller, corresponding to the nominal dlat = 3 steps                  able nominal-success episodes. It does not guarantee recall
+illustrated in Figure S1. The verifier remains below one con-               under perturbations, safety after a repair, coverage after dis-
+trol period at p95 and overlaps with execution. Invocation                  tribution shift, or transfer from simulation to hardware. Those
+matching makes the principal comparison interpretable: a                    properties remain empirical and must be re-evaluated when-
+difference between periodic replanning and CheckVLA re-                     ever the task distribution, observation stack, controller fre-
+flects how the extra calls are timed and used rather than how               quency, or risk-reader memory changes.
+many are spent; the verified-trigger row of Table 3 isolates
+the timing component alone (+3.9 points).                                              Q     Additional Visualizations
+   The fixed-trigger comparison isolates the repair sam-
+pler, whereas RTC (Black, Galliker, and Levine 2025) and                    Figure S7 complements the tabular results with three out-
+REMAC (Wang et al. 2026b) also define native asynchronous                   come views. The left panel decomposes the perturbed-
+execution procedures. We therefore report a separate end-to-                success difference between the open-loop backbone (28.6%)
+end comparison. RTC uses its published training-free sched-                 and full CheckVLA (47.6%) into the contributions of the
+ule; full REMAC is retrained with masked action chunks and                  timely verified trigger, the latency-aware suffix rewrite, and
+is not represented by an inference-only sampler. Validation                 risk-adaptive guidance, with each level anchored to a row of
+selects each asynchronous horizon before the locked test, and               Table S6 or Table S19. The middle panel shows paired rescue
+policy calls and wall-clock cost remain explicit.                           and harm rates for the fixed-trigger repair rules of Table S6;
+                                                                            the joint improvement of higher rescue at lower harm appears
+                                                                            only for the correctly paired adaptive guidance. The right
+       P      Failure Analysis and Evaluation                               panel reports completed-subgoal regression for the matched
+                        Boundaries                                          memory forms of Table S12, isolating the contribution of the
+A blinded annotation audit assigns one primary proximate                    event-driven bank to preserving prior progress.
+cause to each of a sample of 140 residual failures from the full
+method on the perturbation test, reaching Cohen’s κ = 0.79
+before adjudication. The taxonomy attributes 31.4% of resid-
+ual failures to a missed or late alarm that left no useful suffix,
+23.6% to a physically unrecoverable state before deployment,
+Table S17: Audit of repeated interventions after the first deployment. Post-repair re-alarm uses a validation-fixed window of
+Kaudit control steps.
+
+                                                                                          ≥ 1 deployed ≥ 2 deployed Mean rewrites Re-alarm within Post-repair subgoal Harm
+   Evaluation cohort                                                  Episodes             rewrite (%) rewrites (%) per episode     Kaudit (%)      regression (%)    (%) ↓
+   Clean target-suite episodes                                             1500                  4.8                        0.7                 0.06                        8.3                                                1.1              2.1
+   Benign-shift episodes                                                   1440                  6.5                        1.0                 0.08                        9.4                                                1.3              1.2
+   Injected-perturbation episodes                                          1080                 86.2                       16.8                 1.04                       14.5                                                3.2              2.8
+   Held-out natural executions                                              606                 34.8                        7.9                 0.44                       12.1                                                2.9              2.7
+
+Table S18: Runtime and complexity comparison. The periodic baseline matches the full method’s average VLA-call budget and
+carries the same shadow verifier.
+
+                                                                             Added trainable                Added GFLOPs               Monitor p50 / p95                  VLA calls                                    Wall-clock        Peak VRAM
+   Execution mode                                                             params (M)                        / step                       (ms)                           / ep.                                       factor              (GB)
+   Open-loop action backbone                                                            0.0                           0.0                           –                       7.8                                           1.00×            21.4
+   Verifier in shadow mode                                                             88.4                          16.9                      12.1 / 16.4                  7.8                                           1.06×            23.1
+   Invocation-matched periodic re-                                                     88.4                          16.9                      12.1 / 16.4                  10.1                                          1.18×            23.3
+   planning
+   Full CheckVLA                                                                       88.4                          16.9                      12.1 / 16.4                  10.2                                          1.18×            23.3
+
+Table S19: End-to-end asynchronous execution comparison. Clean Average uses the official task weighting; perturbed success,
+harm, policy calls, and wall-clock cost use the controlled perturbation protocol. Training adaptation distinguishes training-free
+scheduling from methods that modify the action model or add a verifier.
+
+                                                                                           Clean     Perturbed  VLA calls Wall-clock Harm
+                                  Execution mode                                        Average (%) success (%) per episode factor    (%) Training adaptation
+                                  Open-loop action backbone                                   21.6                       28.6              7.8                    1.00×                                    –           None
+                                  RTC, native asynchronous schedule                           30.2                       40.8             10.1                    1.17×                                   4.0          None
+                                  Full REMAC                                                  31.4                       42.6             10.3                    1.21×                                   3.5          Masked-chunk training
+                                  Full CheckVLA                                               36.1                       47.6             10.2                    1.18×                                   2.8          Verifier training
+
+
+
+
+                              a        Outcome waterfall                                             b       Paired rescue and harm                                                                            c     Completed-subgoal regression
+                                                                                                                                                                             Regressions / composite episode
+
+
+
+
+                                                                                                              Harm                       Rescue
+                                                                                                                                                                                                                        1.34
+     Perturbed task success (%)
+
+
+
+
+                                                          +12.0     +1.6      47.6        Boundary replan    4.8                        7.4                                                                    1.5
+
+                                  40                                                       RTC inpainting     4.1                                  13.7                                                                           0.92
+                                                 +5.4
+                                         28.6                                                                                                                                                                  1.0
+                                                                                                 Fixed W      3.7                                 12.8
+
+                                  20
+                                                                                      Shuffled exceedance      3.6                                  14.4                                                       0.5
+                                                                                                                                                                                                                                              0.18
+                                                                                           Adaptive W(e)           2.8                                     16.9
+                                   0                                                                                                                                                                           0.0
+                                        Open    Timely     Suffix Adaptive     Full                            5            0             10                  20                                                        No      Recent-K    Episodic
+                                        loop    trigger   rewrite guidance                                                                                                                                            memory     FIFO        bank
+                                                                                                                         Paired episode outcome rate (%)
+
+
+
+
+Figure S7: Outcome visualization. The panels show (left) an additive waterfall of perturbed success from the open-loop
+backbone to full CheckVLA, (middle) paired rescue and harm rates for the fixed-trigger repair rules, and (right) completed-
+subgoal regression for matched memory forms.
+   R     Task Visualizations on RoboCasa365                      The three figures group the tasks by workspace structure:
+Figures S8–S10 visualize twelve representative composite         Figure S8 shows cross-station deliveries, whose instruc-
+tasks from the official RoboCasa365 target benchmark. Each       tions explicitly require driving between stations (e.g., tak-
+composite task issues a natural-language instruction that        ing a straw from a drawer and delivering it to a cup on
+chains several sub-goals, often across different stations of     the dining counter); Figure S9 shows tasks that interleave
+the kitchen, so the mobile manipulator must interleave base      locomotion with appliance operation (microwave, freezer,
+locomotion with arm control: fetching an object at one sta-      stove, cutting station); and Figure S10 shows stationary ap-
+tion, transporting it while grasped, and operating articulated   pliance and counter-top manipulation. Episodes of this kind
+fixtures (doors, drawers, knobs, buttons) at another.            chain partially irreversible sub-goals over a long horizon—
+   Each storyboard follows the same format. The top ribbon       switching appliances on, releasing objects into containers,
+decomposes the episode’s instruction into sub-task prompts,      closing doors on loaded racks—which is precisely the setting
+aligned with the keyframe columns they span; blue boxes de-      in which an in-chunk deviation is costly if it goes unnoticed,
+note manipulation segments, and orange boxes denote seg-         and which motivates the action-conditioned verification and
+ments that involve base locomotion. The two rows below           in-chunk replanning mechanism formalized in Eqs. 2–10.
+show seven time-aligned keyframes from the third-person
+scene camera and the egocentric wrist camera, the two views
+consumed by the policy.
+                                                                                        Move to the
+            Deliver
+                              Open the drawer                 Pick up the straw           dining          Put the straw in the cup
+            Straw                                                                        counter
+
+
+          Third-Person
+              View
+
+
+
+
+          First-Person
+              View
+
+
+
+
+              Get                                                                       Move to the
+                          Start the                                     Take out the
+            Toasted        toaster
+                                         Wait for the lever to pop up
+                                                                           bread
+                                                                                          dining         Put the bread on the plate
+             Bread                                                                       counter
+
+
+          Third-Person
+              View
+
+
+
+
+          First-Person
+              View
+
+
+
+
+             Store
+                                                                                                                       Put the bowl
+           Leftovers     Put the eggplant in the bowl   Put the drumstick in the bowl   Carry the bowl to the fridge
+                                                                                                                       in the fridge
+            in Bowl
+
+
+          Third-Person
+              View
+
+
+
+
+          First-Person
+              View
+
+
+
+
+           Make Ice       Open the                                      Move to the        Grab a           Put the lemon in the
+                                         Put an ice cube in the glass
+          Lemonade         fridge                                         fridge        lemon wedge              lemonade
+
+
+
+          Third-Person
+              View
+
+
+
+
+          First-Person
+              View
+
+
+
+Figure S8: Task visualizations on RoboCasa365 (I): cross-station delivery tasks. Blue prompt boxes mark manipulation segments
+and orange boxes mark base locomotion; the two rows show time-aligned third-person and egocentric wrist views. Tasks: Deliver
+Straw, Get Toasted Bread, Store Leftovers in Bowl, Make Ice Lemonade.
+           Steam in                                     Place it in the   Move to the        Place the     Close the door and press
+                         Pick the onion from the sink
+          Microwave                                         bowl          microwave         bowl inside              start
+
+
+
+          Third-Person
+              View
+
+
+
+
+          First-Person
+              View
+
+
+
+
+           Separate
+                                                        Bring it to the        Fetch the vegetable
+           Freezer       Pick up the meat container
+                                                        second rack                 container
+                                                                                                          Bring it to the highest rack
+            Rack
+
+
+          Third-Person
+              View
+
+
+
+
+          First-Person
+              View
+
+
+
+
+            Searing        Grab the pan from the           Bring it to the rear right       Pick up the   Put it in the    Turn the
+             Meat                 cabinet                            burner                 drumstick         pan          burner on
+
+
+
+          Third-Person
+              View
+
+
+
+
+          First-Person
+              View
+
+
+
+
+            Set Up                                                                                                         Take the
+                                                        Take out the      Bring it to the   Move to the   Pick up the
+            Cutting        Open the knife drawer
+                                                           knife              board         meat plate       meat
+                                                                                                                          meat to the
+            Station                                                                                                         board
+
+
+          Third-Person
+              View
+
+
+
+
+          First-Person
+              View
+
+
+
+Figure S9: Task visualizations on RoboCasa365 (II): tasks interleaving base locomotion with appliance operation. Format as in
+Figure S8. Tasks: Steam in Microwave, Separate Freezer Rack, Searing Meat, Set Up Cutting Station.
+            Prepare                                                       Place the mug under the
+                              Pick the mug from the cabinet                                              Press the start button
+            Coffee                                                               dispenser
+
+
+
+          Third-Person
+              View
+
+
+
+
+          First-Person
+              View
+
+
+
+
+            Kettle        Pick the kettle from the
+                                                                  Place it on a stove burner               Turn the burner on
+            Boiling               counter
+
+
+
+          Third-Person
+              View
+
+
+
+
+          First-Person
+              View
+
+
+
+
+             Pan                                                          Dump the vegetables onto
+                                      Pick up the pan                                                  Return the pan to the stove
+           Transfer                                                              the plate
+
+
+
+          Third-Person
+              View
+
+
+
+
+          First-Person
+              View
+
+
+
+
+           Pre-Soak                                     Place it in the
+                             Pick up the pan                              Put the sponge in the sink       Turn on the water
+             Pan                                            sink
+
+
+
+          Third-Person
+              View
+
+
+
+
+          First-Person
+              View
+
+
+
+Figure S10: Task visualizations on RoboCasa365 (III): stationary appliance and counter-top manipulation tasks. Format as in
+Figure S8. Tasks: Prepare Coffee, Kettle Boiling, Pan Transfer, Pre-Soak Pan.
+                                                   S    Complete Configuration
+Table S20 consolidates every hyperparameter of the executed system, its training and calibration, and the baseline configurations.
+Validation-selected entries were fixed on the validation split of Table S1 before either locked test was read; no value was tuned
+on the target suites.
+
+Table S20: Complete configuration. Validation-selected values are chosen once on the validation split before the locked tests;
+architecture and infrastructure entries are fixed design choices.
+        Component              Hyperparameter                          Value                                         Selected on
+        Execution
+        Chunked execution      Chunk length H                          50                                            Fixed a priori
+        Chunked execution      Flow-integration steps                  10 (∆u=0.1)                                   Fixed a priori
+        Chunked execution      Deployment schedule dlat                3 control steps                               Fixed a priori
+        Verification
+        Rolling prediction     Span bound k                            8                                             Validation
+        Discrepancy            Distance dist                           cosine on pooled, normalized features         Validation
+        Discrepancy            Standardization floor ε                 10−3                                          Fixed a priori
+        Risk head              Window w                                32                                            Validation
+        Trigger                Target level α                          0.05                                          Fixed a priori
+        Trigger                Suppression length smin                 8 (= k)                                       Validation
+        Suffix rewriting
+        Retention              Entry-scale floor wmin                  0.0                                           Validation
+        Retention              Exceedance sensitivity β                1.38                                          Validation
+        Positional decay       λmobility /λmanip , replan              0.60 / 0.90                                   Validation
+        Positional decay       λmobility /λmanip , regular             0.10 / 0.15                                   Validation
+        Episodic memory
+        Keyframe bank          Budget K / tokens per keyframe          8 / 16                                        Validation
+        Write filter           Pause window ws / confirm delay         5/3                                           Validation
+        Write filter           Min. write gap / similarity threshold   10 / 0.95                                     Validation
+        Fusion                 Gate bias initialization                −4                                            Fixed a priori
+        Monitor architecture
+        Latent predictor Ψ   Width / depth / heads                     960 / 7 / 12                                  Fixed a priori
+        Risk head R          Width / depth / heads                     384 / 4 / 6                                   Fixed a priori
+        Monitor total        Added trainable parameters                88.4M                                         –
+        Training and calibration
+        Ψ optimization         AdamW: lr / batch / steps               3×10−4 / 32 / 60k TF + 20k self-rollout       –
+        R optimization         AdamW: lr / batch / steps               1×10−4 / 64 / 20k                             –
+        R supervision          Onset window ∆                          20 control steps                              Fixed a priori
+        R supervision          Mix nominal : natural : perturbed       2:1:1 (1,800 / 900 / 900 rollouts)            Fixed a priori
+        Conformal              Fit / calibration episodes per seed     200 / 400                                     Fixed a priori
+        Audits                 Re-alarm window Kaudit                  20 control steps                              Validation
+        Baselines
+        Periodic replanning Replan interval                            39 control steps                              Validation
+        Policy-side detectors Sample count Q                           8                                             Fixed a priori
+        RTC / REMAC           Asynchronous horizon                     25 control steps                              Validation
+        Infrastructure
+        Hardware               GPU / precision                         A100 80 GB / bf16                             –
+        Software               Framework                               PyTorch 2.3.1, CUDA 12.1                      –
+        Software               Simulator                               RoboCasa365 (robosuite 1.4.1, MuJoCo 3.1.4)   –
+        Runs                   Random seeds                            1/2/3                                         –
+

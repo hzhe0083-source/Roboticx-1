@@ -1,0 +1,1575 @@
+                                            DEFLECT: Temporal Counterfactual Preference
+                                            Learning for Delay-Robust Asynchronous VLAs
+                                                  Yixiang Zhu1,2 Yonghao Chen1 Zijie Yang2 Yusong Hu2                    Xinyu Chen1
+                                             1                                                                           2
+                                                 The Hong Kong University of Science and Technology (Guangzhou)            One Robotics
+
+                                                                  Naive Async
+                                                                                           The cup is now
+                                                                                      at the rightmost position
+                                           Pick up the cup.
+                                                                                 To the RIGHT—grab the cup!
+arXiv:2605.19294v2 [cs.RO] 3 Jun 2026
+
+
+
+
+                                                                                                             Missed!
+                                                                                                                              Train to prefer
+                                                                                                                              execution-time
+                                                                   DEFLECT                  The cup is now                    over stale actions
+                                                                                       at the rightmost position
+                                                                                But it will move to the left later
+
+                                                                                    To the LEFT—grab the cup!
+
+
+
+
+                                                                                                           Successful!
+
+
+
+                                        Figure 1: DEFLECT enables an async VLA to commit to execution-time actions from stale obser-
+                                        vations. The task is to grasp a cup on a moving conveyor. Between observation and execution, the
+                                        cup moves from right to left. Top (Naive Async): the policy reaches where the cup was seen. The
+                                        cup has moved by execution time and the grasp misses. Bottom (DEFLECT): the policy receives
+                                        the same stale observation but anticipates the upcoming motion and reaches the new position to
+                                        complete the grasp. Under naive async, the robot fails on such dynamic interaction.
+
+
+
+                                                  Abstract: Vision-Language-Action (VLA) policies increasingly rely on asyn-
+                                                  chronous inference to hide large-model latency behind ongoing robot motion.
+                                                  While this avoids the stop-and-go behavior of synchronous action-chunk exe-
+                                                  cution, it creates a prediction–execution mismatch: the next chunk is computed
+                                                  from a stale observation at inference start but executed only after the robot and
+                                                  scene have evolved. As a result, actions that fit the prediction-time state can be-
+                                                  come misaligned with the execution-time state. Existing runtime repair, behavior-
+                                                  cloning, and preference-alignment approaches do not directly teach the policy
+                                                  to resolve this stale-input mismatch. We propose DEFLECT, an offline post-
+                                                  training framework for delay-robust asynchronous VLAs. DEFLECT converts
+                                                  latency-induced mismatch into counterfactual preference supervision: a frozen
+                                                  reference VLA generates a preferred chunk from the future execution-time ob-
+                                                  servation and a rejected chunk from the stale prediction-time observation. The
+                                                  trainable policy scores both chunks under the same deployment-time input, learn-
+                                                  ing to favor execution-time-aligned actions while a supervised fine-tuning anchor
+                                                  preserves the expert action manifold. DEFLECT requires no human preference
+                                                  labels, reward models, online robot rollouts, architectural changes, or additional
+                                                  inference-time computation. Across Kinetix, LIBERO, and three real-robot tasks,
+                                                  DEFLECT improves delay robustness over strong asynchronous VLA baselines,
+                                                  raising high-latency success by up to 6.4 percentage points and achieving a 4.6
+                                                  percentage-point gain at the longest delay on a real-scale VLA.
+1       Introduction
+
+Vision-Language-Action (VLA) policies have shown strong performance across a wide range of
+robot manipulation and locomotion tasks [1, 2, 3, 4]. Many of these policies are deployed syn-
+chronously and predict actions as action chunks [5]: at each decision step the model outputs a short
+sequence of actions, the robot executes them in order, and the policy only runs again to produce the
+next chunk after the current one is finished. This execution scheme makes robot motion choppy:
+after each chunk, the robot must wait for the next inference to complete, during which it cannot
+respond to scene changes. To remove this pause, asynchronous inference has become a common
+deployment strategy for real-time VLA execution [6, 7, 8], in which the robot keeps executing the
+current chunk while the model computes the next one in parallel. Because each action chunk typi-
+cally takes longer to execute than a single inference pass, the next chunk can be computed before the
+current one finishes, effectively hiding inference latency behind ongoing robot motion. This overlap
+also allows the policy to issue new chunks more frequently than stop-and-go execution, improving
+responsiveness to scene changes.
+
+
+          Observation Input                    Next Observation                   Execution Outcome
+                               Prediction-
+                               execution
+
+                              misalignment
+
+
+
+          Inference starts:                  Execution starts:                      Execution ends:
+vial at the center of the conveyor vial at the left edge of the conveyor       pellets miss the moved vial
+
+                 Action        …             Action     Action             …     Action
+                    VLA Inference(step n)                   VLA Inference(step n+1)
+
+             t                                        t+d                                 t+2d
+
+
+Figure 2: Async-VLA inference under deployment-relevant latency: a real-robot example. A
+robot dispenses pellets into a target vial on a moving conveyor. Top: robot frames at t, t + d, and
+t + 2d. Bottom: consecutive asynchronous VLA inference cycles. The policy starts inference at
+time t when the vial is centered, but the resulting actions execute after delay d, when the vial has
+moved. By execution end, the stale action chunk releases pellets where the vial was, causing a miss.
+
+However, asynchronous inference also creates a prediction–execution mismatch: the next chunk is
+computed from an earlier observation but executed after the robot and scene have changed. The
+resulting action chunk may therefore no longer fit the state the robot actually faces when execution
+begins. As latency grows, this mismatch accumulates over continuous action execution: each step
+may look reasonable on its own, but the robot drifts from the correct trajectory and eventually fails
+the task. Figure 2 shows the severity of this problem: at prediction time, the vial lies at the center
+of the conveyor, and the predicted action chunk targets pellet release at that position. By the time
+the chunk is executed, the vial has moved to the other end of the conveyor, causing the pellets to
+miss the target. Existing asynchronous strategies [6, 8, 9, 10] can soften this mismatch, but they
+do not address the central issue: the action chunk should match the execution-time world, not the
+prediction-time view.
+To address this execution-time alignment gap, we propose DEFLECT1 , an offline post-training
+framework that teaches asynchronous VLAs to prefer actions that remain correct when executed.
+DEFLECT turns prediction–execution mismatch into counterfactual preference supervision: a
+    1
+        Anonymous code release: https://anonymous.4open.science/r/deflect-release-7388.
+
+
+                                                       2
+frozen reference VLA generates a preferred chunk from the execution-time observation, and a
+rejected chunk from the stale prediction-time observation. The trainable policy then scores both
+chunks under the same stale deployment input used at test time, learning to favor the execution-
+time-aligned chunk over the stale one. This changes the policy’s action preference under stale inputs
+without adding runtime repair, waiting, future-observation access, or extra inference-time computa-
+tion. Across two simulated benchmarks and three real-robot tasks, DEFLECT extends the usable
+delay envelope of asynchronous VLA control, improving high-latency success by +6.4 percentage
+points in simulation and achieving a +4.6-point gain at the longest delay on a real-scale VLA.
+
+2     Background and Motivation
+2.1   Asynchronous VLA Deployment
+
+We consider an action-chunking VLA policy that outputs a chunk of actions at each inference call.
+Inference takes d control steps, then a chunk predicted from the observation at time t is executed only
+after the robot and scene have evolved for d steps. This creates a mismatch between the prediction-
+time input and the execution-time state.
+Let ot denote the visual observation at inference start, st the proprioceptive state, and lt the language
+instruction. We denote the input available to the policy during asynchronous deployment by
+                                              cdep
+                                               t   = (ot , ŝt+d , lt ),                                          (1)
+where ŝt+d is the proprioceptive state estimate available to the async controller after rolling forward
+the actions that are already committed for execution.
+
+2.2   Limitations of Existing Async VLA Strategies
+
+Existing asynchronous execution strategies                                               �� �′0:3 �3 , �3 = �1 +�1 +�2
+mitigate parts of the latency problem, but leave                                                �′4 Zero-Latency
+                                                         inference    inference
+                                                                                �4        ′
+unresolved a more fundamental misalignment:                starts      finishes         � 3
+                                                                                                      DEFLECT
+                                                                                    �′2         �′4
+the policy aligns actions with the world ob-                                    �′1
+                                                                                         � ′
+                                                                          �3               3
+served at prediction time, while the robot needs                                �′1 �′2  �� �′0:3 �1 , �3 = �1 +�1 +�2
+                                                                   �2
+actions that remain valid at execution time. As                                 �′1
+                                                             �1
+                                                                                    �′2
+                                                                                         �� �′0:3 �1 , �3 = �1 +�1 +�2
+shown in Figure 3, an ideal zero-latency ora-         �0
+                                                                    ′                    �′3
+                                                                   �1                           �4′
+cle would predict the next chunk a′0:3 from the                           �′2
+                                                                                                       VLASH
+
+execution-time context (o3 , s3 ), but this oracle                              �3′
+                                                                                      ′ Naive Async
+                                                                                    �4
+                                                                                          �� �′0:3 �1 , �1
+is unavailable in real deployments: inference
+       ′
+for a0:3 starts at s1 while the robot is still ex- Figure 3: Asynchronous deployment contexts
+ecuting the current action chunk a, and finishes under latency. Inference starts at s1 while
+only at s3 . Naive Async therefore predicts from the robot continues executing the current action
+the fully stale input (o1 , s1 ), so its chunk fol- chunk a, and the next chunk a′0:3 is ready at s3 :
+lows the scene at inference start. VLASH-style Naive Async uses (o1 , s1 ),VLASH/DEFLECT
+rollout [6] improves the deployable context to use the deployable (o1 , s3 ), and the zero-latency
+(o1 , s3 ), but remains behavior-cloning based, oracle use the unavailable (o3 , s3 ).
+imitating one target rather than ranking execution-time alternatives. Runtime repair methods such
+as RTC [8], BID [9], and A2C2 [10] improve chunk continuity, while preference-alignment meth-
+ods such as APO [11], RFO [12], PFM [13], and Diffusion-DPO [14] optimize generic preferences
+under fresh or clean observations. Together, they leave a semantic-timestamp error: an action may
+be plausible for the prediction-time state yet misaligned with the execution-time state.
+
+2.3   Our Insight
+
+DEFLECT’s key insight, illustrated in Figure 3, is to use the unattainable zero-latency branch as
+an offline preference oracle for the deployable async branch. The key difference is the observa-
+tion timestamp: zero-latency assumes access to the latest execution-time observation (ot+d , st+d ),
+
+
+                                                          3
+whereas the async policy must act from the stale prediction-time view. DEFLECT uses this contrast
+to define a temporal counterfactual preference: the chunk aligned with the execution-time world is
+preferred over the chunk generated from the stale view. It then learns this preference under the same
+stale deployment input used at test time, shifting the policy toward actions that remain correct when
+executed without changing the runtime interface.
+
+3     DEFLECT Overview
+
+Figure 4 shows the overview of DEFLECT. Figure 4a illustrates how DEFLECT constructs temporal
+counterfactual supervision from offline expert trajectories. The inputs at t and t + d correspond to
+the stale prediction-time scene and the future execution-time scene, respectively. A frozen reference
+VLA is queried on these two timestamped inputs with shared sampling randomness, so the resulting
+contrast mainly reflects the stale-versus-future input difference rather than sampling noise.
+Figure 4b illustrates how DEFLECT uses this temporal contrast to train the policy under the
+deployment-time input cdep
+                        t , which is the same input available at test time. The stale and future
+observations are used only to define the offline preference signal, not as separate optimization in-
+puts. The VLM backbone is frozen, and only the action expert is updated with the objective
+                                      λSFT LFM + λDPO LFM-DPO ,
+where the Supervised Fine-Tuning (SFT) flow-matching term anchors the policy to the expert ac-
+tion manifold, and the Flow-Matching Direct Preference Optimization (FM-DPO) term encourages
+execution-time-aligned actions over stale-aligned ones.
+After training, DEFLECT does not change the asynchronous runtime interface: the policy is queried
+with the same deployment input, the same inference budget, and no access to future observations.
+
+                                                                        Rejected action chunk
+                               Earlier input
+                                                                                      �+�
+                                                                                                  time
+                               Future input
+                                                                               �
+         Expert
+                                                          VLA
+         data                  (� steps later)           Frozen
+                                                                        Preferred action chunk
+
+       (a) Temporal counterfactual data preparation. Here t denotes the prediction-time step, and d is
+       the inference delay in control steps, so the future input corresponds to t + d.
+
+                                VLA                                                   Preference
+                                                                                   loss ℒℱℳ−���
+                                                    Action
+                                      VLM
+                                                    expert                     Favor preferred
+                                     Frozen
+                                                   Trainable                  suppress rejected
+
+       Deployment input                             �SFT ℒℱℳ + �DPO ℒℱℳ−���
+
+       (b) Preference optimization under the deployment input. The objective λSFT LFM +
+       λDPO LFM-DPO balances the SFT flow-matching anchor and the DPO preference loss.
+Figure 4: DEFLECT Overview. (a) A frozen reference VLA contrasts earlier and future inputs
+from offline trajectories to construct temporal counterfactual supervision. (b) DEFLECT freezes
+the VLM and trains the action expert to favor execution-time-aligned chunks while preserving the
+expert action manifold.
+
+
+3.1   Constructing Temporal Counterfactual Preference Pairs
+
+Preference optimization requires paired candidates (A+ , A− ) indicating which action chunk should
+be preferred.DEFLECT constructs this missing contrast from existing offline trajectories.
+
+
+                                                     4
+For each demonstration timestep t and delay d, we query a frozen reference VLA πref twice under
+the same language instruction lt and shared sampling randomness ξ, so that the two chunks differ
+only in their timestamped inputs:
+                   A+                                  A−
+                                                                                  
+                     t = πref (st+d , ot+d ), lt ; ξ ,  t = πref (st , ot ), lt ; ξ .        (2)
+Here A+ t is generated from the future state-observation pair corresponding to execution time, while
+A−t is generated from the stale pair available when inference starts. Both chunks are produced by
+the same frozen reference policy, so the pair lies on the same policy-induced action manifold. The
+                                                                       −
+shared randomness ξ ensures that the difference between A+     t and At is driven primarily by the
+temporal input difference rather than by sampling variation.
+This construction is counterfactual. The deployed policy will not observe (st+d , ot+d ) when pre-
+dicting the chunk, but the offline trajectory records this future state. We therefore use the future-
+conditioned chunk only to label which action better matches the execution-time state. The stale-
+conditioned chunk serves as the rejection, approximating what the pretrained async policy would
+produce from the earlier observation. Using the same reference policy for both sides prevents tem-
+poral mismatch from being conflated with policy-quality mismatch, so Eq. (2) isolates the stale-
+versus-execution-time contrast.
+The delay d is sampled during preprocessing to cover the latency range expected at deployment.
+                                                          −
+When the scene changes little over d steps, A+   t and At may be nearly identical, producing little
+preference signal. When the scene or robot state changes substantially, the pair becomes high-
+contrast and provides the supervision needed for delay robustness. Thus, this construction naturally
+adapts the strength of the preference signal to the severity of the prediction–execution mismatch.
+
+3.2   Preference Optimization under the Deployment-Time Input
+
+The preference pair in Eq. (2) is generated using future and stale observations, but these observations
+should not be used as the policy input during optimization. A tempting alternative would be to train
+                                                −
+A+t under the future input (st+d , ot+d ) and At under the stale input (st , ot ). This matched-input
+training would optimize the policy under contexts that do not match the async deployment decision.
+At deployment, the policy must choose an action from cdep t , not from the future observation. There-
+fore, DEFLECT scores both chunks under the same deployment-time input cdep          t . The future and
+stale observations define the preference label, while cdep
+                                                       t   defines  the input distribution on which the
+policy is optimized.
+With an explicit likelihood model, this gives the standard DPO objective [15]:
+                                      "                                             #!
+                                                        dep                    dep
+                                            πθ (A+ t | ct )        πθ (A− t | ct )
+            LDPO (θ) = − log σ β log                     dep
+                                                             − log              dep
+                                                                                       ,           (3)
+                                            πref (A+t | ct )       πref (A−t | ct )
+
+where σ(·) is the sigmoid function and β > 0 controls the preference strength. The important point
+                        −                                  dep
+is that both A+
+              t and At are evaluated under the same ct . Thus, the policy is trained to answer the
+decision it will face at test time: given the stale deployment input, which chunk should be preferred?
+Flow-matching VLAs do not expose a closed-form likelihood πθ (A | c). Following prior work
+that adapts preference optimization to diffusion and flow-matching generators [14, 16], we use the
+per-example flow-matching loss as a surrogate for negative log likelihood. For an action chunk A,
+conditioning input c, flow time τ ∈ [0, 1], and Gaussian noise ϵ, define
+                                                                                            2
+           Aτ = τ A + (1 − τ )ϵ,        LFM (θ; A, c, τ, ϵ) = ∥vθ (Aτ , τ, c) − (A − ϵ)∥2 .        (4)
+We treat LFM (θ; A, c, τ, ϵ) as proportional to − log πθ (A | c). For each preference pair, the same
+(τ, ϵ) is shared across the preferred and rejected chunks and across the trainable and reference poli-
+cies, so that the DPO margin differs only in the action candidate and model parameters.
+Let
+                             ± dep                                        ± dep
+               L±
+                θ = LFM (θ; At , ct , τ, ϵ),          L±
+                                                       ref = LFM (πref ; At , ct , τ, ϵ).          (5)
+
+
+                                                  5
+Substituting the flow-matching surrogate into Eq. (3) gives
+                                                                   −    −
+                    LFM-DPO (θ) = − log σ −β (L+          +
+                                                                            
+                                                    θ − Lref ) − (Lθ − Lref ) .                      (6)
+Minimizing Eq. (6) encourages the trainable policy to assign a lower relative flow loss to the
+                                                                            −
+preferred chunk A+t and a higher relative flow loss to the rejected chunk At , both under the
+deployment-time input.
+Optimizing the preference term alone is under-regularized. The policy can satisfy the relative margin
+by distorting the flow-loss landscape, for example by decreasing the preferred loss and/or increasing
+the rejected loss without preserving the expert action manifold. We therefore add an SFT anchor on
+the expert chunk paired with the same deployment-time input. Let Aexp    t  denote the demonstration
+chunk paired with cdep
+                     t   in the reference policy’s SFT training; for our  VLASH-style  backbone this
+is the chunk of expert actions recorded starting at the predicted execution time t+d. The final
+DEFLECT objective is
+               LDEFLECT (θ) = λSFT LFM (θ; Aexp  dep
+                                            t , ct , τ, ϵ) +λDPO LFM-DPO (θ).                        (7)
+                                   |         {z          }
+                                                expert anchor
+
+The SFT term keeps the policy on the behavioral support of the demonstration data, while the prefer-
+ence term changes the relative ranking between stale-matched and execution-time-matched chunks.
+In our implementation, the VLM backbone remains frozen and only the action expert is updated.
+At deployment, DEFLECT adds nothing to the control loop: the policy uses only the available
+asynchronous input, and the counterfactual preference signal remains offline. The trained VLA is
+queried with the same cdep
+                       t    and the same inference budget as the original asynchronous controller.
+
+4     Experiments
+We evaluate DEFLECT on two simulated benchmarks, Kinetix [17] and LIBERO [18], and three
+real-robot tasks on a bimanual arm setup. Unless noted, Kinetix results average 12 tasks × 1024
+rollouts per cell, LIBERO results average 500 episodes per suite per delay, and simulation baselines
+use the released VLASH [6] checkpoint. Real-robot experiments compare π0.5 [4], VLASH, and
+DEFLECT under the same hardware protocol. Implementation details are in Appendices B–D; full
+Kinetix/LIBERO tables in Appendices E–F; delay generalization, ablations, and the PFM baseline
+in Appendices G–I; real-robot results, mechanism analyses, and training cost in Appendices J–N.
+
+Delay realism. Our headline regime d ∈ {5, 6, 7} corresponds to ≈ 167–233 ms of hidden in-
+ference time at 30 Hz, matching the inference cycles reported for current flow VLAs (π0.5 [4], X-
+VLA [19]) on consumer GPUs even with state-of-the-art acceleration [20].
+
+4.1   Simulation
+
+Kinetix. Kinetix [17] comprises 12 contact-rich and locomotion tasks that demand fast reaction.
+We train on delays d ∈ {0, . . . , 4} and evaluate on d ∈ {0, . . . , 7}, so d ∈ {5, 6, 7} is the unseen-
+delay generalization regime. Each predicted chunk contains 8 actions, which the robot executes
+sequentially. Meanwhile, the model takes d control steps to compute the next chunk. By the time
+it is ready, the robot has used up d actions, leaving only 8 − d from the current chunk to bridge the
+transition. At d ∈ {5, 6, 7}, this overlap shrinks to just 1–3 actions, which is too short for runtime
+schedulers like RTC and BID that rely on the overlap to splice the new chunk in smoothly.
+As shown in Figure 5 and Table 1, the naive rollover, RTC, and BID all collapse to ≤ 5% success
+in this regime. VLASH remains functional but degrades from 74.6 at d=5 to 60.5 at d=7. Our
+DEFLECT enables asynchronous control to remain effective at higher inference delays, averaging
+73.5 over d ∈ {5, 6, 7} compared to VLASH’s 67.1, a substantial improvement of +6.4 on average
+and up to +7.0 at d=6.
+To confirm that these high-delay gains come from DEFLECT itself rather than a cosine-restart
+artifact, and that they generalize beyond the training delay range, we run two additional experiments
+
+
+                                                    6
+                           Naive   VLASH    RTC    BID   PFM     DEFLECT           Method        avg(d=0-7) avg(d=5-7)
+                100%
+                                                                                   NAIVE           42.4         1.5
+                75%                                                                RTC             48.9         2.0
+ Success rate                                                                      BID             46.7         2.0
+                50%
+                                                                                   PFM             78.4        65.5
+                25%
+                                                                                   VLASH           79.4        67.1
+                                                                                   DEFLECT         83.3        73.5
+                 0%                                                                ∆ vs. VLASH     +3.9       +6.4
+                       0      1      2       3      4        5    6        7
+                                         Inference delay d                         ∆ vs. PFM       +4.9       +8.0
+
+Figure 5: Kinetix delay robustness. Suc- Table 1: Kinetix summary (success rate %).
+cess rate vs. inference delay d ∈ {0, . . . , 7} at Per-delay breakdown in Appendix E; PFM com-
+K= max(d, 1). Horizon-robustness sweep and parison in Appendix I.
+full per-delay numbers in Appendix E.
+
+
+(Appendix G and L). After subtracting the restart lift, DEFLECT still contributes +1.6, +2.3, and
++2.0 at d=5, 6, 7. Even when DEFLECT is trained on only d ∈ {1, 2} instead of the full {0, . . . , 4}
+range, it still beats VLASH by +3.7 at d=7, well outside its training delays. Two design ablations
+further support these conclusions (Appendix H): removing the SFT anchor collapses average success
+to 12.3 (−71 pp vs. the full recipe at 83.3), confirming the anchor is essential, and scoring A+
+under its future observation and A− under its stale observation, rather than scoring both under the
+same deployment input as DEFLECT does, underperforms DEFLECT at every delay, with the gap
+widening from −0.3 at d=0 to −2.3 at d=7.
+To isolate the delay-aware signal, we compare DEFLECT against PFM [13], a preference baseline
+with the same training compute but no delay awareness. PFM underperforms VLASH at d ≥ 2,
+and DEFLECT outperforms PFM by +8.0 over d ∈ {5, 6, 7}. A delay-unaware preference signal
+therefore not only fails to help, it actively hurts performance under stale observations.
+
+LIBERO. LIBERO [18] is an image-based manipulation benchmark with four task suites. We use
+it to test whether the Kinetix gains transfer to a π0.5 backbone, the same VLA architecture deployed
+in our real-robot study. On the 4-suite average, DEFLECT matches or improves over VLASH at
+every delay, with the improvement growing from +0.2 at d=1 to +4.6 at d=7. Aggregating over the
+4 suites (N =2,000 episodes per method per delay), the d=7 gain is statistically significant under the
+95% Wilson CI of the difference (+4.6 ± 2.7 pp; Appendix F).2 Per-suite results are in Appendix F.
+
+4.2               Real-World Evaluation
+
+We test DEFLECT on a real bimanual arm setup with three tasks that stress different aspects of
+delay-robust execution. Conveyor-I is a two-step pick-and-place: the left arm places a cup on a
+moving conveyor, and the right arm must retrieve it before it leaves the workspace. Conveyor-II
+adds a middle step in which the right arm must drop the red cube (not the green one) into the
+cup before retrieval. Whack-a-Mole is a single-arm reactive task in which moles surface briefly at
+random positions and the arm must strike each one before it retracts. We report full-task success rate
+on the conveyor tasks, requiring all sub-goals to be achieved, and mean moles struck per 30-second
+trial on Whack-a-Mole. Each cell uses N =30 trials, with per-sub-goal breakdowns in Appendix J.
+On Conveyor-I, π0.5 achieves 76.7%, VLASH reaches 86.7%, and DEFLECT reaches 96.7%,
+improving over VLASH by +10 pp and over π0.5 by +20 pp. On Conveyor-II, which adds a middle
+sub-goal that tightens the time budget, π0.5 collapses to 46.7%, VLASH recovers to 83.3%, and
+DEFLECT further reaches 90.0%. On the reactive Whack-a-Mole, π0.5 , VLASH, and DEFLECT
+strike 8.9, 10.4, and 13.6 moles per 30-second trial respectively.
+    2
+      LIBERO runs use only 200 fine-tuning steps, too short for the cosine-restart artifact, so the gains are cleanly
+attributable to the DPO objective. Reproducibility against the original VLASH numbers and the extension to
+d ∈ {5, 6, 7} are detailed in Appendix F.
+
+
+                                                                               7
+(a) Conveyor-I
+
+                    ① push the cup on the conveyor      ② retrieve the cup at the other end
+
+
+
+
+(b) Conveyor-II
+                                                            ② drop the red cube and
+                    ① push the cup on the conveyor
+                                                                retrieve the cup
+
+
+
+
+(c) Whack-a-Mole
+
+                      ① strike the illuminated target     ② complete the striking task
+
+
+Figure 6: Real-robot tasks and results. For each task, two snapshots of the setup are shown
+alongside the corresponding success metric. (a) Conveyor-I: left arm places a cup on the moving
+conveyor, right arm retrieves it. (b) Conveyor-II: same as (a) plus a middle sub-goal in which the
+right arm must drop the correct cube into the cup before retrieval. (c) Whack-a-Mole: the arm strikes
+moles that surface briefly at random positions. DEFLECT improves on both π0.5 and VLASH
+across all three tasks, with the largest gains on the latency-sensitive Conveyor-II and Whack-a-Mole.
+
+
+
+On selected high-disagreement states across 12 Kinetix tasks, DEFLECT’s correction is both
+dynamics-aware and variance-preserving. It applies larger changes on contact-rich tasks and smaller
+ones on periodic locomotion, while keeping the spread of the action distribution close to the ref-
+erence. Per-task breakdowns are deferred to Appendix K and the single-task case study to Ap-
+pendix M; design ablations are in Appendix H.
+
+
+5   Conclusion
+
+We presented DEFLECT, a fully offline refinement that converts inference delay into counterfac-
+tual preference supervision for flow-matching VLAs. The learned correction is dynamics-aware
+and variance-preserving rather than mode-collapsing, extending the usable delay envelope of asyn-
+chronous VLAs into the regime where runtime-scheduling baselines collapse, all without changing
+inference, adding a scheduler, or requiring human or reward labels. Across Kinetix, LIBERO, and
+three real-robot tasks, DEFLECT improves high-delay execution, achieving a 6.4 percentage-point
+gain over VLASH on Kinetix, a 4.6 percentage-point gain on LIBERO, and consistent improvements
+over both π0.5 and VLASH on real robot.
+
+
+6   Limitations
+
+DEFLECT’s fresh/stale preference signal is weakest at low delays, where the two observations are
+nearly identical and the labeled contrast is small, so the DPO contribution mainly appears in the
+high-delay regime. We also instantiate FM-DPO for flow-matching action heads and have not yet
+tested whether the same surrogate extends to autoregressive heads with different likelihood forms.
+More broadly, DEFLECT suggests a general counterfactual-supervision recipe: whenever an ideal-
+but-undeployable condition and a deployable condition can be simulated offline, both candidates
+can be scored under the deployment context to provide a zero-cost preference signal, e.g., for full-
+precision versus quantized action heads, full-sensor versus sensor-dropout perception, or teacher
+versus distilled policies.
+
+
+                                                            8
+References
+ [1] B. Zitkovich, T. Yu, S. Xu, P. Xu, T. Xiao, F. Xia, J. Wu, P. Wohlhart, S. Welker, A. Wahid,
+     et al. RT-2: Vision-language-action models transfer web knowledge to robotic control. In
+     Conference on Robot Learning, pages 2165–2183. PMLR, 2023.
+ [2] M. J. Kim, K. Pertsch, S. Karamcheti, T. Xiao, A. Balakrishna, S. Nair, et al. OpenVLA: An
+     open-source vision-language-action model. In Conference on Robot Learning (CoRL), 2024.
+ [3] K. Black, N. Brown, D. Driess, A. Esmail, M. Equi, C. Finn, N. Fusai, L. Groom, K. Hausman,
+     B. Ichter, et al. π0 : A Vision-Language-Action flow model for general robot control, 2024.
+ [4] K. Black, N. Brown, J. Darpinian, K. Dhabalia, D. Driess, A. Esmail, M. R. Equi, C. Finn,
+     N. Fusai, M. Y. Galliker, et al. π0.5 : A Vision-Language-Action model with open-world gen-
+     eralization. In Conference on Robot Learning (CoRL), 2025.
+ [5] T. Z. Zhao, V. Kumar, S. Levine, and C. Finn. Learning fine-grained bimanual manipulation
+     with low-cost hardware, 2023. URL https://arxiv.org/abs/2304.13705.
+ [6] J. Tang, Y. Sun, Y. Zhao, S. Yang, Y. Lin, Z. Zhang, J. Hou, Y. Lu, Z. Liu, and S. Han. VLASH:
+     Real-time VLAs via future-state-aware asynchronous inference, 2025.
+ [7] Y. Jiang, S. Cheng, Y. Ding, F. Gao, and B. Qi. AsyncVLA: Asynchronous flow matching for
+     Vision-Language-Action models, 2025.
+ [8] K. Black, M. Y. Galliker, and S. Levine. Real-time execution of action chunking flow policies,
+     2025. URL https://arxiv.org/abs/2506.07339.
+ [9] Y. Liu, J. Hamid, A. Xie, Y. Lee, M. Du, and C. Finn. Bidirectional decoding: Improving
+     action chunking via guided test-time sampling. In International Conference on Learning Rep-
+     resentations, volume 2025, pages 4594–4627, 2025.
+[10] K. Sendai, M. Alvarez, T. Matsushima, Y. Matsuo, and Y. Iwasawa. Leave no observation
+     behind: Real-time correction for VLA action chunks, 2025.
+[11] W. Xia, Y. Yang, H. Wu, X. Ma, T. Kong, and D. Hu. Human-assisted robotic policy refinement
+     via action preference optimization. Advances in Neural Information Processing Systems, 38:
+     36746–36768, 2026.
+[12] H. Zhong, Z. Li, X. Wang, and L. Huang. Reparameterization flow policy optimization, 2026.
+     URL https://arxiv.org/abs/2602.03501.
+[13] M. Kim, Y. Lee, S. Kang, J. Oh, S. Chong, and S.-Y. Yun. Preference alignment with flow
+     matching. In Advances in Neural Information Processing Systems, volume 37, pages 35140–
+     35164, 2024.
+[14] B. Wallace, M. Dang, R. Rafailov, L. Zhou, A. Lou, S. Purushwalkam, S. Ermon, C. Xiong,
+     S. Joty, and N. Naik. Diffusion model alignment using direct preference optimization. In
+     IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR), pages 8228–
+     8238, 2024.
+[15] R. Rafailov, A. Sharma, E. Mitchell, S. Ermon, C. D. Manning, and C. Finn. Direct prefer-
+     ence optimization: Your language model is secretly a reward model. In Advances in Neural
+     Information Processing Systems, 2023.
+[16] D. McAllister, S. Ge, B. Yi, C. M. Kim, E. Weber, H. Choi, H. Feng, and A. Kanazawa. Flow
+     matching policy gradients, 2025. URL https://arxiv.org/abs/2507.21053.
+[17] M. Matthews, M. Beukman, C. Lu, and J. Foerster. Kinetix: Investigating the training of
+     general agents through open-ended physics-based control tasks. In International Conference
+     on Learning Representations (ICLR), 2025.
+
+
+                                                9
+[18] B. Liu, Y. Zhu, C. Gao, Y. Feng, Q. Liu, Y. Zhu, and P. Stone. LIBERO: Benchmarking
+     knowledge transfer for lifelong robot learning. In Advances in Neural Information Processing
+     Systems, 2023.
+
+[19] J. Zheng, J. Li, Z. Wang, D. Liu, X. Kang, Y. Feng, Y. Zheng, J. Zou, Y. Chen, J. Zeng, Y.-Q.
+     Zhang, J. Pang, J. Liu, T. Wang, and X. Zhan. X-VLA: Soft-prompted transformer as scalable
+     cross-embodiment Vision-Language-Action model, 2025. URL https://arxiv.org/abs/
+     2510.10274.
+
+[20] Y. Lu, Z. Liu, X. Fan, Z. Yang, J. Hou, J. Li, K. Ding, and H. Zhao. FASTER: Rethinking
+     real-time flow VLAs, 2026. URL https://arxiv.org/abs/2603.19199.
+
+[21] Octo Model Team, D. Ghosh, H. Walke, K. Pertsch, K. Black, O. Mees, S. Dasari, J. Hejna,
+     C. Xu, J. Luo, et al. Octo: An open-source generalist robot policy. In Robotics: Science and
+     Systems, 2024.
+
+[22] NVIDIA. GR00T N1: An open foundation model for generalist humanoid robots, 2025.
+
+[23] C. Chi, Z. Xu, S. Feng, E. Cousineau, Y. Du, B. Burchfiel, R. Tedrake, and S. Song. Diffusion
+     policy: Visuomotor policy learning via action diffusion. The International Journal of Robotics
+     Research, 44(10–11):1684–1704, 2025.
+
+[24] S. Liu, L. Wu, B. Li, H. Tan, H. Chen, Z. Wang, K. Xu, H. Su, and J. Zhu. RDT-1B: A dif-
+     fusion foundation model for bimanual manipulation. In International Conference on Learning
+     Representations, volume 2025, pages 29982–30009, 2025.
+
+[25] P. F. Christiano, J. Leike, T. B. Brown, M. Martic, S. Legg, and D. Amodei. Deep reinforcement
+     learning from human preferences. In Advances in Neural Information Processing Systems,
+     2017.
+
+[26] L. Ouyang, J. Wu, X. Jiang, D. Almeida, C. L. Wainwright, P. Mishkin, C. Zhang, S. Agarwal,
+     K. Slama, A. Ray, J. Schulman, J. Hilton, F. Kelton, L. Miller, M. Simens, A. Askell, P. Welin-
+     der, P. Christiano, J. Leike, and R. Lowe. Training language models to follow instructions with
+     human feedback. In Advances in Neural Information Processing Systems, 2022.
+
+[27] J. Hejna, R. Rafailov, H. Sikchi, C. Finn, S. Niekum, W. B. Knox, and D. Sadigh. Contrastive
+     preference learning: Learning from human feedback without RL. In International Conference
+     on Learning Representations (ICLR), 2024.
+
+[28] M. G. Azar, M. Rowland, B. Piot, D. Guo, D. Calandriello, M. Valko, and R. Munos. A
+     general theoretical paradigm to understand learning from human preferences. In International
+     Conference on Artificial Intelligence and Statistics (AISTATS), 2024.
+
+[29] J. Liu, H. Chen, P. An, Z. Liu, R. Zhang, C. Gu, X. Li, Z. Guo, S. Chen, M. Liu, C. Hou,
+     M. Zhao, K. a. Zhou, P.-A. Heng, and S. Zhang. HybridVLA: Collaborative diffusion and
+     autoregression in a unified Vision-Language-Action model, 2025. URL https://arxiv.
+     org/abs/2503.10631.
+
+[30] J. Cen, C. Yu, H. Yuan, Y. Jiang, S. Huang, J. Guo, X. Li, Y. Song, H. Luo, F. Wang, D. Zhao,
+     and H. Chen. WorldVLA: Towards autoregressive action world model, 2025. URL https:
+     //arxiv.org/abs/2506.21539.
+
+[31] M. J. Kim, C. Finn, and P. Liang. Fine-tuning Vision-Language-Action models: Optimizing
+     speed and success, 2025. URL https://arxiv.org/abs/2502.19645.
+
+[32] J. Wen, Y. Zhu, J. Li, M. Zhu, K. Wu, Z. Xu, N. Liu, R. Cheng, C. Shen, Y. Peng, F. Feng,
+     and J. Tang. TinyVLA: Towards fast, data-efficient vision-language-action models for robotic
+     manipulation, 2025. URL https://arxiv.org/abs/2409.12514.
+
+
+                                                10
+[33] K. Pertsch, K. Stachowicz, B. Ichter, D. Driess, S. Nair, Q. Vuong, O. Mees, C. Finn, and
+     S. Levine. FAST: Efficient action tokenization for vision-language-action models, 2025. URL
+     https://arxiv.org/abs/2501.09747.
+[34] G. Yan, J. Zhu, Y. Deng, S. Yang, R.-Z. Qiu, X. Cheng, M. Memmel, R. Krishna, A. Goyal,
+     X. Wang, and D. Fox. ManiFlow: A general robot manipulation policy via consistency flow
+     training, 2025. URL https://arxiv.org/abs/2509.01819.
+[35] Y. Yue, Y. Wang, B. Kang, Y. Han, S. Wang, S. Song, J. Feng, and G. Huang. DeeR-VLA:
+     Dynamic inference of multimodal large language models for efficient robot execution, 2024.
+     URL https://arxiv.org/abs/2411.02359.
+
+[36] W. Luan, J. Li, W. Zhao, W. Zhang, T. Wu, and R. Ma. SnapFlow: One-step action generation
+     for flow-matching VLAs via progressive self-distillation, 2026. URL https://arxiv.org/
+     abs/2604.05656.
+[37] J. Sheng, Z. Wang, P. Li, and M. Liu. MP1: Meanflow tames policy learning in 1-step for
+     robotic manipulation, 2025. URL https://arxiv.org/abs/2507.10543.
+
+[38] M. Du and S. Song. DynaGuide: Steering diffusion polices with active dynamic guidance,
+     2025. URL https://arxiv.org/abs/2506.13922.
+[39] Y. Lipman, R. T. Q. Chen, H. Ben-Hamu, M. Nickel, and M. Le. Flow matching for generative
+     modeling, 2022.
+
+[40] M. S. Albergo and E. Vanden-Eijnden. Building normalizing flows with stochastic interpolants,
+     2022.
+[41] K. Chen, Z. Liu, T. Zhang, Z. Guo, S. Xu, H. Lin, H. Zang, X. Li, Q. Zhang, Z. Yu, G. Fan,
+     T. Huang, Y. Wang, and C. Yu. πRL : Online RL fine-tuning for flow-based Vision-Language-
+     Action models, 2026. URL https://arxiv.org/abs/2510.25889.
+
+[42] T. Zhang, C. Yu, S. Su, and Y. Wang. ReinFlow: Fine-tuning flow matching policy with online
+     reinforcement learning, 2026. URL https://arxiv.org/abs/2505.22094.
+[43] J. Liu, G. Liu, J. Liang, Y. Li, J. Liu, X. Wang, P. Wan, D. Zhang, and W. Ouyang. Flow-
+     GRPO: Training flow matching models via online RL, 2025. URL https://arxiv.org/
+     abs/2505.05470.
+
+[44] A. Wagenmaker, M. Nakamoto, Y. Zhang, S. Park, W. Yagoub, A. Nagabandi, A. Gupta, and
+     S. Levine. Steering your diffusion policy with latent space reinforcement learning, 2025. URL
+     https://arxiv.org/abs/2506.15799.
+[45] D. Huang, Z. Fang, T. Zhang, Y. Li, L. Zhao, and C. Xia. CO-RFT: Efficient fine-tuning of
+     vision-language-action models through chunked offline reinforcement learning, 2025. URL
+     https://arxiv.org/abs/2508.02219.
+[46] G. Zou, W. Li, Y. Qian, H. Wang, H. Wu, and Y. Wang. D2 PPO: Diffusion policy policy
+     optimization with dispersive loss. In AAAI Conference on Artificial Intelligence, 2026.
+[47] R. Liu, C. Bai, J. Lyu, S. Sun, Y. Du, and X. Li. VLP: Vision-language preference learning for
+     embodied manipulation, 2025. URL https://arxiv.org/abs/2502.11918.
+
+
+
+
+                                                11
+A    Related Work
+
+VLA policies and delay-robust execution. Modern VLA policies span several architectural fami-
+lies: autoregressive discrete-token decoders (RT-2 [1], OpenVLA [2]); cross-embodiment generalist
+transformers (Octo [21], GR00T N1 [22]); continuous-action heads based on CVAE (ACT [5]) or
+diffusion (Diffusion Policy [23], RDT-1B [24]); and flow-matching policies (π0 [3], π0.5 [4]). The
+last family is the class we target. Inference latency in such policies has been tackled along two
+complementary axes. Runtime-side methods operate on a frozen base policy at deployment: RTC
+inpaints the residual chunk prefix at inference boundaries [8], BID performs closed-loop action
+resampling under forward-contrast and backward-coherence criteria [9], and A2C2 applies a correc-
+tion head at test time [10]. Training-time interventions instead modify the supervised pipeline itself:
+VLASH rolls the proprioceptive state forward at training to align prediction with the execution-
+time state [6], and AsyncVLA combines an asynchronous flow-matching objective with a learned
+confidence rater that triggers partial chunk regeneration [7]. Both lines share a common limita-
+tion: runtime methods do not change the policy itself, and training-time methods stay within be-
+havior cloning. Under a stale observation, neither teaches the policy to favor the action that fits the
+execution-time scene over the action that only fits the stale view. DEFLECT addresses this gap by
+refining the policy parameters through preference optimization. It leaves inference unchanged and
+is therefore composable with any runtime scheduler.
+
+Preference optimization for continuous policies. Preference optimization originated in deep RL
+from human preferences [25] and matured into RLHF [26] and DPO [15, 27], with subsequent
+variants such as IPO [28]. The paradigm has been extended to diffusion image generation [14],
+VLA refinement with human labels [11], and flow matching itself via Preference Flow Matching
+(PFM) [13], which trains an add-on flow module from expert-vs-policy preferences on clean obser-
+vations. We differ in two ways: (i) we target fully offline flow-matching VLA post-training rather
+than online RL, and (ii) our preference labels are generated automatically from latency-induced
+fresh/stale counterfactuals rather than from human labels, reward models, or clean-observation ex-
+pert comparisons. In our experiments (Table 1), a clean-conditioned preference signal applied under
+stale observations does not improve on the base policy at d ≥ 2, suggesting this distinction matters
+in practice.
+
+B    Implementation Details
+
+Preference-pair generation. Both A+ and A− are produced online from the frozen VLASH
+reference policy, not from the dataset, so the pair always lives on the deployable action manifold
+(Algorithm 1). The preferred action A+ is sampled from the reference policy conditioned on the
+future observation (st+d , ot+d ). The rejected action A− is sampled with identical Gaussian noise
+and ODE schedule, but conditioned on the earlier observation (st , ot ). We use dmax =4 on both
+benchmarks. The async-training context delay dctx is sampled from {0, 1, 2, 3, 4} per example,
+while the DPO-pair delay dDPO is drawn from {1, 2, 3, 4}. d=0 is skipped from dDPO because A+
+and A− would coincide, degenerating the pair, while dctx =0 is kept so the SFT anchor still sees the
+synchronous context. Evaluation extends to the larger test-time range d ∈ {0, . . . , 7} without any
+retraining. For LIBERO the DPO data budget is 200 steps × batch 8 = 1,600 pair-uses per suite,
+sampled with replacement from a small pre-collected pool produced by 8 parallel environments
+running the frozen reference policy. For Kinetix the reference policy is fast enough to sample pairs
+on-the-fly, so no offline pool is materialized.
+
+Training. We use AdamW with a cosine schedule, a 1,000-step linear warmup, and decay to
+1% of peak LR. Shared hyperparameters across both benchmarks are β=1.0 for the DPO loss,
+λSFT =1.0 for the SFT anchor, and context delays dctx sampled uniformly from {0, 1, 2, 3, 4}
+with DPO-pair delays dDPO drawn from {1, 2, 3, 4}. Benchmark-specific differences are in Ta-
+ble 2. The DPO weight λDPO is tuned per benchmark. On Kinetix we sweep λDPO ∈
+{0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5} and select 0.02 (see Figure 11). On LIBERO we use λDPO =0.1.
+
+
+                                                  12
+Flow-matching loss reduction. The ∥ · ∥22 in Eq. (4) sums squared errors over both the chunk-
+horizon and action-dimension axes, with no per-element averaging. This convention is load-bearing
+for the DPO margin: the magnitude of LFM scales linearly with chunk-length × action-dim,
+so the effective preference strength under a fixed β differs by roughly a factor of 22 between
+Kinetix (8 × 2) and LIBERO (50 × 7). A reimplementation that uses a per-element mean (e.g.,
+torch.nn.MSELoss() default) shrinks the margin by the same factor and degenerates the DPO
+loss to near-zero gradient. The flow time τ and noise ϵ are each drawn once per preference pair (sin-
+gle Monte Carlo sample, no τ -integration), shared across A+ , A− , and the trainable and reference
+policies. The outer DPO loss in Eq. (6) is averaged over the minibatch.
+
+Table 2: Per-benchmark hyperparameters that differ between Kinetix and LIBERO. Shared val-
+ues are listed in the surrounding paragraph.
+        Hyperparameter          Kinetix                    LIBERO
+        Base policy             VLASH-K INETIX             VLASH-LIBERO (π0.5 )
+        Trainable parameters    3M / 3M (100%, full FT)    693M / 3617M (19%, action expert)
+        Schedule                24 epochs (cosine)         200 gradient steps
+        Batch size              512                        8
+        Peak learning rate      3 × 10−4                   1 × 10−6
+        DPO loss weight λDPO    0.02                       0.1
+
+All main-paper numbers, figures, and ablations on Kinetix use the 24-epoch cosine setting. The co-
+sine restart alone contributes +2.6 to delay-averaged success (Appendix L, VLASH- RETR . column
+of Table 11). The VLM backbone is frozen for LIBERO, while Kinetix uses full fine-tuning.
+
+Evaluation. LIBERO: 500 episodes per suite per delay, MuJoCo 3.3.7; 95% Wilson binomial CIs
+are reported per delay in Appendix F. Kinetix: 1024 rollouts per task per delay/horizon configuration
+over all 12 Kinetix tasks (per-cell numbers in Table 3 are averaged across the 12 tasks).
+
+Benchmark protocols. We use the standard reward, termination, episode-length, success crite-
+rion, and action-space conventions from Kinetix [17] and LIBERO [18] without modification. No
+task curriculum, action rescaling, or reward shaping is introduced for either benchmark.
+
+Baselines. Main-table baselines (Naive, VLASH, RTC, BID) are all evaluated on the released
+VLASH checkpoint. RTC and BID are test-time chunk-level schedulers that replace the naive
+asynchronous rollover. RTC inpaints the residual chunk prefix at inference boundaries, and BID
+resamples chunks under forward-contrast and backward-coherence criteria. Both rely on the resid-
+ual chunk prefix from the previous prediction, which shrinks to 1–3 steps at d ≥ 5 and becomes too
+short to support either method. Other concurrent VLA work includes architectural variants (Hybrid-
+VLA [29], WorldVLA [30], OpenVLA-OFT [31], TinyVLA [32], π0 -FAST [33], ManiFlow [34]),
+inference-acceleration methods (DeeR-VLA [35], SnapFlow [36], MP1 [37]), and runtime guidance
+modules (DynaGuide [38]). These target architectural design, inference cost, or runtime steering
+rather than delay-robust execution and are orthogonal to our refinement.
+
+C    Algorithm: One Gradient Step of DEFLECT
+Algorithm 1 spells out one gradient step of DEFLECT: pair construction, shared (τ, ϵ) sampling,
+the FM-loss evaluation, and the joint SFT+DPO update.
+
+D    Flow-Matching Loss as a Log-Likelihood Surrogate for DPO
+Section 3.2 uses the per-example flow-matching loss as a stand-in for − log πθ (A | c) inside the
+DPO margin. We make that connection explicit here, following the variational framing of Flow
+Matching Policy Gradients [16] and the Diffusion-DPO recipe [14]. The argument is a four-step
+sketch, not a full derivation.
+
+
+                                                 13
+Algorithm 1 One gradient step of DEFLECT.
+Require: Frozen reference policy πref ; trainable action expert θ; demonstration dataset D; max
+    delay dmax ; loss weights λSFT , λDPO , β. VLM backbone is frozen; only θ is updated.
+ 1: Sample minibatch index t, language instruction lt , context delay dctx ∼ Unif{0, . . . , dmax },
+    and DPO-pair delay dDPO ∼ Unif{1, . . . , dmax }              {d=0 excluded from dDPO : A+ =A−
+    degenerates the pair}
+                                          dep
+ 2: Form the deployment-time input ct =(ot , ŝt+dctx , lt ).
+                                        exp
+ 3: Look up the expert SFT target At ← D[t+dctx : t+dctx +H−1] {H chunk length; pad with
+    the final action if the slice runs past the episode end}
+ 4: Sample shared ξ (Gaussian noise and solver schedule).
+ 5: A+ ← πref ((st+dDPO , ot+dDPO ), lt ; ξ), A− ← πref ((st , ot ), lt ; ξ).
+ 6: Sample τ ∼ Unif[0, 1] and Gaussian ϵ (shared across the DPO pair and the SFT anchor), and
+                                                   exp
+    build x±        ±                    exp
+            τ = τ A + (1−τ )ϵ and xτ = τ At            + (1−τ )ϵ.
+                                 ±          ±  dep                    ±
+ 7: Query trainable velocity vθ = vθ (xτ , ct , τ ) and reference vref    .
+                ±          ±       ±      2       ±
+ 8: Compute rθ = −∥vθ − (A −ϵ)∥2 and rref analogously.
+ 9: LDPO ← − log σ β (rθ+ −rθ− ) − (rref   +     −
+                                                    
+                                              −rref ) .
+                          dep          exp
+10: LFM ← ∥vθ (xexpτ , ct , τ ) − (At −ϵ)∥2
+                                                 2
+                                                                  {SFT anchor on expert chunk Aexp
+                                                                                               t }
+11: Update θ via ∇θ [λSFT LFM + λDPO LDPO ].
+
+
+Step 1: The flow-matching loss is a conditional evidence lower bound (ELBO). For conditional
+flow matching with a Gaussian source and a linear interpolant xτ = τ A + (1 − τ )ϵ, the per-example
+loss                                          h                           i
+                                                                        2
+                       LFM (θ; A, c) ≜ Eτ,ϵ vθ (xτ , c, τ ) − (A − ϵ) 2                         (8)
+is an upper bound on the negative conditional log-likelihood, up to a term that depends on (A, c) but
+not on θ [16, 39, 40]:
+                          LFM (θ; A, c) = − log πθ (A | c) + h(A, c),                             (9)
+where h(A, c) collects the path-entropy and interpolant-Jacobian terms intrinsic to the noising kernel
+and is independent of θ. The conditioning c stands for cdep
+                                                         t  throughout, which already includes the
+language instruction lt .
+
+Step 2: The implicit likelihood surrogate.     Define
+                    rθ (A | c) ≜ −LFM (θ; A, c) = log πθ (A | c) − h(A, c).                      (10)
+This is the quantity that enters the FM-surrogate of Eq. (6) in Section 3.2.
+
+Step 3: Cancellation in the reference-calibrated margin. The DPO margin of Eq. (3) takes the
+form
+                    M = rθ (A+ ) − rθ (A− ) − rref (A+ ) − rref (A− ) ,
+                                                                  
+                                                                                        (11)
+where conditioning on cdep
+                       t   (which includes lt ) is implicit in every term. Substituting the decompo-
+sition of Step 2,
+               M = log πθ (A+ ) − log πθ (A− ) − log πref (A+ ) − log πref (A− )
+                                                                                   
+
+                      + − h(A+ ) − h(A− ) + h(A+ ) − h(A− ) .
+                                                                      
+                                                                                                 (12)
+                         |                      {z                       }
+                                                 =0
+
+The h terms appear identically in the trainable and reference branches and cancel pairwise. The
+remaining quantity is exactly the log-ratio margin that the original DPO derivation of Rafailov et al.
+[15] optimizes.
+
+Step 4: Monte Carlo realization. At training time, the expectations over (τ, ϵ) in LFM are es-
+timated with one sample per chunk, shared between A+ and A− and between θ and ref (line 5
+of Algorithm 1). Sharing (τ, ϵ) across the four terms cancels the within-margin sampling noise to
+leading order, the same variance-reduction step used in Diffusion-DPO [14].
+
+
+                                                  14
+Scope. The decomposition in Eq. (9) is specific to the linear-interpolant, Gaussian-source flow-
+matching family used by our base policy (π0 , π0.5 ). Other interpolants yield a different h, but the
+cancellation in Step 3 only requires that h be θ-independent, which holds in the conditional flow-
+matching ELBO framework of McAllister et al. [16]. The same surrogate approximately carries
+over to single-step and distilled variants of flow matching [37, 36], under the assumption that their
+per-sample training objective remains an implicit likelihood proxy.
+
+
+E    Full Kinetix Per-Delay Results
+
+
+                                            Naive     VLASH       RTC         BID     PFM      DEFLECT
+                              100%
+               Success rate
+
+
+
+
+                              80%
+
+
+                              60%
+
+
+                              40%
+
+                                      1       2        3           4           5          6       7      8
+                                                    Execution horizon K (at d = 1)
+Figure 7: Kinetix horizon robustness at d=1. Success rate vs. execution horizon K ∈ {1, . . . , 8}
+at fixed delay d=1. DEFLECT’s improvement is consistent across K.
+
+Table 3 reports per-delay Kinetix success rates for the five evaluated methods plus a zero-inference-
+delay reference column (S YNC‡ ). S YNC‡ runs the same policy under zero inference delay but with
+the chunked execution horizon still fixed to K= max(1, d) to match the delayed methods. Its appar-
+ent downward trend with d therefore reflects open-loop chunk-execution cost at large K, not delay-
+induced degradation. Sampled instead at K=1 for every d, S YNC‡ is essentially flat at ≈ 89.4%, the
+no-delay no-open-loop reference for this backbone. S YNC‡ is included for context, not as a rank-
+ing competitor: bolded entries in Table 3 mark the best result among the five delay-aware methods
+(NAIVE, VLASH, RTC, BID, DEFLECT), and S YNC‡ is excluded from this bolding rule.
+
+
+Table 3: Kinetix main results, full per-delay table (success rate %, 1024 rollouts × 12 tasks per
+cell). ∆ is DEFLECT−VLASH. Bolded values in the success-rate columns mark the best among
+the five delay-aware methods (NAIVE, VLASH, RTC, BID, DEFLECT). S YNC‡ is a no-inference-
+delay reference and is excluded from this rule. RTC (inpainting) and BID (closed-loop resampling)
+both rely on the residual chunk prefix from the previous prediction. This prefix shrinks with d
+(chunk length 8 minus d) and becomes too short to support either method at d ≥ 5, at which point
+both collapse. VLASH itself remains functional throughout the sweep but degrades. DEFLECT
+further improves on VLASH everywhere, with the largest margins in the extreme-delay regime.
+           d                     NAIVE       VLASH         RTC         BID     S YNC‡         DEFLECT        ∆
+           0                         89.3      89.5        89.2        89.7        89.4         91.3     +1.8
+           1                         76.5      89.3        86.8        84.8        89.4         90.9     +1.6
+           2                         68.1      87.7        82.1        77.5        89.1         89.1     +1.4
+           3                         53.9      85.5        69.5        62.2        87.5         88.4     +2.9
+           4                         46.5      81.9        57.5        53.5        86.6         86.1     +4.2
+           5                          3.9      74.6         4.9         5.0        86.1         80.8     +6.2
+           6                          0.1      66.3         0.2         0.1        85.2         73.3     +7.0
+           7                          0.6      60.5         0.9         0.8        83.3         66.3     +5.8
+           avg(0−7)                  42.4      79.4        48.9        46.7        87.1         83.3     +3.9
+           avg(5−7)                   1.5      67.1         2.0         2.0        84.9         73.5     +6.4
+
+
+
+                                                                  15
+F                  LIBERO Per-Suite Results
+
+Table 4: LIBERO per-suite results under varying delay (success rate %, 500 episodes per suite
+per delay). DEFLECT improves the 4-suite average at every delay, with the largest gain at d=7.
+Per-suite cells are mixed at low delay and mostly improve at higher delay. ∆ is the 4-suite-averaged
+improvement over VLASH.
+                              Spatial                           Object                                               Goal                          LIBERO-10               Avg
+     d             VLASH            DEFLECT             VLASH      DEFLECT              VLASH                              DEFLECT          VLASH            DEFLECT        ∆
+     1                97.0              96.8             98.4            99.6            96.4                                  96.6            94.6            94.0        +0.2
+     2                96.0              98.2             99.4            98.2            96.8                                  97.6            96.0            96.0        +0.5
+     3                95.4              97.4             98.8            98.4            93.2                                  94.2            94.4            95.6        +1.0
+     4                91.8              95.0             96.4            97.4            93.4                                  93.0            90.6            92.4        +1.4
+     5                85.2              90.0             90.8            92.6            90.0                                  90.4            87.4            89.4        +2.3
+     6                77.4              82.0             81.6            83.8            85.8                                  86.4            82.8            84.8        +2.3
+     7                64.6              74.2             66.6            72.8            80.6                                  80.8            79.8            82.2        +4.6
+
+
+
+                                                                         Gap    VLASH      DEFLECT
+
+                                           (a) Success rate                                                                       (b) Episode length (lower = faster)
+               100%                                                                                                  240
+
+
+
+
+                                                                                            Episode length (steps)
+               95%                                                                                                   220
+Success rate
+
+
+
+
+               90%                                                                                                                                      −13.6 steps
+                                                                                                                     200
+               85%                                  max Δ=+4.6
+                                                                                                                     180
+               80%
+
+               75%                                                                                                   160
+
+               70%                                                                                                   140
+                      1         2          3        4       5        6          7                                          1          2        3       4        5      6         7
+                                           Inference delay d                                                                                   Inference delay d
+
+Figure 8: LIBERO 4-suite average success rate under varying inference delay. Gains grow from
++0.2 at d=1 to +4.6 at d=7.
+
+
+Reproducibility check against the original VLASH paper. We re-evaluate VLASH under our
+protocol (500 episodes per suite per delay) using the released π0.5 -LIBERO checkpoint. Table 5
+compares our VLASH measurements at d ∈ {1, . . . , 4} against the numbers reported in [6]. All per-
+cell differences are within |∆| < 2.5 pp, with the 4-suite-averaged differences ranging from −0.7
+to +0.9 pp. The slight discrepancies reflect random seeds and evaluation stochasticity, rather than
+a re-trained checkpoint. The original paper [6] does not report results for d ∈ {5, 6, 7}, the regime
+where DEFLECT’s gains concentrate, so our extension to that regime is a new measurement.
+
+Table 5: VLASH reproducibility on LIBERO (success rate %). “Paper” is [6] Table 1, and “Ours”
+is our re-evaluation under the protocol used throughout this paper. Differences are reported as Ours
+− Paper.
+                                Spatial                            Object                                                      Goal                        LIBERO-10
+               d      Paper         Ours        ∆         Paper     Ours            ∆      Paper                               Ours        ∆       Paper       Ours        ∆
+               1      98.8          97.0       −1.8       99.2      98.4        −0.8       96.7                                96.4       −0.3        94.4      94.6   +0.2
+               2      97.5          96.0       −1.5       99.2      99.4        +0.2       97.3                                96.8       −0.5        94.6      96.0   +1.4
+               3      94.4          95.4       +1.0       98.8      98.8         0.0       93.3                                93.2       −0.1        91.9      94.4   +2.5
+               4      92.5          91.8       −0.7       96.9      96.4        −0.5       93.3                                93.4       +0.1        89.6      90.6   +1.0
+
+
+
+Statistical uncertainty. Aggregating over the 4 suites at N =2,000 episodes per method per delay,
+the high-delay improvements are statistically significant under the 95% Wilson confidence interval
+of the difference: ∆=+2.3±1.9 pp at d=5 and ∆=+4.6±2.7 pp at d=7. The monotone growth of
+∆ from d=1 to d=7 is a structured signal that independent per-cell noise cannot produce, supporting
+
+
+                                                                                    16
+the framing that DEFLECT targets the extreme-delay regime. Low-delay performance is already
+near the no-delay ceiling for both VLASH and DEFLECT, leaving little room to improve there.
+
+G    Zero-Shot Delay Generalization
+
+A natural concern is that our DPO preference pairs are sampled from a limited training-delay pool
+(dDPO ∈ {1, 2, 3, 4}, Section 3.1), yet we evaluate at delays as high as d=7. To test whether DE-
+FLECT transfers the correction mechanism beyond its training distribution, we train two additional
+variants that differ from the main run only in the DPO-pair delay sampler: Model A (narrow)
+with dDPO ∈ {1, 2}, Model B (main run, dDPO ∈ {1, 2, 3, 4}), and Model C (covers test) with
+dDPO ∈ {1, . . . , 7} (Model C additionally extends the asynchronous interval to 8). Model A, trained
+with DPO pairs only at d ∈ {1, 2}, still recovers +3.7 at d=7 over VLASH (a delay more than 3×
+beyond its DPO training range) and captures roughly 70% of the full gain of the test-range-covering
+Model C. The bulk of the robustness improvement therefore transfers zero-shot to unseen delays.
+
+                            90%
+             Success rate
+
+
+
+
+                            80%
+
+
+
+
+                            70%
+                                       VLASH baseline
+                                       A: dDPO ∈ {1, 2}
+                                       B (main / DEFLECT): dDPO ∈ {1. . 4}
+                            60%        C: dDPO ∈ {1. . 7}, async=8
+
+
+                                  Train delay
+                                                              A {1, 2}
+                                                                                   B {1. . 4}
+                                                                                                                 C {1. . 7}
+
+                                   0            1         2          3        4            5         6       7
+                                                                    Test delay d
+
+Figure 9: DEFLECT learns a delay-agnostic correction. Model A beats VLASH at every test
+delay despite never observing d ≥ 3 in the contrastive objective.
+
+
+                       Table 6: Zero-shot delay generalization on Kinetix (success rate %).
+                                                d   VLASH           A{1,2}    B{1,...,4}        C{1,...,7}
+                                                0     89.5           91.2           91.3          90.8
+                                                1     89.3           90.6           90.9          89.9
+                                                2     87.7           89.1           89.1          88.2
+                                                3     85.5           87.7           88.4          87.0
+                                                4     81.9           85.1           86.1          85.3
+                                                5     74.6           79.0           80.8          81.4
+                                                6     66.3           71.4           73.3          77.3
+                                                7     60.5           64.2           66.3          71.7
+                                            avg       79.4           82.3           83.3          83.9
+
+
+
+H    Ablation Studies
+
+All ablation runs start from the same VLASH checkpoint, use the same 24-epoch cosine schedule,
+and vary only the ablated component.
+
+Preference-pair construction and SFT anchor. Figure 10 reports the VLASH baseline, three ab-
+lation/control variants, and the full DEFLECT recipe (83.3 delay-averaged success rate on Kinetix).
+
+
+                                                                         17
+Continuing SFT alone with the same 24-epoch cosine schedule (λDPO =0) reaches 82.0, isolating
+the cosine-restart artifact (+2.6 over the VLASH baseline at 79.4) from the net DPO contribution.
+Replacing the naive fully-stale rejection with the VLASH-style partially-corrected rejection (DPO
+VLASH-style rejection) drops to 81.9 (−1.4 vs DEFLECT), consistent with the intuition that a
+stronger fresh-vs-stale contrast yields a higher-signal gradient. Removing the SFT anchor entirely
+(DPO no SFT anchor) causes a catastrophic collapse to 12.3 (−71 pp), confirming that the flow-
+matching SFT loss acts as a behavioral-support regularizer keeping the policy on the expert action
+manifold.
+
+                                             84%                                                                                        83.3
+
+                                                                                  82.0                 81.9
+                                             82%
+               Delay-averaged success rate
+
+
+
+
+                                             80%                  79.4
+
+
+                                             78%
+
+
+                                             76%
+                                                                                                                        12.3
+                                             10%
+                                               5%
+                                               0%
+                                                                VLASH          λDPO = 0          DPO w/           DPO w/o             DEFLECT
+                                                                baseline      (cont. SFT)      VLASH reject.     SFT anchor             (full)
+
+Figure 10: Ablations on Kinetix (delay-averaged success rate % over d ∈ {0, . . . , 7}). Five bars
+from left to right: VLASH baseline (79.4); λDPO =0, i.e. continued SFT only with our cosine
+schedule (82.0, isolates the cosine-restart effect); DPO with the VLASH-style partially-corrected
+rejection rather than naive-stale (81.9); DPO without the expert SFT anchor (catastrophic collapse
+to 12.3); and the full DEFLECT recipe at λDPO =0.02 (83.3).
+
+
+Sensitivity to λDPO . Figure 11 sweeps the preference loss weight over {0, 0.01, 0.02, 0.05, 0.1,
+0.2, 0.5}. The λ=0 curve isolates the +2.6 cosine-restart effect (see Appendix L). Our final choice
+λDPO =0.02 is the Pareto-optimal setting on the (delay-avg, horizon-avg) plane. Performance is
+robust across a broad band λ ∈ [0.01, 0.05] (delay-avg 83.0−83.3, horizon-avg 87.6−88.0) and
+degrades for λ ≥ 0.2 as the preference term starts to erode the expert prior. The +1.3 net DPO con-
+tribution at λ=0.02 is concentrated at higher delay (+1.6/+2.3/+2.0 at d=5/6/7), which is precisely
+the regime where the fresh-vs-stale label quality is highest.
+
+                                                        84.0%                            selected λ = 0.02
+                                                                                                                                        88%
+                                                        83.5%
+                                                                                                                                               avg-K SR
+                                             avg-d SR
+
+
+
+
+                                                        83.0%                                                                           87%
+
+                                                        82.5%
+                                                                                                                                        86%
+                                                        82.0%
+                                                                                                                                        85%
+                                                        81.5%
+                                                                    0      0.01    0.02         0.05      0.10   0.20          0.50
+                                                                                                λDPO
+                                               robust band [0.01, 0.05]             avg-d SR (d ∈ {0. . 7})        avg-K SR (K ∈ {1. . 8}, d = 1)
+
+
+Figure 11: Sensitivity to λDPO on Kinetix. Robust over λ ∈ [0.01, 0.05], with the final choice
+λ=0.02 maximizing the joint (delay-avg, horizon-avg) objective.
+
+
+Label-noise robustness. Our preference labels are by construction noisy (Section 3.1): when the
+scene is near-static A+ and A− nearly coincide and the ordering carries no information. To test
+
+
+                                                                                                 18
+whether such low-signal pairs need to be filtered out, we sweep a threshold θ on the per-pair contrast
+c = ∥A+ − A− ∥2 (a single scalar per pair, large when fresh and stale predictions disagree, ≈ 0 when
+the scene is near-static) and exclude pairs with c < θ from the DPO loss (the SFT anchor still trains
+on all samples). On Kinetix preference triples c has mean 4.7 and percentiles [P10 , P25 , P50 , P75 ] =
+[2.6, 3.9, 4.9, 5.7], where Pk =v means k% of pairs satisfy c ≤ v. Thus θ=2.5 (≈ P10 ) drops the
+bottom ≈ 10% of pairs and θ=5.0 (≈ P50 ) drops the bottom ≈ 50%.
+
+      d                                   0        1       2        3          4          5         6    7     avg
+      DEFLECT (θ=0, main)                91.3   90.9      89.1     88.4       86.1       80.8   73.3    66.3   83.3
+      θ=2.5 (filters ≈ 10%)              91.4   91.0      89.1     88.4       86.0       80.7   73.3    66.3   83.3
+      θ=5.0 (filters ≈ 50%)              91.3   91.0      88.9     87.7       85.8       80.7   73.2    66.2   83.1
+
+
+All three configurations are within 0.2 pp at every delay: even removing half of the pairs (those
+where A+ and A− are almost identical) leaves the result unchanged. Pairs with near-zero contrast
+contribute almost no gradient signal, so keeping or dropping them has the same effect on training. In
+practice this means DEFLECT does not require manually filtering preference pairs before training,
+which is a common bottleneck for human-labeled DPO.
+
+
+Training-input ablation. DEFLECT feeds both A+ and A− through the policy using the same
+input cdep
+        t   defined in Eq. (1), the input the policy actually sees at inference. A natural-looking
+alternative is to instead feed each action through the policy using the (state, observation) pair from
+which it was originally generated: A+ paired with the future pair (st+d , ot+d ), and A− paired with
+the stale pair (st , ot ). We call this the matched-input variant and train it with the same setup as
+DEFLECT (λDPO =0.02, 24-epoch cosine schedule, identical pairs and noise), then compare on
+Kinetix.
+
+
+                                         Gap |Δ|       Matched context        Unified (DEFLECT)
+
+                               90%
+                Success rate
+
+
+
+
+                               80%
+
+                                                                    max Δ=+2.3
+                               70%
+
+
+                               60%
+                                     0    1        2           3          4          5          6       7
+                                                        Inference delay d
+Figure 12: Training-input ablation on Kinetix (success rate %, 12 tasks × 1024 rollouts). Top:
+a matched-input variant that uses each action’s own generating observation as its training input
+uniformly underperforms the unified-cdep
+                                      t  DEFLECT recipe across all 8 inference delays. Bottom:
+the gap ∆ grows monotonically from −0.3 at d=0 to −2.3 at d=7, precisely the regime where the
+deployment-time input differs most from either generating observation.
+
+
+
+Figure 12 shows two things: (a) the matched-input variant uniformly underperforms DEFLECT at
+every delay, and (b) the gap grows monotonically with d. Applying preference optimization under
+the deployment-time input cdept   is therefore not a notational convenience but the component that
+aligns the trained policy with the input it actually sees at inference. Matched-input training instead
+optimizes a policy that will never be deployed.
+
+
+                                                            19
+I       Preference-Signal Baseline: Preference Flow Matching (PFM)
+
+Preference Flow Matching [13] was originally proposed for general flow-based generative-policy
+alignment and is not a VLA method. For a fair comparison we re-implement it within our VLA
+training pipeline. Conceptually, PFM trains an add-on flow module on top of a frozen reference
+policy using (expert, reference) preference pairs drawn on clean observations, then corrects the refer-
+ence’s chunk at test time by integrating its own flow conditioned on the test-time (stale) observation.
+Our re-implementation is matched to DEFLECT in every respect (same F LOW P OLICY architecture,
+same VLASH initialization, same Kinetix dataset, same 24-epoch cosine schedule, same compute),
+so the only controlled differences are (i) the preference-pair construction (expert-vs-policy on clean
+o for PFM vs. fresh-vs-stale counterfactual for DEFLECT) and (ii) the training loss (PFM uses its
+own flow-matching regression loss, while DEFLECT uses the FM-DPO loss in Eq. (3)). PFM’s
+loss exposes a single hyperparameter σ that controls how smoothly the flow regresses to the target
+action. We evaluate two settings of this knob: σ=0 (the strictest, no smoothing) and σ=0.1 (the
+value used in the PFM paper). Reporting both rules out the possibility that any gap to DEFLECT
+is just a tuning artifact of σ.
+
+
+Table 7: PFM vs. DEFLECT on Kinetix (success rate %). PFM passes the sanity check at d=0
+(+0.8 over VLASH, the clean-observation regime where its preference supervision is valid) but is a
+negative-transfer correction at d ≥ 2: under stale observations, integrating a flow trained on clean-
+observation preferences produces worse actions than the base VLASH policy. DEFLECT beats
+the strongest PFM variant by +4.9 on delay-averaged success and by +8.0 on the extreme-delay
+average, confirming that the delay-aware preference signal is the component that turns preference-
+alignment-on-flow into a usable delay-robustness method.
+    d                             0       1       2       3       4       5       6       7      avg
+    VLASH                       89.5    89.3    87.7    85.5    81.9    74.6    66.3    60.5     79.4
+    PFM (σ=0)                   90.3    89.3    87.3    84.6    79.0    72.0    64.9    59.5     78.4
+    PFM (σ=0.1)                 89.6    89.2    87.4    84.5    79.9    71.7    64.6    59.6     78.3
+    DEFLECT                     91.3    90.9    89.1    88.4    86.1    80.8    73.3    66.3     83.3
+    ∆ (best PFM − VLASH)        +0.8     0.0    −0.3    −0.9    −2.0    −2.6    −1.4    −0.9    −1.0
+    ∆ (DEFLECT − best PFM)      +1.0    +1.6    +1.7    +3.8    +6.2    +8.8    +8.4    +6.7    +4.9
+
+
+
+Three findings. (a) Sanity pass at d=0: PFM σ=0 correctly improves VLASH by +0.8 at d=0
+(the in-distribution setting for its clean-observation preferences), confirming that our PFM imple-
+mentation is functional. (b) Insensitive to the smoothing parameter σ: the original PFM paper
+sets σ=0.1 because its preference pairs are sampled independently and the regression target benefits
+from a small amount of smoothing. Our pairs are already exactly coupled by construction (A+ and
+A− are two rollouts of the same frozen reference policy at the same state), so σ has little to regular-
+ize. Consistent with this, σ=0 and σ=0.1 differ by only 0.04 pp on delay-averaged success (78.35
+vs. 78.31), confirming that the comparison is not bottlenecked by an undertuned σ. (c) Negative
+transfer at high delay: at d ≥ 2, PFM is worse than doing nothing (i.e., worse than just running
+VLASH) by as much as −2.6 at d=5. The clean-observation preferences that PFM integrates at
+test time recommend actions that would be correct under a fresh observation but are actively harm-
+ful once the environment has evolved during inference. This directly validates the novelty claim in
+Contribution 2: within an identical training recipe, only the delay-aware preference signal of DE-
+FLECT turns preference alignment into a delay-robustness mechanism. Generic expert-vs-policy
+alignment makes things worse.
+
+Related preference and RL refinement methods. Other concurrent approaches refine flow
+or diffusion policies via online RL (πRL [41], ReinFlow [42], Flow-GRPO [43]), latent-space
+steering (DSRL [44]), chunked offline RL (CO-RFT [45]), or alternative preference formula-
+tions (D2 PPO [46], VLP [47]). These are complementary to DEFLECT’s offline counterfactual-
+preference refinement.
+
+
+                                                  20
+J   Real-Robot Per-Sub-Goal Breakdown
+
+Hardware setup. We use a bimanual AgileX dual-arm platform with 6 DoF per arm, three Intel
+RealSense D435i cameras, one head-mounted overhead and one wrist-mounted on each arm, 30 Hz
+control, and a joint-position action space of 7 dimensions per arm and 14 dimensions bimanually,
+namely 6 joint targets plus 1 gripper open/close per arm. The reference policy is a π0.5 checkpoint we
+trained in-house on this platform following the VLASH training procedure on our own teleoperation
+demonstrations; it is not the released LIBERO checkpoint used in the simulation experiments. Policy
+inference runs on a single NVIDIA RTX 5090.
+
+Conveyor-I (simple, two sub-goals). The simpler variant scores two sequential sub-goals: S1 (left
+arm places cup on conveyor) and S2 (right arm retrieves cup from conveyor). Full-task success is
+the conjunction.
+
+Table 8: Conveyor-I per-sub-goal success (N =30 trials per method). All methods complete S1
+(cup placement) without failure, so the only failure mode on this task is S2 (cup retrieval). DE-
+FLECT improves S2 success by +10 pp over VLASH (96.7 vs. 86.7) and by +20 pp over π0.5
+(96.7 vs. 76.7).
+        Method                S1: cup on conveyor        S2: cup off conveyor   Full task (∧ S1, S2)
+        π0.5                     30/30 (100.0)              23/30 (76.7)          23/30 (76.7)
+        VLASH                    30/30 (100.0)              26/30 (86.7)          26/30 (86.7)
+        DEFLECT (ours)          30/30 (100.0)               29/30 (96.7)          29/30 (96.7)
+
+
+Conveyor-II (full, three sub-goals). The harder variant inserts a middle sub-goal (S2: select the
+red rather than green cube and place into cup), so the scoring becomes S1 (cup on conveyor), S2
+(correct cube into cup), S3 (cup off conveyor).
+
+Table 9: Conveyor-II per-sub-goal success (N =30 trials per method, scored on three sequential
+sub-goals: S1 cup on conveyor, S2 correct cube into cup, S3 cup off conveyor; full task is the
+conjunction). The π0.5 failures are concentrated on S3 (cup retrieval), with a smaller drop on S2
+(cube selection). VLASH closes both gaps but still misses 5/30 on S3 and 1/30 on S2.
+       Method                     S1                     S2                S3            Full task
+       π0.5                  30/30 (100.0)     22/30 (73.3)          15/30 (50.0)     14/30 (46.7)
+       VLASH                 30/30 (100.0)     29/30 (96.7)          25/30 (83.3)     25/30 (83.3)
+       DEFLECT (ours)       30/30 (100.0)     30/30 (100.0)          27/30 (90.0)     27/30 (90.0)
+
+
+
+K    Mechanism: What DEFLECT Changes in the Flow-Matching Policy
+
+To isolate what DEFLECT changes in the policy, we compare it against VLASH under matched
+inputs. For each of the 12 Kinetix tasks at d=6, we pick 4 rollout states where the two policies dis-
+agree on the action and integrate both denoising ODEs from the same Gaussian noise seed, yielding
+48 paired trajectories per panel. The same-noise protocol isolates the policy difference from envi-
+ronment stochasticity. Selecting disagreement states is deliberate and upper-bounds the deflection
+magnitudes we report. On typical states, corrections will be smaller. The two qualitative signatures
+of the correction, namely which task types receive larger corrections and whether the action distri-
+bution collapses, are properties of the policies themselves and survive the selection rule. Variance
+preservation is in fact strengthened by the selection: even at maximally-divergent states, DEFLECT
+does not collapse the action distribution. Figure 13 shows per-task correction magnitude, and Fig-
+ure 14 shows per-task variance ratio.
+
+Dynamics-aware, variance-preserving. Figure 13 and Figure 14 identify DEFLECT as a
+dynamics-aware, variance-preserving correction: per-task variance changes are an order of magni-
+
+
+                                                    21
+                                     samples        IQR + median      mean
+ Grasp Easy                          Trampoline                          Car Launch
+                      μ=0.602                               μ=0.456                              μ=0.427
+                      σ=0.571                               σ=0.628                              σ=0.445
+
+
+
+
+ Chain Lander                        H17 Unicycle                        Hard Lunar Lander
+                      μ=0.370                               μ=0.340                              μ=0.278
+                      σ=0.141                               σ=0.185                              σ=0.110
+
+
+
+
+ Catapult                            MJC Swimmer                         Catcher v3
+                      μ=0.261                               μ=0.236                              μ=0.222
+                      σ=0.212                               σ=0.195                              σ=0.222
+
+
+
+
+ MJC Walker                          MJC Half Cheetah                    Cartpole Thrust
+                      μ=0.184                               μ=0.158                              μ=0.147
+                      σ=0.314                               σ=0.160                              σ=0.103
+
+
+
+
+0.0     0.6     1.2    1.8          0.0     0.6      1.2     1.8        0.0      0.6       1.2    1.8
+
+                             Final deflection |DEFLECT(τ = 1) − VLASH(τ = 1)|2
+
+Figure 13: What DEFLECT does to the flow-matching policy, aggregated across all 12 Kinetix
+tasks at d=6. Intervention magnitude is dynamics-aware: it tracks how fast the scene changes be-
+tween observation and execution. Tasks with sharp transient dynamics (grasp easy, trampoline,
+car launch, chain lander, mean 0.37−0.60) require the largest corrections, because the few-
+step state drift is large. Tasks with slow or periodic dynamics (mjc walker, mjc half cheetah,
+cartpole thrust, 0.14−0.18) require the smallest, because the few-step drift is small.
+
+
+tude smaller than the mean displacements they accompany, ruling out mode collapse and indicating
+that the dominant effect is a translation of the action distribution.
+
+
+Per-task variance table (companion to Fig. 14). For each of the 12 Kinetix tasks at a d=6 critical
+state, we draw N =200 independent denoising noises and measure the action-dim-averaged standard
+deviation at chunk-position 0 under both policies.
+
+
+Chunk-position distribution of the correction. When aggregated over the 12 Kinetix tasks (Fig-
+ure 15), the DEFLECT-vs-VLASH deflection is distributed broadly across all chunk positions
+0−7, with a small bias toward the early positions 0−2 that dominate the behavioral footprint under
+chunked execution. Individual tasks can show sharper task-specific patterns: the catapult single-
+state case study (Appendix M) shows the correction concentrating on positions {0, 1, 3}, which
+reflects that task’s dynamics rather than a global rule.
+
+
+                                                    22
+                                        ≥ 1: wider          < 1: narrower            parity          median 0.97
+
+
+          Catcher v3                                                                                                     1.14
+          Grasp Easy                                                                                    1.07
+         Trampoline                                                                     1.02
+Hard Lunar Lander                                                      0.99
+    MJC Swimmer                                                        0.99
+        Chain Lander                                          0.96
+            Catapult                                          0.96
+ MJC Half Cheetah                                             0.96
+        H17 Unicycle                                        0.95
+         Car Launch                                                  0.98
+    Cartpole Thrust                                  0.93
+        MJC Walker          0.81
+
+                   0.75      0.80     0.85      0.90           0.95           1.00            1.05           1.10       1.15      1.20
+                                                 Spread ratio σDEFLECT/σVLASH
+
+Figure 14: What DEFLECT does to the flow-matching policy, aggregated across all 12 Kinetix
+tasks at d=6. Variance is preserved: per-task σ-ratios cluster tightly around 1 (median 0.97, all 12
+tasks within [0.81, 1.14]).
+
+
+Table 10: Variance preservation across tasks (Kinetix, d=6, N =200). Per-task ratio
+σDEFLECT /σVLASH : median 0.97, range [0.81, 1.14] across all 12 tasks, ruling out mode collapse.
+ task                     σVLASH    σDEFLECT    ratio                task                        σVLASH             σDEFLECT    ratio
+ catcher v3               0.375      0.428      1.14                 catapult                        0.432           0.415      0.96
+ grasp easy               0.304      0.325      1.07                 mjc half cheetah                0.266           0.255      0.96
+ trampoline               0.405      0.415      1.02                 h17 unicycle                    0.402           0.384      0.95
+ hard lunar lander        0.364      0.359      0.99                 car launch                      0.331           0.323      0.97
+ mjc swimmer              0.416      0.410      0.99                 cartpole thrust                 0.437           0.405      0.93
+ chain lander             0.494      0.473      0.96                 mjc walker                      0.341           0.276      0.81
+
+
+
+
+L       Restart-Effect Decomposition (VLASH vs VLASH- RETRAINED vs
+        DEFLECT)
+
+Any method that resumes training from a pretrained checkpoint inherits a non-trivial lift from new
+optimizer state and LR warmup. We call this the restart/cosine effect. To give reviewers a transpar-
+ent decomposition of DEFLECT’s delay-averaged +3.9 lift over VLASH, we train an additional
+dedicated control VLASH- RETRAINED: the same VLASH checkpoint, the same 24-epoch cosine
+schedule, the same optimizer and batch size as DEFLECT, but with λDPO =0 (i.e., pure SFT con-
+tinuation with no preference term).
+
+
+Interpretation. Of the +3.9 delay-averaged improvement of DEFLECT over VLASH reported
+in Table 3, roughly +2.6 is attributable to the cosine restart alone (any continued-training run on top
+of VLASH would inherit it), and the remaining +1.3 is the net contribution of preference alignment.
+Crucially, ∆DPO is essentially zero at d ∈ {0, 1, 2} and climbs monotonically to +2.3 at d=6,
+demonstrating that preference alignment concentrates its benefit precisely in the delay regime where
+fresh and stale observations produce different actions (the high-contrast regime for our preference
+pairs). A pure-SFT schedule change cannot reproduce this delay-dependent structure, since nothing
+in the λ=0 objective is aware of the fresh/stale distinction. The clean isolation is further corroborated
+by the LIBERO results: LIBERO fine-tunes run for only 200 gradient steps, so the cosine-restart
+artifact is negligible, yet the d=7 gain there reaches +4.6, i.e., the preference objective by itself
+carries most of the signal when the restart confound is absent.
+
+
+                                                            23
+                        Mean ‖Δa‖2 at τ = 1
+                                              0.6
+
+
+                                              0.4
+
+
+                                              0.2
+
+
+                                              0.0
+                                                                    0            1         2         3        4         5         6         7
+                                                                                               Chunk position
+
+Figure 15: Mean correction magnitude vs. chunk position (aggregated over 12 tasks × 4 critical
+states at d=6, N =48 paired trajectories per position). Bars are means; error bars are the standard
+deviation across the 48 paired trajectories. The correction is approximately uniform across the 8-
+position predicted chunk, with a mild emphasis on positions 0−2.
+
+
+Table 11: Kinetix delay: restart-effect decomposition (success rate %). ∆restart isolates the
+cosine/optimizer-restart effect (VLASH- RETR . − VLASH); ∆DPO isolates the net contribution of
+preference alignment (DEFLECT − VLASH- RETR .). Both columns are positive on average, and
+∆DPO grows monotonically with d from ≈ 0 at low delay to +2.3 at d=6, consistent with the stale-
+vs-fresh-contrast argument.
+         d     VLASH                           VLASH- RETR . (λ=0)                                       DEFLECT (λ=0.02)                       ∆restart   ∆DPO
+         0       89.5                                                    90.7                                         91.3                       +1.2      +0.6
+         1       89.3                                                    90.0                                         90.9                       +0.7      +0.9
+         2       87.7                                                    88.8                                         89.1                       +1.1      +0.3
+         3       85.5                                                    87.4                                         88.4                       +1.9      +1.0
+         4       81.9                                                    84.5                                         86.1                       +2.6      +1.6
+         5       74.6                                                    79.2                                         80.8                       +4.6      +1.6
+         6       66.3                                                    71.0                                         73.3                       +4.7      +2.3
+         7       60.5                                                    64.3                                         66.3                       +3.8      +2.0
+         avg     79.4                                                    82.0                                         83.3                       +2.6      +1.3
+
+
+
+M    Catapult Single-Task Case Study
+
+This appendix zooms in on a single Kinetix task (catapult, d=6), a single critical state, and a
+single Gaussian noise seed, to show what one instance of the correction looks like in detail. The
+numbers reported here are illustrative, not representative: the magnitudes are larger than the multi-
+task averages in Appendix K, and the per-state structure is not claimed to generalize.
+
+                                                                        VLASH (μ = − 0.24, σ = 0.66)       DEFLECT (μ = − 0.64, σ = 0.52)
+
+
+                                                                    Δμ = − 0.40, Δσ = − 0.14
+                                                              0.8
+
+                                                              0.6
+                                                    Density
+
+
+
+
+                                                              0.4
+
+                                                              0.2
+
+                                                              0.0
+                                                                            -2                  -1                0               1
+                                                                                     Action value (chunk pos 0, action dim 0)
+
+
+Figure 16: Catapult single-state action distribution (d=6, action dim 0, N =200 independent
+noise seeds). At this state, VLASH has µ=−0.24, σ=0.66; DEFLECT has µ=−0.64, σ=0.52.
+The mean displacement (∆µ=−0.39) is an order of magnitude larger than the variance change
+(∆σ=−0.14), consistent with the variance-preserving characterization at the multi-task level (Ap-
+pendix K). This is the largest single-dimension variance change observed. The population-level
+σ-ratio is much closer to unity, with median 0.97 and range [0.81, 1.14] (Table 10).
+
+
+
+                                                                                                     24
+Per-dimension action statistics at this state. The histogram in Figure 16 visualizes only action
+dimension 0, the dimension with the largest |µVLASH − µDEFLECT | at this state. Full per-dimension
+statistics are below.
+
+                  Dim     µVLASH     σVLASH    µDEFLECT      σDEFLECT        ∆µ
+                    0     −0.244      0.657      −0.636        0.516       −0.392
+                    1     +0.212      0.669      +0.160        0.680       −0.052
+                    2     −0.715      0.471      −0.640        0.515       +0.075
+                    3     −0.161      0.662      −0.245        0.645       −0.084
+                    4     +0.469      0.236      +0.454        0.231       −0.015
+                    5     +0.483      0.242      +0.499        0.231       +0.016
+
+Five of the six action dimensions retain their VLASH mean and variance to within 0.08 and 5% at
+this state, so the histogram is not a side effect of DEFLECT sharpening every dimension uniformly.
+The dim-0 contraction from σVLASH =0.66 to σDEFLECT =0.52 (ratio 0.78) is the largest single-
+dimension variance change observed in this study. At the multi-task population level (Table 10) the
+per-task median ratio is 0.97 with all 12 tasks within [0.81, 1.14].
+
+N    Training-Time Cost of DEFLECT
+
+DEFLECT does not change inference at all, since the flow-matching ODE is solved exactly as for
+the VLASH base policy. It does add an offline training cost relative to simply continuing SFT, with
+different breakdowns on Kinetix and LIBERO due to where the preference pairs are sourced.
+
+Kinetix (on-the-fly pair sampling). For each gradient step the reference policy is queried twice to
+draw A+ and A− by running its flow-matching ODE for 5 denoising steps each, contributing 2×5 =
+10 reference forward passes. The trainable-velocity evaluation at the shared x±
+                                                                              τ adds one trainable
+forward and one backward, and the reference-velocity evaluation needed by the full DPO margin in
+Eq. (6) adds one more reference forward. Per gradient step this totals 11 reference forwards plus
+1 trainable forward+backward, compared with 1 trainable forward+backward for vanilla SFT. All
+reference passes are wrapped in stop gradient and do not contribute to the gradient computation.
+
+LIBERO (offline pre-collected pool). Preference pairs are not sampled on-the-fly; instead a one-
+time offline collection pass runs the reference policy over the demonstration suite. Under our default
+setting (4 suites × 4 delays × 10 tasks × 10 inits × ∼ 230 steps per episode × 10 flow steps), this
+amounts to roughly 3.7 × 106 reference forwards as a fixed up-front cost. Once the pool is built,
+each gradient step costs 2 trainable forward+backward (SFT and DPO) plus 1 reference forward for
+the full-margin term, i.e. about 3× the per-step compute of vanilla SFT.
+
+Implications. The reference forwards dominate the wall-clock overhead on Kinetix because they
+happen inside every gradient step; on LIBERO they are amortized to a one-time collection cost. In
+both cases the additional compute is entirely offline. Inference is unchanged, and the trained policy
+is queried with the same cdep
+                           t  and the same flow-step budget as the original VLASH backbone, so
+DEFLECT remains a drop-in replacement for deployed VLASH checkpoints.
+
+
+
+
+                                                 25
+

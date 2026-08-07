@@ -1,0 +1,790 @@
+                                         Sentinel-VLA: A Metacognitive VLA Model with Active Status Monitoring for
+                                                          Dynamic Reasoning and Error Recovery
+
+
+                                             Wenhao Li 1 Xiu Su 2 Dan Niu 3 Yichao Cao 2 Hongyan Xu 2 Zhe Qu 2 Lei Fan 4 Shan You 5 Chang Xu 1
+
+
+                                                                  Abstract                                        Sentinel-VLA                        0.600   Sentinel-VLA                      0.513
+                                              Vision-language-action (VLA) models have ad-                       OneTwoVLA                   0.520            OneTwoVLA              0.440
+arXiv:2605.01191v2 [cs.RO] 28 May 2026
+
+
+
+
+                                              vanced the field of embodied manipulation by                       AHA              0.360                       AHA            0.347
+
+                                              harnessing broad world knowledge and strong                        ECoT            0.353                        ECoT               0.387
+                                                                                                                                                 +14.0%                                      +9.3%
+                                                                                                                 PI0                     0.460                PI0                    0.420
+                                              generalization. However, current VLA models
+                                                                                                                 OpenVLA 0.307               Real-world       OpenVLA 0.307              RLBench
+                                              still face several key challenges, including limited
+                                              reasoning capability, lack of status monitoring,                        “Transfer the              Monitored Status: Error!!!         Status Monitor
+                                                                                                                    banana in green              Recovery Plan:1. Pick up banana. Deep Think
+                                              and difficulty in self-correction. In this paper, we                 plate to blue plate”          2. Move banana above blue plate.       Error
+                                                                                                                                                                                       Recovery
+                                              introduce Sentinel-VLA, a metacognitive VLA                                                        3. Release the gripper to make the
+                                                                                                                                                 banana fall into the plate.
+                                              model equipped with an active “sentinel” mod-                                                      Current Subtask: Subtask1
+                                              ule to monitor real-time execution status. Only                                                    Error Reflection:Hold the banana
+                                                                                                                                                 tight; don't let go on the move.
+                                              when necessary, such as during initial planning                    The banana Sentinel-
+                                                                                                                     fell     VLA Continuous Learning From Successful Recovery Trials
+                                              or upon detecting an error, the model triggers a
+                                              dynamic reasoning or formulate error recovery                      Figure 1. The performance and mechanism of Sentinel-VLA.
+                                              solutions. This on-demand reasoning mechanism
+                                                                                                                et al., 2024a; Li et al., 2025b; Wang et al., 2025; Li et al.,
+                                              ensures robust decision-making while minimiz-
+                                                                                                                2025a) have recently achieved revolutionary success in the
+                                              ing computational overhead. Notably, all training
+                                                                                                                digital world. However, the path toward true AGI (Wang &
+                                              data (spanning 44 tasks and over 2.6 million tran-
+                                                                                                                Sun, 2025; Yenduri et al., 2025; Bikkasani, 2025; Restrepo,
+                                              sitions) is automatically generated and annotated
+                                                                                                                2025) demands agents that transcend the virtual realm to
+                                              through our designed pipeline. We also propose
+                                                                                                                interact physically with the world. Consequently, Embod-
+                                              the Self-Evolving Continual Learning (SECL) al-
+                                                                                                                ied AI (Liu et al., 2025a;b; Fung et al., 2025; Feng et al.,
+                                              gorithm, which allows Sentinel-VLA to identify
+                                                                                                                2025; Li et al., 2025c;d; Chen et al., 2026; Li et al., 2021;
+                                              its capability boundaries and automatically col-
+                                                                                                                2023) has emerged as a critical frontier in the field. In this
+                                              lect data for expansion, paired with Orthogonal
+                                                                                                                pursuit, VLA models (Kim et al., 2024; Liu et al., 2024c;
+                                              Continual Adapter (OC-Adapter) to constrain pa-
+                                                                                                                Li et al., 2024b; Team et al., 2024c; Black et al., 2024; Xu
+                                              rameter updates to an orthogonal space, thereby
+                                                                                                                et al., 2025b;a; Yang et al., 2026; Li et al., 2026a;b), which
+                                              preventing catastrophic forgetting. Real-world ex-
+                                                                                                                evolved from the powerful foundations of LLMs and VLMs,
+                                              periments demonstrate that Sentinel-VLA boosts
+                                                                                                                have rapidly become the dominant paradigm in embodied
+                                              the task success rate by over 30% compared to
+                                                                                                                manipulation. Leveraging their extensive world knowledge,
+                                              the SOTA model, PI0.
+                                                                                                                strong generalization capabilities, and robust multi-modal
+                                         1    Introduction                                                      understanding, VLA models hold immense promise for the
+                                                                                                                development of general-purpose robotic assistants.
+                                         Large Language Models (LLMs) (Touvron et al., 2023; Bai
+                                                                                                                Despite this promise, a critical gap persists between the capa-
+                                         et al., 2023; Team, 2024; Zhang et al., 2024; Zeng et al.,
+                                                                                                                bilities of current VLA models and the demands of complex,
+                                         2026; Tan et al., 2025) and vision-language models (VLMs)
+                                                                                                                long-horizon tasks in the real world. Specifically, they face
+                                         (Zhu et al., 2023; Wang et al., 2024; Liu et al., 2024a; Team
+                                                                                                                three core challenges: i) Insufficient Reasoning Capability.
+                                            1
+                                              University of Sydney 2 Central South University 3 Southeast       Unlike LLMs and VLMs which are capable of deep reason-
+                                         University 4 University of New South Wales 5 Sensetime Research.       ing, most VLA models function as direct input-to-action
+                                         Correspondence to: Xiu Su, Chang Xu <xiusu1994@csu.edu.cn,             mappings, limiting their ability to handle complexity (Za-
+                                         c.xu@sydney.edu.au>.                                                   walski et al., 2024). ii) Lack of Status Monitoring. Current
+                                         Proceedings of the 43 rd International Conference on Machine           VLA models are unaware of runtime errors (like grasping
+                                         Learning, Seoul, South Korea. PMLR 306, 2026. Copyright 2026           an empty kettle when tasked with pouring water) and tend
+                                         by the author(s).                                                      to continue execution despite being in a faulty state (Zhou
+
+                                                                                                            1
+    Sentinel-VLA: A Metacognitive VLA Model with Active Status Monitoring for Dynamic Reasoning and Error Recovery
+
+       Initial Status        Normal Status          Error Status              Normal Status           New-subtask Status           Normal Status
+    Reasoning: Conduct                           Reasoning: Conduct                                  Reasoning: Switch to
+                             No reasoning                                     No reasoning                                         No reasoning
+      initial task plan                             recovery plan                                        new subtask
+
+
+                                      VLM        Environment              Status              Execution        Status-driven               Action
+      Sentinel-VLA                    Expert       Abstract               Monitor              Status         Reasoning (opt.)             Expert
+
+
+
+
+      First Frame         Normal Frames          Encounter Error          Normal Frames             Subtask Completion           Normal Frames
+Figure 2. The core idea of Sentinel-VLA: In most frames, it determines a “normal status” and directly outputs an action without reasoning.
+In the few frames, Sentinel-VLA assesses current status and reasons as needed, generating a better action or recovering from an error.
+
+et al., 2025a). iii) Inability to Self-Reflect and Correct. VLA           plemented by OC-Adapter. This allows Sentinel-VLA to
+models are incapable of learning or recovering from their                 efficiently learn from novel real-world interactions, progres-
+mistakes (Li et al., 2024a), which severely compromises                   sively expanding its knowledge boundary and the scope of
+their reliability and safety in practical applications.                   errors it can handle, all while effectively mitigating catas-
+Existing solutions for these issues remain piecemeal and                  trophic forgetting. Extensive experiments demonstrate that
+limited. For reasoning, methods like ECoT (Zawalski et al.,               Sentinel-VLA achieves relative improvements of over 22%
+2024) and CoT-VLA (Zhao et al., 2025) have improved ac-                   and 30% on RLBench (unseen tasks) and real-world set-
+tion generation with intermediate thoughts, but their rigid               tings, respectively, compared to the SOTA VLA PI0 (Black
+“reason-at-every-step” strategy is inflexible and incurs high             et al., 2024). To sum up, our contributions are as follows:
+latency. While OneTwoVLA (Lin et al., 2025) attempted                         • We propose Sentinel-VLA, a unified VLA model that
+selective reasoning, its reliance on a special token with ran-                  integrates an active status monitor for dynamic, on-
+domness is unstable and lacks interpretability. Furthermore,                    demand reasoning and error recovery. This metacog-
+it cannot think and act concurrently. For error handling,                       nitive approach enables robust reasoning and self-
+most existing approaches (Xia et al., 2025; Dai et al., 2024;                   correction while minimizing computational overhead.
+Duan et al., 2024; Pan et al., 2025; Zhou et al., 2025a; Li                   • We develop EC-Gen, a scalable pipeline that automati-
+et al., 2024a) rely on external models or tools for monitoring                  cally synthesizes a large (2.6M+ transitions) error re-
+and recovery. Besides being architecturally cumbersome                          covery trajectories with rich annotations. It effectively
+and incurring high overhead, the performance of such meth-                      trains the model’s status-aware behaviors without rely-
+ods is also bottlenecked by the VLA’s own inability to follow                   ing on laborious manual data collection and annotation.
+the complex external corrections (Glossop et al., 2025).                      • We introduce the Self-Evolving Continual Learning
+In this paper, we introduce Sentinel-VLA, a metacognitive                       algorithm, featuring an Orthogonal Continual Adapter.
+VLA model designed with an integrated cognitive architec-                       This framework allows Sentinel-VLA to continuously
+ture. The cornerstone of Sentinel-VLA is an active moni-                        learn from experiences, expanding its knowledge and
+toring module, which acts as a sentinel to vigilantly track                     capabilities while mitigating catastrophic forgetting.
+the real-time execution status of a task. This mechanism
+                                                                          Conflict of Interest Disclosure                  None.
+enables a paradigm of on-demand reasoning: only when
+necessary—during initial planning or upon anomaly detec-
+                                                                          2     Related Work
+tion—does the model trigger deeper cognitive processes for
+reasoning or error recovery. This approach enables the agent              Deep Think in VLA Models. To enhance reasoning in
+with robust decision-making and self-correction capabilities              VLA models, approaches like ECoT (Zawalski et al., 2024),
+while circumventing the high computational overhead of                    CoT-VLA (Zhao et al., 2025), RoboMamba (Liu et al.,
+previous static, “reason-at-every-step” strategies.                       2024b), and PI0.5 (Black et al., 2025) predict intermedi-
+To train this status-aware behavior, we developed EC-Gen,                 ate auxiliary information (e.g., sub-tasks or gripper poses).
+a scalable data generation pipeline that automatically syn-               However, these static outputs fail to adapt to dynamic task
+thesizes diverse error recovery trajectories with rich anno-              contexts. Recent models, including ChatVLA (Zhou et al.,
+tations, obviating the need for manual data collection. Fur-              2025c), ChatVLA2 (Zhou et al., 2025b), and Hume (Song
+thermore, to ensure Sentinel-VLA continuously improves                    et al., 2025), introduce free-form natural language thought
+from its experiences, we propose the SECL algorithm, com-                 but lack status monitoring. Consequently, they rigidly en-
+                                                                          gage in latency-heavy reasoning at every step, making them
+
+                                                                      2
+      Sentinel-VLA: A Metacognitive VLA Model with Active Status Monitoring for Dynamic Reasoning and Error Recovery
+
+                                  Sentinel-VLA Inference                                          Self-Evolving Continual Learning
+      Thought      “Transfer the banana in                           [MONITOR] Query                                     Add           Offline
+                  green plate to blue plate”                                                     Sentinel-VLA                          Adapter
+      Memory
+                                                                                                                                    EMA
+                                                                                                Deploy
+                                                                                                                                    Update
+                                                          KV                                   Diverse Settings                        Online
+         VLM Expert (SigLIP+Gemma)                               Status Monitor Expert              Env 1                              Adapter
+                                                                                                 60% Success
+                                                                                                    Env 2              Orthogonal      Train
+                      KV Cache                                                                    2% Success           Constraint
+                                               Execution Status     (Thought Trigger)               Env n
+                                                                                                 60% Success
+
+         Action Expert                 Normal          Initial       Error      Subtask          Select
+                                       Status          Status        Status    Complete
+                                                                                                60% Success
+                                                                                               Boundary Setting
+                                         No                Status-driven Adaptive
+                                       Thought            Thought (VLM generated)               Collect
+                                     (Most cases)          Plan/Recovery/Progress                                 Success Trajectories in
+         Generated Action Chunk                                                                                     Boundary Settings
+
+Figure 3. Left: Pipeline of Sentinel-VLA. The Status Monitor Expert activates on-demand Adaptive Thought. Right: Pipeline of SECL.
+The model continually evolves by learning from boundary success trajectories, updating its adapter with Orthogonal Constraint.
+
+unsuitable for real-time manipulation. While OneTwoVLA                        tinel” to assess current status. Esm first processes a learn-
+(Lin et al., 2025) attempts to regulate reasoning frequency,                  able [MONITOR] query through its first layer’s Q matrix,
+its reliance on a stochastic token prediction renders it unreli-              producing the query vector Qsm . This vector then probes
+able and difficult to interpret.                                              the internal (Kt , Vt ) cache within the VLM expert via cross-
+                                                                              attention, allowing Esm to determine if the current context
+Error Recovery in VLA Models. To address the critical                         requires the activation of a specific cognitive capability. The
+lack of error resilience in VLAs, researchers have intro-                     output of Esm is passed through an MLP head to compute
+duced external oversight modules. Works such as AHA                           the trigger probability distribution:
+(Duan et al., 2024), Phoenix (Xia et al., 2025), and Racer
+(Dai et al., 2024) utilize external LLMs/VLMs for corrective                  St = softmax(MLP(Esm (Qsm , Kt , Vt = Evlm (It , T ))))
+feedback, while others employ rule-based monitors (Zhou                                                                                 (1)
+et al., 2025a), specialized tools (Li et al., 2024a), or 3D                   To introduce task planning and error recovery capabilities,
+discrepancy detection (Pan et al., 2025). Despite their util-                 we define a set of trigger states, St , corresponding to the
+ity, these methods suffer from architectural rigidity and a                   model’s core cognitive functions.
+fundamental bottleneck: VLAs often struggle to precisely
+follow external instructions (Glossop et al., 2025), meaning                            St ∈ {Initial, Normal, New-subtask, Error}             (2)
+even valid recovery plans from external monitors may not
+be correctly executed.                                                        Dynamic Reasoning. Conditioned on the activated trigger
+                                                                              status St , the VLM expert Evlm is invoked again to deter-
+3     Sentinel-VLA
+                                                                              mine whether and how to perform deep thinking. We main-
+The architecture of Sentinel-VLA comprises a VLM expert                       tain a dynamically updated thought memory, Mt , which
+(Evlm ), an action expert (Eact ), and a novel Status Monitor                 stores information such as the task plan, the current subtask,
+expert (Esm ). These components share attention mecha-                        and error reflections. Let Ψreason (·) denote the cognitive
+nisms for efficient information exchange, as depicted in                      policy executed by Evlm . The update logic for Mt is:
+Figure 3.
+                                                                                     
+3.1    Dynamic Reasoning via Active Status Monitor                                   
+                                                                                      Ψplan (It , T )       if St = Initial
+                                                                                     
+                                                                                     M
+Active Monitoring. At each timestep t, the model re-                                     t−1                 if St = Normal
+                                                                                Mt =
+ceives the current image observation It and the task in-                             
+                                                                                     
+                                                                                      Ψupdate (Mt−1 , It ) if St = New-subtask
+struction T . The VLM expert projects this input into a                                Ψrecover (Mt−1 , It ) if St = Error
+                                                                                     
+latent feature space, yielding the key-value cache context                                                                            (3)
+Kt , Vt = Evlm (It , T ). Then, to determine the demand of                    Here, Ψplan produces an initial task plan P = {pi }N   i=1 ,
+reasoning, the Status Monitor expert Esm acts as a “sen-                      where each pi is a subtask, and sets the current subtask to
+
+                                                                          3
+      Sentinel-VLA: A Metacognitive VLA Model with Active Status Monitoring for Dynamic Reasoning and Error Recovery
+
+p1 . Ψupdate advances the current subtask in memory from              Algorithm 1 Inference Process of Sentinel-VLA
+pi to pi+1 . Ψrecover formulates a new recovery plan Prec ,            1: Input: Task instruction T ; Experts Evlm , Esm , Eact ;
+a new current subtask, and an error reflection. Critically,                 Thought memory M0 ← ∅; Timestep t ← 0
+in the “Normal” state, which constitutes the vast majority             2: while task is not terminated do
+of execution time, no specific capability is triggered, and                 //  ——— 1. Active Capability Triggering ———
+the model generates no new thoughts (Mt = Mt−1 ). It                   3:                     ▷ Encode context with VLM expert
+directly leverages the existing thought memory for decision-           4:    Kt , Vt ← Evlm (It , T )
+making, significantly reducing computational overhead.                 5:                             ▷ Process the [MONITOR]
+Act with Reasoning. Finally, the action expert Eact inte-              6:    Qsm ← Esm .ProjectToQuery([MONITOR])
+grates all context to generate the final action At :                   7:              ▷ Perceive trigger status by probing VLM
+                                                                       8:    St ← softmax(MLP(Esm (Qsm , Kt , Vt )))
+                  At = Eact (It , T , St , Mt )            (4)            // ——— 2. Decide whether and what to think ———
+Training with Unified Objective.The overall training loss              9:    if St = Initial then
+for this dynamic chain-of-thought process, LDCoT , com-               10:                 ▷ System starts, trigger initial planning.
+bines a flow matching loss for action prediction, Lf low , a          11:         Mt ← GeneratePlan(It , T )
+cross-entropy loss for thought generation, Lthought , and a           12:    else if St = New-subtask then
+cross-entropy loss for the status monitor, Lmonitor :                 13:             ▷ Subtask complete, trigger subtask update.
+                                                                      14:         Mt ← UpdateSubtask(Mt−1 , It , T )
+         LDCoT = Lf low + λ(Lthought + Lmonitor )          (5)        15:    else if St = Error then
+where λ is a hyperparameter. Sentinel-VLA is optimized                16:            ▷ Error detected, trigger recovery reasoning.
+in a fully end-to-end manner, ensuring strict alignment be-           17:         Mt ← Recovery(Mt−1 , It , T )
+tween metacognitive judgment and physical execution.                  18:    else                  ▷ St = Normal, skip thinking.
+                                                                      19:         Mt ← Mt−1
+3.2    EC-Gen Data Generation Pipeline                                20:    end if
+To train the status-aware behaviors of Sentinel-VLA, we de-               //        ——— 3. Action Generation ———
+velop EC-Gen, a pipeline that transforms expert trajectories          21:    Generate the final action using all available context:
+into error-correction sequences via a stochastic perturba-            22:    At ← Eact (It , T , St , Mt )
+tion mapping. Let a successful trajectory be a sequence               23:    t←t+1
+of waypoints τ = {w1 , . . . , wN }, where each waypoint              24: end while
+wi = ⟨ei , gi ⟩ consists of an SE(3) end-effector pose ei
+and a binary gripper state gi ∈ {0, 1}. We define an error
+injection operator Φ(wj , ϵ) that maps a target waypoint wj           adding a perturbation vector ∆pose to the original pose ej ,
+to an erroneous state wj′ based on a specific failure ϵ.              while keeping the gripper state gj unchanged:
+
+                                                                                 wj′ = Φ(wj , ϵpose ) = ⟨ej ⊕ ∆pose , gj ⟩      (8)
+                wj′ = ⟨e′j , gj′ ⟩ = Φ(⟨ej , gj ⟩, ϵ)      (6)
+While real-world errors are diverse, we posit that the vast           where ⊕ denotes the composition of the pose with the trans-
+majority of manipulation failures can be decomposed into              lational noise.
+or combined from three core failure modalities: interaction,          3. Semantic Understanding Errors (ϵsem ): This modality
+spatial, and semantics. We design our error generation                represents a failure to correctly interpret task semantics,
+pipeline to cover these fundamental dimensions:                       such as acting on the wrong object. The robot interacts
+1. Object Interaction Errors (ϵgripper ): This modality               with the wrong object. We simulate this by shifting the end-
+covers failures at the point of interaction, such as failing          effector’s original position by the displacement vector from
+to grasp or release an object. At a waypoint wj where a               the intended object to an incorrect one. Let ptarget and
+gripper state change was supposed to occur, we suppress this          pdistractor denote the positions of the correct and incorrect
+change. The erroneous waypoint wj′ is formed by retaining             objects, respectively. We define a semantic shift vector
+the original pose ej but adopting the gripper state from the          vshif t = pdistractor − ptarget . The perturbed state directs
+previous waypoint:                                                    the effector towards the wrong semantic entity:
+
+                                                                                 wj′ = Φ(wj , ϵsem ) = ⟨ej ⊕ vshif t , gj ⟩     (9)
+             wj′ = Φ(wj , ϵgripper ) = ⟨ej , gj−1 ⟩        (7)
+2. Spatial Localization Errors (ϵpose ): This dimension               For interaction and localization errors, we construct a recov-
+relates to incorrect spatial positioning. A deviation is intro-       ery sequence by inserting an intermediate transition way-
+duced to the end-effector’s pose. This is implemented by              point wtrans followed by the original correct waypoint wj ,
+
+                                                                  4
+      Sentinel-VLA: A Metacognitive VLA Model with Active Status Monitoring for Dynamic Reasoning and Error Recovery
+
+                                                                         Reference Trajectory                 Reference Waypoint
+                                                                            (Expert Data)                       Error Waypoint
+                                                                                                              Transition Waypoint
+        Start
+                           Error Types                                                                                         End
+
+
+                                                                Recovery         Perturbation             Recovery
+                                                                                              Noise
+                                                                 Path 1           Injection                Path 2
+           Interaction      Spatial         Semantic
+              Error          Error            Error
+
+                         Figure 4. EC-Gen pipeline of scalable data generation for error recovery trajectories.
+
+forming a segment ⟨..., wj−1 , wj′ , wtrans , wj , ...⟩. For se-         formally defined as:
+mantic understanding errors, the recovery is direct and con-                                    [
+tains no intermediate transition waypoint, forming a seg-                   Dboundary =                 {ξ ∼ π(h) | S(ξ) = 1}       (11)
+ment ⟨..., wj−1 , wj′ , wj , ...⟩.                                                        h∈Hboundary
+
+We then automatically annotate this synthetic data with CoT              This data, representing skills at the edge of the model’s
+labels. The task plan P is manually annotated once per task.             current competency, is used to train a new online LoRA
+Since key-waypoints naturally split subtasks, the subtask pi             adapter, ∆Wonline . To integrate this new knowledge with-
+and status St for each frame are known. The error reflec-                out disrupting existing skills (i.e., catastrophic forgetting),
+tion and experience, Re , are generated from a predefined                we employ the OC-Adapter mechanism.
+template-base generator Gtemplate based on the injected er-
+                                                                         3. Consolidate Knowledge via EMA Fusion: After the
+ror type ϵ. Crucially, during training, the action loss Lf low
+                                                                         online adapter is trained, its learned knowledge is gently
+is masked for the erroneous actions produced from wj′ to
+                                                                         merged into the long-term offline weights. This step con-
+prevent the model from learning incorrect behaviors.
+                                                                         solidates the newly acquired skill into the model’s stable
+3.3    Self-Evolving Continual Learning                                  memory base.
+The SECL algorithm aims to expanding the model’s “knowl-                  ∆Wof f line = α · ∆Wof f line + (1 − α) · ∆Wonline (12)
+edge boundary”—the frontier where success rates fluctuate
+between stability and failure. We conceptualize this process             The updated offline weight ∆Wof f line is then added to
+as an iterative expansion of the policy πθ parameterized by              Wbase for further expansion.
+base weights Wbase and an evolving adapter module.                       Orthogonal Continual Adapter (OC-Adapter): OC-
+                                                                         Adapter ensures that new skills are learned in a way that is
+1. Deploy and Identify the Boundary: The current sta-                    mathematically decorrelated from previously learned skills,
+ble model, with weights Wdeploy = Wbase + ∆Wof f line ,                  thus minimizing interference.
+is deployed across a range of environmental settings                     In LoRA-based methods, parameter updates ∆W are con-
+H. Let SR(W, h) denote the task success rate of the                      fined to the column space of a low-rank matrix B (i.e.,
+model with weights W in setting h. We identify the                       ∆W = B × A). When introducing a new “online” adapter
+model’s current performance edge—the “boundary settings”                 (∆Wonline = Bonline × Aonline ), its updates can interfere
+Hboundary —where this success rate is within a specific                  with or overwrite knowledge learned by previous “offline”
+range [τlow , τhigh ]:                                                   adapters (Bof f line ), as their column spaces may overlap.
+                                                                         To address this, our core innovation is to introduce an orthog-
+ Hboundary = {h ∈ H | τlow ≤ SR(Wdeploy , h) ≤ τhigh }                   onality constraint during the training of the online adapter.
+                                                              (10)       This term explicitly penalizes the overlap between the col-
+Settings with a success rate below τlow are considered too               umn space of Bonline and that of Bof f line :
+difficult for effective learning at this stage, while those above                     Lortho = ∥Bof f line × Bonline ∥2             (13)
+τhigh are considered already mastered.
+                                                                         where ∥ · ∥2 is the L2 norm. The total loss for training the
+2. Learn from Boundary Successes: By running the                         online adapter in round k is therefore a combination of the
+model within the identified boundary settings Hboundary ,                primary task loss and this orthogonality penalty:
+we collect the set of successful execution trajectories,                         LSECL = LDCoT (Dboundary ) + βLortho               (14)
+Dboundary . Let π(h) = Rollout(Wdeploy , h) represent the
+policy rollout distribution in setting h, and S(ξ) be an indi-           where β is a hyperparameter that balances task performance
+cator function for a successful trajectory ξ. The dataset is             with knowledge preservation. This entire SECL process
+
+                                                                     5
+      Sentinel-VLA: A Metacognitive VLA Model with Active Status Monitoring for Dynamic Reasoning and Error Recovery
+
+             Table 1. Comprehensive Success Rate Comparison across RLBench, LIBERO-LONG, and Real-world Tasks.
+ Category               Task                 OpenVLA    PI0     ECoT AHA+OpenVLA OneTwoVLA Sentinel-VLA (Ours)
+                        Close box              62%      84%   66%              64%             86%               94%
+                        Close laptop lid       38%      64%   50%              58%             68%               78%
+                        Toilet seat down       72%     100% 86%                80%            100%              100%
+                        Close fridge           76%      90%   84%              72%             86%               94%
+ RLBench Seen           Frame off hanger       16%      72%   20%              30%             70%               74%
+                        Water plants           14%      44%   24%              16%             26%               46%
+                        Phone on base          20%      26%   24%              18%             32%               40%
+                        Put rubbish in bin      8%      20%   12%               8%             22%               24%
+                        Change clock           14%      20%   16%              18%             22%               22%
+                        Average (Seen)        35.6%    57.8% 42.4%            40.4%           56.9%             63.5%
+                   Close box                   46%      70%   56%              60%             74%               86%
+                   Close laptop                30%      54%   38%              42%             62%               70%
+                   Toilet seat                 54%      82%   74%              68%             84%               90%
+                   Close fridge                62%      78%   70%              66%             82%               86%
+ RLBench Disturbed Frame off                   10%      52%   10%              24%             54%               64%
+                   Water plants                 8%      30%   14%              12%             24%               32%
+                   Phone on base               10%      18%   14%              14%             24%               30%
+                   Put rubbish                  0%      14%    8%               8%             16%               16%
+                   Change clock                10%      16%   10%              12%             16%               18%
+                   Average (Disturbed)        25.6%    46.0% 32.7%            34.0%           48.4%             54.7%
+                        Sweep dustpan          52%      62%   60%              54%             66%               72%
+ RLBench Unseen         Umbrella out           32%      46%   42%              34%             46%               54%
+                        Wine at rack            8%      18%   14%              16%             20%               28%
+                        Average (Unseen)      30.7%    42.0% 38.7%            34.7%           44.0%             51.3%
+ LIBERO-LONG            Average               53.7%    85.2% 62.4%            71.2%           87.8%             90.7%
+                        Stack cube             24%      46%   28%              32%             50%               54%
+ Real-world             Pour water             36%      50%   42%              36%             56%               66%
+                        Sweep rubbish          32%      42%   36%              40%             50%               60%
+                        Average (Real)        30.7%    46.0% 35.3%            36.0%            52%              60.0%
+
+allows Sentinel-VLA to robustly and continually learn from          adaptation, the pre-trained Sentinel-VLA is finetuned for
+experience, progressively expanding its ability to solve com-       30,000 steps. Each task evaluation involves 50 execution
+plex and unseen problems.                                           trials to robustly calculate the average success rate.
+                                                                    Compared Baselines. We compared Sentinel-VLA against
+4     Experiments                                                   current SOTA VLA base models, error-handling and CoT
+4.1    Implementation Details                                       reasoning methods, including PI0 (Black et al., 2024), Open-
+                                                                    VLA (Kim et al., 2024), ECoT (Zawalski et al., 2024), AHA
+Model Architecture. Our implementation of Sentinel-VLA
+                                                                    (Duan et al., 2024), and OneTwoVLA (Lin et al., 2025).
+is built upon the publicly available PI0 model (Black et al.,
+2024). Both the VLM expert (Evlm ) and the action expert            Benchmarks. We conducted experiments on two simulation
+(Eact ) are inherited from PI0, and are the 3B PaliGemma            benchmarks, RLbench (James et al., 2020) and LIBERO-
+(Steiner et al., 2024) and the 330M Gemma (Team et al.,             LONG (Liu et al., 2023); for real-world experiments, we
+2024b), respectively. The new status monitor expert (Esm )          utilized an Agilex Piper robotic arm.
+we have added has a network architecture consistent with            4.2   Overall Performance
+the action expert.
+                                                                    As shown in Table 1, Sentinel-VLA significantly outper-
+Training Data. With EC-Gen, we created a large-scale
+                                                                    forms all baselines consistently. Detailed analyses across
+pre-training dataset that consists of 11,000 trajectories,
+                                                                    different settings are provided below.
+totaling approximately 2.6 million transitions, and covers
+44 different RLBench tasks.                                         Performance on RLBench Seen Tasks. We first evalu-
+Training Setup. The model was pre-trained for 90,000                ated the model on 9 tasks from RLBench used during pre-
+steps on 8 NVIDIA A100 GPUs with a batch size of 128.               training. Sentinel-VLA achieves a dominant average suc-
+We used the learning rate of 2.5 × 10−5 and a cosine decay          cess rate of 63.5%, significantly surpassing the base model
+schedule. The loss weighting hyperparameters were set               PI0 (57.8%) and the CoT-based method ECoT (42.4%).
+to λ = 0.1. For the thought generation loss, α = 0.9 for
+online-offline LoRA merge and β = 0.5 for the OC-Adapter            Performance on RLBench Unseen Tasks. To assess gen-
+orthogonality loss during the SECL phase. τlow and τhigh            eralization, we evaluated the model on tasks that were not
+are set to 20% and 80%, respectively. For task-specific             seen during pre-training. Sentinel-VLA maintains supe-
+
+                                                                6
+    Sentinel-VLA: A Metacognitive VLA Model with Active Status Monitoring for Dynamic Reasoning and Error Recovery
+
+    Table 2. Real-world average single action computation time of Sentinel-VLA and other comparative methods on an RTX4090.
+  Method                          OpenVLA         PI0          ECoT        AHA+OpenVLA                        OneTwoVLA           Sentinel-VLA (Ours)
+  Computation time / action          57 ms       8.5 ms    1528 ms                         547 ms                 37ms                    13 ms
+
+Table 3. Real-world ablation study on SECL and OC-Adapter.                Table 5. F1-Score of the Status Monitor Expert (Esm ) in simula-
+SECL and OC-Adapter jointly enable the continual evolution.               tion and real-world.
+ Variant                       Stack   Pour     Sweep      Avg                    Metric                       Simulation                Real-World
+ Sentinel-VLA w/o SECL         50%     58%      54%       54.0%                   Dataset Size              100,000 transitions         1,000 frames
+ w/ SECL w/o OC-Adapter        42%     48%      46%       44.7%                   Annotation               EC-Gen Ground Truth        4 Human Experts
+ Sentinel-VLA (Full)           54%     66%      60%       60.0%
+                                                                                  F1-Score                       0.9024                     0.8567
+Table 4. Error detection rate of the Status Monitor on the RLBench              Sentinel-VLA w/ SECL w/o OC-Adapter       Sentinel-VLA w/o SECL   Sentinel-VLA
+evaluation set and the Real-world error status set.
+
+
+
+
+                                                                           Success Rat e
+    Evaluation Dataset                        Detection Rate
+    RLBench Eval Set (Simulation)                 97.4%
+    Real-world Error Set (Real)                   90.6%
+                                                                                           Sweep dustpan           Umbrella out             Wine at rack
+rior performance with an average success rate of 51.3%,
+outperforming PI0 (42.0%) and OpenVLA (30.7%) by a                        Figure 5. Ablation study of SECL and OC-Adapter on RLBench.
+                                                                          They jointly enable the continual evolution.
+large margin. Specifically, in the challenging “Wine at rack”
+task which requires precise manipulation, Sentinel-VLA                    grasp failure, whereas baseline models simply halted or exe-
+achieves 28%, triple the success rate of OpenVLA (8%).                    cuted empty grasps. This result highlights the high practical
+This indicates that the model is not merely memorizing                    utility of our approach in diverse physical embodiments.
+trajectories but has learned generalized error recovery and
+planning capabilities that effectively transfer to novel task             Inference Efficiency and Control Frequency. A key ad-
+semantics and object interactions.                                        vantage of Sentinel-VLA is its on-demand reasoning. To
+                                                                          verify this, we tested the real-world average computation
+Performance on LIBERO-LONG. We further tested the                         time against baselines on an RTX 4090. The results in
+model’s long-horizon generalization on the LIBERO-LONG                    Table 2 show that Sentinel-VLA operates at 13ms per ac-
+benchmark (Liu et al., 2023). Sentinel-VLA achieves a                     tion. This is significantly faster than CoT-based methods
+remarkable 90.7% success rate. This represents a 5.5%                     like ECoT (1528ms) and comparable to non-reasoning base
+and 37.0% improvement over PI0 (85.2%) and Open-                          models, validating that our model achieves high-level cogni-
+VLA (53.7%), respectively. Despite the lack of domain-                    tion without compromising real-time control frequency.
+specific pre-training, our metacognitive architecture facili-
+                                                                          4.3              Component Analysis and Ablation Studies
+tates strong transfer learning, proving its robustness in han-
+dling long-horizon sequential decision-making where error                 Performance of Status Monitor. We evaluated the stan-
+accumulation typically leads to failure in baseline models.               dalone performance of the Status Monitor Expert (Esm )
+                                                                          using 100k simulation transitions. Additionally, during real-
+Robustness Under High Disturbance. To test the ef-                        world deployment, we collected 1,000 pairs of scenes and
+fectiveness of our model under instability, we evaluated                  predicted statuses, which were manually judged by four hu-
+Sentinel-VLA in an RLBench setting with artificial distur-                man experts. To prevent the dominant ”Normal” state from
+bances (injecting 5% random perturbation probability per                  inflating metrics, we report the average F1-score across the
+step, with a magnitude range of -0.1 to 0.1). As shown                    critical Initial, New-subtask, and Error states. As shown in
+in the “Disturbed” section of Table 1, OpenVLA’s perfor-                  Table 5, Esm achieves high F1-scores in both simulation
+mance collapses drastically from 35.6% to 25.6% as it lacks               (90.2%) and the real world (85.7%), providing a reliable
+a mechanism to recognize that its trajectory has been per-                foundation for downstream dynamic reasoning.
+turbed. In contrast, Sentinel-VLA demonstrates exceptional
+resilience, maintaining a 54.7% success rate.                             Generalization of Error Recognition. To demonstrate
+                                                                          that the status monitor can generalize to complex real-world
+Performance on Real-world Tasks. On a real-world                          errors, we annotated a separate real-world dataset of 1,000
+Piper robot arm, Sentinel-VLA achieved an average success                 error instances. We evaluated the model fine-tuned on real-
+rate of 60.0% across 3 tasks, outperforming PI0 (46.0%)                   world data against this set. As shown in Table 4, the model
+and OpenVLA (30.7%) by nearly 25-30%. As shown in Fig-                    achieves a 90.6% detection rate for diverse failure modes
+ure 6, the integrated error recovery was particularly crucial;            (e.g., gripper slip, wrong target object), which is comparable
+for instance, in “Pour Water”, the model recovered from                   to its simulation performance of 97.4%. This proves that
+
+                                                                      7
+   Sentinel-VLA: A Metacognitive VLA Model with Active Status Monitoring for Dynamic Reasoning and Error Recovery
+
+
+                                Status: Initial Status
+                                                                                                Status: New                                           Status: New
+ “Stack the                     Task Plan: 1. Pick up the         Normal                                           Normal
+                                                                                                  Subtask                                               Subtask
+ blue block                     blue cube.2. Move it above
+                                                                                                  Current                                               Current
+                                the black bottle.3. Release
+ on the black                   the blue cube.
+                                                                                                 Subtask:                                              Subtask:
+ bottle.”                       Current Subtask: Pick up          Progress                     Move it above       Progress                           Release the
+                                                                                              the black bottle.                                        blue cube.
+                                the blue cube
+                                                                                                                                                                      Normal
+                                                                                           Status: Error Status                                                       Progress
+                                           Status: New                                     Recovery Plan: 1. Grasp and position the blue
+                               Normal        Subtask                            Normal
+                                                                                           cube directly above the bottle.2. Release the blue
+                                             Current                                       cube.
+   Finish                                   Subtask:                                       Current Subtask: Grasp and position the blue
+                               Progress    Release the                          Progress   cube directly above the bottle
+                                            blue cube.                                     Error Reflection: The cube must be precisely and
+                                                                                           closely above the bottle when releasing gripper.
+
+
+
+                                 Status: Initial Status                                            Status: Error Status
+  “Pour the                      Task Plan: 1. Grasp the             Normal                        Recovery Plan: 1. Put the bottle back and grab it by the body.2.
+  water in                       plastic bottle.2. Move the                                        Move the plastic bottle over the cup.3. Tilt the bottle to pour
+                                 plastic bottle over the cup.3.
+  the plastic                    Tilt the bottle to pour water                                     water into the cup.
+  bottle into                    into the cup.                                                     Current Subtask: Put the bottle back and grab it by the body.
+                                                                     Progress
+                                 Current Subtask: Grasp the                                        Error Reflection: Grasp the bottle body, not the bottle opening.
+  the cup.”                      plastic bottle.                                                   Otherwise, it's impossible to pour the water.
+                                                                                                                                                                      Normal
+                                                                                                                                                                      Progress
+                               Normal        Status: New Subtask                                 Normal
+                                                                                                                  Status: New Subtask
+   Finish                                    Current Subtask: Tilt the
+                                                                                                                  Current Subtask: Move the
+                                             bottle to pour water into the
+                                                                                                                  plastic bottle over the cup.
+                               Progress      cup.                                                Progress
+
+
+     Figure 6. Two representative cases of Sentinel-VLA. It accomplished planning and recovery using only 4-5 reasoning times.
+Table 6. Ablation study on model architecture across RLBench                        causes Sentinel-VLA’s performance to drop to 60.7%. This
+seen tasks. We compare the performance of OpenVLA trained
+with EC-Gen data, Sentinel-VLA without the status monitor (w/o
+                                                                                    degradation highlights a critical architectural insight: status
+SM), and the full Sentinel-VLA model.                                               prediction is inherently a discrete, option-based classifica-
+                                                                                    tion task. Assigning this task to a specialized, independent
+                      OpenVLA Sentinel-VLA Sentinel-VLA                             classifier (Esm ) is structurally more effective and reason-
+Task
+                     (w/ EC-Gen) (w/o SM)      (Full)                               able than forcing the VLM expert to predict it as part of a
+Close box               74%                90%                      94%             continuous natural language generation process.
+Close laptop lid        44%                72%                      78%
+Toilet seat down        80%               100%                     100%             Ablation on SECL and OC-Adapter. Finally, to validate
+Close fridge            82%               90%                       94%             our continual learning strategy, we compared Sentinel-VLA
+Frame off hanger        24%                74%                      74%             under three conditions: without SECL, with SECL + LoRA,
+Water plants            20%                44%                      46%
+Phone on base           28%                32%                      40%
+                                                                                    and with the full SECL + OC-Adapter. The real-world
+Put rubbish in bin      12%                22%                      24%             results are presented in Table 3, and RLBench results are
+Change clock            18%                22%                      22%             in Figure 5. The model without SECL achieves 54.0% in
+Average                42.4%              60.7%                    62.6%            the real world. Simply applying LoRA for SECL leads to
+                                                                                    catastrophic forgetting, dropping the average success rate
+                                                                                    to 44.7% (a -9.3% regression). In contrast, incorporating
+our monitor, despite being trained on synthetic data, effec-
+                                                                                    our SECL with OC-Adapter allows the model to evolve and
+tively transfers its anomaly detection capabilities to visually
+                                                                                    achieve the highest success rate of 60.0%. This confirms
+distinct real-world failure scenarios.
+                                                                                    that the orthogonality constraint is essential for SECL.
+Architecture and Data Ablation. To validate the effec-
+tiveness of our multi-expert architecture and the EC-Gen
+                                                                                    5      Conclusion
+dataset, we benchmarked the full Sentinel-VLA against                               We introduced Sentinel-VLA, a unified cognitive VLA
+two variants: an OpenVLA trained on our EC-Gen data,                                model that, for the first time, integrates dynamic deep think-
+and a Sentinel-VLA variant without the dedicated Status                             ing, status monitoring, and error recovery. This model’s
+Monitor (w/o SM) (Table 6). In the w/o SM variant, the                              training was powered by our scalable EC-Gen pipeline,
+VLM expert directly generates the status token and the full                         which automatically synthesized a large-scale dataset span-
+reasoning chain autoregressively. As shown in the results,                          ning 44 tasks and over 2.6 million transitions with rich
+OpenVLA achieves a success rate of 42.4% using our data,                            annotations. Sentinel-VLA integrates a status monitor for
+proving the intrinsic value of the synthesized error-recovery                       efficient on-demand reasoning, ensuring robust decision-
+trajectories. However, removing the Status Monitor (Esm )                           making with low overhead, while our SECL algorithm en-
+
+                                                                                8
+   Sentinel-VLA: A Metacognitive VLA Model with Active Status Monitoring for Dynamic Reasoning and Error Recovery
+
+ables continual learning from experience. Extensive exper-            Feng, Z., Xue, R., Yuan, L., Yu, Y., Ding, N., Liu, M.,
+iments demonstrate Sentinel-VLA’s superior performance                  Gao, B., Sun, J., Zheng, X., and Wang, G. Multi-agent
+over SOTA baselines, showcasing exceptional robustness                  embodied ai: Advances and future directions. arXiv
+and strong generalization, representing a significant step              preprint arXiv:2505.05108, 2025.
+toward creating more robust and adaptive embodied agents.
+                                                                      Fung, P., Bachrach, Y., Celikyilmaz, A., Chaudhuri, K.,
+Impact Statement                                                        Chen, D., Chung, W., Dupoux, E., Gong, H., Jégou, H.,
+                                                                        Lazaric, A., et al. Embodied ai agents: Modeling the
+This paper presents work whose goal is to advance the field             world. arXiv preprint arXiv:2506.22355, 2025.
+of Machine Learning, specifically in the domain of Embod-
+ied AI and VLA models. The proposed methods for active                Glossop, C., Chen, W., Bhorkar, A., Shah, D., and Levine,
+status monitoring and dynamic error recovery have broad                 S. Cast: Counterfactual labels improve instruction fol-
+applications in automation, service robotics, and complex               lowing in vision-language-action models. arXiv preprint
+manipulation tasks. While this technology enables higher                arXiv:2508.13446, 2025.
+reliability and safety in physical environments, it also shares
+the general societal implications associated with advanced            James, S., Ma, Z., Arrojo, D. R., and Davison, A. J. Rlbench:
+automation and robotics. There are no specific ethical con-             The robot learning benchmark & learning environment.
+cerns or adverse societal consequences unique to this work              IEEE Robotics and Automation Letters, 5(2):3019–3026,
+that we feel must be highlighted here.                                  2020.
+
+References                                                            Kim, M. J., Pertsch, K., Karamcheti, S., Xiao, T., Balakr-
+                                                                        ishna, A., Nair, S., Rafailov, R., Foster, E., Lam, G., San-
+Bai, J., Bai, S., Chu, Y., Cui, Z., Dang, K., Deng, X., Fan,            keti, P., et al. Openvla: An open-source vision-language-
+  Y., Ge, W., Han, Y., Huang, F., et al. Qwen technical                 action model. arXiv preprint arXiv:2406.09246, 2024.
+  report. arXiv preprint arXiv:2309.16609, 2023.
+                                                                      Li, C., Liu, J., Wang, G., Li, X., Chen, S., Heng, L., Xiong,
+Bikkasani, D. C. Navigating artificial general intelligence             C., Ge, J., Zhang, R., Zhou, K., et al. A self-correcting
+  (agi): Societal implications, ethical considerations, and             vision-language-action model for fast and slow system
+  governance strategies. AI and Ethics, 5(3):2021–2036,                 manipulation. arXiv preprint arXiv:2405.17418, 2024a.
+  2025.
+                                                                      Li, M., Huang, X., and Zhang, Z. Self-supervised geometric
+Black, K., Brown, N., Driess, D., Esmail, A., Equi, M., Finn,            features discovery via interpretable attention for vehicle
+  C., Fusai, N., Groom, L., Hausman, K., Ichter, B., et al.              re-identification and beyond. In ICCV, 2021.
+  pi0 : A vision-language-action flow model for general
+                                                                      Li, M., Liu, J., Zheng, C., Huang, X., and Zhang, Z.
+  robot control. arXiv preprint arXiv:2410.24164, 2024.
+                                                                        Exploiting multi-view part-wise correlation via an ef-
+Black, K., Brown, N., Darpinian, J., Dhabalia, K., Driess, D.,          ficient transformer for vehicle re-identification. IEEE
+  Esmail, A., Equi, M., Finn, C., Fusai, N., Galliker, M. Y.,           Transactions on Multimedia, 25:919–929, 2023. doi:
+  et al. pi0.5: a vision-language-action model with open-               10.1109/TMM.2021.3134839.
+  world generalization. arXiv preprint arXiv:2504.16054,              Li, Q., Liang, Y., Wang, Z., Luo, L., Chen, X., Liao, M.,
+  2025.                                                                 Wei, F., Deng, Y., Xu, S., Zhang, Y., et al. Cogact: A
+                                                                        foundational vision-language-action model for synergiz-
+Chen, Y., Cao, Z., Ren, H., Yang, C., Li, W., Wang, S.,                 ing cognition and action in robotic manipulation. arXiv
+  Wang, Y., Zhang, L., Shao, Y., Zhao, Z., et al. Roborouter:           preprint arXiv:2411.19650, 2024b.
+  Training-free policy routing for robotic manipulation.
+  arXiv preprint arXiv:2603.07892, 2026.                              Li, W., Su, X., Wu, J., Yang, F., Liu, Y., Chen, Y., You,
+                                                                        S., and Xu, C. Identify, isolate, and purge: Mitigating
+Dai, Y., Lee, J., Fazeli, N., and Chai, J. Racer: Rich                  hallucinations in lvlms via self-evolving distillation. In
+  language-guided failure recovery policies for imitation               Proceedings of the 33rd ACM International Conference
+  learning. arXiv preprint arXiv:2409.14674, 2024.                      on Multimedia, pp. 6791–6800, 2025a.
+
+Duan, J., Pumacay, W., Kumar, N., Wang, Y. R., Tian,                  Li, W., Su, X., Cao, Y., Xu, H., Xia, X., You, S., Chen, Y.,
+  S., Yuan, W., Krishna, R., Fox, D., Mandlekar, A., and                and Xu, C. Sentinel-vla: A metacognitive vla model with
+  Guo, Y. Aha: A vision-language-model for detecting and                active status monitoring for dynamic reasoning and error
+  reasoning over failures in robotic manipulation. arXiv                recovery, 2026a. URL https://arxiv.org/abs/
+  preprint arXiv:2410.00371, 2024.                                      2605.01191.
+
+                                                                  9
+   Sentinel-VLA: A Metacognitive VLA Model with Active Status Monitoring for Dynamic Reasoning and Error Recovery
+
+Li, W., Su, X., Niu, D., Cao, Y., Xu, H., Qu, Z., Fan, L.,              Restrepo, P. We won’t be missed: Work and growth in the
+  You, S., and Xu, C. Vla-attc: Adaptive test-time compute                agi world. Technical report, National Bureau of Economic
+  for vla models with relative action critic model, 2026b.                Research, 2025.
+  URL https://arxiv.org/abs/2605.01194.
+                                                                        Song, H., Qu, D., Yao, Y., Chen, Q., Lv, Q., Tang, Y., Shi,
+Li, Y., Yang, C., Dong, J., Yao, Z., Xu, H., Dong, Z., Zeng,              M., Ren, G., Yao, M., Zhao, B., et al. Hume: Introducing
+  H., An, Z., and Tian, Y. Ammkd: Adaptive multimodal                     system-2 thinking in visual-language-action model. arXiv
+  multi-teacher distillation for lightweight vision-language              preprint arXiv:2505.21432, 2025.
+  models. arXiv preprint arXiv:2509.00039, 2025b.
+                                                                        Steiner, A., Pinto, A. S., Tschannen, M., Keysers, D., Wang,
+Li, Z., Chi, C., Wei, Y., Zhu, B., Huang, T., Sun, Z., Peng, Y.,          X., Bitton, Y., Gritsenko, A., Minderer, M., Sherbondy,
+  Wang, P., Wang, Z., Liu, F., et al. Do you have freestyle?              A., Long, S., et al. Paligemma 2: A family of versatile
+   expressive humanoid locomotion via audio control. arXiv                vlms for transfer. arXiv preprint arXiv:2412.03555, 2024.
+   preprint arXiv:2512.23650, 2025c.
+                                                                        Tan, S., Qiu, X., Shu, Y., Xu, G., Xu, L., Xu, X., Zhuang,
+Li, Z., Chi, C., Zhu, B., Wei, Y., Bai, S., Ji, Y., Peng,                 H., Li, M., and Yu, F. WMarkGPT: Watermarked image
+  Y., Huang, T., Wang, P., Wang, Z., et al. Robomirror:                   understanding via multimodal large language models. In
+  Understand before you imitate for video to humanoid                     Proceedings of the 42nd International Conference on Ma-
+  locomotion. arXiv preprint arXiv:2512.23649, 2025d.                     chine Learning, volume 267 of Proceedings of Machine
+                                                                          Learning Research, pp. 58621–58636. PMLR, 13–19 Jul
+Lin, F., Nai, R., Hu, Y., You, J., Zhao, J., and Gao, Y.
+                                                                          2025.
+  Onetwovla: A unified vision-language-action model with
+  adaptive reasoning. arXiv preprint arXiv:2505.11917,                  Team, G., Georgiev, P., Lei, V. I., Burnell, R., Bai, L.,
+  2025.                                                                   Gulati, A., Tanzer, G., Vincent, D., Pan, Z., Wang, S.,
+                                                                          et al. Gemini 1.5: Unlocking multimodal understand-
+Liu, B., Zhu, Y., Gao, C., Feng, Y., Liu, Q., Zhu, Y., and
+                                                                          ing across millions of tokens of context. arXiv preprint
+  Stone, P. Libero: Benchmarking knowledge transfer for
+                                                                          arXiv:2403.05530, 2024a.
+  lifelong robot learning. Advances in Neural Information
+  Processing Systems, 36:44776–44791, 2023.                             Team, G., Mesnard, T., Hardin, C., Dadashi, R., Bhupatiraju,
+                                                                          S., Pathak, S., Sifre, L., Rivière, M., Kale, M. S., Love,
+Liu, H., Li, C., Li, Y., and Lee, Y. J. Improved baselines
+                                                                          J., et al. Gemma: Open models based on gemini research
+  with visual instruction tuning. In Proceedings of the
+                                                                          and technology. arXiv preprint arXiv:2403.08295, 2024b.
+  IEEE/CVF conference on computer vision and pattern
+  recognition, pp. 26296–26306, 2024a.                                  Team, O. M., Ghosh, D., Walke, H., Pertsch, K., Black,
+                                                                          K., Mees, O., Dasari, S., Hejna, J., Kreiman, T., Xu, C.,
+Liu, J., Liu, M., Wang, Z., Lee, L., Zhou, K., An, P., Yang,
+                                                                          et al. Octo: An open-source generalist robot policy. arXiv
+  S., Zhang, R., Guo, Y., and Zhang, S. Robomamba: Mul-
+                                                                          preprint arXiv:2405.12213, 2024c.
+  timodal state space model for efficient robot reasoning
+  and manipulation. arXiv e-prints, pp. arXiv–2406, 2024b.              Team, Q. Qwen2 technical report.            arXiv preprint
+                                                                          arXiv:2407.10671, 2024.
+Liu, S., Wu, L., Li, B., Tan, H., Chen, H., Wang, Z., Xu,
+  K., Su, H., and Zhu, J. Rdt-1b: a diffusion founda-                   Touvron, H., Lavril, T., Izacard, G., Martinet, X., Lachaux,
+  tion model for bimanual manipulation. arXiv preprint                    M.-A., Lacroix, T., Rozière, B., Goyal, N., Hambro, E.,
+  arXiv:2410.07864, 2024c.                                                Azhar, F., et al. Llama: Open and efficient foundation lan-
+                                                                          guage models. arXiv preprint arXiv:2302.13971, 2023.
+Liu, Y., Chen, W., Bai, Y., Liang, X., Li, G., Gao, W.,
+  and Lin, L. Aligning cyber space with physical world:                 Wang, C., Guo, J., Li, H., Tian, Y., Nie, Y., Xu, C., and
+  A comprehensive survey on embodied ai. IEEE/ASME                       Han, K. Circle-rope: Cone-like decoupled rotary posi-
+  Transactions on Mechatronics, 2025a.                                   tional embedding for large vision-language models. arXiv
+                                                                         preprint arXiv:2505.16416, 2025.
+Liu, Y., Chen, W., Bai, Y., Liang, X., Li, G., Gao, W.,
+  and Lin, L. Aligning cyber space with physical world:                 Wang, P., Bai, S., Tan, S., Wang, S., Fan, Z., Bai, J., Chen,
+  A comprehensive survey on embodied ai. IEEE/ASME                       K., Liu, X., Wang, J., Ge, W., et al. Qwen2-vl: Enhancing
+  Transactions on Mechatronics, 2025b.                                   vision-language model’s perception of the world at any
+                                                                         resolution. arXiv preprint arXiv:2409.12191, 2024.
+Pan, S., Xu, Y., Xu, R., Zhou, Z., Wu, S., and Yu, Z. Self-
+  correcting robot manipulation via gaussian-splatted fore-             Wang, Y. and Sun, A. Toward embodied agi: A review
+  sight. In Proceedings of the AAAI Conference on Artificial             of embodied ai and the road ahead. arXiv preprint
+  Intelligence, pp. 26642–26650, 2025.                                   arXiv:2505.14235, 2025.
+
+                                                                   10
+   Sentinel-VLA: A Metacognitive VLA Model with Active Status Monitoring for Dynamic Reasoning and Error Recovery
+
+Xia, W., Feng, R., Wang, D., and Hu, D. Phoenix: A                  Zhou, Z., Zhu, Y., Zhu, M., Wen, J., Liu, N., Xu, Z., Meng,
+  motion-based self-reflection framework for fine-grained             W., Cheng, R., Peng, Y., Shen, C., et al. Chatvla: Unified
+  robotic action correction. In Proceedings of the Computer           multimodal understanding and robot control with vision-
+  Vision and Pattern Recognition Conference, pp. 6981–                language-action model. arXiv preprint arXiv:2502.14420,
+  6990, 2025.                                                         2025c.
+
+Xu, S., Wang, Y., Xia, C., Zhu, D., Huang, T., and Xu,              Zhu, D., Chen, J., Shen, X., Li, X., and Elhoseiny, M.
+  C. Vla-cache: Efficient vision-language-action ma-                  Minigpt-4: Enhancing vision-language understanding
+  nipulation via adaptive token caching. arXiv preprint               with advanced large language models. arXiv preprint
+  arXiv:2502.02175, 2025a.                                            arXiv:2304.10592, 2023.
+
+Xu, S., Wang, Z., Wang, Y., Xia, C., Huang, T., and Xu,
+  C. Affordance field intervention: Enabling vlas to escape
+  memory traps in robotic manipulation. arXiv preprint
+  arXiv:2512.07472, 2025b.
+
+Yang, Y., Zeng, S., Lin, T., Chang, X., Qi, D., Xiao, J.,
+  Liu, H., Chen, R., Chen, Y., Huo, D., et al. Abot-m0:
+  Vla foundation model for robotic manipulation with ac-
+  tion manifold learning. arXiv preprint arXiv:2602.11236,
+  2026.
+
+Yenduri, G., Murugan, R., Maddikunta, P. K. R., Bhat-
+  tacharya, S., Sudheer, D., and Savarala, B. B. Artificial
+  general intelligence: Advancements, challenges, and fu-
+  ture directions in agi research. IEEE Access, 2025.
+
+Zawalski, M., Chen, W., Pertsch, K., Mees, O., Finn, C., and
+  Levine, S. Robotic control via embodied chain-of-thought
+  reasoning. arXiv preprint arXiv:2407.08693, 2024.
+
+Zeng, X., Xu, Q., Wang, Y., and Xu, C. Hici: Hierarchical
+  construction-integration for long-context attention. arXiv
+  preprint arXiv:2603.20843, 2026.
+
+Zhang, P., Zeng, G., Wang, T., and Lu, W. Tinyllama:
+  An open-source small language model. arXiv preprint
+  arXiv:2401.02385, 2024.
+
+Zhao, Q., Lu, Y., Kim, M. J., Fu, Z., Zhang, Z., Wu, Y.,
+  Li, Z., Ma, Q., Han, S., Finn, C., et al. Cot-vla: Visual
+  chain-of-thought reasoning for vision-language-action
+  models. In Proceedings of the Computer Vision and
+  Pattern Recognition Conference, pp. 1702–1713, 2025.
+
+Zhou, E., Su, Q., Chi, C., Zhang, Z., Wang, Z., Huang, T.,
+  Sheng, L., and Wang, H. Code-as-monitor: Constraint-
+  aware visual programming for reactive and proactive
+  robotic failure detection. In Proceedings of the Com-
+  puter Vision and Pattern Recognition Conference, pp.
+  6919–6929, 2025a.
+
+Zhou, Z., Zhu, Y., Wen, J., Shen, C., and Xu, Y. Chatvla-2:
+  Vision-language-action model with open-world embodied
+  reasoning from pretrained knowledge. arXiv preprint
+  arXiv:2505.21906, 2025b.
+
+                                                               11
+    Sentinel-VLA: A Metacognitive VLA Model with Active Status Monitoring for Dynamic Reasoning and Error Recovery
+
+A     Details of EC-Gen
+A.1   Tasks used by EC-Gen
+We used a total of 44 tasks in the EC-Gen data generation process, including: ”beat the buzz”, ”change channel”,
+”change clock”, ”close box”, ”close door”, ”close fridge”, ”close grill”, ”close jar”, ”close laptop lid”,
+”get ice from fridge”, ”hang frame on hanger”, ”hit ball with queue”, ”insert onto square peg”, ”insert usb in computer”,
+”open door”, ”open microwave”, ”open washing machine”, ”open window”, ”open wine bottle”, ”phone on base”,
+”pick and lift small”, ”place shape in shape sorter”, ”play jenga”, ”pour from cup to cup”, ”put bottle in fridge”,
+”put groceries in cupboard”, ”put item in drawer”, ”put knife in knife block”, ”put knife on chopping board”,
+”put money in safe”, ”put rubbish in bin”, ”scoop with spatula”, ”setup chess”, ”solve puzzle”, ”stack cups”,
+”take lid off saucepan”, ”take off weighing scales”, ”take plate off colored dish rack”, ”take toilet roll off stand”,
+”take tray out of oven”, ”toilet seat down”, ”turn oven on”, ”tv on”, ”water plants”.
+A.2   Status assignment
+When annotating the status for trajectories generated by EC-Gen, we label the first 5 steps of each trajectory as Initial
+Status. The first 5 steps at the beginning of each non-erroneous subtask are labeled as New-subtask Status. The last 10
+steps of the execution subsequence corresponding to the injected error waypoint are labeled as Error Status. All other steps
+are labeled as Normal Status.
+A.3   Error Reflection Generation
+When generating error reflections for the errors we constructed, we use rule-based and template-based methods to generate
+the reflection text based on the error’s type and specific content. For example, when we construct an Object Interaction
+Error where we suppress a ”release gripper” operation that should have occurred at the error waypoint, we read the current
+interactive object ”[object]” and the current subtask ”[subtask]” from RLBench. One of the templates for this scenario is:
+”When executing [subtask], the gripper should be released when the [object] reaches the appropriate position, instead of
+continuing to move while holding it.” We have multiple templates for each error category to ensure the diversity of the
+training data.
+
+
+
+
+                                                            12
+

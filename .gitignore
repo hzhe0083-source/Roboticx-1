@@ -1,0 +1,21 @@
+# 大文件产物(超出 GitHub 大小限制,不入库)
+checkpoints/
+data/
+papers/*.pdf
+logs/
+*.pt
+*.mp4
+*.png
+
+# Python 缓存
+__pycache__/
+.pytest_cache/
+.playwright-mcp/
+*.pyc
+
+# 环境/编辑器
+.venv/
+venv/
+.idea/
+.vscode/
+MUJOCO_LOG.TXT

@@ -1,0 +1,1016 @@
+                                                         WAM4D: Fast 4D World Action Model via
+                                                         Spatial Register Tokens
+                                             Ying Li1,2,∗ , Xiaobao Wei1,3,∗ , Jiajun Cao1,3,† , Hao Wang1 , Xiaowei Chi2 , Chengyu Bai1 , Qianpu
+                                             Sun1 , Jiajun Li1 , Xiaojie Zhang2 , Jian Tang3 , Sirui Han2,‡ , Shanghang Zhang1,3,‡
+                                             1
+                                               Peking University
+                                             2
+                                               The Hong Kong University of Science and Technology
+                                             3
+                                               Beijing Innovation Center of Humanoid Robotics
+                                             ∗
+                                               Equal Contribution, † Project Leader, ‡ Equal Corresponding Author
+arXiv:2606.14048v1 [cs.CV] 12 Jun 2026
+
+
+
+
+                                             World action models (WAMs) have recently shown promise in jointly modeling future observations
+                                             and executable robot actions. However, most existing WAMs still operate in 2D video or latent spaces,
+                                             where visually plausible rollouts miss the 3D spatial constraints and occluded contact geometry required
+                                             for precise manipulation. While geometric foundation models offer strong priors for recovering dense 3D
+                                             structure and motion from visual observations, forcing WAMs to predict the dense 4D representation
+                                             introduces costly geometric decoding and slows down causal action generation. To address the
+                                             trade-off, we present WAM4D, a fast 4D world action model that uses lightweight spatial register
+                                             tokens as training-time future-depth readouts to transfer pretrained geometric priors into a causal
+                                             video-action transformer, then removes the register branch for lightweight action inference. To prevent
+                                             non-causal shortcuts, we further design causal mixture attention for the Mixture-of-Transformers
+                                             (MoT) WAM backbone, defining modality-specific visibility among video, action, and geometry tokens.
+                                             Comprehensive experiments on RoboTwin 2.0 and challenging real-world manipulation tasks show that
+                                             WAM4D improves spatial consistency and achieves competitive action prediction while maintaining
+                                             efficient inference.
+
+                                             Date: June 15, 2026
+                                             Code: https://github.com/myendless1/wam4d
+
+
+                                         Keywords: World Action Model, 4D World Modeling, Robot Manipulation
+
+
+                                         1       Introduction
+                                         World models have been viewed as a foundation for embodied intelligence by predicting how the physical
+                                         environment evolves under interaction (Wan et al., 2025; Yang et al., 2025; Ding et al., 2025). With the
+                                         rapid progress of video generative models, this predictive capability has begun to transfer from general video
+                                         modeling to embodied domains (Chi et al., 2025; Li et al., 2026a,b; Zeng et al., 2026; Chen et al., 2026). As
+                                         robotic simulators of future scene evolution, world models support data generation and policy evaluation (Fan
+                                         et al., 2026; Zhou et al., 2024; Yu et al., 2025; Wu et al., 2026). The generated videos are further converted
+                                         into executable actions using inverse dynamics models.
+                                         VLA policies have become a dominant route for robot control by directly mapping visual observations and
+                                         language instructions to actions (Brohan et al., 2022; Black et al., 2024; Physical Intelligence et al., 2025;
+                                         Cao et al., 2026; Intelligence et al., 2026). However, manipulation is not a simple observation to action
+                                         mapping. It requires reasoning about scene geometry, contacts, and object dynamics. Current VLAs learn
+                                         these factors mainly from action supervision, which leads to weak generalization ability (Zhang et al., 2026).
+                                         Recent spatially grounded VLAs address this issue by injecting 3D inputs or geometric foundation priors into
+                                         policy learning (Qu et al., 2025; Li et al., 2026; Sun et al., 2025; Li et al., 2025; Wang et al., 2026). These
+                                         methods improve the spatial representation of direct policies, but future scene evolution and robot dynamics
+                                         remain implicit in the action prediction objective. Therefore, recent works have turned to world action models
+                                         (WAMs). WAMs extend world models from robotic video generation to joint prediction of future observations
+                                         Previous Works                                                                     Ours
+
+
+
+                                         Width Dim Concat
+             ℰ             ℰ                                                           ℰ                               ℰ           Spatial Registers
+                                                ℰ
+                 Add
+
+
+
+
+                                                                                                        Denoise
+                                                            Denoise
+                                                                            DiT Blocks × (𝑁−𝑀)                                         Depth
+   Denoise
+
+
+
+
+                               Denoise
+                                                                                                                  DiT Blocks × 𝑁
+             DiT Blocks × 𝑁               DiT Blocks × 𝑁                                                                             Blocks × 4
+                                                                            VA DiT         Depth DiT
+                                                                          Blocks × 𝑀       Blocks × 𝑀
+
+                 Project
+                                                𝒟                                                                                     Geometric
+             𝒟             𝒟              Width Dim Split                    𝒟                 𝒟                       𝒟               Decoder
+
+
+
+
+             (a) TesserAct                (b) Kinema4D                           (c) X-WAM                                 (d) WAM4D
+
+Figure 1 Comparison with representative 4D world-action modeling designs. TesserAct projects geometry into a 4D
+scene representation, Kinema4D concatenates geometric and visual tokens, and X-WAM uses modal adaptation for
+explicit RGB-D future synthesis. In contrast, WAM4D distills geometric foundation priors through spatial register
+tokens, then removes the geometry readout for fast action inference. The inverse dynamics model in TesserAct and
+joint action denoising in X-WAM and WAM4D are omitted for clarity.
+
+
+and executable robot actions (Li et al., 2026; Yuan et al., 2026; Team et al., 2026; Zhang et al., 2026). By
+using the priors of video generative foundation models, this end-to-end formulation couples imagination and
+control in one pipeline. It learns an implicit transition model that predicts how the scene and robot may
+evolve from the initial observation and task instruction.
+Despite this progress, most WAMs represent future states in 2D video or latent spaces. Such rollouts are
+useful for learning visual dynamics, but they provide an incomplete physical state for manipulation (Ai et al.,
+2025). Precise manipulation requires reasoning over object extent, occluded surfaces, free space, contacts, and
+robot motion across future steps. A visually plausible rollout hides errors in contact geometry, which directly
+affect spatially precise robotic manipulation. Recent 4D embodied world models address this limitation by
+augmenting future prediction with depth maps, surface normals, point clouds, or point maps (Guo et al.,
+2026; Wang et al., 2026; Xu et al., 2026; Zhen et al., 2025; Tian et al., 2026). These representations make
+predicted futures more aligned with the physical state needed for action inference. However, existing designs
+often treat dense 4D geometry as an explicit inference target. These methods improve reconstruction fidelity
+but require dense geometry decoding or optimization during action inference, which increases deployment
+costs and latency. More fundamentally, explicit 4D prediction may shift the WAM objective toward geometric
+reconstruction. Current methods do not ensure that geometric priors strengthen the causal coupling between
+video prediction and action generation.
+To address these issues, we propose WAM4D, a fast 4D world action model that uses spatial register tokens as
+a compact bridge between 2D WAM latents and geometric priors. WAM4D uses geometry as a training-time
+readout target rather than an additional sensory input or inference-time output: spatial registers query history
+video tokens, decode depth through a pretrained geometric head, and backpropagate the depth loss into the
+history video features used for action prediction. At deployment, the geometric head and depth readout are
+removed, so the policy keeps the same lightweight 2D observation-to-action interface.
+Our main contributions are:
+     • We propose WAM4D, a fast 4D world action model that brings geometric foundation priors into a causal
+       video-action model through a compact spatial-register interface.
+     • We design causal mixture attention for Mixture-of-Transformers (MoT). It defines visibility across
+       video, action and spatial register tokens, enabling geometry supervision during training and lightweight
+       inference at deployment.
+
+
+                                                                      2
+    • We evaluate WAM4D on RoboTwin 2.0 and real-world long-horizon tasks. Experiments show improved
+      spatial consistency and success rates while preserving efficient causal action inference.
+
+
+2     Related Work
+Embodied World Models. Video generative models have made strong progress in modeling temporal visual
+dynamics (Ho et al., 2022; Blattmann et al., 2023; Wan et al., 2025; Yang et al., 2025; Seedance et al., 2026).
+This progress has motivated embodied world models that use video generation as learned simulators for
+interactive environments (Chi et al., 2025; Li et al., 2026a,b; Zeng et al., 2026; Chen et al., 2026). Several
+works learn interactive world models from mixed embodied data and Internet videos (Yang et al., 2023;
+Yin et al., 2026). Other works predict robotic videos and convert them into actions with inverse dynamics
+models (Du et al., 2023; Zhou et al., 2024; Wang et al., 2025). These works show that video priors can model
+future scene evolution, but future prediction and action generation are separated. Recent world action models
+(WAM) jointly model future observations and executable robot actions (Wang et al., 2026; Bi et al., 2025;
+Team et al., 2026; Li et al., 2026; Yuan et al., 2026; Guo et al., 2026). In contrast, WAM4D uses lightweight
+spatial registers to transfer 4D geometric priors into video-action representations.
+Geometric Foundation Models. Explicit geometry provides important priors for embodied perception and
+control. One line of work represents scenes with optimized 3D structures, such as neural radiance fields and 3D
+Gaussian primitives, which support view synthesis, planning, data generation, and manipulation (Mildenhall
+et al., 2020; Kerbl et al., 2023; Ze et al., 2023; Lu et al., 2024; Shorinwa et al., 2024; Duan et al., 2024; Huang
+et al., 2024; Wei et al., 2025, 2026). Another line develops feed-forward geometric foundation models that
+recover depth, point maps, camera poses, and dense correspondence directly from images (Wang et al., 2024,
+2025; Lin et al., 2025; Wang et al., 2025; Wei et al., 2025; Wang et al., 2025; Wu et al., 2026; Wang et al.,
+2026). These models enable scalable geometric supervision from large-scale robot videos. Recent embodied
+world models further inject geometry into future prediction by generating RGBD videos, normals, point maps,
+3D trajectories, or 4D robot world interactions (Zhen et al., 2025; Shen et al., 2026; Huang et al., 2026; Yang
+et al., 2026; Xu et al., 2026; Tian et al., 2026; Tu et al., 2026). Collectively, these methods indicate that
+explicit geometry improves physical consistency and spatial reasoning. However, they often require geometry
+to appear as an input, output, or reconstructed scene state during generation. WAM4D instead uses future
+depth as a training signal through spatial registers.
+Robotic Manipulation Policy. Robot manipulation policies commonly learn a direct mapping from observations
+to actions. Early methods model action sequences from demonstrations (Zhao et al., 2023; Chi et al., 2025).
+Recent policies scale this paradigm with large language models. RT series formulate robot control as sequence
+prediction over visual, language, and action tokens (Brohan et al., 2022; Zitkovich et al., 2023). Several works
+provide open generalist policies trained on large robot datasets (Kim et al., 2024; Team et al., 2024; Liu et al.,
+2026). Pi series further improve cross embodiment generalization with larger training mixtures and stronger
+action modeling (Liu et al., 2025; Black et al., 2024; Physical Intelligence et al., 2025; Intelligence et al.,
+2026). Recent spatially grounded VLAs further improve action prediction by injecting geometric foundation
+priors (Qu et al., 2025; Li et al., 2026; Sun et al., 2025; Li et al., 2025; Wang et al., 2026). However, they
+usually learn geometry, contacts, and dynamics only through action labels. In contrast, WAMs turn video
+generative models into robot policies by jointly modeling future observations and executable actions.
+
+
+3     Method
+3.1    WAM4D Backbone
+WAM4D builds on the causal video-action backbone of LingBot-VA (Li et al., 2026). At decision step t, the
+model conditions on a language instruction l, multi-view RGB history, and a queue of historical actions. Let
+Othist denote the history RGB mosaic sequence, Otfut the future RGB targets used during training, and ai:j
+the action sequence from step i to j. With historical action length La and action prediction horizon Ha , the
+causal context is
+                                         Ct = {l, Othist , at−La :t−1 },                                   (1)
+
+
+
+                                                        3
+                     WAM4D Model Structure                                                 Causal MoT Attention
+    History          History RGB                                                               VA Self Attention
+    Actions          (multi-view)        Spatial Registers
+                                                                                           K
+                                                                                       Q
+                                                                                   𝑧𝑡−2
+      Video-Action MoT                   Depth Extraction         Depth            𝑧𝑡−1
+          Backbone                           Module              Features
+                                                                                    𝑧𝑡
+         VA Block 1                       Depth Block 1
+                                                                                   𝑧𝑡+1
+         VA Block 2                       Depth Block 2                            𝑧𝑡+2
+                 …                                                                 𝑧𝑡+3
+         VA Block n                       Depth Block 3
+                 …                                                                 𝑎𝑡−1
+         VA Block 30                      Depth Block 4                            𝑎𝑡
+
+                                                                                                       Depth Cross Attention
+                                         …               Pretrained                        K
+                                                       Geometric Head                  Q
+                                                                                   𝑑𝑡+1
+                                                                                   𝑑𝑡+2
+                                                                                   𝑑𝑡+3
+ Future Action           Future Video                Future Geometry
+
+
+Figure 2 WAM4D architecture and causal visibility pattern.
+
+
+where future RGB frames and future actions are prediction targets rather than additional causal inputs. The
+noised future video and action tokens are still included in the transformer sequence only as flow-matching
+states, so that the model can predict their corresponding flow targets.
+For the video stream, a video VAE encodes the RGB sequence and splits the resulting latents into history
+tokens and clean future targets:
+                                  [Zhist  fut         hist
+                                                           , Otfut ] .                               (2)
+                                                                    
+                                    t , Zt ] = Evae [Ot
+
+During flow-matching training, the future video tokens fed to the backbone are noised states of these clean
+future targets, denoted as Z̃fut
+                             t .
+
+The action stream is embedded in the same way:
+
+                                        Ahist
+                                         t    = Ea (at−La :t−1 ),           Ãfut
+                                                                              t = Ea (ãt:t+Ha −1 ),                           (3)
+
+where Ea is a lightweight action embedding layer, and ãt:t+Ha −1 denotes the flow-matching state of the future
+action chunk.
+WAM4D then follows causal WAMs (Li et al., 2026) by jointly modeling future video latents and future
+actions in one video-action token sequence:
+                                                     (0)
+                                                  Xt       = [Zhist  fut  hist  fut
+                                                               t , Z̃t , At , Ãt ].                                           (4)
+
+The sequence is processed by a video-action Mixture-of-Transformers (MoT) backbone:
+                                                                 
+                                      (ℓ+1)               (ℓ)
+                                    Xt      = VABlockℓ Xt ; MVA ,                                                              (5)
+
+where MVA is the causal visibility mask for the main video-action stream. The video and action heads predict
+flow targets for the noised future video and action tokens, respectively. The clean future video latents Zfut
+                                                                                                          t
+and the clean future action chunk at:t+Ha −1 are used to construct the corresponding training targets.
+This main video-action path follows the causal WAM formulation, while our contribution lies in attaching a
+training-time geometry readout to its intermediate history video features.
+
+
+
+
+                                                                        4
+3.2    Spatial Register Distillation
+We introduce spatial register tokens as learnable geometry queries that extract future geometric information
+from causal video features. Before being fed into the depth branch, a shared register grid is copied over the
+future depth timesteps and aligned with the multi-view RGB mosaic. Since multi-camera observations are
+tiled into a single RGB canvas before VAE encoding, each register corresponds to a spatial region in the
+mosaic.
+Let R⋆ denote the learnable register grid, and let Tt denote the future depth supervision timesteps paired
+with the prediction targets. The input registers are constructed as
+
+                                            R0t = Repeatτ ∈Tt (R⋆ ) .                                         (6)
+
+Each copied register is associated with a target timestep and a mosaic pixel position.
+Let Rℓt denote the register tokens at layer ℓ, and let Zhist,ℓ
+                                                          t    denote the valid history video tokens from the
+video-action backbone at the same layer. At selected layers ℓ ∈ Lr , the registers are updated by a depth
+extraction block. The registers serve as queries, while the key-value set contains the registers themselves and
+history video tokens:
+                            Rℓ+1   = DepthBlockℓ Q = Rℓt , K, V = [Rℓt , Zhist,ℓ                             (7)
+                                                                                  
+                              t                                             t    ] .
+A standard RoPE encoding is applied inside the block using the target timestep and mosaic coordinates of
+the register and video tokens. This update combines self-attention among registers with cross-attention from
+registers to history video features.
+The updated register features are projected to the input space of a pretrained geometric head:
+
+                                Gt = Pg {Rℓ+1               D̂fut                                             (8)
+                                                      
+                                             t  }ℓ∈Lr ,       t = Gϕ (Gt ).
+
+
+Here Pg is a lightweight projection layer, and Gϕ is the pretrained geometric head. The output D̂fut
+                                                                                                 t   is the
+predicted future depth sequence.
+The register branch is used only during training. It predicts future depth from history video features, and the
+depth loss backpropagates into the shared video-action backbone. By requiring future depth to be decoded
+from these register features, the pretrained geometric teacher distills its spatial priors into the history video
+features used by the backbone.
+Our default readout places depth blocks after layers 12, 14, 16, and 18, and initializes the geometric head
+from Depth Anything V3 (Lin et al., 2025).
+
+3.3    Causal Mixture Attention
+The model structure and causal visibility rules are summarized in Fig. 2. Text instructions are injected
+through cross attention and are visible to both video and action tokens. The main video-action stream follows
+a causal visibility pattern centered on future action prediction. At each denoising step, future action tokens
+can attend to history video tokens, history action tokens, and their own noised future action tokens. This
+gives the action predictor access to the causal observation and action context, while still allowing interaction
+among the action tokens being denoised.
+To avoid non-causal shortcuts, future action tokens are masked from future video tokens and spatial registers.
+The future video tokens remain prediction targets for the video objective, rather than causal inputs for action
+generation. Spatial registers are also kept outside the policy path. They attend only to themselves and
+valid history video tokens, so the depth objective can shape causal video features without exposing auxiliary
+geometry tokens to the action predictor.
+At inference, registers, depth blocks, and the geometric head are removed. The model reduces to a pure
+observation-to-action generation path. Training and inference paths are shown in Fig. 3.
+
+
+
+
+                                                       5
+ History Future History Future                                                    Observation Queue
+  RGB     RGB Actions Actions    Spatial Registers                                                          VA Backbone
+                                                                                                                      KV-cache
+
+
+   Video-Action Diffusion        Depth Blocks           Pretrained
+          Blocks                     ×4               Geometric Head            History Action
+
+
+    ℒvideo + λact ℒ action       Depth Features × 4   λdepth ℒdepth
+                                                                                       Execution        Action Prediction Only
+                Multi-Modal Joint Optimization                                        Light-weight Policy Inference
+Figure 3 Training and inference paths of WAM4D.
+
+
+3.4     Training Objective
+The main video-action stream is trained with the conditional flow matching objective of the base causal
+WAM (Li et al., 2026). We denote the future-video and future-action losses as Lvideo and Laction , respectively.
+For geometry distillation, future depth is supervised with a SmoothL1 loss. Let Tt = {t + 1, . . . , t + Hv } be
+the set of future depth indices, where Hv matches the future video horizon. Let D̂τ,p and Dτ,p denote the
+predicted and target depth at time τ and pixel p. Let Ωτ denote the set of valid depth pixels.
+                                          1        X X                        
+                           Ldepth = P                     SmoothL1 D̂τ,p , Dτ,p .                             (9)
+                                       τ ∈Tt |Ωτ |             τ ∈Tt p∈Ωτ
+
+
+The final objective is
+                                               L = Lvideo + λact Laction + λdepth Ldepth .                                (10)
+We set λact = 1 and λdepth = 1. The depth loss updates the video-action backbone, spatial registers, depth
+blocks, projection layer, and geometric head.
+
+3.5     Implementation Details
+Frame sampling strategy. The video-action backbone is initialized from the pretrained LingBot-VA base
+model and uses the Wan2.2 video VAE. We sample at most 17 frames from each sequence. A start frame id is
+randomly sampled over the sequence; when enough preceding frames are available, the history context contains
+1, 5, or 9 frames. After the start frame, 8 video-prediction target frames are sampled every 4 collected steps
+to match the VAE temporal stride. If the remaining sequence is shorter than 8 target frames, the targets are
+padded to length 8. For the latent video loss, only slots that can be encoded as valid VAE latents contribute
+to the loss, and latent slots containing padding frames are masked. Depth targets use the same timestamps as
+the sampled video targets; unlike the latent-level video loss, depth supervision is frame-level, so every valid
+depth frame contributes to the depth loss. The default action chunk size is 32. For RoboTwin and AstriBot
+S1 experiments, the input is represented as a three-view mosaic consisting of one head camera and two wrist
+cameras. The main view is resized to 256 × 320, and each wrist view is resized to 128 × 160.
+Action Prediction. The policy predicts only the absolute end-effector poses of the left and right arms. Each
+arm is represented by a 3D position, a quaternion, and one gripper open/close value, giving a 16-dimensional
+action vector in total. Position channels are normalized with percentile-based min–max normalization, i.e.,
+quantile min–max normalization, using dataset-level q01 and q99 statistics. Quaternion and gripper-opening
+channels use fixed lower and upper bounds of −1 and 1. All normalized action channels are represented in the
+range [−1, 1].
+View layout strategy. Spatial registers are aligned with the pixel layout of the mosaic. Given the VAE spatial
+stride of 16 and the WAM transformer’s 2 × 2 latent grouping, each register corresponds to a 32 × 32 cell
+in the input image. The main view contributes an 8 × 10 register grid, each wrist view contributes a 4 × 5
+register grid, and the tiled three-view mosaic forms a 12 × 10 register grid per future depth frame. With 8
+future-indexed depth frames, the default three-view model uses 960 spatial register tokens. Unless stated
+otherwise, register cross-attention is applied after transformer layers 12, 14, 16, and 18. Registers attend only
+to valid history video tokens and registers themselves, not to action tokens or future-video tokens.
+
+
+                                                                       6
+Geometric readout. The geometric readout uses a pretrained DA3-GIANT-1.1 any-view DualDPT head. Four
+learned linear adapters map WAM hidden states to the input dimension of the geometric head.
+Attention mask. The transformer sequence is partitioned into history-video tokens, future-video noise tokens,
+history-action tokens, future-action noise tokens, and register tokens. The allowed self-attention pattern is:
+
+                       Query token group     Allowed key/value token groups
+                       Future action noise   History video, history action, future action noise
+                       Register              Register, history video
+                       Future video noise    History video, future video noise
+                       History video         History video
+                       History action        History action
+
+Inference procedure. At deployment, the geometry path is removed and the policy maintains an observation
+queue and an executed-action history. The inference loop is:
+
+    Algorithm 1: Deployment inference loop
+     1 Qobs ← ∅, Ahist ← ∅
+     2 while policy is running do
+     3     if Qobs = ∅ then capture the current observation and enqueue it into Qobs
+     4     Encode Qobs with the VAE to obtain video-context latents
+     5     Replace the video portion of the KV cache with the context latents
+     6     if Ahist ̸= ∅ then encode it and fill the action KV cache
+     7     Denoise future action tokens to obtain an action chunk
+     8     Execute the action chunk
+     9     During execution, capture one observation every 4 actions and enqueue it into Qobs
+    10     Ahist ← executed actions
+    11 end while
+
+Training Hyperparameters. Unless stated otherwise,√ the loss weights are set to λact = 1 and λdepth = 1.
+Training uses AdamW with learning rate 2 × 10−5 N , where N is the number of machines used for multi-
+machine parallel training, 10 warmup steps, gradient clipping at 2.0, bf16 parameters, a 50k-step budget for
+the main experiments, and a 10k-step budget for ablation experiments.
+
+
+4     Experiments
+4.1     Experimental Setup
+Datasets and Tasks. We evaluate WAM4D across simulation control, video and geometry quality, and
+real-world manipulation.
+RoboTwin 2.0. A unified policy is trained on the complete RoboTwin 2.0 task suite. The clean setting
+comprises relatively uncluttered scenes, whereas the randomized setting introduces variation in clutter,
+illumination, background, tabletop height, object placement, and language instruction. Geometry-supervised
+training uses re-collected RoboTwin demonstrations with depth annotations. Each task contains 50 clean
+trajectories and 500 randomized trajectories.
+Real-world tasks. Real-world evaluation is conducted on the AstriBot S1 robot across four manipulation tasks:
+plate lifting, bottle placement, pen cap removal, and LEGO sorting. The dataset contains 100 demonstrations
+per task, yielding 400 demonstrations in total. Each method is evaluated with 10 physical rollouts per task.
+Depth supervision for real-world demonstrations is likewise obtained with Depth Anything 3 following the
+same offline pseudo-depth pipeline.
+Baselines.
+The RoboTwin evaluation compares WAM4D with VLA baselines (π0 , π0.5 ) and recent video-action models,
+including Motus, LingBot-VA, and Fast-WAM. Whenever possible, reproduced baselines use the same training
+and evaluation splits. They also follow the same camera configuration and training budget. For latency
+
+
+
+                                                          7
+Table 1 RoboTwin 2.0 full-task success rate. Action genera- Table 2 Real-robot sub-action success over 10 rollouts
+tion latency and VRAM are reported.                         per task.
+
+                                                    Latency     VRAM                      Plate Bottle     Blocks     Pen
+ Method              Clean Rand. Avg.                                        Method                                         Avg.
+                                                     (ms)       (GiB)
+                                                                                           S1    S1      S1 S2 S3 S1 S2
+ π0                    65.9       58.4   62.2   64.16 ± 0.06     8.45
+ π0.5                  82.7       76.8   79.8   72.03 ± 0.06     8.45        π0.5          1.0   0.8     0.7 0.6 0.5 0.8 0.8 0.74
+ Motus                 88.7       87.0   87.9 1516.30 ± 10.64   11.55        LingBot-VA    1.0   1.0     1.0 0.7 0.4 0.9 0.9 0.84
+ LingBot-VA            92.9       91.6   92.3 843.57 ± 11.55    12.97        Fast-WAM      0.9   1.0     0.8 0.7 0.5 0.9 0.8 0.80
+ Fast-WAM              91.9       91.8   91.8 425.53 ± 6.01     11.55
+                                                                             WAM4D         0.9   0.9     1.0 0.9 0.8 0.9 0.9 0.90
+ WAM4D                 93.8       89.9   91.8   525.43 ± 5.64    9.71
+
+
+                                          Initial                           Interaction                Completion
+        “Lift the white plate.”
+             Pick-and-place ·S1
+
+   “Collect the chemical bottles
+    and place them in the box.”
+      Collision-aware placement ·S1–S2
+
+         “Pick up the pen and
+           remove the cap.”
+   Precision contact ·Bimanual ·S1–S2
+
+   “Sort the LEGO bricks into
+   boxes of matching colors.”
+  Color grounding ·Long-horizon ·S1–S3
+
+
+Figure 4 Real-world tasks on the AstriBot S1 platform.
+
+
+comparisons, all models use 10 action-denoising steps, and video-action models use 5 video-denoising steps
+when applicable. The deployment configuration of WAM4D removes the geometry path and performs action
+prediction only.
+Metrics.
+Policy performance is reported as the fraction of successful rollouts. For real-world tasks, sub-action success
+records whether each task-specific intermediate goal is completed.
+Video quality is evaluated with FVD, PSNR, SSIM, and LPIPS. FVD measures the distribution gap between
+generated and ground-truth videos in a learned video-feature space; lower values indicate more realistic
+temporal generation. PSNR measures pixel-level reconstruction fidelity, SSIM measures structural image
+similarity, and LPIPS measures perceptual distance in deep visual features.
+Depth quality is evaluated with AbsRel and threshold accuracy δ1 and δ2 with respect to the available
+reference depth. AbsRel is the mean relative absolute depth error, so lower is better. δ1 and δ2 report the
+fraction of pixels whose predicted depth is within fixed multiplicative error thresholds of the target depth, so
+higher is better.
+For point-cloud metrics, predicted and target depth maps are back-projected using a fixed dataset-level camera
+intrinsic matrix. This protocol yields comparable point clouds for all methods. CD1 and CD2 denote L1
+and L2 Chamfer Distance variants between predicted and target point clouds. F-score measures thresholded
+point-cloud overlap with the target geometry, while F-score-T measures the temporal consistency of this
+overlap across predicted future frames.
+
+4.2       Simulation Results on RoboTwin 2.0
+We evaluate WAM4D on the full RoboTwin 2.0 task suite and report the average success rate over 50 tasks
+under both clean and randomized settings. The full per-task success rates are reported in Tab. 3. We compare
+WAM4D with strong VLA baselines and recent video-action models. The overall success rate is reported in
+Tab. 1. WAM4D achieves competitive performance while maintaining low inference cost. For a fair comparison,
+
+
+                                                                        8
+latency is measured under a unified inference setting with 10 action denoising steps and 5 video denoising
+steps for all applicable models. VRAM is reported as the peak allocated memory of the video-action backbone
+during inference.
+Full per-task results. We evaluate WAM4D on the full RoboTwin 2.0 task suite and compare it with advanced
+baselines, including Fast-WAM, LingBot-VA, π0 , π0.5 , and Motus. Table 3 reports the per-task success rates
+over 50 tasks under both Easy and Hard settings, corresponding to the clean and randomized evaluation
+protocols, respectively. This full table complements the aggregate results in Tab. 1 and shows the task-level
+behavior of each method.
+Table 3 Per-task RoboTwin 2.0 success rates. All entries are percentages. Easy and Hard correspond to the clean and
+randomized settings, respectively. Baseline results are taken from the full LingBot-VA RoboTwin 2.0 report (Li et al.,
+2026) and the Fast-WAM paper (Yuan et al., 2026).
+
+ Simulation Task              Horizon    WAM4D      Fast-WAM LingBot-VA               π0          π0.5       Motus
+                                        Easy Hard Easy Hard Easy Hard Easy Hard Easy Hard Easy Hard
+ Adjust Bottle                   1      100   99     100       100    90    94   99        95   100    99    89    93
+ Beat Block Hammer               1       99   97      99        97    96    98   79        84    96    93    95    88
+ Blocks Ranking RGB              3      100   97     100       100    99    98   80        63    92    85   99     97
+ Blocks Ranking Size             3       98   84      94        98    94    96   14         5    49    26    75    63
+ Click Alarmclock                1      100   100    100       100    99   100   77        68    98    89   100   100
+ Click Bell                      1      100   100    100       100   100   100   71        48    99    66   100   100
+ Dump Bin Bigbin                 1      92    94      97        96   89     96   88        83    92    97    95    91
+ Grab Roller                     1      100   100    100       100   100   100   98        94   100   100   100   100
+ Handover Block                  2      96     93     95        81    99   78    47        31    66    57    86    73
+ Handover Mic                    2      94    94      99       100    94    96   97        97    98    97    78    63
+ Hanging Mug                     2       64    57     58        62    40    28   14        11    18    17   38     39
+ Lift Pot                        1      100   88     100       100   100    99   80        72    96    85    96    99
+ Move Can Pot                    1       96    97     90        88   94     97   68        48    51    55    34    74
+ Move Pillbottle Pad             1      100    99    100        99    99    99   67        46    84    61    93    96
+ Move Playingcard Away           1      100   100    100       100   100    99   74        65    96    84   100    96
+ Move Stapler Pad                1      79    76      77        64    91    79   41        24    56    42    83    85
+ Open Laptop                     1      100   66      98       100   92     94   71        81    90    96    95    91
+ Open Microwave                  1      61    65      62        45    82    86    4        32    34   77     95    91
+ Pick Diverse Bottles            2      98     92     80        85    89    82   69        31    81    71    90    91
+ Pick Dual Bottles               2      100    99    100        96   100   99    59        37    93    63    96    90
+ Place A2B Left                  1       97   86      95        93    97    93   43        47    87    82    82    79
+ Place A2B Right                 1      94    79      93        99    97    95   39        34    87    84    90    87
+ Place Bread Basket              1      93     97     91        93    97    95   62        46    77    64    91    94
+ Place Bread Skillet             2      93    87      90        93   95     90   66        49    85    66    86   83
+ Place Burger Fries              2      96    97      96        99    97    95   81        76    94    87    98    98
+ Place Can Basket                2       87   83      71        69    81    84   55        46    62   62     81    76
+ Place Cans Plasticbox           2      100   100     99        96   100    99   63        45    94    84    98    94
+ Place Container Plate           1      98    91      96       100    99    97   97        92    99    95    98    99
+ Place Dual Shoes                2      96     97     94        88    94    89   59        51    75    75    93    87
+ Place Empty Cup                 1      100   100    100       100   100   100   91        85   100    99    99    98
+ Place Fan                       1      100   95      96        96    99    93   66        71    87    85    91    87
+ Place Mouse Pad                 1       96    97     83        89    93    96   20        20    60    39   66     68
+ Place Object Basket             2      88     90     89        88    91    88   67        70    80    76    81    87
+ Place Object Scale              1       99    97     90        97    96    95   57        52    86    80    88    85
+ Place Object Stand              1      98    100     90        94    99    96   82        68    91    85    98    97
+ Place Phone Stand               1      94    81      97        99   97     97   49        53    81    81    87   86
+ Place Shoe                      1      100    99     96        99    98    98   76        76    92    93    99    97
+ Press Stapler                   1       97   94      90        97    85    82   44        37    87    83   93     98
+ Put Bottles Dustbin             3      87    85      95        90    87   91    65        56    84    79    81    79
+ Put Object Cabinet              2      81    53      94        89    85    87   73        60    80    79    88    71
+ Rotate QRcode                   1      95    95      93        89    96    91   74        70    89    87    89    73
+ Scan Object                     2      92    68      89       92     96    91   55        42    72    65    67    66
+ Shake Bottle Horizontally       1      100   99     100       100   100   99    98        92    99    99   100    98
+ Shake Bottle                    1      100   99     100       100   100    97   94        91    99    97   100    97
+ Stack Blocks Three              3      98    97      95        97    99    98   72        52    91   76     91    95
+ Stack Blocks Two                2      100   100    100       100   100    98   93        79    97   100   100    98
+ Stack Bowls Three               3      83    84      80        81    86    83   77        75    77    71    79    87
+ Stack Bowls Two                 2      96    95      92        98    94   98    94        95    95    96    98    98
+ Stamp Seal                      1       96   87      90        94    96    97   46        33    79    55    93    92
+ Turn Switch                     1      60    64      61        59   44     45   41        42    62    54    84    78
+ Average (50 tasks)              –      93.82 89.86 91.88 91.78 92.90 91.50 65.92 58.40 82.74 76.76 88.52 87.04
+
+
+
+
+                                                           9
+      Input Image   Query Frame 0     Attn Map      Query Frame 24     Attn Map     Query Frame 2    Attn Map
+
+
+
+
+      Input Image   Query Frame 0     Attn Map      Query Frame 0      Attn Map     Query Frame 28   Attn Map
+
+
+
+
+Figure 5 Spatial register attention on RoboTwin randomized samples.
+
+
+4.3      Real-World Results
+We evaluate WAM4D on the AstriBot S1 platform using four different manipulation scenarios. Fig. 4 illustrates
+the evaluation setup, and the sub-action definitions are reported in Tab. 4. The quantitative results are
+reported in Tab. 2. WAM4D achieves the best overall performance across all four real-robot evaluations,
+demonstrating its robustness in contact-rich, geometry-sensitive, and long-horizon manipulation. LingBot-VA
+shows lower success rates in these settings. In its default code implementation, action predictions are anchored
+to the initial action history, which can cause global trajectory drift when the initial configuration changes. Its
+long history window may further introduce stale action information that conflicts with the current observation,
+reducing reliability during precise contact and long-horizon execution. In our tests, π0.5 and Fast-WAM show
+a narrower effective workspace, failing more often when object positions move farther from the nominal region.
+Sub-action definitions. Table 4 defines the sub-actions used for real-robot evaluation on the AstriBot S1
+platform. During each rollout, a sub-action is counted as successful when the robot completes the corresponding
+intermediate goal. Because the tasks are sequential, if any sub-action fails, subsequent sub-actions are not
+attempted and are recorded as 0.
+
+Table 4 Sub-action definitions for the AstriBot S1 real-world tasks.
+
+                     Task      Step Success criterion
+                     Plate   S1      Grasp and lift the white plate.
+                             S1      Grasp a chemical bottle.
+                     Bottles
+                             S2      Place the grasped bottle into the tray.
+                             S1      Place the first colored Lego block into its matching box.
+                     Lego    S2      Place the second colored Lego block into its matching box.
+                             S3      Place the third colored Lego block into its matching box.
+                             S1      Grasp the pen.
+                     Pen
+                             S2      Remove the pen cap from the pen.
+
+
+
+4.4      Model Analysis and Ablations
+All ablations use the same data, backbone size, history length, action horizon, optimizer, and training budget
+unless stated otherwise. Each comparison controls all variables except the component under study. We
+therefore evaluate both generation quality and control performance, since a lower depth loss alone does not
+show that geometry improves manipulation. The ten-task split and full ablation metrics are reported in Tab. 5
+and Tab. 6.
+
+
+
+                                                         10
+Ablation split and full metrics.
+
+Table 5 RoboTwin ten-task split used for model-analysis ablations.
+
+                                            Simulation Task             Horizon
+                                            Handover Block                2
+                                            Hanging Mug                   2
+                                            Move Stapler Pad              1
+                                            Open Microwave                1
+                                            Pick Diverse Bottles          2
+                                            Place Can Basket              2
+                                            Press Stapler                 1
+                                            Put Object Cabinet            2
+                                            Stack Bowls Three             3
+                                            Turn Switch                   1
+
+
+
+Table 6 Per-task success rates and full ablation metrics for the RoboTwin ten-task runs.
+
+ Metric / Task                    No Depth Bi-dir    Deep      Middle Shallow Uniform VAE DH Rand. DA3 Train. DA3
+ Transformer Params                5.089B   5.841B 5.690B 5.690B 5.690B           5.690B   5.744B   5.690B   5.690B
+ Clean SR (100-eval tasks)         71.7%    76.6% 74.5% 75.2% 72.5%               70.6%    70.7%    70.0%    80.1%
+ Randomized SR (100-eval tasks)    69.1%    72.5% 67.4% 69.7% 66.2%               67.0%    68.6%    74.8%    75.4%
+ Video metrics
+ FVD ↓                             181.2    175.3    171.5     179.8     168.8    175.3    178.0    189.8     164.5
+ PSNR ↑                            20.39    20.75    20.63     20.67     21.19    20.57    20.72    20.22     21.13
+ SSIM ↑                            0.795    0.798    0.797     0.798     0.808    0.798    0.802    0.794     0.811
+ LPIPS ↓                           0.165    0.155    0.158     0.159     0.143    0.162    0.153    0.162     0.143
+ Depth and point-cloud metrics
+ δ1 ↑                                       0.916     0.931     0.945   0.940      0.941    0.901    0.941    0.948
+ δ2 ↑                                       0.952     0.963    0.972     0.971     0.971   0.950     0.973    0.974
+ AbsRel ↓                                    0.074   0.064     0.053    0.058      0.058    0.081    0.059    0.049
+ CD1 ↓                               –      0.0151   0.0130    0.0108   0.0128    0.0121   0.0171   0.0129   0.0099
+ CD2 ↓                                      0.0007   0.0005    0.0004   0.0005    0.0005   0.0009   0.0005   0.0003
+ F-score ↑                                  0.579     0.621    0.685    0.613      0.652    0.519    0.589    0.710
+ F-score-T ↑                                0.769     0.776    0.825    0.784      0.824    0.685    0.737    0.848
+ Clean
+ Handover Block                    97/100   98/100 100/100 98/100 100/100         98/100   99/100   78/100   100/100
+ Hanging Mug                       58/100   57/100 82/100 79/100 56/100           53/100   60/100   45/100    85/100
+ Move Stapler Pad                  66/100   69/100 69/100 67/100 76/100           56/100   51/100   49/100   65/100
+ Open Microwave                    39/100   69/100 45/100 53/100 44/100           50/100   40/100   53/100   78/100
+ Pick Diverse Bottles              94/100   92/100 91/100 90/100 91/100           91/100   93/100   93/100   94/100
+ Place Can Basket                  68/100   72/100 67/100 81/100 64/100           60/100   77/100   69/100   75/100
+ Press Stapler                     95/100   94/100 94/100 96/100 93/100           95/100   99/100   92/100   97/100
+ Put Object Cabinet                54/100   52/100 55/100 46/100 47/100           49/100   48/100   66/100   87/100
+ Stack Bowls Three                 78/100   85/100 77/100 81/100 88/100           81/100   79/100   70/100   74/100
+ Turn Switch                       68/100   78/100 65/100 61/100 66/100           73/100   61/100   85/100   46/100
+ Average (Clean)                   71.7%    76.6% 74.5% 75.2% 72.5%               70.6%    70.7%    70.0%     80.1%
+ Randomized
+ Handover Block                    75/100   95/100   79/100    81/100   70/100    77/100   72/100   97/100   97/100
+ Hanging Mug                       66/100   69/100   72/100    64/100   66/100    71/100   72/100   79/100   81/100
+ Move Stapler Pad                  61/100   46/100   49/100    55/100   58/100    54/100   57/100   49/100   49/100
+ Open Microwave                    41/100   78/100   34/100    53/100   35/100    31/100   44/100   80/100   79/100
+ Pick Diverse Bottles              80/100   89/100   91/100    87/100   80/100    88/100   80/100   90/100   89/100
+ Place Can Basket                  75/100   72/100   72/100    68/100   74/100    71/100   73/100   72/100   75/100
+ Press Stapler                     94/100   95/100   93/100    95/100   94/100    94/100   95/100   97/100   98/100
+ Put Object Cabinet                43/100   47/100   47/100    48/100   45/100    45/100   51/100   49/100   37/100
+ Stack Bowls Three                 88/100   75/100   85/100    82/100   75/100    80/100   81/100   79/100   87/100
+ Turn Switch                       68/100   59/100   52/100    64/100   65/100    59/100   61/100   56/100   62/100
+ Average (Randomized)              69.1%    72.5%    67.4%     69.7%    66.2%     67.0%    68.6%    74.8%    75.4%
+
+
+Model-analysis ablations are conducted on a fixed ten-task subset of RoboTwin 2.0 to maintain computational
+tractability while preserving diverse manipulation requirements. The split covers single-step and multi-step
+tasks involving hanging, articulated-object interaction, contact pressing, placement, handover, object selection,
+
+
+                                                              11
+Table 7 Ablation of depth readout interface, register placement, and register visibility on the RoboTwin 10-task split
+with the depth head fixed. Selected quality metrics are reported.
+
+ Variant                 Depth Readout            Layers       Clean SR FVD ↓ PSNR ↑ LPIPS ↓ AbsRel ↓ δ1 ↑ CD1 ↓ F-score ↑ F-score-T ↑
+ No depth                None                       –            71.7   181.2   20.39   0.165                       –
+ VAE depth head          Future video hiddens 27, 28, 29, 30     70.7   178.0   20.72   0.153   0.081   0.901 0.0171    0.519   0.685
+ Shallow registers                               2, 4, 6, 8      72.5   168.8   21.19   0.143   0.058   0.940 0.0128    0.613   0.784
+ Middle registers                             12, 14, 16, 18     75.2   179.8   20.67   0.159   0.053   0.945 0.0108    0.685   0.825
+ Deep registers          Spatial registers    22, 24, 26, 28     74.5   171.5   20.63   0.158   0.064   0.931 0.0130    0.621   0.776
+ Uniform registers                             6, 12, 18, 24     70.6   175.3   20.57   0.162   0.058   0.941 0.0121    0.652   0.824
+ Bidirectional registers                       6, 12, 18, 24     76.6   175.3   20.75   0.155   0.074   0.916 0.0151    0.579   0.769
+
+
+
+
+and stacking. Table 5 lists the tasks and horizons used by all ablation runs. Table 6 consolidates per-task
+success rates, model size, and full video/geometry metrics for the nine ten-task ablation runs. No Depth
+is an otherwise identical model trained under the same conditions without any depth branch or depth loss.
+VAE DH discretizes depth into 0–255 values and uses the VAE as a depth head to decode depth latents; its
+depth readout is taken from the output of the layer-26 VA block. All remaining variants use Spatial Registers
+as the depth readout interface. For the layer configurations, Shallow, Middle, Deep, and Uniform registers
+insert cross-attention after layers 2/4/6/8, 12/14/16/18, 22/24/26/28, and 6/12/18/24, respectively; Bi-dir
+uses layers 6/12/18/24 with bidirectional visibility. Rand. DA3 and Train. DA3 use the default middle-layer
+Spatial Register interface with the DA3 head trained from random and pretrained initialization, respectively.
+Within each summary or per-task row, the best entry is bolded and the second-best entry is underlined, with
+ties marked together.
+
+4.4.1      Spatial Register Attention Analysis
+We visualize register-to-history attention on RoboTwin randomized samples in Fig. 5. The attention maps are
+extracted from selected transformer layers and averaged over heads. They show which history image regions
+are queried by spatial registers when predicting future depth. The visualizations show that spatial registers
+capture meaningful geometric cues from the history context. Object-related registers often attend to the
+same object across views, while background-related registers focus on geometrically consistent static regions.
+Gripper-related registers show strong attention around the initial gripper pose, suggesting that the model
+uses early action-history cues to predict future geometry.
+
+4.4.2      Spatial Register Design Ablation
+Tab. 7 studies three design choices: the depth readout interface, the register insertion layers, and the visibility
+between registers and the main video-action stream. Adding a direct depth head to future VAE latents
+improves RGB generation over the no-depth baseline, but its geometry metrics remain weaker than the
+spatial-register variants. This is likely because RGB VAE latents are not designed for accurate metric depth
+encoding and decoding without retraining the VAE. In contrast, spatial registers query only history video
+tokens, so the depth objective directly shapes the history video features used by action prediction. The
+pretrained geometric head also provides a more precise depth readout than a lightweight VAE-latent decoder.
+Register placement reveals different trade-offs between visual synthesis and geometric distillation. Shallow
+registers achieve the best RGB metrics, possibly because early geometry regularization encourages the denoising
+backbone to extract useful structure from noisy features, which benefits the overall denoising process. However,
+they provide weaker control and geometry quality than middle-layer registers. Middle-layer registers achieve
+the best balance between geometric distillation and visual feature preservation, leading to the strongest
+unidirectional control performance and the best overall geometry quality. Deep and uniform placements are
+less effective, likely because late features are more specialized for denoising output prediction, while uniform
+insertion spreads the geometric readout across layers with different abstraction levels.
+The bidirectional variant obtains the highest success rate, but it requires the main video-action stream to read
+register features, introducing additional computation and model complexity. It also degrades most geometry
+metrics compared with the middle-layer unidirectional setting. Therefore, we choose unidirectional registers
+at layers 12, 14, 16, and 18 as the default design. This setting balances geometric distillation with visual
+feature preservation, while also providing a practical trade-off between control performance and training cost.
+
+
+                                                                        12
+Table 8 Geometric head ablations on the RoboTwin 10-task split.
+
+ Variant                 Clean SR FVD ↓ PSNR ↑ LPIPS ↓ AbsRel ↓ δ1 ↑ CD1 ↓ F-score ↑ F-score-T ↑
+ w/o depth                  71.7     181.2   20.39     0.165                          –
+ Trainable random init      70.0     189.8   20.22     0.162      0.059   0.941 0.0129    0.589       0.737
+ Trainable pretrained       80.1     164.5   21.13     0.143      0.049   0.948 0.0099    0.710       0.848
+ Fixed pretrained           75.2     179.8   20.67     0.159      0.053   0.945 0.0108    0.685       0.825
+
+
+
+4.4.3   Geometric Head Ablation
+We compare different depth supervision paths with the same register interface. A randomly initialized depth
+head tests whether ordinary depth prediction is sufficient. A tuned pretrained geometric head tests whether
+adaptation is needed. A fixed pretrained geometric head tests whether geometric foundation knowledge is
+sufficient without adaptation.
+Tab. 8 shows that initializing the geometric head from pretrained weights and allowing it to adapt during
+training gives the strongest generation quality, with the best selected video, depth, and point-cloud consistency
+metrics. In contrast, fully random initialization causes a clear drop in both video and geometry quality,
+suggesting that depth supervision alone is not sufficient without a strong geometric prior. The fixed pretrained
+geometric head lies between these two settings in generation quality: it retains useful geometric priors and
+improves substantially over random initialization, but lacks the adaptation capacity of the trainable pretrained
+geometric head. We therefore use the trainable pretrained geometric head as the final setting.
+
+4.5     Qualitative 4D Rollout Visualization
+Although the spatial-register depth branch is introduced primarily as an auxiliary training objective to
+regularize causal video features with geometric supervision, it can also be retained for qualitative analysis. In
+this setting, WAM4D has an interpretable 4D rollout capability: starting from only the first observed frame,
+the model autoregressively predicts future RGB frames and depth maps, and the generated RGB-D frames
+can be back-projected into point clouds. Fig. 6 visualizes this process. This analysis path is separate from the
+default deployment path, where the depth branch is removed and the policy interacts with the environment
+through lightweight action generation.
+
+4.6     Failure Analysis
+Fig. 7 shows a representative failure case in long autoregressive rollout. Because WAM4D does not introduce
+an explicit long-term memory, objects that become occluded or leave the visible context may be completed
+as different objects when the model continues rolling out the scene. This limitation affects closed-loop
+visualization of generated futures, but it does not compromise the policy success rate in our evaluation: during
+control, the model continuously receives fresh observations from the real environment or simulator, rather
+than relying solely on its own generated rollout.
+
+
+
+
+                                                       13
+Figure 6 RGB-D and point-cloud rollout visualization. Starting from a single initial frame, WAM4D autoregressively
+predicts future RGB frames and depth maps; the predicted RGB-D frames are then back-projected into point clouds
+to visualize the induced 4D scene evolution.
+
+
+
+
+                                                       14
+Figure 7 Failure case of long autoregressive rollout. Without an explicit long-term memory, the model may complete
+an object as a visually plausible but different object after it becomes occluded during rollout.
+
+
+4.7    Compute Details
+Tab. 9 reports the full compute comparison corresponding to the latency and VRAM numbers in Tab. 1. All
+latency and peak-memory measurements are collected on a single A800 80GB GPU. Training includes the
+register blocks and pretrained geometric head. Default WAM4D inference removes register tokens, register
+cross-attention blocks, and the geometric head entirely.
+
+Table 9 Compute and latency comparison on a single A800 80GB GPU. Latency is reported as mean ± std in ms
+when available. Peak memory follows the VRAM measurement in Tab. 1.
+
+    Method / Mode                      Denoising steps               Latency / Chunk (ms)         Peak Mem.
+    π0 inference                      10 action steps                      64.16 ± 0.06             8.45 GiB
+    π0.5 inference                    10 action steps                      72.03 ± 0.06             8.45 GiB
+    Motus inference           5 video steps & 10 action steps            1516.30 ± 10.64           11.55 GiB
+    LingBot-VA inference      5 video steps & 10 action steps             843.57 ± 11.55           12.97 GiB
+    Fast-WAM inference                10 action steps                     425.53 ± 6.01            11.55 GiB
+    WAM4D inference                   10 action steps                      525.43 ± 5.64            9.71 GiB
+
+
+
+5     Conclusion and Limitation
+We present WAM4D, a fast 4D world action model that transfers geometric foundation priors into causal
+video-action representations through spatial register distillation. Experiments show that WAM4D improves
+spatial consistency and action prediction across simulation and real-world long-horizon tasks. While WAM is
+still slower than VLA at present, we aim to further boost its speed in future work.
+WAM4D improves geometry-aware video-action representations without requiring dense geometry during
+policy deployment. However, as discussed in Sec. 4.6, the model does not maintain an explicit long-term
+object memory during autoregressive rollout. This can lead to identity-inconsistent completions after severe
+occlusion in qualitative generated futures. Future work could add persistent object memory or scene-state
+tracking while preserving the lightweight observation-to-action deployment path.
+
+
+                                                       15
+References
+T. Wan, A. Wang, B. Ai, B. Wen, C. Mao, C.-W. Xie, D. Chen, F. Yu, H. Zhao, J. Yang, et al. Wan: Open and
+  advanced large-scale video generative models. arXiv preprint arXiv:2503.20314, 2025.
+Z. Yang, J. Teng, W. Zheng, M. Ding, S. Huang, J. Xu, Y. Yang, W. Hong, X. Zhang, G. Feng, et al. Cogvideox:
+  Text-to-video diffusion models with an expert transformer. In International Conference on Learning Representations,
+  volume 2025, pages 83048–83077, 2025.
+J. Ding, Y. Zhang, Y. Shang, Y. Zhang, Z. Zong, J. Feng, Y. Yuan, H. Su, N. Li, N. Sukiennik, et al. Understanding
+   world or predicting future? a comprehensive survey of world models. ACM Computing Surveys, 58(3):1–38, 2025.
+X. Chi, P. Jia, C.-K. Fan, X. Ju, W. Mi, K. Zhang, Z. Qin, W. Tian, K. Ge, H. Li, et al. Wow: Towards a world
+  omniscient world model through embodied interaction. arXiv preprint arXiv:2509.22642, 2025.
+Y. Li, X. Wei, X. Chi, Y. Li, Z. Zhao, H. Wang, N. Ma, M. Lu, and S. Zhang. Manipdreamer: Boosting robotic
+  manipulation world model with action tree and visual guidance. In ICASSP 2026-2026 IEEE International Conference
+  on Acoustics, Speech and Signal Processing (ICASSP), pages 12027–12031. IEEE, 2026a.
+Y. Li, X. Wei, X. Chi, Y. Li, Z. Zhao, H. Wang, N. Ma, M. Lu, and S. Han. Manipdreamer3d: Synthesizing plausible
+  robotic manipulation video with occupancy-aware 3d trajectory. In Proceedings of the AAAI Conference on Artificial
+  Intelligence, volume 40, pages 6644–6652, 2026b.
+K. Zeng, Z. Wu, K. Xiong, X. Wei, X. Guo, Z. Zhu, K. Ho, L. Zhou, B. Zeng, M. Lu, H. Sun, B. WANG, G. Chen, H. Ye,
+  and W. Zhang. Rethinking driving world model as synthetic data generator for perception tasks. In The Fourteenth
+  International Conference on Learning Representations, 2026. URL https://openreview.net/forum?id=z3cFADf6zZ.
+Y. Chen, R. Chen, D. Huo, Y. Yang, D. Qi, H. Liu, T. Lin, S. Zeng, J. Xiao, X. Chang, et al. Abot-physworld:
+  Interactive world foundation model for robotic manipulation with physics alignment. arXiv preprint arXiv:2603.23376,
+  2026.
+C.-K. Fan, X. Chi, X. Ju, H. Li, Y. Bao, Y.-K. Wang, L. Chen, Z. Jiang, K. Ge, Y. Li, et al. Wow, wo, val! a
+  comprehensive embodied world model evaluation turing test. arXiv preprint arXiv:2601.04137, 2026.
+S. Zhou, Y. Du, J. Chen, Y. Li, D.-Y. Yeung, and C. Gan. Robodreamer: Learning compositional world models for
+   robot imagination. arXiv preprint arXiv:2404.12377, 2024.
+T. Yu, G. Lu, Z. Yang, H. Deng, S. S. Chen, J. Lu, W. Ding, G. Hu, Y. Tang, and Z. Wang. Manigaussian++: General
+  robotic bimanual manipulation with hierarchical gaussian world model. In 2025 IEEE/RSJ International Conference
+  on Intelligent Robots and Systems (IROS), pages 12232–12239. IEEE, 2025.
+D. Wu, J. Hu, K.-H. Hui, X. Wei, C. Luo, J. Li, and Z. Liu. Phymix: Towards physically consistent single-image 3d
+  indoor scene generation with implicit–explicit optimization. arXiv preprint arXiv:2604.10125, 2026.
+A. Brohan, N. Brown, J. Carbajal, Y. Chebotar, X. Chen, K. Choromanski, T. Ding, D. Driess, A. Dubey, C. Finn,
+  et al. RT-1: Robotics transformer for real-world control at scale. arXiv preprint arXiv:2212.06817, 2022.
+K. Black, N. Brown, D. Driess, A. Esmail, M. Equi, C. Finn, N. Fusai, L. Groom, K. Hausman, B. Ichter, et al. π0 : A
+  vision-language-action flow model for general robot control. arXiv preprint, 2024.
+Physical Intelligence, K. Black, N. Brown, J. Darpinian, K. Dhabalia, D. Driess, A. Esmail, M. Equi, C. Finn, N. Fusai,
+  et al. π0.5 : A vision-language-action model with open-world generalization. arXiv preprint arXiv:2504.16054, 2025.
+J. Cao, Q. Zhang, P. Jia, X. Zhao, B. Lan, X. Zhang, X. Wei, S. Chen, L. Li, X. Liu, et al. Fastdrivevla: Efficient
+   end-to-end driving via plug-and-play reconstruction-based token pruning. In Proceedings of the AAAI Conference
+   on Artificial Intelligence, volume 40, pages 2571–2579, 2026.
+P. Intelligence, B. Ai, A. Amin, R. Aniceto, A. Balakrishna, G. Balke, K. Black, G. Bokinsky, S. Cao, T. Char-
+  bonnier, et al. Pi0.7: a steerable generalist robotic foundation model with emergent capabilities. arXiv preprint
+  arXiv:2604.15483, 2026.
+J. Zhang, X. Chen, Q. Wang, M. Li, Y. Guo, Y. Hu, J. Zhang, S. Bai, J. Lin, and J. Chen. Vlm4vla: Revisiting
+   vision-language-models in vision-language-action models. arXiv preprint arXiv:2601.03309, 2026.
+D. Qu, H. Song, Q. Chen, Y. Yao, X. Ye, Y. Ding, Z. Wang, J. Gu, B. Zhao, D. Wang, et al. Spatialvla: Exploring
+  spatial representations for visual-language-action model. arXiv preprint arXiv:2501.15830, 2025.
+
+
+
+
+                                                          16
+C. Li, J. Wen, Y. Peng, Y. Peng, and Y. Zhu. Pointvla: Injecting the 3d world into vision-language-action models.
+  IEEE Robotics and Automation Letters, 11(3):2506–2513, 2026.
+L. Sun, B. Xie, Y. Liu, H. Shi, T. Wang, and J. Cao. Geovla: Empowering 3d representations in vision-language-action
+   models. arXiv preprint arXiv:2508.09071, 2025.
+F. Li, W. Song, H. Zhao, J. Wang, P. Ding, D. Wang, L. Zeng, and H. Li. Spatial forcing: Implicit spatial representation
+   alignment for vision-language-action model. arXiv preprint arXiv:2510.12276, 2025.
+H. Wang, X. Wei, J. He, C. Bai, C.-K. Fan, J. Cao, J. Chen, Y. Li, S. Rong, M. Lu, et al. Vega: Visual encoder
+  grounding alignment for spatially-aware vision-language-action models. arXiv preprint arXiv:2605.10485, 2026.
+L. Li, Q. Zhang, Y. Luo, S. Yang, R. Wang, F. Han, M. Yu, Z. Gao, N. Xue, X. Zhu, et al. Causal world modeling for
+   robot control. arXiv preprint arXiv:2601.21998, 2026.
+T. Yuan, Z. Dong, Y. Liu, and H. Zhao. Fast-WAM: Do world action models need test-time future imagination? arXiv
+  preprint arXiv:2603.16666, 2026.
+M. Team, C. Xiang, F. Bao, H. Liu, H. Tan, H. Bi, J. Li, J. Liu, J. Pang, K. Jing, et al. Motubrain: An advanced
+ world action model for robot control. arXiv preprint arXiv:2604.27792, 2026.
+Y. Zhang, Y. Chen, C. Liu, Z. Ding, J. Xu, S. Zou, J. Liao, J. Hu, X. Ren, X. Zhang, et al. Pelican-unified 1.0: A unified
+  embodied intelligence model for understanding, reasoning, imagination and action. arXiv preprint arXiv:2605.15153,
+  2026.
+B. Ai, S. Tian, H. Shi, Y. Wang, T. Pfaff, C. Tan, H. I. Christensen, H. Su, J. Wu, and Y. Li. A review of learning-based
+  dynamics models for robotic manipulation. Science Robotics, 10(106):eadt1497, 2025.
+J. Guo, Q. Li, P. Li, Z. Chen, N. Sun, Y. Su, H. Wang, Y. Zhang, X. Li, and H. Liu. Unified 4D world action modeling
+   from video priors with asynchronous denoising. arXiv preprint arXiv:2604.26694, 2026.
+J. Wang, Y. Jiang, T. He, J. Sun, Q. Zhang, J. He, J. Cao, Z. Gan, M. Sun, Q. Shao, et al. Mvista-4d: View-consistent
+   4d world model with test-time action inference for robotic manipulation. arXiv preprint arXiv:2602.09878, 2026.
+M. Xu, T. Zhang, T. Liu, Z. Chen, X. Han, and Z. Liu. Kinema4d: Kinematic 4d world modeling for spatiotemporal
+  embodied simulation. arXiv preprint arXiv:2603.16669, 2026.
+H. Zhen, Q. Sun, H. Zhang, J. Li, S. Zhou, Y. Du, and C. Gan. TesserAct: Learning 4D embodied world models.
+  arXiv preprint arXiv:2504.20995, 2025.
+Y. Tian, Y. Jin, B. Yu, Y. Shi, H. Wu, C. H. Liu, K. Chen, and C. Huang. Starry: Spatial-temporal action-centric
+  world modeling for robotic manipulation. arXiv preprint arXiv:2604.26848, 2026.
+J. Ho, W. Chan, C. Saharia, J. Whang, R. Gao, A. Gritsenko, D. P. Kingma, B. Poole, M. Norouzi, D. J. Fleet, et al.
+   Imagen video: High definition video generation with diffusion models. arXiv preprint arXiv:2210.02303, 2022.
+A. Blattmann, T. Dockhorn, S. Kulal, D. Mendelevitch, M. Kilian, D. Lorenz, Y. Levi, Z. English, V. Voleti, A. Letts,
+  et al. Stable video diffusion: Scaling latent video diffusion models to large datasets. arXiv preprint arXiv:2311.15127,
+  2023.
+T. Seedance, D. Chen, L. Chen, X. Chen, Y. Chen, Z. Chen, Z. Chen, F. Cheng, T. Cheng, Y. Cheng, et al. Seedance
+  2.0: Advancing video generation for world complexity. arXiv preprint arXiv:2604.14148, 2026.
+Z. Yang, Y. Chen, J. Wang, S. Manivasagam, W.-C. Ma, A. J. Yang, and R. Urtasun. Unisim: A neural closed-loop
+   sensor simulator. In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition, pages
+  1389–1399, 2023.
+C. Yin, D. Huang, D. Yang, J. Wang, N. Zhao, C. Xu, W. Sun, L. Hou, Z. Li, J. Wu, et al. Genie sim 3.0: A
+  high-fidelity comprehensive simulation platform for humanoid robot. arXiv preprint arXiv:2601.02078, 2026.
+Y. Du, S. Yang, B. Dai, H. Dai, O. Nachum, J. Tenenbaum, D. Schuurmans, and P. Abbeel. Learning universal policies
+  via text-guided video generation. Advances in neural information processing systems, 36:9156–9172, 2023.
+B. Wang, N. Sridhar, C. Feng, M. Van der Merwe, A. Fishman, N. Fazeli, and J. J. Park. This&that: Language-gesture
+  controlled video generation for robot planning. In 2025 IEEE International Conference on Robotics and Automation
+  (ICRA), pages 12842–12849. IEEE, 2025.
+S. Wang, J. Shi, Z. Fu, X. He, F. Liu, C. Yang, Y. Zhou, Z. Fei, J. Gong, J. Fu, et al. World action models: The next
+   frontier in embodied ai. arXiv preprint arXiv:2605.12090, 2026.
+
+
+
+                                                           17
+H. Bi, H. Tan, S. Xie, Z. Wang, S. Huang, H. Liu, R. Zhao, Y. Feng, C. Xiang, Y. Rong, et al. Motus: A unified latent
+  action world model. arXiv preprint arXiv:2512.13030, 2025.
+B. Mildenhall, P. P. Srinivasan, M. Tancik, J. T. Barron, R. Ramamoorthi, and R. Ng. NeRF: Representing scenes as
+  neural radiance fields for view synthesis. In European Conference on Computer Vision, 2020.
+B. Kerbl, G. Kopanas, T. Leimkühler, and G. Drettakis. 3D Gaussian Splatting for real-time radiance field rendering.
+  ACM Transactions on Graphics, 42(4), 2023.
+Y. Ze, G. Yan, Y.-H. Wu, A. Macaluso, Y. Ge, J. Ye, N. Hansen, L. E. Li, and X. Wang. GNFactor: Multi-task real
+  robot learning with generalizable neural feature fields. Conference on Robot Learning, 2023.
+G. Lu, S. Zhang, Z. Wang, C. Liu, J. Lu, and Y. Tang. ManiGaussian: Dynamic gaussian splatting for multi-task
+  robotic manipulation. arXiv preprint arXiv:2403.08321, 2024.
+O. Shorinwa, J. Tucker, A. Smith, A. Swann, T. Chen, R. Firoozi, M. Kennedy III, and M. Schwager. Splat-MOVER:
+  Multi-stage, open-vocabulary robotic manipulation via editable gaussian splatting. arXiv preprint arXiv:2405.04378,
+  2024.
+J. Duan, W. Yuan, W. Pumacay, Y. R. Wang, K. Ehsani, D. Fox, and R. Krishna. Manipulate-Anything: Automating
+   real-world robots using vision-language models. arXiv preprint arXiv:2406.18915, 2024.
+N. Huang, X. Wei, W. Zheng, P. An, M. Lu, W. Zhan, M. Tomizuka, K. Keutzer, and S. Zhang. S3gaussian:
+  Self-supervised street gaussians for autonomous driving. arXiv preprint arXiv:2405.20323, 2024.
+X. Wei, Q. Wuwu, Z. Zhao, Z. Wu, N. Huang, M. Lu, N. Ma, and S. Zhang. Emd: Explicit motion modeling for
+  high-quality street gaussian splatting. In Proceedings of the IEEE/CVF international conference on computer vision,
+  pages 28462–28472, 2025.
+X. Wei, Z. Ye, Y. Gu, Z. Zhu, Y. Guo, Y. Shen, S. Zhao, M. Lu, H. Sun, B. Wang, et al. Parkgaussian: Surround-view
+  3d gaussian splatting for autonomous parking. arXiv preprint arXiv:2601.01386, 2026.
+S. Wang, V. Leroy, Y. Cabon, B. Chidlovskii, and J. Revaud. Dust3r: Geometric 3d vision made easy. In Proceedings
+   of the IEEE/CVF conference on computer vision and pattern recognition, pages 20697–20709, 2024.
+J. Wang, M. Chen, N. Karaev, A. Vedaldi, C. Rupprecht, and D. Novotny. Vggt: Visual geometry grounded transformer.
+   In Proceedings of the Computer Vision and Pattern Recognition Conference, pages 5294–5306, 2025.
+H. Lin, S. Chen, J. Liew, D. Y. Chen, Z. Li, G. Shi, J. Feng, and B. Kang. Depth anything 3: Recovering the visual
+  space from any views. arXiv preprint arXiv:2511.10647, 2025.
+Y. Wang, J. Zhou, H. Zhu, W. Chang, Y. Zhou, Z. Li, J. Chen, J. Pang, C. Shen, and T. He. Pi3: Permutation-
+  equivariant visual geometry learning. arXiv preprint arXiv:2507.13347, 2025.
+X. Wei, P. Chen, G. Li, M. Lu, H. Chen, and F. Tian. Gazegaussian: High-fidelity gaze redirection with 3d gaussian
+  splatting. In Proceedings of the IEEE/CVF International Conference on Computer Vision, pages 13293–13303, 2025.
+H. Wang, X. Wei, X. Zhang, J. Li, C. Bai, Y. Li, M. Lu, W. Zheng, and S. Zhang. Embodiedocc++: Boosting
+  embodied 3d occupancy prediction with plane regularization and uncertainty sampler. In Proceedings of the 33rd
+  ACM International Conference on Multimedia, pages 925–934, 2025.
+D. Wu, Z. Li, T. Hua, Y. Ren, X. Wei, R. Qin, and W. Zhao. Feed-forward gaussian splatting from sparse aerial views.
+  arXiv preprint arXiv:2605.19949, 2026.
+J. Wang, M. Chen, S. Zhang, N. Karaev, J. Schönberger, P. Labatut, P. Bojanowski, D. Novotny, A. Vedaldi, and
+   C. Rupprecht. Vggt-omega. arXiv preprint arXiv:2605.15195, 2026.
+T. Shen, S. Bahmani, K. He, S. G. Srinivasan, T. Cao, J. Ren, R. Li, Z. Wang, N. Sharp, Z. Gojcic, et al. Lyra 2.0:
+  Explorable generative 3d worlds. arXiv preprint arXiv:2604.13036, 2026.
+S. Huang, L. Chen, P. Zhou, S. Chen, Y. Liao, Z. Jiang, Y. Hu, P. Gao, H. Li, M. Yao, et al. Enerverse: Envisioning
+   embodied future space for robotics manipulation. Advances in Neural Information Processing Systems, 38:37693–
+   37720, 2026.
+Y. Yang, L. Fan, Z. Shi, J. Peng, F. Wang, and Z. Zhang. Neoverse: Enhancing 4d world model with in-the-wild
+  monocular videos. arXiv preprint arXiv:2601.00393, 2026.
+P. Tu, H. Zhu, J. Sun, S. Ren, C. Wang, J. Luo, X. Cheng, and Z. Chen. Embody4d: A generalist 4d world model for
+   embodied ai. arXiv preprint arXiv:2605.01799, 2026.
+
+
+
+                                                         18
+T. Z. Zhao, V. Kumar, S. Levine, and C. Finn. Learning fine-grained bimanual manipulation with low-cost hardware.
+  arXiv preprint arXiv:2304.13705, 2023.
+C. Chi, Z. Xu, S. Feng, E. Cousineau, Y. Du, B. Burchfiel, R. Tedrake, and S. Song. Diffusion policy: Visuomotor
+  policy learning via action diffusion. The International Journal of Robotics Research, 44(10-11):1684–1704, 2025.
+B. Zitkovich, T. Yu, S. Xu, P. Xu, T. Xiao, F. Xia, J. Wu, P. Wohlhart, S. Welker, A. Wahid, et al. Rt-2: Vision-
+  language-action models transfer web knowledge to robotic control. In Conference on Robot Learning, pages 2165–2183.
+  PMLR, 2023.
+M. J. Kim, K. Pertsch, S. Karamcheti, T. Xiao, A. Balakrishna, S. Nair, R. Rafailov, E. Foster, G. Lam, P. Sanketi,
+  et al. Openvla: An open-source vision-language-action model. arXiv preprint arXiv:2406.09246, 2024.
+O. M. Team, D. Ghosh, H. Walke, K. Pertsch, K. Black, O. Mees, S. Dasari, J. Hejna, T. Kreiman, C. Xu, et al. Octo:
+  An open-source generalist robot policy. arXiv preprint arXiv:2405.12213, 2024.
+Z. Liu, J. Liu, H. Chen, J. Yu, Z. Guo, C. Hou, C. Gu, X. Mi, R. Zhang, K. Wu, et al. Last _{0}: Latent spatio-temporal
+   chain-of-thought for robotic vision-language-action model. arXiv preprint arXiv:2601.05248, 2026.
+S. Liu, L. Wu, B. Li, H. Tan, H. Chen, Z. Wang, K. Xu, H. Su, and J. Zhu. Rdt-1b: a diffusion foundation model for
+   bimanual manipulation. In International Conference on Learning Representations, volume 2025, pages 29982–30009,
+   2025.
+
+
+
+
+                                                          19
+

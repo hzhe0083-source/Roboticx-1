@@ -1,0 +1,764 @@
+                                         Look Where It Matters: Adaptive Visual Refinement for Vision-Language-Action
+                                                                           Models
+                                                     Jin Cui1∗ , Yanbin Hu1, 2∗ , Xinyue Long1, 2 , Linkai Li1, 2 , Boran Zhao1,2† , Pengju Ren1
+                                                                      1
+                                                                       State Key Laboratory of Human-Machine Hybrid Augmented Intelligence,
+                                                                     and Institute of Artificial Intelligence and Robotics, Xi’an Jiaotong University
+                                                                              2
+                                                                                School of Software Engineering, Xi’an Jiaotong University
+                                                                                                  andycui@stu.xjtu.edu.cn
+
+
+                                                                      Abstract                                  2023; Black et al. 2024). By post-training pretrained vision-
+                                                                                                                language backbones on diverse robot demonstrations, re-
+                                          Vision-language-action (VLA) models inherit rich semantic             cent VLAs achieve strong generalization across manipulation
+                                          priors from large-scale vision-language pretraining, yet their        tasks. However, robotic control requires more than semantic
+                                          visual representations remain unreliable for spatially precise        recognition; the visual encoder must preserve spatially faith-
+                                          robotic manipulation. We uncover that vision encoders in
+                                          VLAs also exhibit attention artifacts previously documented
+                                                                                                                ful representations for target localization, geometric reason-
+arXiv:2608.02197v1 [cs.RO] 3 Aug 2026
+
+
+
+
+                                          in generic Vision Transformers, and further show that, in em-         ing, and precise contact. This raises a fundamental question:
+                                          bodied policies, these artifacts are closely associated with          how does embodied post-training reshape the visual repre-
+                                          spatial perception capabilities acquired during post-training.        sentations of pretrained encoders, and are these representa-
+                                          As the encoder learns task-relevant information such as object        tions sufficiently reliable for fine-grained manipulation?
+                                          location, depth ordering, and local geometry, limited global-            Through systematic analysis of manipulation failures, we
+                                          token capacity causes part of this information to spill into low-     identify two visual bottlenecks in current VLAs. First, mod-
+                                          information patch tokens. We introduce AtVLA, a framework             els frequently fail to correctly identify target objects and
+                                          that inserts learnable register tokens into the visual encoder.       disambiguate task types—a surprising deficiency given the
+                                          Trained end-to-end using only embodied data and the original
+                                          action objective, these registers emerge as dedicated carriers
+                                                                                                                powerful semantic understanding of their VLM backbones.
+                                          of embodied spatial information, while the remaining patch            Inspecting their attention distributions, we find that VLA vi-
+                                          tokens recover clean and spatially faithful attention distribu-       sual encoders exhibit the high-norm artifacts previously ob-
+                                          tions crucial for precise target localization and fine-grained        served in generic Vision Transformers (Darcet et al. 2023):
+                                          contact. Clean attention restores reliable localization, but can-     background patches are repurposed as repositories for global
+                                          not recover geometric details lost in low-resolution observa-         information, displacing local spatial content and corrupting
+                                          tions. AtVLA therefore couples attention rectification with           dense attention maps. We further show that this pathology
+                                          uncertainty-gated local refinement. The action expert sam-            is closely associated with embodied post-training. As the
+                                          ples multiple action chunks and estimates uncertainty from            encoder acquires manipulation-relevant information such as
+                                          their disagreement; only for uncertain predictions, action-           object location, depth ordering, instance structure, and local
+                                          conditioned attention rollout identifies the task-relevant re-
+                                          gion, which is cropped, re-encoded at high resolution, and
+                                                                                                                geometry, the limited capacity of its original global tokens
+                                          appended to the cached prefix for refined action generation.          causes part of this information to spill into spatial patch to-
+                                          Across LIBERO, SimplerEnv, and a challenging single-view              kens. Useful embodied knowledge is therefore stored in the
+                                          real-world benchmark, AtVLA improves the average LIBERO               wrong representational channels, undermining the precise
+                                          success rate from 94.2% to 98.4% and real-world success               localization and contact reasoning required for control.
+                                          from 46.5% to 69.0% over π0 . The additional inference cost              Second, even correct localization does not guarantee pre-
+                                          remains limited: cropping is triggered on approximately 30%           cise manipulation. Fine-grained actions require local geo-
+                                          of replanning steps, resulting in only 1.4–1.6× the total com-        metric details near the target and contact region, yet such
+                                          putation of π0 under the representative deployment setting.           details may occupy only a few patches in a low-resolution
+                                                                                                                third-person observation. Wrist-mounted cameras provide
+                                                                                                                close-range views, but suffer from acute viewpoint and pose-
+                                                                  Introduction                                  change sensitivity; the highly variable relative position be-
+                                        Vision-language-action (VLA) models have emerged as a                   tween the gripper and object causes the relevant image region
+                                        promising paradigm for generalist robot manipulation, trans-            to shift unpredictably. Explicit vision experts or 3D represen-
+                                        ferring the semantic knowledge and instruction-following ca-            tations can provide stronger geometry, but introduce addi-
+                                        pabilities of large-scale vision-language models into con-              tional sensing, calibration, and modeling complexity. These
+                                        tinuous control policies (Kim et al. 2024; Brohan et al.                observations motivate a selective coarse-to-fine mechanism
+                                                                                                                that first restores reliable localization and then increases vi-
+                                           ∗                                                                    sual resolution only when the base observation is insufficient.
+                                               These authors contributed equally.
+                                           †
+                                               Corresponding author.                                               We introduce AtVLA, a framework that combines register-
+                                                                                                         relevant regions, enabling high-resolution perception
+                                                                                                         only when needed for precise manipulation.
+                                                                                                       • Extensive experiments across simulated and real-world
+                                                                                                         benchmarks demonstrate substantial performance gains
+                                                                                                         with modest overhead, as adaptive refinement is invoked
+                                   Put both the cream cheese box                                         on only a fraction of replanning steps.
+  Put the white mug on the plate   and the butter in the basket    Put both moka pots on the stove
+
+
+                                                                                                                            Related Work
+                                                                                                      Attention Artifacts in Visual Encoders and VLA Ground-
+                                                                                                      ing. Patch-level representations are critical for spatial
+                                                                                                      grounding in vision-language-action models. Large-scale Vi-
+                                                                                                      sion Transformers can develop high-norm tokens in low-
+  Put the yellow and white mug           Turn on the stove and     Pick up the book and place it in
+  in the microwave and close it          put the moka pot on it    the back compartment of caddy
+                                                                                                      information regions, which act as repositories for global in-
+                                                                                                      formation and distort dense spatial features (Darcet et al.
+Figure 1: Attention artifacts in a standard VLA visual en-                                            2023). We find that this phenomenon is further exacerbated
+coder. High-norm regions emerge in low-information back-                                              during embodied post-training, where visual encoders must
+grounds or unrelated objects, corrupting the spatial ground-                                          capture task-relevant geometry, instance structure, and spatial
+ing of task-relevant targets and interaction regions.                                                 relations beyond conventional 2D semantics (Qu et al. 2025;
+                                                                                                      Li et al. 2025b,a). Related studies report attention sinks, rep-
+                                                                                                      resentation collapse, and dispersed task attention in VLA
+enhanced visual encoding with uncertainty-gated local re-                                             policies (Kachaev et al. 2025; Song et al. 2025), while analy-
+finement. We insert learnable register tokens into the visual                                         ses of VLMs show that visual grounding signals can deterio-
+encoder and optimize them using only embodied demonstra-                                              rate across network depth (Kaduri, Bagon, and Dekel 2024;
+tions and the original action objective. During post-training,                                        Jiang et al. 2024). Object-centric tokenization and slot-based
+the registers emerge as dedicated carriers of spatial infor-                                          representations improve VLA grounding through feature se-
+mation acquired from robot interaction, while the remain-                                             lection or decomposition (Bendikas et al. 2025; Hanyu et al.
+ing patch tokens recover clean and spatially faithful atten-                                          2025), but do not explicitly address corrupted patch represen-
+tion distributions. Unlike discarding these tokens, we retain                                         tations. In contrast, we use register tokens to absorb excess
+their outputs as additional spatial context for action genera-                                        global information while preserving clean patch features for
+tion. Linear-probing confirms that they encode stronger task-                                         spatial grounding.
+relevant spatial information than the original class token or                                         Visual Refinement for Precise Perception. MLLMs may
+pooled patch features. Based on the rectified visual prefix, the                                      correctly localize task-relevant regions yet fail to resolve fine
+action expert samples multiple action chunks and estimates                                            details under limited input resolution, motivating targeted
+uncertainty from their disagreement. Confident predictions                                            visual re-examination (Zhang et al. 2025). Previous work
+follow the original inference path. For uncertain predictions,                                        explores hierarchical search, attention-guided cropping, KV-
+AtVLA reuses action-conditioned attention to localize the                                             cache-based localization, and learned zoom policies (Shen
+task-relevant region, crops and re-encodes it at high resolu-                                         et al. 2024; Liu et al. 2024; Zhang et al. 2024; Zhong et al.
+tion, and appends the resulting tokens to the cached prefix for                                       2025; Carvalho, Dias, and Martins 2026). In robotic manip-
+refined action generation. Clean attention determines where                                           ulation, related methods incorporate auxiliary visual cues or
+to look, while adaptive cropping recovers the local geometry                                          explicit spatial supervision to improve manipulation ground-
+needed to act precisely.                                                                              ing (Li et al. 2024c; Zawalski et al. 2024; Deng et al. 2025),
+   Across LIBERO, SimplerEnv, and a challenging real-                                                 but do not directly leverage the policy’s internal attention for
+world benchmark, AtVLA consistently improves object                                                   adaptive visual refinement. We instead use rectified atten-
+grounding, spatial reasoning, and fine-grained manipulation.                                          tion maps for uncertainty-gated cropping, re-encoding task-
+It raises the average LIBERO success rate of π0 from 94.2%                                            relevant regions at high resolution only when the base action
+to 98.4% and real-world success from 46.5% to 69.0%. Lo-                                              prediction is uncertain.
+cal refinement is triggered on only approximately 30% of
+replanning steps, yielding 1.4–1.6× the total computation                                                                        Method
+of π0 under our deployment setting. Our contributions are
+summarized as follows:                                                                                Overview
+                                                                                                      Given a raw visual observation It , a language instruction
+ • We uncover attention artifacts in VLA visual encoders                                              ℓ, and a proprioceptive state st , our method augments π0
+   and reveal their connection to spatial features acquired                                           with two complementary mechanisms: register-enhanced vi-
+   during embodied post-training. After rectification, regis-                                         sual encoding and uncertainty-gated local visual refinement.
+   ters emerge as stable carriers of embodied spatial infor-                                          Register tokens provide dedicated global-information slots
+   mation, while restoring clean, spatially faithful attention.                                       inside the SigLIP encoder, preventing background patch to-
+ • We develop uncertainty-gated, attention-guided visual                                              kens from being repurposed as high-norm information reser-
+   refinement that selectively crops and re-encodes task-                                             voirs. Their output features are retained as multi-slot global
+  INPUT                                         Vision Encoder with registers                                UNCERTAIN PATH:                                      CONFIDENT PATH (DEFA ULT)
+                        Raw observation
+                                                                                                             Attention-guided cropping
+                                                [CLS] + REG1 REG2 REG3 REG4 + [patch] 1 … [patch]256
+
+
+                                                                                                                                      resize
+                                                                 Vision Encoder
+                                                           (Trained with REG tokens)
+                                                                                                                                                                                    NO
+  Language instruction                                                                                                                      224 × 224             YES
+                                                  Register Features:    Base-view Patch Tokens:                                                                                       𝑈 > 𝜏?
+         Place the yellow cylinder              Embodied Spatial Context Clean Spatial Features             Append crop tokens
+                                                                                                            without recomputing                 Vision
+         to the left structure.                                                                                                                Encoder                 K-sample disagreement as
+                                                                                                             base/language KV                                            uncertainty estimation
+  Proprioceptive state
+                                                                                                             crop_pos_embedding =                                      U = mean over translational dims
+                                                                                                                                                    …
+                 𝒑𝑒𝑒   𝑒𝑒                                  …                 …                …                                                                                           (𝐊)
+                                                                                                                                                                                of Stdk [𝐀 𝟏:𝐡 ]
+                  𝑡 , 𝝆𝑡 , 𝑔𝑡                                                                                  MLP(𝑥1, 𝑦1, 𝑥2, 𝑦2)
+                                                                                                                                      Crop-view tokens (256)
+                                                   [REG]       [Base view]       [Language]       [State]
+                                                                                                                                                                  Sample K action chunks from expert
+              Spatial information in REGs
+                                                                                              LLM Backbone                                                             (1)
+                                                                                                                                                                     𝐴1:ℎ
+                                                                                                                                                                                      (2)
+                                                                                                                                                                                    𝐴1:ℎ       •••     (𝐾)
+                                                                                                                                                                                                     𝐴1:ℎ
+                                                                                                                                                                    (h steps)      (h steps)         (h steps)
+                                                   Training Strategy                                                             Cached KV for prefix
+                                                   Phase1: Encoder warm-up
+  Emerged during embodied training
+                                                      VE LLM AE                                                                      Action Expert
+      Vanilla VE:            With registers:
+  high-norm artifacts      artifacts absorbed
+                                                   Phase2: Backbone adapt
+                                                                                                                 Cropped image
+                                                      VE LLM AE                                                                                                Cropped image
+
+                                                   Phase3: Complete finetune
+                                                       VE LLM AE
+
+
+
+Figure 2: Overview of AtVLA. Register tokens absorb excess global information and retain embodied spatial context while
+restoring clean patch representations. The action expert estimates uncertainty from multiple sampled action chunks: confident
+predictions follow the base path, whereas uncertain predictions trigger attention-guided cropping, high-resolution re-encoding,
+and prefix extension. A three-stage curriculum progressively aligns the registers, crop branch, and complete policy.
+
+
+context, while the remaining patch tokens preserve spatially                                                  Uncertainty-Gated Action Prediction
+faithful local representations. Based on this clean visual pre-
+fix, the flow-matching action expert first predicts multiple                                                  LLM backbone processes Cbt once to construct a reusable
+action chunks and estimates action uncertainty from their                                                     prefix key–value cache. Conditioned on this cache, the flow-
+disagreement. The base prediction is executed directly when                                                   matching action expert generates K action chunks from in-
+uncertainty is low. Otherwise, an attention rollout localizes                                                 dependent Gaussian initializations:
+the task-relevant region, which is re-encoded at full reso-                                                        (k)                  (k)                        (k)
+                                                                                                                                      A1:H = ODESolve vθ , z0 | Cbt
+                                                                                                                                                                           
+lution and appended to the cached prefix for refined action                                                     z0 ∼ N (0, I),
+generation. The gate is evaluated once per action-chunk re-                                                                                                                (4)
+planning step rather than at every low-level control step.                                                    where H is the predicted chunk horizon. All samples share
+                                                                                                              the visual and language prefill and differ only in action-expert
+Register-Enhanced Visual Prefix                                                                               denoising. We measure disagreement over the translational
+Let the vision encoder operate on 224 × 224 images with                                                       action dimensions Dtr and the first h ≤ H actions that will
+patch size 14, producing Nb = 16 × 16 = 256 patch tokens.                                                     actually be executed:
+We insert Nr = 4 learnable register embeddings immedi-                                                                                     v                                                                     !2
+                                                                                                                                       h                                       K                           K
+                                                                                                                                           u
+ately after the class token:                                                                                          1                X X u                      1 X  (k)   1 X (k)
+                                                                                                               Ut =                        t                          Aj,d −    Aj,d
+               Xt = [xcls ; r1 , . . . , rNr ; p1 , . . . , pNb ].                                   (1)            h|Dtr | j=1                                 K −1         K
+                                                                                                                                                d∈Dtr                        k=1                         k=1
+
+The register-augmented visual encoder Evis outputs                                                                                                                                                               (5)
+                                                                                                              Restricting the score to near-term translation isolates dis-
+                           [hcls , Rt , Pt ] = Evis (Xt ),                                           (2)      agreement in the end-effector motion most directly related
+where Rt ∈ RNr ×dv denotes register features and Pt ∈                                                         to spatial ambiguity. The noise schedule, ODE solver, and
+RNb ×dv denotes spatial patch features. Unlike the original                                                   number of integration steps are fixed when computing Ut .
+use of registers solely as internal workspace, we retain Rt                                                   If Ut ≤ τ , the mean action chunk A1:H is returned through
+and project it through the PaliGemma visual projector Π.                                                      the default confident path. The threshold τ is selected on a
+The base multimodal prefix is                                                                                 held-out set by measuring how well Ut predicts the empirical
+                                                                                                              error reduction obtained from cropping.
+           Cbt = [Π(Rt ); Π(Pt ); Elang (ℓ); Estate (st )].                                          (3)
+Thus, the registers expose several global context slots to the                                                Attention-Guided Local Refinement
+downstream policy, while the full 16 × 16 patch grid remains
+available for spatial grounding. For multiple camera views,                                                   When Ut > τ , we derive a task-conditioned spatial map
+each view is encoded independently with the same register-                                                    from attention matrices already produced during base action
+augmented encoder, and the resulting visual sequences are                                                     sampling. For layer l, we average the attention matrices over
+concatenated in the prefix.                                                                                   heads and a fixed subset of denoising steps, add the residual
+Table 1: Success rates (%) on commonly used benchmarks with standard deviations reported when available. Baseline results
+are taken from reported settings. PCC, MN and O/C denote Pick Coke Can, Move Near and Open/Close. π0 + Cropping variant
+takes cropped images from an external VLM without embodied pre-training, while ∗ is analyzed in the following context.
+                                                             Standard LIBERO Suites                                                        SimplerEnv Google
+ Method                                                                                                  Method
+                                                  Spatial       Object          Goal      Long-10                                          PCC      MN   O/C
+ Octo (Team et al. 2024)                         78.9±1.0       85.7±1.2       84.6±0.9     50.9±1.2     Octo (Team et al. 2024)           17.0    4.2   22.7
+ OpenVLA (Kim et al. 2024)                       85.0±1.1       88.6±0.9       79.2±1.0     53.6±1.0     OpenVLA (Kim et al. 2024)         16.3   46.2   35.6
+ π0 (Black et al. 2024)                          96.8±1.3       98.8±1.2       95.8±1.5     85.2±1.0     π0 (Black et al. 2024)            88.0   80.3   56.0
+ π0.5 (Intelligence et al. 2025)                 97.3±1.7       98.8±0.9       96.9±1.2     94.2±1.8     RT-1-X (Brohan et al. 2023)       56.7   31.7   59.7
+ SpatialVLA (Qu et al. 2025)                     88.2±0.5       89.9±0.7       78.6±0.6     55.5±1.0     RT-2-X (Brohan et al. 2023)       78.7   77.9   25.0
+ CoT-VLA (Zhao et al. 2025)                     81.13±0.6       87.5±1.4       91.6±0.5     69.0±0.8     RoboVLM (Li et al. 2024b)         77.3   61.7   43.5
+ OFT (Kim, Finn, and Liang 2025)                   96.2           98.3           96.2         90.7       SpatialVLA (Qu et al. 2025)       86.0   77.9   57.4
+ VLANeXt (Wu et al. 2026)                          99.0           99.2           96.6         94.8       TraceVLA (Zheng et al. 2024)      28.0   53.7   57.0
+ π0 + Registers                                  98.8±0.6       99.0±0.8       98.0±0.9     93.1±1.7     π0 + Registers                    88.2   80.5   56.0
+ π0 + Cropping                                   96.5±1.3       98.2±1.2       96.7±1.5     93.3±2.1     π0 + Cropping                     90.0   79.2   56.9
+ AtVLA (Full)                                    99.3±0.7       99.4±0.8       98.3±1.2     96.5±2.6     AtVLA (Full)                      91.3   81.6   57.5∗
+
+Table 2: Evaluation in RealWorld scene. All models underwent extensive fine-tuning tailored to their respective architectures,
+and standard deviations were derived from 20 independent experiments.
+                                                                           Kitchen                                   Building Blocks
+          Method
+                                                     Move       Grab        Pick     Long      Spatial    Stack   Edge    Spatial   Long     Grab
+          Octo (Team et al. 2024)                    20±10      10±5       25±5        0       15±10      20±15     0     10±15       0       5±5
+          OpenVLA (Kim et al. 2024)                  35±15      30±10      45±5        0       45±10      35±5      0     30±10       0      10±5
+          π0 (Black et al. 2024)                     50±5       35±5       55±15     15±5      75±5       55±10   25±5    55±15     15±5     35±10
+          π0.5 (Intelligence et al. 2025)            65±5       35±10      60±10     30±10     75±5       65±5    25±10   60±10     20±5     35±5
+          π0 + Registers                             75±10      45±10      75±5      25±5      75±10      65±5    30±15   65±5      25±5     60±10
+          π0 + Cropping                              65±10      40±15      60±10     25±10     70±10      70±5    35±15   65±10     30±5     50±15
+          AtVLA (Full)                               80±10      65±5       80±5      40±5      75±10      80±5    50±10   70±5      35±5     70±10
+
+
+connection, and row-normalize:                                                               The selected region is cropped from It , resized to 224 ×
+                                                                                        224, and encoded by the same register-augmented vision
+  f l = RowNorm I + 1
+                                X X                                                       encoder. The crop-side register outputs are discarded because
+  M                                 M l,m,q  (6)                                         the base registers already summarize global context; only the
+                         |H||Q|
+                                                m∈H q∈Q                                   Nc = 256 crop patch features Pct are retained. To preserve
+                                                                                          the crop’s position in the original image, we compute
+Attention rollout propagates token influence through the ac-                                                                            
+tion expert:                                                                                                           x1 y1 x2 y2
+                                                                                                        eb = MLP          ,    , ,                  (9)
+                                                                                                                       W HI W HI
+                  Mroll = M
+                          f LM
+                             f L−1 · · · M
+                                         f1                                    (7)
+                                                                                          and add it to every projected crop token. The augmented
+We average the entries from the first h action-token rows                                 prefix is
+to the base image-token columns and reshape them into a                                                                           ⊤
+16 × 16 saliency map St . Register columns are excluded                                                 C+       b      c
+                                                                                                          t = [Ct ; Π(Pt ) + 1Nc eb ].       (10)
+from spatial localization since registers provide global con-                             Only the newly appended crop segment is prefetched; the
+text, whereas only patch tokens retain a fixed image-grid                                 key–value cache of the base image, instruction, and state is
+correspondence. The saliency map is bilinearly upsampled                                  reused. Action expert is then rerun under C+
+                                                                                                                                     t to produce the
+to the input resolution. We search a predefined set of square                             refined action chunk. Consequently, confident steps incur no
+windows and select the region whose average internal atten-                               crop encoding, while uncertain steps pay for one additional
+tion is most distinctive from its surrounding ring:                                       vision encoding and one augmented action generation.
+                                                                          
+                      1 X                        1          X                             Training Objective and Paradigm
+ b∗t = arg max                   St (u) −                           St (u) (8)
+          b∈B         |b|                    |ρ(b) \ b|                                   Our model is initialized from a pretrained π0 policy and
+                            u∈b                           u∈ρ(b)\b
+                                                                                          retains its original vision–language backbone and action-
+where ρ(b) is a context-expanded version of b. This con-                                  generation formulation. We therefore use the standard π0
+trastive criterion discourages both diffuse full-image crops                              action objective, denoted by Lπ0 , without modifying its ac-
+and small windows centered on isolated attention peaks.                                   tion representation or generation process. Training focuses
+                        Move                              Grab                              Pick                             Long                            Spatial
+
+
+
+
+ Task: Place the eggplant on the   Task: Place the teapot on the     Task: Place the eggplant on    Task: Place the eggplant and the Task: Place the sweet potato into
+ blue plate.                       right stove.                      the blue plate from the pot.   corn onto the left and right plates. the container on the right stove.
+
+
+
+
+                        Move                              Grab                              Pick                             Long                            Spatial
+Task: Place the right green block Task: Place the purple triangle   Task: Place the right green block Task: Place the orange square to    Task: Place the yellow
+onto the top of the left structure. on top of the red cylinder.     onto the top of the left structure. the top right of the structure,   cylinder to the left structure
+                                                                                                        then place the cylinder on top.
+
+Figure 3: Real-world evaluation benchmark. The Kitchen suite (top) evaluates visual grounding and reasoning in cluttered
+household scenes, while Building Blocks (bottom) tests small-object stacking, spatial relations, and long-horizon construction.
+
+on integrating the newly introduced register tokens, crop-                              consistent execution in multi-stage tasks. We follow the stan-
+position encoding, and attention-guided localization while                              dard training and evaluation splits and report mean task suc-
+preserving the pretrained policy capabilities.                                          cess rates, with standard deviations when available.
+   We adopt a three-stage post-training paradigm. First, we                                SimplerEnv. We evaluate the Google Robot suit of Sim-
+adapt the register tokens to embodied observations using                                plerEnv under its official protocol, covering Pick Coke Can,
+the original action supervision, initially updating only the                            Move Near, and Open/Close Drawer. These tasks assess
+registers and subsequently unfreezing the last few layers of                            pose-robust grasping, object-relative spatial reasoning, and
+the visual encoder. Second, we introduce ground-truth crops                             articulated-object interaction. We omit the WidowX suite
+and train the crop-position encoder and bounding-box predic-                            since it requires BridgeData-specific training and embod-
+tor while keeping the pretrained visual representation fixed.                           iment adaptation, which would confound visual improve-
+Finally, we jointly optimize action prediction, crop localiza-                          ments with embodiment transfer; its tabletop settings are
+tion, and action-conditioned attention grounding. During this                           also covered by our more challenging real-world benchmark.
+stage, training progressively transitions from ground-truth                             Real-world evaluation. Our real-world benchmark com-
+crops to crops generated by model’s own attention rollout,                              prises two suites, Kitchen and Building Blocks. Kitchen
+while crop dropout exposes the policy to both the base-only                             evaluates visual grounding, contact-point localization, and
+and crop-augmented inference paths. The final objective is                              spatial reasoning in cluttered household scenes. Building
+                L = Lπ0 + λcp Lcp + λag Lag ,            (11)                           Blocks emphasizes small-object grasping, stacking, and
+where Lcp supervises the predicted crop coordinates and                                 structure construction, where similar appearances and single-
+Lag encourages action-to-image attention to concentrate in-                             view depth ambiguity demand implicit 3D reasoning and
+side the task-relevant object region. We use λcp = 0.1 and                              precise placement. Both suites include long-horizon tasks
+λag = 1.0. Detailed optimization schedules and parameter                                that test persistent planning and behavioral consistency.
+configurations are provided in the Appendix.                                            Model and implementation details. All AtVLA variants
+                                                                                        are initialized from the same pretrained π0 checkpoint and
+                            Experiments                                                 retain its original action representation. The base policy con-
+Experimental Setup                                                                      tains a 3B PaliGemma model, comprising a SigLIP-So400m
+Evaluation. We evaluate AtVLA on two public manip-                                      visual encoder and a Gemma-2B language backbone, to-
+ulation benchmarks, LIBERO (Liu et al. 2023) and Sim-                                   gether with a 300M-parameter action expert. Four 1152-
+plerEnv (Li et al. 2024a), together with a real-world bench-                            dimensional register embeddings add only 4,608 parameters,
+mark constructed on a Franka Research 3 robot.                                          while the crop-position MLP and auxiliary bounding-box
+   LIBERO. We evaluate on the four standard LIBERO                                      head are also lightweight relative to the backbone.
+suites: Spatial, Object, Goal, and Long-10, which respec-                                  Both full images and cropped regions are resized to 224 ×
+tively assess spatial-relation generalization, object general-                          224. We use four register tokens and rank-32 LoRA adapters.
+ization, instruction and goal understanding, and temporally                             Register adaptation runs for 20K, followed by 10K steps of
+ Task: pick up the book and place it in the back      Task: turn on the stove and put the moka pot on it     Task: put both moka pots on the stove
+ compartment of the caddy                       (a) Rectified attention distribution without cropping.
+
+
+
+
+  Task: pick up the book and place it in the back     Task: turn on the stove and put the moka pot on it   Task: put the yellow and white mug in the
+  compartment of the caddy                        (b) Rectified attention distribution with cropping.      microwave and close it
+
+Figure 4: Qualitative effects of attention rectification and adaptive visual refinement. (a) Register-enhanced encoding pro-
+duces clean attention aligned with task-relevant objects. (b) When uncertainty triggers refinement, attention rollout selects the
+interaction-critical region, whose high-resolution re-encoding sharpens perception around the target and contact area.
+
+crop alignment and 40K steps of joint refinement. Training                       Q1: Does attention rectification work in embodied poli-
+is distributed over eight NVIDIA RTX 6000 Ada GPUs. All                          cies, and can the repaired attention reliably guide crop-
+real-world policies are deployed on a NVIDIA RTX 4090                            ping? Fig. 1 shows that adding register tokens largely re-
+GPU with 24 GB memory and Franka Research 3 robot with                           moves the high-norm artifacts observed in Fig. 1 and redi-
+a single third-person Intel RealSense D435i camera.                              rects attention toward objects and regions relevant to action
+                                                                                 generation. The resulting maps also provide reliable local-
+Baselines and variants. We select representative general-                        ization signals for cropping. This demonstrates that attention
+ist VLAs and fine-tuning methods listed in Table. 1. For real-                   artifacts can be corrected through embodied post-training,
+world evaluation, all locally evaluated methods use the same                     without additional vision-only pretraining or generic visual
+camera observation, task demonstrations, and are fine-tuned                      supervision. We also experimented with mixing ImageNet
+with comparable steps. We further compare three controlled                       and CC3M datasets for separate visual adaptation; this intro-
+π0 variants: registers only, cropping only, and the complete                     duced additional cost and noticeably disrupted capabilities
+model. These variants share the same initialization and train-                   acquired from robot demonstrations. We therefore train the
+ing data, isolating the contribution of each component.                          registers entirely with embodied data and action supervision.
+Results and Analysis                                                             Q2: How much embodied task information is captured
+                                                                                 by register tokens? We use linear probes to measure task-
+Benchmark evaluation. As shown in Table 1-2, AtVLA
+                                                                                 relevant spatial information contained in the CLS token, spa-
+achieves the best performance across all four LIBERO suites,
+                                                                                 tial patch features, and register tokens. As shown in Fig. 5,
+leads on two SimplerEnv tasks, and remains competitive
+                                                                                 registers consistently provide the strongest probe perfor-
+on Open/Close Drawer. It also obtains the strongest perfor-
+                                                                                 mance for object localization, depth, and surface-normal pre-
+mance across all real-world tasks. The gains are particularly
+                                                                                 diction, with all three scores exceeding 0.70. This supports
+evident on object-centric tasks, including LIBERO-Object
+                                                                                 our hypothesis that embodied training introduces spatial and
+and Kitchen Grab/Pick, as well as spatially demanding tasks
+                                                                                 geometric information beyond the capacity of the original
+LIBERO-Spatial and Building Blocks Spatial/Grab. Fig. 4
+                                                                                 global token. Without dedicated storage slots, this informa-
+and the Appendix further show that AtVLA consistently at-
+                                                                                 tion spills into patch tokens and produces attention artifacts;
+tends to task-relevant regions and invokes cropping near fine-
+                                                                                 registers instead absorb and preserve it as structured context.
+grained interaction areas. These results confirm that rectified
+                                                                                    Removing the learned registers from π0 +Registers causes
+attention improves perception, while RoI refinement recovers
+                                                                                 a substantial degradation across all LIBERO suites, indi-
+local details required for precise manipulation.
+                                                                                 cating that they do not merely suppress artifacts but retain
+   Both controlled variants also improve over the original π0 .                  task-relevant embodied knowledge.
+π0 +Registers performs particularly well on spatial reasoning
+and object localization, consistent with its cleaner attention                   Q3: Which tasks benefit from cropping? Beyond the ex-
+maps. π0 +Cropping improves several fine-grained and long-                       pected gains in fine-grained perception, Tables 1–2 reveal
+horizon tasks, although its gains depend strongly on crop                        several additional effects of cropping. First, the crops used
+quality. We next analyze the four questions introduced above.                    by π0 + Cropping are generated by an external VLM with-
+  Task: put the white mug on the left plate and put the yellow and white mug on the right plates
+
+
+
+
+                                         Prob Acc: 0.88            Prob Acc: 0.75                  Prob Acc: 0.82
+            (a) Scene               (b) Object Location            (c) Depth                (d) Su rface Normal      (e) Spatial-info Coverage Rate
+
+Figure 5: Probing embodied spatial information in visual tokens. Independent linear probes predict object location, depth, and
+surface normals from the CLS token, mean-pooled patch tokens, or register tokens; bars report normalized held-out scores.
+Register features consistently retain the richest task-relevant spatial information.
+
+Table 3: Ablation of the learned register tokens on LIBERO.                    pass, respectively, AtVLA requires roughly 1.4–1.6× the to-
+Results are success rates (%); the final column reports the                    tal computation of π0 for the same number of steps. The
+average task-level change.                                                     exact latency and trigger-dependent cost are reported using
+                                                                               measurements on the deployment RTX 4090.
+  Variant        Spatial   Object     Goal     Long-10    Avg. ∆
+  w/o REGs        93.2      92.1       92.2      81.3     −4.45
+                                                                               0.9                  0.87 0.88       100
+
+                                                                                                                    97
+out embodied post-training. Qualitative inspection shows that                  0.8   0.76 0.75
+these crops often fail to isolate the interaction-critical region,                                                  94
+which is consistent with their slightly lower performance                      0.7                                  91
+than full AtVLA and further highlights the importance of                                    0.60
+                                                                               0.6                                  88
+embodied supervision for learning decision-relevant visual
+                                                                                                                    85
+grounding. Second, cropped observations improve LIBERO-                        0.5
+Long-10 and both real-world long-horizon categories. We at-
+                                                                                 CLS     Spatial   REG-1 REG-2
+tribute this gain to the additional visual context provided for                                                       Spatial   Object   Goal   Long-10
+subsequent decisions, suggesting that cropping can support                       REG-3 REG-4 REG-5 REG-6
+not only local precision but also temporally extended plan-
+                                                                               Figure 6: Effect of register-token capacity. Left: probe scores
+ning. In contrast, the SimplerEnv Open/Close Drawer scene
+                                                                               for the CLS token, patch tokens, and different numbers of
+is largely occupied by the cabinet, causing most crops to pre-
+                                                                               registers. Right: success rates in LIBERO suites.
+serve nearly the entire original image rather than resolve the
+handle or contact point, and thus yielding suboptimal per-
+formance. Overall, additional task-relevant visual context is                  Number of register tokens. As shown in Fig. 6, using only
+beneficial, but the remaining results of π0 + Cropping also                    a small number of register tokens can introduce additional
+show that inaccurate crops can distort the policy input, reduce                interference rather than improve performance. We attribute
+decision accuracy, and increase action uncertainty when no                     this to incomplete absorption of the attention artifacts: the re-
+clean attention signal is available to guide them.                             maining corrupted patch features disrupt the coordination es-
+                                                                               tablished between the vision encoder and the LLM backbone
+Q4: What is the system cost of adaptive cropping? Let                          during embodied post-training, causing task performance to
+Cbase denote one visual encoding and prefix prefill, CA one                    drop, in some cases even below the π0 baseline. Performance
+action-expert sampling pass, Ccrop the incremental crop en-                    saturates when the number of registers reaches four, while
+coding and prefill, K the number of action samples, r the                      the amount of spatial information measured by linear prob-
+crop-trigger rate, and N the number of replanning steps. The                   ing also ceases to increase. We therefore adopt four register
+approximate task-level computation is                                          tokens as the smallest sufficient capacity.
+      Cπ0 = N (Cbase + CA ),                                  (12)
+                                                                                                         Conclusion
+   CAtVLA = N (Cbase + KCA + r(Ccrop + CA )) .                (13)
+                                                                               We presented AtVLA, which enhances visual perception in
+The attention rollout itself adds little cost because it reuses                VLA visual encoders by reorganizing embodied spatial infor-
+attention computed during action sampling, while the base                      mation into register tokens and selectively restoring missing
+prefix KV cache is retained when crop tokens are appended.                     local detail through uncertainty-gated, attention-guided crop-
+Under a representative setting of K = 4 and r ≈ 0.3, and                       ping. Across simulated and single-view real-world bench-
+assuming that one expert pass and crop refinement cost ap-                     marks, AtVLA substantially improves precise manipulation
+proximately 10–15% and 20–25% of a full π0 replanning                          with modest additional computation.
+                        References                                 Kachaev, N.; Kolosov, M.; Zelezetsky, D.; Kovalev, A. K.;
+Bendikas, R.; Dijkman, D.; Peschl, M.; Haresh, S.; and Maz-        and Panov, A. I. 2025. Don’t Blind Your VLA: Align-
+zaglia, P. 2025. Focusing on What Matters: Object-Agent-           ing Visual Representations for OOD Generalization. ArXiv,
+centric Tokenization for Vision Language Action models.            abs/2510.25616.
+ArXiv, abs/2509.23655.                                             Kaduri, O.; Bagon, S.; and Dekel, T. 2024. What’s in the
+Black, K.; Brown, N.; Driess, D.; Esmail, A.; Equi, M.; Finn,      Imageƒ A Deep-Dive into the Vision of Vision Language
+C.; Fusai, N.; Groom, L.; Hausman, K.; Ichter, B.; Jakubczak,      Models. 2025 IEEE/CVF Conference on Computer Vision
+S.; Jones, T.; Ke, L.; Levine, S.; Li-Bell, A.; Mothukuri,         and Pattern Recognition (CVPR), 14549–14558.
+M.; Nair, S.; Pertsch, K.; Shi, L. X.; Tanner, J.; Vuong, Q.;      Kim, M. J.; Finn, C.; and Liang, P. 2025. Fine-Tuning Vision-
+Walling, A.; Wang, H.; and Zhilinsky, U. 2024. π0: A Vision-       Language-Action Models: Optimizing Speed and Success.
+Language-Action Flow Model for General Robot Control.              ArXiv, abs/2502.19645.
+ArXiv, abs/2410.24164.
+                                                                   Kim, M. J.; Pertsch, K.; Karamcheti, S.; Xiao, T.; Bal-
+Brohan, A.; Brown, N.; Carbajal, J.; Chebotar, Y.; Chen, X.;       akrishna, A.; Nair, S.; Rafailov, R.; Foster, E. P.; Lam,
+Choromanski, K.; Ding, T.; Driess, D.; Dubey, A.; Finn, C.;        G.; Sanketi, P. R.; Vuong, Q.; Kollar, T.; Burchfiel, B.;
+Florence, P.; Fu, C.; Arenas, M. G.; Gopalakrishnan, K.; Han,      Tedrake, R.; Sadigh, D.; Levine, S.; Liang, P.; and Finn, C.
+K.; Hausman, K.; Herzog, A.; Hsu, J.; Ichter, B.; Irpan, A.;       2024. OpenVLA: An Open-Source Vision-Language-Action
+Joshi, N.; Julian, R.; Kalashnikov, D.; Kuang, Y.; Leal, I.;       Model. ArXiv, abs/2406.09246.
+Lee, L.; Lee, T.-W. E.; Levine, S.; Lu, Y.; Michalewski, H.;
+Mordatch, I.; Pertsch, K.; Rao, K.; Reymann, K.; Ryoo, M.;         Li, C.; Wen, J.; Peng, Y.; Peng, Y.; Feng, F.; and Zhu, Y.
+Salazar, G.; Sanketi, P.; Sermanet, P.; Singh, J.; Singh, A.;      2025a. PointVLA: Injecting the 3D World into Vision-
+Soricut, R.; Tran, H.; Vanhoucke, V.; Vuong, Q.; Wahid, A.;        Language-Action Models. ArXiv, abs/2503.07511.
+Welker, S.; Wohlhart, P.; Wu, J.; Xia, F.; Xiao, T.; Xu, P.; Xu,   Li, X.; Heng, L.; Liu, J.; Shen, Y.; Gu, C.; Liu, Z.; Chen,
+S.; Yu, T.; and Zitkovich, B. 2023. RT-2: Vision-Language-         H.; Han, N.; Zhang, R.; Tang, H.; Zhang, S.; and Dong, H.
+Action Models Transfer Web Knowledge to Robotic Control.           2025b. 3DS-VLA: A 3D Spatial-Aware Vision Language
+arXiv:2307.15818.                                                  Action Model for Robust Multi-Task Manipulation. In Lim,
+Carvalho, M.; Dias, H.; and Martins, B. 2026. CropVLM:             J.; Song, S.; and Park, H.-W., eds., Proceedings of The 9th
+Learning to Zoom for Fine-Grained Vision-Language Per-             Conference on Robot Learning, volume 305 of Proceedings
+ception. arXiv:2511.19820.                                         of Machine Learning Research, 2344–2359. PMLR.
+Darcet, T.; Oquab, M.; Mairal, J.; and Bojanowski, P.              Li, X.; Hsu, K.; Gu, J.; Pertsch, K.; Mees, O.; Walke, H. R.;
+2023.     Vision Transformers Need Registers.            ArXiv,    Fu, C.; Lunawat, I.; Sieh, I.; Kirmani, S.; Levine, S.; Wu, J.;
+abs/2309.16588.                                                    Finn, C.; Su, H.; Vuong, Q. H.; and Xiao, T. 2024a. Evaluat-
+Deng, S.; Yan, M.; Wei, S.; Ma, H.-L.; Yang, Y.; Chen, J.;         ing Real-World Robot Manipulation Policies in Simulation.
+Zhang, Z.; Yang, T.; Zhang, X.; Cui, H.; Zhang, Z.; and            In Conference on Robot Learning.
+Wang, H. 2025. GraspVLA: a Grasping Foundation Model               Li, X.; Li, P.; Qian, L.; Liu, M.; Wang, D.; Liu, J.; Kang, B.;
+Pre-trained on Billion-scale Synthetic Action Data. ArXiv,         Ma, X.; Wang, X.; Guo, D.; Kong, T.; Zhang, H.; and Liu,
+abs/2505.03233.                                                    H. 2024b. What matters in building vision–language–action
+Hanyu, T.; Chung, N.; Le, H.; Nguyen, T.; Ikebe, Y.; Gunder-       models for generalist robots. Nature Machine Intelligence,
+man, A.; Minh, D. N. H.; Vo, K. T.; Kieu, T.; Yamazaki, K.;        8: 158 – 172.
+Rainwater, C.; Nguyen, A.; and Le, N. 2025. SlotVLA:               Li, Z.; Ren, L.; Yang, J.; Zhao, Y.; Wu, X.; Xu, Z.; Bai, X.;
+Towards Modeling of Object-Relation Representations in             and Zhao, H. 2024c. VIP: Vision Instructed Pre-training for
+Robotic Manipulation. ArXiv, abs/2511.06754.                       Robotic Manipulation.
+Intelligence, P.; Black, K.; Brown, N.; Darpinian, J.; Dha-        Liu, B.; Zhu, Y.; Gao, C.; Feng, Y.; Liu, Q.; Zhu, Y.; and
+balia, K.; Driess, D.; Esmail, A.; Equi, M.; Finn, C.; Fusai,      Stone, P. 2023. LIBERO: Benchmarking Knowledge Transfer
+N.; Galliker, M. Y.; Ghosh, D.; Groom, L.; Hausman, K.;            for Lifelong Robot Learning. ArXiv, abs/2306.03310.
+Ichter, B.; Jakubczak, S.; Jones, T.; Ke, L.; LeBlanc, D.;
+                                                                   Liu, Z.; Dong, Y.; Rao, Y.; Zhou, J.; and Lu, J. 2024. Chain-
+Levine, S.; Li-Bell, A.; Mothukuri, M.; Nair, S.; Pertsch, K.;
+                                                                   of-Spot: Interactive Reasoning Improves Large Vision-
+Ren, A. Z.; Shi, L. X.; Smith, L.; Springenberg, J. T.; Sta-
+                                                                   Language Models. ArXiv, abs/2403.12966.
+chowicz, K.; Tanner, J.; Vuong, Q.; Walke, H. R.; Walling, A.;
+Wang, H.; Yu, L.; and Zhilinsky, U. 2025. π0.5: a Vision-          Qu, D.; Song, H.; Chen, Q.; Yao, Y.; Ye, X.; Ding, Y.;
+Language-Action Model with Open-World Generalization.              Wang, Z.; Gu, J.; Zhao, B.; Wang, D.; and Li, X. 2025.
+ArXiv, abs/2504.16054.                                             SpatialVLA: Exploring Spatial Representations for Visual-
+Jiang, Z.; Chen, J.; Zhu, B.; Luo, T.; Shen, Y.; and Yang, X.      Language-Action Model. ArXiv, abs/2501.15830.
+2024. Devils in Middle Layers of Large Vision-Language             Shen, H.; Zhao, K.; Zhao, T.; Xu, R.; Zhang, Z.; Zhu, M.;
+Models: Interpreting, Detecting and Mitigating Object Hal-         and Yin, J. 2024. ZoomEye: Enhancing Multimodal LLMs
+lucinations via Attention Lens. 2025 IEEE/CVF Confer-              with Human-Like Zooming Capabilities through Tree-Based
+ence on Computer Vision and Pattern Recognition (CVPR),            Image Exploration. In Conference on Empirical Methods in
+25004–25014.                                                       Natural Language Processing.
+Song, W.; Zhou, Z.; Zhao, H.; Chen, J.; Ding, P.; Yan, H.;                         Training Paradigm
+Huang, Y.; Tang, F.; Wang, D.; and Li, H. 2025. ReconVLA:        Rather than training the complete policy from scratch, we
+Reconstructive Vision-Language-Action Model as Effective         adopt a staged post-training procedure on top of pretrained
+Robot Perceiver. In AAAI Conference on Artificial Intelli-       π0 . The design follows two principles. First, newly introduced
+gence.                                                           visual components are aligned before being jointly optimized
+Team, O. M.; Ghosh, D.; Walke, H. R.; Pertsch, K.; Black,        with the policy, preventing unstable feature shifts from dis-
+K.; Mees, O.; Dasari, S.; Hejna, J.; Kreiman, T.; Xu, C.; Luo,   rupting the pretrained vision–language representation. Sec-
+J.; Tan, Y. L.; Sanketi, P. R.; Vuong, Q.; Xiao, T.; Sadigh,     ond, the crop-input distribution is progressively aligned with
+D.; Finn, C.; and Levine, S. 2024. Octo: An Open-Source          inference, where crop regions are generated from the model’s
+Generalist Robot Policy. ArXiv, abs/2405.12213.                  own action-conditioned attention rather than from annota-
+                                                                 tions.
+Wu, X.-M.; Fan, B.; Liao, K.; Jiang, J.-J.; Yang, R.; Luo, Y.;      Let Lπ0 denote the original action-training objective of π0 .
+Wu, Z.; Zheng, W.; and Loy, C. C. 2026. VLANeXt: Recipes         We retain this objective throughout all stages. During joint
+for Building Strong VLA Models. ArXiv, abs/2602.18532.           refinement, we additionally supervise the action-to-image
+Zawalski, M.; Chen, W.; Pertsch, K.; Mees, O.; Finn, C.; and     attention:
+Levine, S. 2024. Robotic Control via Embodied Chain-of-                                      P
+                                                                                                p∈Ω(bgt ) Ap + ϵ
+Thought Reasoning. In Conference on Robot Learning.                            Lag = − log       P                ,         (14)
+                                                                                                    p Ap + ϵ
+Zhang, J.; Khayatkhoei, M.; Chhikara, P.; and Ilievski, F.
+2024. Towards Perceiving Small Visual Details in Zero-           where Ap denotes the aggregated attention assigned by the
+shot Visual Question Answering with Multimodal LLMs.             near-term action tokens to base-image patch p, and Ω(bgt )
+arXiv:2310.16033.                                                is the set of patch centers inside the annotated task-relevant
+                                                                 region. This objective encourages the attention used for crop
+Zhang, J.; Khayatkhoei, M.; Chhikara, P.; and Ilievski, F.       extraction to concentrate on regions relevant to the current
+2025. MLLMs Know Where to Look: Training-free Percep-            manipulation decision.
+tion of Small Visual Details with Multimodal LLMs. ArXiv,
+abs/2502.17422.                                                  Stage 0: Register Adaptation
+Zhao, Q.; Lu, Y.; Kim, M. J.; Fu, Z.; Zhang, Z.; Wu, Y.;         The first stage adapts the randomly initialized register tokens
+Li, Z.; Ma, Q.; Han, S.; Finn, C.; Handa, A.; Liu, M.-Y.;        to embodied visual observations. All training samples use
+Xiang, D.; Wetzstein, G.; and Lin, T.-Y. 2025. CoT-VLA:          the base view only, and the crop branch is disabled. The pre-
+Visual Chain-of-Thought Reasoning for Vision-Language-           trained PaliGemma backbone, visual projector, and action
+Action Models. 2025 IEEE/CVF Conference on Computer              expert remain frozen. The standard Lπ0 objective propagates
+Vision and Pattern Recognition (CVPR), 1702–1713.                task-level supervision through the frozen policy to the train-
+Zheng, R.; Liang, Y.; Huang, S.; Gao, J.; Daum’e, H.;            able visual parameters.
+Kolobov, A.; Huang, F.; and Yang, J. 2024. TraceVLA: Vi-            Stage 0 spans 20K optimization steps and is divided into
+sual Trace Prompting Enhances Spatial-Temporal Awareness         two consecutive phases. During the first 4K steps, only the
+for Generalist Robotic Policies. ArXiv, abs/2412.10345.          four register embeddings are updated:
+Zhong, L.; Rosenthal, F.; Sicking, J.; Hüger, F.; Bagdonat,                         min E(o,ℓ,s,a)∼D [Lπ0 ] .               (15)
+                                                                                    θreg
+T.; Gottschalk, H.; and Schwinn, L. 2025. FOCUS: Internal
+MLLM Representations for Efficient Fine-Grained Visual           This warm-up allows the registers to acquire useful global-
+Question Answering. arXiv:2506.21710.                            information storage behavior without immediately perturb-
+                                                                 ing the pretrained image features.
+                                                                    For the remaining 16K steps, the last four SigLIP trans-
+                     Training Data                               former blocks are additionally unfrozen:
+All reported models are post-trained exclusively on robot                                  min ED [Lπ0 ] .                  (16)
+                                                                                              last
+                                                                                       θreg ,θvis
+demonstrations. For LIBERO, we train a single unified policy
+on the mixture of the four standard suites: Spatial, Object,     The earlier visual blocks and all downstream pretrained com-
+Goal, and Long-10. Each suite contains ten tasks with 50         ponents remain fixed. This gradual unfreezing enables the
+expert demonstrations per task, resulting in 40 tasks and        upper visual layers to reorganize embodied global informa-
+2,000 trajectories in total.                                     tion into the register slots while limiting drift in low-level
+   Each demonstration contains RGB observations, a lan-          visual representations. We use learning rates of 1 × 10−4
+guage instruction, proprioceptive states, and continuous ac-     for the register-only phase and 2 × 10−5 after unfreezing the
+tion sequences. For crop-related training, each observation      final visual blocks.
+is additionally associated with an annotated task-relevant
+region used to construct ground-truth crops and supervise        Stage 1: Ground-Truth Crop Alignment
+action-conditioned attention. An episode-disjoint subset of      After register adaptation, we introduce the crop-augmented
+the training demonstrations is held out for uncertainty-         input format. Each training sample contains the base obser-
+threshold calibration.                                           vation together with a high-resolution crop extracted from
+the annotated task-relevant region. Ground-truth crops are           Mixed transition phase. From 40% to 90% of joint train-
+used exclusively in this stage, and crop dropout is disabled.        ing, α is linearly increased from 0 to 1. For each non-dropped
+   The complete SigLIP encoder, register embeddings, visual          sample, the crop source is selected as
+projector, and pretrained backbone weights remain frozen.                       roll                          roll
+We optimize the crop-position encoder and rank-32 LoRA                         b , u < α and Valid(b ),
+adapters inserted into the language and action components            bcrop = bgt , u ≥ α,                                  u ∼ U (0, 1).
+                                                                                          u < α and ¬ Valid(broll ),
+using the original action objective:                                           
+                                                                                  ∅,
+                                                                                                                                (20)
+                         Lalign = Lπ0 .                      (17)    Here, ∅ denotes the base-only input. Thus, an invalid roll-
+                                                                     out does not fall back to a ground-truth crop; it skips crop
+   This stage teaches the policy to interpret the additional         refinement, matching the failure-handling behavior used at
+crop tokens and their position in the original image without         deployment.
+altering the register-specialized visual encoder. The crop-             Over the same interval, the crop-dropout probability is
+position encoder maps the normalized crop coordinates                linearly increased from 0 to 0.3. Crop dropout removes the
+(x1 /W, y1 /H, x2 /W, y2 /H) to the multimodal hidden di-            complete crop-view segment, forcing the policy to retain
+mension and adds the resulting embedding to every crop-              strong performance under the base-only input used by the
+view token. We train this stage for 10K steps with a learning        confident inference path.
+rate of 1 × 10−4 .
+                                                                     Inference-alignment phase. During the final 10% of train-
+Action-Conditioned Attention Grounding                               ing, all valid non-dropped crops are obtained from attention
+                                                                     rollout:
+The crop used at inference is generated from action-to-image                            α = 1,     pdrop = 0.3.              (21)
+attention. Optimizing only the action objective does not guar-
+antee that this attention identifies the task-relevant interaction   If rollout localization is invalid, the crop segment is omit-
+region; it may instead concentrate on visually salient back-         ted and the sample follows the base-only path. The policy
+grounds or persistent positional sinks. We therefore activate        is therefore optimized under the same crop-generation and
+Lag from the first step of the final joint-training stage.           failure-handling mechanisms used at deployment.
+   Attention grounding is not trained as an isolated continu-
+ation stage. Instead, action prediction, visual adaptation, and      Optimization Details
+attention calibration co-adapt throughout the same optimiza-
+tion trajectory, avoiding abrupt changes in the objective or         Stage 2 is trained for 40K steps with AdamW, a batch size of
+learning-rate schedule.                                              4, and a constant learning rate of 1 × 10−4 . Together with the
+                                                                     20K-step register adaptation and 10K-step crop alignment,
+                                                                     the complete post-training procedure contains 70K gradient
+Stage 2: Joint Refinement and Inference Alignment                    updates.
+The final stage jointly adapts the complete AtVLA policy.               Both base images and crop regions are resized to 224×224.
+The base weights of SigLIP, Gemma, and the action expert             Training is distributed over eight NVIDIA RTX 6000 Ada
+remain frozen, while rank-32 LoRA adapters in all three              GPUs. The same pretrained π0 action representation, action
+components are trainable. The register embeddings, visual            normalization, prediction horizon, and flow-matching objec-
+projector, and crop-position encoder are optimized directly.         tive are retained across all stages. The procedure therefore
+                                                                     introduces visual specialization and adaptive re-examination
+  The joint objective is
+                                                                     without changing the underlying action space or deployment
+          Ljoint = Lπ0 + λag Lag ,         λag = 1.0.        (18)    interface of the base policy.
+
+The original action objective preserves control quality, while                 Uncertainty-Gated Refinement
+Lag calibrates the internal attention used for local refinement.
+                                                                     At each action-chunk replanning step, the base visual and
+   To reduce the mismatch between training with annotated
+                                                                     language prefix is computed once and stored in a reusable
+crops and inference with attention-derived crops, we em-
+                                                                     key–value cache. Conditioned on this shared prefix, the ac-
+ploy a three-phase crop curriculum over the 40K-step joint-
+                                                                     tion expert generates K = 4 action chunks from indepen-
+training schedule. Let α denote the probability of using a
+                                                                     dent Gaussian initializations. We use the same ten-step Euler
+rollout-derived crop instead of a ground-truth crop.
+                                                                     solver and noise schedule for all samples.
+                                                                              (k)
+Stable alignment phase. During the first 40% of joint                   Let A1:H denote the k-th sampled action chunk, where H
+training, all crops are extracted from ground-truth regions:         is the native action horizon of the underlying π0 checkpoint.
+                                                                     Uncertainty is computed over the first h actions, where h
+                    α = 0,       pdrop = 0.                  (19)    equals the number of low-level commands executed before
+                                                                     the next policy query. Thus, the uncertainty estimate always
+This phase stabilizes multimodal fusion and prevents inac-           covers exactly the near-term portion of the chunk that influ-
+curate early attention maps from corrupting crop inputs.             ences closed-loop execution.
+  Using the translational action dimensions Dtr =                   We average the rollout entries from the first h action-token
+{∆x, ∆y, ∆z}, we compute                                         rows to the 256 base-image patch columns and reshape them
+                       v                                         into a 16 × 16 saliency map. Register-token columns are
+                h      u        K             2                excluded because registers encode global embodied context
+          1 X X u      t 1
+                                X    (k)
+  Ut =                              Aj,d − Aj,d ,                but do not retain a fixed image-grid correspondence. The
+       h|Dtr | j=1       K −1
+                    d∈Dtr            k=1                         saliency map is bilinearly upsampled to the original image
+                                                         (22)    resolution before window search.
+where                                                               For multiple camera views, rollout maps are computed in-
+                                K
+                             1 X (k)                             dependently for each view. We select the single view–window
+                    Aj,d =      Aj,d .                   (23)    pair with the highest localization score, so an uncertain re-
+                             K
+                               k=1                               planning step introduces at most one additional crop encod-
+   When Ut ≤ τ , the mean sampled action chunk is executed       ing.
+directly. When Ut > τ , attention-guided crop refinement is
+attempted. The refined path performs one additional crop         Contrastive Window Search
+encoding and one additional action generation rather than        We search square candidate windows with side lengths
+repeating all K samples.
+                                                                                  S = {84, 112, 140} pixels                (29)
+Threshold Calibration                                            on the 224 × 224 input image. Windows are evaluated using
+The uncertainty scale depends on the embodiment-specific         a 14-pixel stride, aligned with the SigLIP patch size.
+action normalization and control interface. We therefore cali-      For candidate window b, let ρ(b) denote the context win-
+brate one threshold per embodiment rather than using a single    dow obtained by expanding its side length by a factor of 1.25.
+threshold across robots. In particular, the same threshold is    We select
+shared across all four LIBERO suites, while separate thresh-                                                                   
+                                                                                    1   X                1        X
+olds are used for the Google Robot and Franka embodiments.       b∗ = arg max             St (u) −                      St (u) .
+   For each sample in the episode-disjoint calibration set,                 b∈B    |b|               |ρ(b) \ b|
+                                                                                      u∈b                       u∈ρ(b)\b
+we evaluate both the base and crop-augmented paths and
+                                                                                                                          (30)
+measure the reduction in near-term translational action error:
+                                                                 The contrastive score favors regions whose internal attention
+                   ∆et = ebase
+                          t    − ecrop
+                                  t    .                 (24)    is distinctive relative to their local surroundings, discour-
+                                                                 aging both diffuse full-image crops and isolated attention
+We select the threshold that maximizes the expected benefit      peaks.
+of refinement subject to an approximate 30% trigger-rate            The selected box is padded by 10% on each side, clipped to
+budget:                                                          the image boundary, cropped from the original observation,
+τ ∗ = arg max E [∆et ⊮(Ut > τ )] ,         Pr(Ut > τ ) ≤ 0.3.    and resized to 224 × 224. Its normalized coordinates are
+           τ                                                     passed through a two-layer crop-position MLP,
+                                                          (25)
+In practice, the 70th percentile of the validation uncertainty                        4 → 256 → dLLM ,                     (31)
+distribution provides the initial threshold, which is then ad-   with a GELU activation. The resulting position embedding
+justed using the measured crop benefit.                          is added to every projected crop patch token.
+     Attention Rollout and Crop Extraction                       Invalid Rollout Handling
+Rollout Aggregation                                              A rollout is considered invalid if any of the following condi-
+We collect action-to-prefix attention from all 18 joint-         tions holds:
+attention layers of the action expert. Attention matrices are      • the saliency map contains non-finite values;
+averaged over all heads and over Euler denoising steps             • its total attention mass is smaller than ϵ = 10−6 ;
+                       Q = {3, 6, 9}.                    (26)      • window search produces no finite candidate score;
+                                                                   • the selected coordinates are degenerate or lie outside the
+These steps provide complementary early, intermediate, and           image after clipping; or
+late action-conditioned signals without storing attention from
+the complete denoising trajectory.                                 • the final crop has a side length smaller than 56 pixels.
+   For layer l, we compute                                          For an invalid rollout, crop refinement is skipped and the
+                                                               policy executes the action prediction obtained from the base-
+                              1     X X                          view path. The same rule is used during joint training and
+  M
+  f l = RowNorm I +                         Ml,m,q  , (27)     deployment, preventing ground-truth fallbacks from intro-
+                           |H||Q|
+                                    m∈H q∈Q                      ducing a train–test discrepancy.
+where H denotes the set of attention heads. Attention is then
+propagated across layers:                                               Key Implementation Configuration
+                                                                 Key training and inference configurations are listed in Ta-
+                Mroll = M f L−1 · · · M
+                        fLM           f1.                (28)    ble. 4.
+ Configuration                 Value
+ LIBERO training data          40 tasks, 2,000 trajectories
+ Register tokens               4
+ Input resolution              224 × 224
+ Register adaptation           20K steps: 4K register-only/16K SigLIP
+ Ground-truth crop alignment   10K steps
+ Joint refinement              40K steps
+ LoRA rank                     32
+ Action samples for gating     K=4
+ Flow integration              10-step Euler
+ Rollout denoising steps       {3, 6, 9}
+ Rollout layers                All 18 joint-attention layers
+ Candidate crop sizes          {84, 112, 140} pixels
+ Window-search stride          14 pixels
+ Context expansion             1.25×
+ Final crop padding            10%
+ Target trigger rate           Approximately 30% per embodiment
+
+ Table 4: Training and inference configuration for AtVLA.
+
+
+                 More Demonstrations
+Figure 7 provides additional qualitative rollouts illustrating
+how AtVLA combines global scene understanding with se-
+lective high-resolution perception. The full observation re-
+mains available throughout execution, allowing the policy to
+preserve the task instruction, workspace layout, and relation-
+ships among multiple objects. When the action prediction
+becomes uncertain near a grasp or placement event, the re-
+finement branch concentrates additional visual capacity on
+the corresponding interaction region rather than repeatedly
+processing irrelevant background details.
+Figure 7: Additional real-world demonstrations of AtVLA. Each row presents a temporally ordered manipulation rollout.
+

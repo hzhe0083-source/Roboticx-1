@@ -1,0 +1,642 @@
+                                                               TeNet: Text-to-Network for Compact Policy Synthesis
+
+                                                                         Ariyan Bighashdel1,2 and Kevin Sebastian Luck2
+                                                                                          1
+                                                                                            Utrecht University
+                                                                                   2
+                                                                                     Vrije Universiteit Amsterdam
+                                                                                a.bighashdel@uu.nl, k.s.luck@vu.nl
+
+
+                                                                  Abstract                               (VLA) systems such as PaLM-E [Driess et al., 2023], Say-
+arXiv:2601.15912v1 [cs.RO] 22 Jan 2026
+
+
+
+
+                                                                                                         Can [Brohan et al., 2023], RT-2 [Zitkovich et al., 2023],
+                                              Robots that follow natural-language instructions           OpenVLA [Kim et al., 2025], and OCTO [Team et al., 2024].
+                                              often either plan at a high level using hand-              These systems highlight how expressive language can be for
+                                              designed interfaces or rely on large end-to-end            specifying complex robotic behaviors. However, this expres-
+                                              models that are difficult to deploy for real-time          siveness often comes at the cost of scale. Many recent ap-
+                                              control. We propose TeNet (Text-to-Network), a             proaches to language-conditioned control rely on large
+                                              framework for instantiating compact, task-specific         end-to-end architectures, which can be computationally
+                                              robot policies directly from natural language de-          expensive and difficult to deploy in high-frequency con-
+                                              scriptions. TeNet conditions a hypernetwork on             trol loops or on robots with limited onboard compute.
+                                              text embeddings produced by a pretrained large                At the other end of the spectrum are compact sequence
+                                              language model (LLM) to generate a fully exe-              models such as Decision Transformers (DT) [Chen et al.,
+                                              cutable policy, which then operates solely on low-         2021] and Prompt-DT [Xu et al., 2022], which prioritize
+                                              dimensional state inputs at high control frequen-          efficiency and ease of deployment in offline reinforcement
+                                              cies. By using the language only once at the               learning. However, these models do not naturally incorporate
+                                              policy instantiation time, TeNet inherits the gen-         language: instead, they rely on trajectory prompts or task-
+                                              eral knowledge and paraphrasing robustness of pre-         specific demonstrations to distinguish tasks, often requiring
+                                              trained LLMs while remaining lightweight and               demonstrations even at test time and degrading as task diver-
+                                              efficient at execution time. To improve gener-             sity increases. This leaves a clear gap between expressive
+                                              alization, we optionally ground language in be-            language-conditioned systems and compact policies that are
+                                              havior during training by aligning text embed-             efficient but are not language-enabled.
+                                              dings with demonstrated actions, while requiring              Several works attempt to bridge this gap by using lan-
+                                              no demonstrations at inference time. Experiments           guage indirectly. Code-as-Policies [Liang et al., 2023]
+                                              on MuJoCo and Meta-World benchmarks show that              translates instructions into robot API calls, while Code-as-
+                                              TeNet produces policies that are orders of magni-          Rewards [Venuto et al., 2024] maps task descriptions into re-
+                                              tude smaller than sequence-based baselines, while          ward functions for reinforcement learning. Although effec-
+                                              achieving strong performance in both multi-task            tive in specific settings, these methods depend on predefined
+                                              and meta-learning settings and supporting high-            interfaces or accurate simulators, limiting their applicability
+                                              frequency control. These results show that text-           to real-world robotics.
+                                              conditioned hypernetworks offer a practical way
+                                                                                                            In this work, we ask a simpler question: can language
+                                              to build compact, language-driven controllers for
+                                                                                                         itself be used as a direct conditioning signal for policy in-
+                                              ressource-constrained robot control tasks with real-
+                                                                                                         stantiation? Rather than executing a large language model
+                                              time requirements.
+                                                                                                         inside the control loop, we use it once—at policy instantia-
+                                                                                                         tion—through a hypernetwork [Ha et al., 2016]. We intro-
+                                                                                                         duce TeNet (Text-to-Network), a framework that conditions
+                                         1   Introduction                                                a hypernetwork on LLM-derived text embeddings to gener-
+                                         Recent advances in large language models (LLMs), such           ate compact, task-specific policies. The resulting controller
+                                         as GPT [Brown et al., 2020] and LLaMA [Touvron et al.,          operates solely on low-dimensional state inputs, requires no
+                                         2023], have demonstrated that natural language can act as       demonstrations at inference time, and can run at high control
+                                         a powerful and flexible interface across a wide range of        frequencies on resource-constrained robots.
+                                         domains. In robotics, this has led to growing interest in          While direct text-to-policy instantiation is effective, we
+                                         language-conditioned control, where robots are guided by        find that performance improves when language is grounded
+                                         natural-language instructions, often alongside perceptual in-   in behavior. By aligning language representations with ex-
+                                         puts. Prominent examples include vision–language–action         pert trajectories during training, task descriptions capture not
+only linguistic intent but also behavioral semantics, leading      alignment is auxiliary: language grounding serves to stabilize
+to stronger generalization in multi-task and meta-learning set-    text-conditioned policy generation rather than constituting the
+tings. Importantly, grounding is used only during training: at     primary modeling objective.
+inference, policies are instantiated from text alone.                 Compact Sequence Models for Policy Learning. A sep-
+   This paper investigates a first approach into the possibil-     arate line of research explores compact sequence models as
+ity to utilze large robotic foundation models for resource-        policies for reinforcement learning. The Decision Trans-
+constrained robots via language-enabled hypernetworks for          former (DT) [Chen et al., 2021] formulates offline RL as con-
+compact policy synthesis. While this could be applied to           ditional sequence modeling, generating actions autoregres-
+VLAs in the future, our first steps focus on low-dimensional,      sively given states and return-to-go. While effective in single-
+trajectory-based domains (Mujoco and Meta-World), isolat-          task settings, DT lacks an explicit mechanism for task identi-
+ing the role of language in policy instantiation without ad-       fication and therefore struggles in multi-task or meta-learning
+dressing perception.                                               regimes.
+   In summary, our contributions are:                                 Extensions such as Prompt-DT [Xu et al., 2022] and Meta-
+   • Text-to-Network Policy Generation. We introduce               DT [Wang et al., 2024] introduce task-conditioning via tra-
+      TeNet, a framework that conditions a hypernetwork            jectory prompts, improving generalization at the cost of re-
+      on LLM text embeddings to synthesize compact, task-          quiring demonstrations at inference time. Diffusion-based
+      specific robot policies suitable for real-time deployment.   approaches, including MTDiff [He et al., 2023] and MetaD-
+                                                                   iffuser [Ni et al., 2023], similarly condition on trajectories
+   • Grounding Language in Behavior. We show that
+                                                                   or task contexts to generalize across tasks. Although these
+      aligning language with expert trajectories during train-
+                                                                   methods demonstrate strong performance, their reliance on
+      ing enriches linguistic representations with behavioral
+                                                                   prompt trajectories limits scalability when demonstrations are
+      semantics and improves generalization in multi-task and
+                                                                   unavailable or expensive.
+      meta-learning settings.
+                                                                      In parallel, visuomotor diffusion policies such as Diffusion
+   • Empirical Insights into a New Paradigm. We provide            Policy [Chi et al., 2025] generate actions directly from im-
+      an extensive study on Mujoco and Meta-World bench-           ages and have shown impressive real-world results. These
+      marks, highlighting both the promise and limitations of      approaches differ fundamentally from the low-dimensional,
+      language-enabled hypernetworks and outlining paths to-       state-based settings we consider. We therefore focus on DT-
+      ward future vision-grounded extensions.                      based baselines to maintain architectural comparability and
+                                                                   isolate the role of language-conditioned policy instantiation.
+2   Related Work                                                      Overall, compact sequence models demonstrate that
+Language-Conditioned Control in Robotics. Large lan-               lightweight architectures can scale to multi-task RL, but their
+guage models (LLMs) have recently been integrated into             dependence on trajectory prompts and lack of direct lan-
+robotic systems to enable natural language instruction fol-        guage grounding constrain their applicability as instruction-
+lowing and high-level planning. Early approaches such as           following agents.
+SayCan [Brohan et al., 2023] and PaLM-E [Driess et al.,               Hypernetworks and Policy Generation. Hypernet-
+2023] leverage pretrained LLMs to map language into sym-           works [Ha et al., 2016] generate the parameters of another
+bolic plans or action primitives executed by low-level con-        network and have been widely explored for rapid special-
+trollers. These methods exploit LLMs’ world knowledge but          ization and meta-learning in reinforcement learning [Beck et
+typically operate at a goal or planning level rather than syn-     al., 2023]. Prior work conditions hypernetworks on a vari-
+thesizing executable control policies.                             ety of signals, including structured task embeddings [Rezaei-
+   Other works connect language and control indirectly.            Shoshtari et al., 2023; Ren et al., ], demonstration trajecto-
+Code-as-Policies [Liang et al., 2023] translates instructions      ries [Hegde et al., 2024; Liang et al., 2024], behavior de-
+into robot API calls, while Code-as-Rewards [Venuto et al.,        scriptors or archives [Hegde et al., 2023], robot morphol-
+2024] maps task descriptions into reward functions for re-         ogy [Xiong et al., 2024], or visual observations [Gklezakos
+inforcement learning. SayTap [Tang et al., 2023] similarly         et al., 2022].
+maps language into structured locomotion patterns. While ef-          In parallel, language-conditioned hypernetworks have been
+fective in constrained settings, these approaches rely on pre-     studied in NLP to generate adapter or LoRA weights from
+defined interfaces or accurate simulators, limiting their gen-     task descriptions [Ye and Ren, 2021; Mahabadi et al., 2021;
+erality. More recent vision-language-action systems, such as       Lv et al., 2024; Charakorn et al., 2025]. These methods focus
+RT-2 [Zitkovich et al., 2023], OpenVLA [Kim et al., 2025],         on adapting large language models rather than synthesizing
+and OCTO [Team et al., 2024], integrate language and per-          control policies.
+ception in large end-to-end models, but their computational           Across these domains, existing approaches either rely on
+demands hinder deployment in resource-constrained or high-         structured task descriptors, demonstrations, morphology sig-
+frequency control settings.                                        nals, or use language only to adapt large models. None di-
+   Several works also explore grounding language in behavior       rectly combine LLM-based text encoders with hypernetworks
+through representation learning. For example, CLASP [Rana          to synthesize compact, task-specific robot control policies.
+et al., 2023] learns joint language–state–action embeddings           Summary. Prior work has explored language-conditioned
+via contrastive objectives, focusing on representation pre-        planning, compact sequence models, and hypernetwork-
+training rather than policy synthesis. In contrast, our use of     based policy generation. However, no existing approach di-
+rectly instantiates executable robot policies from natural lan-                  Few-shot adaptation (baselines). A common meta-RL
+guage via a shared hypernetwork. Our work fills this gap                      strategy is to provide a small number of expert trajectories
+by using language as a conditioning signal for compact pol-                   from the unseen task as adaptation data (few-shot setting).
+icy synthesis, grounded in behavior during training and exe-                  Prompt Decision Transformers (Prompt-DT) implement this
+cutable without demonstrations at inference time.                             by using short expert rollouts (prompt trajectories) as test-
+                                                                              time task identifiers.
+3    Problem Statement                                                           Language-based instantiation (ours).             In contrast
+                                                                              Prompt-DT, we do not rely on prompt trajectories; instead
+Language-Augmented MDP (LA-MDP). We model a sin-
+                                                                              we leverage natural-language descriptions sampled from Lτ
+gle task as a Language-Augmented MDP
+                                                                              to instantiate policies for τ ∈ Ttest , requiring the learner to
+                   M̃ = (S, A, P, R, µ, H, L),                          (1)   ground language into behavior.
+which extends a standard MDP by including a language de-
+scriptor. The first six elements (S, A, P, R, µ, H) are the
+                                                                              4     Method
+standard MDP components: S is the state space, A the action                   Our framework, TeNet (Text-to-Network), synthesizes com-
+space, P (s′ | s, a) the transition dynamics, R(s, a) the re-                 pact, task-specific robot policies directly from natural lan-
+ward function, µ the initial state distribution, and H the hori-              guage descriptions by conditioning a hypernetwork on lan-
+zon. The additional component L ∈ ∆(L) is a language de-                      guage embeddings. At training time (Figure 1, top), the
+scriptor, i.e., a probability distribution over natural-language              model receives task descriptions and expert demonstrations.
+strings in the space L. Each task is associated with its own                  Task descriptions are first encoded into text embeddings. Ex-
+descriptor distribution L, which generates natural-language                   pert demonstrations supervise the policy through an imita-
+paraphrases (e.g., “move forward” vs. “go straight”) of the                   tion loss. In the grounded variant, we additionally introduce
+same underlying dynamics P and reward function R. Thus,                       a trajectory encoder, and align its embeddings with the text
+the LA-MDP can be viewed as a standard MDP augmented                          embeddings (i.e., language grounding), thereby enriching the
+with a generative source of equivalent task descriptions. A                   language representation with behavioral semantics. At infer-
+policy π(a | s) induces a trajectory distribution in M̃, and its              ence time (Figure 1, bottom), a new task description is passed
+performance is                                                                through the text encoder, projected to the appropriate embed-
+                             "H−1               #                             ding space, and fed into the hypernetwork to generate a policy
+                               X                                              that can be executed without further demonstrations.
+                   J(π) = E          R(st , at ) ,            (2)                We present two variants of our approach: Direct TeNet,
+                                  t=0                                         which conditions the hypernetwork solely on text embed-
+with the task-optimal policy π ∗ = arg maxπ∈Π J(π).                           dings, and Grounded TeNet, which aligns text embeddings
+   Multi-task LA-MDP. We consider a distribution over                         with trajectory embeddings during training to capture behav-
+tasks, where each task τ ∈ T is an LA-MDP                                     ioral semantics and improve generalization.
+               M̃τ = (Sτ , A, Pτ , Rτ , µτ , H, Lτ ).                   (3)   4.1   Direct TeNet
+Tasks may differ in Sτ , Pτ , Rτ , µτ and Lτ , while sharing the              In the Direct TeNet variant, policies are instantiated directly
+action space A. The multi-task objective is to learn a single                 from task descriptions without trajectory grounding. Given a
+                                                           ∗                  description d ∈ L, the text encoder ftext produces an embed-
+policy that maximizes expected return across tasks: π =
+arg maxπ∈Π Eτ ∼p(T ) Jτ (π) .                                                 ding zd = ftext (d) ∈ Rdz . A projection network g maps zd
+   Offline setting. No online interaction is permitted. The                   into the conditioning space of the hypernetwork: z̃d = g(zd ).
+learner receives a static dataset collected from training tasks               The hypernetwork h then generates the parameters θπ of a
+Ttrain , each modeled as an LA-MDP                                            task-specific policy network πθπ
+                        
+                Dtrain = (Xτ , Dτ ) τ ∈ Ttrain ,             (4)                              θπ = h(z̃d ),      πθπ (a | s).             (5)
+                   (k)                                            (k)
+where Xτ = {ξτ }K            k=1 is a set of expert trajectories ξτ    =        Training relies on expert demonstrations ξτ             =
+                                            (m)
+(s0 , a0 , r0 , . . . , sH ), and Dτ = {dτ }M         are i.i.d. descrip-     {(st , at )}H
+                                                                                          t=0 from task τ .  The  policy is supervised by
+                                                m=1
+                                                        (m)                   behavior cloning (imitation learning)
+tions sampled from the language descriptor, dτ ∼ Lτ .                                                                      
+   Multi-task learning. The learner is trained on demonstra-                                LBC = −E(s,a)∼ξτ log πθπ (a | s) .         (6)
+tions from a set of tasks Ttrain . The objective is to learn a
+single model that approximates πτ∗ for all τ ∈ Ttrain , exploit-                Thus, Direct TeNet provides a simple mechanism for map-
+ing shared structure across tasks instead of training disjoint                ping language directly into executable policies through the
+policies.                                                                     hypernetwork.
+   Meta-learning. The learner is trained on a collection of
+tasks Ttrain with the objective of generalizing to previously un-             4.2   Grounded TeNet
+seen tasks τ ∈ Ttest . The challenge is to acquire transferable               Direct TeNet instantiates policies solely from projected text
+structure from Ttrain that enables rapid policy instantiation for             embeddings (Section 4.1). To better capture behavioral se-
+new tasks without further environment interaction.                            mantics, Grounded TeNet augments training with additional
+                                                                                                                              Actions
+                                                                                                                 States
+                        Task Trajectory
+
+                                                       Trajectory
+         {(state, action, next state, reward), …}                          Grounding Loss
+                                                        Encoder
+
+
+
+                Task Description
+                                                                                                               Policy
+         Push the mug under the             Text                                                                            Imitation
+                                                        Projection                           Hypernetwork                     Loss
+         coffee machine.                   Encoder
+
+
+
+         Training                                                                                                Predicted Actions
+
+                                                                                                 Actions
+
+                Task Description
+                                                                                              Policy
+         Push the mug under the             Text
+                                                        Projection           Hypernetwork
+         coffee machine.                   Encoder
+
+
+
+         Inference                                                                               States
+
+
+Figure 1: Training (top) and inference (bottom) of the proposed framework. During training, trajectories and task descriptions are encoded,
+projected, and aligned through a language grounding module, with a hypernetwork generating task-specific policies optimized by imitation
+and grounding losses. At inference, only the task description conditions the hypernetwork to instantiate a policy that maps states to actions.
+
+
+grounding objectives that align text and trajectory embed-                  (ii) Text–text contrastive. Task descriptions can be struc-
+dings. We emphasize that grounding is not the primary con-               turally similar (e.g., differing only in goal parameters), which
+ceptual contribution of TeNet: it is an auxiliary mechanism              may collapse text embeddings. To encourage description-
+that stabilizes and enriches the text embeddings, while the              level discrimination, we add
+core novelty lies in generating executable policy parameters                              "                                         #
+directly from natural language.                                                                           exp sim(z̃d , z̃d )/β
+                                                                           Ltext-text = Ed − log P                                   . (8)
+   Given an expert trajectory ξ = {(st , at , rt , st+1 )}H
+                                                          t=0 , the                                    d′ ∈Cd exp sim(z̃d , z̃d )/β
+                                                                                                                                ′
+
+trajectory encoder ftraj produces an embedding zξ = ftraj (ξ).
+                                                                            The final contrastive objective is Lcontrastive = Ltext-traj +
+Both zξ and the projected text embedding z̃d are mapped into
+                                                                         Ltext-text .
+a shared space, and a grounding loss Lground is applied. We
+explore two variants:                                                    Summary. The total training loss combines imitation learn-
+                                                                         ing with grounding: L = LBC +λg Lground , where Lground may
+Direct alignment (MSE). A simple strategy is to directly                 include Lalign or Lcontrastive , and λg balances their contribution.
+minimize the squared distance between
+                                    projected   text and tra-          At inference time, no trajectories are required – the policy is
+jectory embeddings Lalign = E(d,ξ) ∥z̃d − zξ ∥22 . This objec-           instantiated from text alone. Grounding is used only during
+tive enforces absolute closeness of paired embeddings in the             training to shape the representation.
+shared space.
+Contrastive alignment. Let sim(·, ·) denote cosine simi-                 5     Experiments
+larity and β > 0 a temperature parameter. For each update,
+                                                                         We conduct an extensive empirical study to evaluate TeNet
+we consider a finite candidate set of trajectory embeddings Cξ
+                                                                         and to provide insights into the design and behavior of
+and a finite candidate set of text embeddings Cd that provide
+                                                                         language-enabled hypernetworks. Our experiments are per-
+negatives for the contrastive normalization.
+                                                                         formed on Mujoco control benchmarks (HalfCheetah-Vel,
+   (i) Text–trajectory contrastive (symmetric). For paired
+                                                                         HalfCheetah-Dir, Ant-Dir) [Todorov et al., 2012] and Meta-
+(z̃d , zξ ), we align text to trajectory and trajectory to text with
+                                                                         World manipulation benchmarks (ML1 Pick-Place, MT10,
+a symmetric InfoNCE
+                                                                         MT50) [Yu et al., 2020], covering both multi-task and meta-
+                                                                         learning settings.
+                        "                                    
+               1                        exp sim(z̃d , zξ )/β
+ Ltext-traj = 2 E(d,ξ) − log P                                             Beyond reporting standard performance, our goal is to sys-
+                                    ξ ′ ∈Cξ exp sim(z̃d , zξ )/β
+                                                             ′
+                                                                         tematically answer a series of questions about when and why
+                                                                  #     TeNet is effective, how grounding influences policy quality,
+                                        exp sim(z̃d , zξ )/β
+                          − log P                                 .     and how design choices affect performance. This section is
+                                    d′ ∈Cd exp sim(z̃d , zξ )/β          therefore organized around these questions, with results inter-
+                                                         ′
+
+                                                                   (7)   leaved with analysis.
+5.1   Experimental Setup                                           all benchmarks, confirming that natural language is an effec-
+Benchmarks. We evaluate on Mujoco locomotion                       tive source of task signals. However, its relative performance
+(HalfCheetah-Dir, HalfCheetah-Vel, Ant-Dir) and Meta-              compared to Prompt-DT depends critically on the setting.
+World manipulation (ML1 Pick-Place, MT10, MT50),                   On meta-learning benchmarks (HalfCheetah-Vel, Ant-Dir,
+spanning multi-task and meta-learning regimes. Full task           ML1 Pick-Place), Direct TeNet falls behind Prompt-DT, sug-
+definitions, state/action spaces, and splits are provided in the   gesting that text encodings, while informative, do not gen-
+supplementary materials.                                           eralize to unseen tasks as effectively as trajectory prompts.
+                                                                   In contrast, on multi-task benchmarks (MT10, MT50), Di-
+Models. We compare DT [Chen et al., 2021], Prompt-                 rect TeNet consistently outperforms Prompt-DT. These re-
+DT [Xu et al., 2022], and three TeNet variants: TeNet (direct,     sults indicate that direct language-to-policy instantiation is
+no grounding), TeNet-MSE (MSE grounding), and TeNet-               viable and scales well in diverse multi-task regimes, but that
+Contrast (contrastive grounding). Implementation details,          additional grounding is required for robust generalization in
+Prompt-DT size variants, and the Prompt-DT+Hypernetwork            meta-learning settings where the agent must extrapolate to
+modification are provided in the supplementary materials.          unseen tasks.
+Metrics & protocol. We report episodic return on Mujoco
+and success rate on Meta-World, plus controller size and con-      5.4   How should we ground language in behavior?
+trol frequency for deployability. Results are averaged over 3      The results in Figure 2 show that grounded TeNet, regardless
+seeds; each task is evaluated with 50 rollouts.                    of the chosen strategy, consistently outperforms Direct TeNet
+                                                                   on the meta-learning benchmarks (HalfCheetah-Vel, Ant-Dir,
+Defaults. Unless stated otherwise: the text encoder is             ML1 Pick-Place). This confirms that additional grounding is
+Llama-3 8B (frozen), the trajectory encoder is Prompt-DT           necessary for robust generalization to unseen tasks.
+(used only for grounded variants), and TeNet uses a small             Among the grounding methods, contrastive alignment
+MLP hypernetwork to instantiate a ∼40K-parameter policy.           generally performs better than direct alignment (MSE). The
+Training is strictly offline.                                      reason is that MSE enforces absolute closeness between
+5.2   Results                                                      paired text and trajectory embeddings, but provides no mech-
+                                                                   anism to separate embeddings from different tasks. As a
+Figure 2 summarizes performance across all six benchmarks,         result, embeddings from similar descriptions may collapse,
+with a shared legend shown on top.                                 limiting discriminability. In contrast, contrastive objectives
+   Several general trends are clear. First, DT is consistently     simultaneously pull together matching text–trajectory pairs
+the weakest model across all domains, confirming that a            and push apart non-matching pairs, yielding a representation
+compact sequence model without explicit task signals is not        space that is both semantically aligned and better separated
+suitable for multi-task or meta-learning. Both Prompt-DT           across tasks. This improved structure in the shared embed-
+and TeNet address this limitation by providing task signals,       ding space translates into stronger policy generalization.
+but they do so in fundamentally different ways: Prompt-
+DT relies on short expert rollouts (prompt trajectories) as        5.5   Why does Prompt-DT struggle in MT10 and
+identifiers, while TeNet derives task signals directly from              MT50?
+natural language descriptions. This text-based conditioning        The Meta-World multi-task benchmarks (MT10 and MT50)
+avoids the need for demonstrations at test time, making TeNet      contain tasks that are far more distinct than those in Mujoco
+more scalable and practical within our state-based multi-task      (e.g., pick-place versus drawer-open, compared to velocity or
+benchmarks, as it removes the requirement for task-specific        direction variations). This task diversity poses a major chal-
+trajectory prompts.                                                lenge for Prompt-DT. Furthermore, as the number of tasks
+   Second, when comparing TeNet variants (more specifically        increases, the success rate of Prompt-DT drops (from 0.73 on
+TeNet-Contrast) against Prompt-DT, we observe consis-              MT10 to 0.61 on MT50; see Figure 2). To better understand
+tent advantages. TeNet-Contrast outperforms Prompt-DT in           this gap, we conduct two follow-up experiments.
+HalfCheetah-Dir and Ant-Dir, matches it in HalfCheetah-Vel,           First, we ask whether the failure is simply due to insuf-
+and is slightly worse in ML1 Pick-Place (which we analyze          ficient model capacity. If trajectory prompts are expressive
+further in Section 5.7). Most strikingly, in MT10 and MT50         enough, then increasing the size of Prompt-DT (from small
+TeNet-Contrast hugely outperforms Prompt-DT. This large            to medium to large) should yield meaningful improvements.
+gap prompted us to investigate why Prompt-DT struggles so          Table 1 shows that this is not the case: larger Prompt-DT
+severely in multi-task benchmarks and to identify which de-        models achieve only marginal gains, indicating that the issue
+sign choices in TeNet are responsible for its robust perfor-       lies deeper than model capacity.
+mance. We return to this question in later subsections, where         Second, we test whether the limitation arises from the lack
+we dissect the role of task diversity, grounding, and hypernet-    of task-specific parameterization. In this variant, Prompt-DT-
+work conditioning.                                                 HN serves as a trajectory-conditioned hypernetwork baseline,
+                                                                   where the prompt trajectory is encoded and used to generate
+5.3   Can we directly build policies from language,                policy weights via a shared hypernetwork. To this end, we
+      or do we need grounding?                                     add a hypernetwork on top of Prompt-DT to generate policy
+The results in Figure 2 reveal a mixed picture. Direct TeNet       parameters conditioned on task signals. Table 1 indicates that
+already provides a substantial improvement over DT across          this modification yields a substantial boost in success rates
+                                                  DT                Prompt-DT                                        TeNet                 TeNet-Contrast                                     TeNet-MSE
+                       1000
+                                            HalfCheetah-Dir                                                         HalfCheetah-Vel                                                          Ant-Dir
+                                                                                                 50
+                                                                                                                                                                       500
+
+
+
+
+                                                                            Episode Return
+      Episode Return
+
+
+
+
+                                                                                                                                                   Episode Return
+                                                                                                                                                                       400
+                                                                                                100
+                        500
+
+                                                                                                                                                                       300
+                                                                                                150
+
+
+                             0
+                                                                                                                                                                       200
+                                                                                                200
+
+                                                                                                                                                                       100
+                                                                                                250
+
+                        500                                                                                                                                              0
+                                 0    1000      2000     3000    4000   5000                             0    1000     2000    3000      4000   5000                         0   1000      2000   3000       4000   5000
+                                             Training Iteration                                                     Training Iteration                                                  Training Iteration
+                                                  ML1                                                                    MT10                                                                MT50
+                                                                                                                                                                       1.0
+                       1.0                                                                     1.0
+
+
+
+
+                                                                                                                                                        Success Rate
+      Success Rate
+
+
+
+
+                                                                                Success Rate
+                                                                                                                                                                       0.8
+                       0.8                                                                     0.8
+
+
+                       0.6                                                                     0.6                                                                     0.6
+
+
+
+                       0.4                                                                     0.4                                                                     0.4
+
+
+
+                       0.2                                                                     0.2                                                                     0.2
+
+
+                       0.0                                                                     0.0                                                                     0.0
+
+                             0       2000      4000     6000     8000   10000                        0       1000      2000   3000       4000   5000                         0   1000      2000   3000       4000   5000
+
+                                            Training Iteration                                                      Training Iteration                                                  Training Iteration
+
+
+Figure 2: Performance across Mujoco (HalfCheetah-Dir, HalfCheetah-Vel, Ant-Dir) and Meta-World (ML1 Pick-Place, MT10, MT50). Each
+subplot reports mean and standard deviation over three seeds. A shared legend is shown at the top.
+
+
+Table 1: Success rate on MT10 and MT50, along with controller size                                                            5.7     Does scaling the number of training tasks
+and control frequency. Prompt-DT-S is the default configuration.
+                                                                                                                                      improve TeNet’s generalization?
+                                                      Success Rate       Ctrl                        Ctrl                     In Section 5.2 we noted that TeNet-Contrast slightly under-
+                       Model                                                                                                  performs Prompt-DT on ML1 Pick-Place. To investigate fur-
+                                                                         Size                        Freq.
+                                                  MT10          MT50                                                          ther, we study how scaling the number of training tasks af-
+                       Prompt-DT-S                    0.73      0.61     1M                       557 Hz                      fects generalization. Specifically, we vary the number of ML1
+                       Prompt-DT-M                    0.79      0.65     6M                       331 Hz                      tasks available during training (50, 100, 200, 400, 800, 1600),
+                       Prompt-DT-L                    0.74      0.58     39M                      190 Hz                      while always holding out 10% of tasks for testing. The results
+                       Prompt-DT-HN                   0.99      0.97     5M                       462 Hz                      are shown in Figure 3.
+                       TeNet                          0.99      0.98     40K                     9300 Hz
+                                                                                                                                 Performance improves steadily from a success rate of 0.80
+                                                                                                                              with 50 tasks to 0.99 with 1600 tasks. This indicates that
+                                                                                                                              scaling the diversity of training tasks substantially enhances
+on both MT10 and MT50. The comparison demonstrates                                                                            TeNet’s ability to generalize. One possible factor is that as the
+that explicitly generating task-specific parameters is crucial                                                                number of training tasks grows, the domain gap between train
+when dealing with distinct multi-task benchmarks. TeNet nat-                                                                  and test tasks decreases, making generalization easier. In any
+urally benefits from this principle while also being language-                                                                case, reaching a success rate of 99% with 1600 training tasks
+enabled, removing the reliance on demonstration prompts.                                                                      shows that TeNet can fully solve ML1 Pick-Place when pro-
+                                                                                                                              vided with sufficient data. These results highlight both the
+5.6                    How fast are TeNet policies?                                                                           promise and the data demands of language-enabled hyper-
+Beyond task success, deployability depends critically on the                                                                  networks: like foundation models in other domains, TeNet
+efficiency of the policy: controllers must be compact enough                                                                  benefits strongly from scale, even if it is data hungry.
+to fit on resource-constrained robots, and fast enough to sup-
+port high-frequency control loops. Table 1 reports both the                                                                   5.8     How Robust Is TeNet to Paraphrased Task
+number of parameters (controller size) and the control fre-                                                                           Descriptions?
+quency that the method can sustain.                                                                                           Since language is used only once to instantiate a policy, a
+   The results highlight a stark contrast. Prompt-DT variants                                                                 key question is how robust TeNet is to variations in how a
+range from 1M to 39M parameters, with control frequencies                                                                     task is described. In practice, semantically identical instruc-
+between 190 Hz and 600 Hz. Adding a hypernetwork further                                                                      tions may differ substantially in wording, syntax, or length.
+increases model size to 5M parameters, while improving task                                                                   We therefore evaluate TeNet’s sensitivity to paraphrasing by
+success, but the resulting policies remain limited to the sub-                                                                training on canonical task descriptions and testing on in-
+kHz regime. In contrast, TeNet policies contain only 40K pa-                                                                  creasingly complex paraphrases. We conduct this study on
+rameters and sustain control rates of over 9 kHz, more than                                                                   MT10, comparing two text encoders—LLaMA [Touvron et
+an order of magnitude faster than all Prompt-DT baselines.                                                                    al., 2023] and BERT [Devlin et al., 2019]. Models are trained
+           1.0                      ML1                                4
+                                                                                      HalfCheetah-Vel
+                        TeNet-Contrast                                          Ideal                                    Table 2: Success rates on MT10
+
+
+
+
+                                                        Achieved velocity
+                                                                       3        TeNet-Contrast                           when training on canonical de-
+Success Rate
+           0.9                                                                  Prompt-DT                                scriptions and evaluating on in-
+                                                                       2                                                 creasingly complex paraphrases.
+           0.8                                                         1
+                                                                       0                                                  Encoder       L0     L1      L2
+           0.7                                                              0        1           2         3   4
+                 0     250   500   750 1000 1250 1500
+                             Number of Tasks                                             Target velocity                  LLaMA        0.99   0.95    0.89
+                                                                                                                          BERT         0.99   0.89    0.82
+Figure 3: TeNet-Contrast performance on                 Figure 4: Achieved forward velocity vs. in-
+ML1 Pick-Place with varying numbers of                  structed target velocity in HalfCheetah-Vel
+tasks.                                                  (mean over 50 rollouts).
+
+
+using 10 canonical (Level 0) descriptions per task and evalu-                                 We further find that task-specific parameterization is crit-
+ated on unseen paraphrases of growing linguistic complexity                                ical in diverse multi-task settings. Prompt-DT degrades
+(Level 1 and Level 2), which differ syntactically but describe                             sharply on MT10 and MT50, and increasing model ca-
+the same underlying task.                                                                  pacity alone does not resolve this issue. In contrast, ex-
+   Both encoders achieve identical performance on canoni-                                  plicitly generating task-conditioned parameters—most ef-
+cal descriptions, indicating that TeNet can reliably instantiate                           fectively via language-conditioned hypernetworks—enables
+policies from simple instructions regardless of the encoder                                TeNet to scale to large and heterogeneous task sets.
+choice. However, as paraphrasing complexity increases, per-                                   Despite this added flexibility, TeNet remains highly effi-
+formance degrades for both models, with a substantially                                    cient. Instantiated policies contain only ∼40K parameters
+larger drop observed for BERT. This gap suggests that richer                               and sustain control rates above 9 kHz, exceeding Prompt-
+language models produce more stable and semantically con-                                  DT baselines by more than an order of magnitude. TeNet
+sistent embeddings under linguistic variation, leading to more                             also exhibits robustness to linguistic variation: performance
+reliable policy instantiation from natural language.                                       degrades gracefully under increasingly complex paraphrases,
+                                                                                           with larger language models such as LLaMA producing more
+5.9            Qualitative Evaluation: Velocity Following in                               stable policy instantiations than BERT. Qualitative evaluation
+               HalfCheetah-Vel                                                             on HalfCheetah-Vel further confirms that text-instantiated
+                                                                                           policies accurately follow commanded velocities and gener-
+HalfCheetah-Vel evaluates velocity tracking by reward-                                     alize smoothly across unseen targets.
+ing policies for matching a target forward speed, r =                                         Additional ablation studies—analyzing the effect of the
+− |vcurrent − vtarget |, so episodic return directly reflects track-                       text–text contrastive term, grounded-flow, fine-tuning, and
+ing accuracy. Target velocities are defined on a grid                                      multiple task descriptions—are provided in the supplemen-
+from 0.075 to 3.0 m/s. Models are trained on a sub-                                        tary materials.
+set of this grid and evaluated on unseen target velocities                                    Overall, these findings indicate that compact, language-
+{0.225, 0.6, 1.2, 1.8, 2.025} m/s, as well as an out-of-                                   enabled hypernetworks can close much of the gap between
+distribution instruction at 3.5 m/s. Policies are instantiated                             lightweight sequence models and large language-conditioned
+from commands of the form “Move forward with target ve-                                    systems within state-based, offline imitation settings. Ex-
+locity X m/s.” and evaluated over 50 rollouts. Achieved ve-                                tending TeNet to real-world robotics will require addressing
+locity is computed as the average forward speed over the final                             noisy demonstrations, multimodal (vision–language) ground-
+20 steps.                                                                                  ing, and reinforcement fine-tuning, which we leave as direc-
+   Figure 4 compares achieved versus instructed velocity                                   tions for future work.
+for TeNet-Contrast and Prompt-DT. TeNet-Contrast closely
+tracks commanded speeds across all unseen test velocities,                                 6     Conclusion
+indicating smooth generalization over the continuous veloc-
+ity range. For the extrapolated 3.5 m/s instruction, both meth-                            We introduced TeNet, a text-to-network framework for in-
+ods saturate near ∼ 3 m/s, reflecting the physical limits of the                           stantiating compact, task-specific policies directly from nat-
+HalfCheetah dynamics rather than a failure of instruction fol-                             ural language. By combining LLM-based text embed-
+lowing.                                                                                    dings, trajectory grounding, and hypernetwork-based pa-
+                                                                                           rameter generation, TeNet produces lightweight controllers
+                                                                                           that generalize across tasks without requiring demonstra-
+5.10                 Summary of Empirical Insights
+                                                                                           tions at inference time. Experiments on Mujoco and Meta-
+Our results show that direct text-to-policy instantiation is                               World benchmarks show that TeNet outperforms Prompt-DT
+viable, but that grounding language in behavior is essen-                                  in multi-task settings, achieves competitive performance in
+tial for robust generalization. Across meta-learning bench-                                meta-learning, and supports control frequencies above 9 kHz.
+marks, grounded TeNet variants consistently outperform Di-                                 Together, these results highlight language-enabled hypernet-
+rect TeNet, with contrastive alignment providing stronger                                  works as a promising direction for scalable, efficient, and de-
+task discrimination than direct (MSE) alignment.                                           ployable robot learning.
+References                                                         and data synthesizer for multi-task reinforcement learn-
+[Beck et al., 2023] Jacob Beck, Matthew Thomas Jackson,            ing. Advances in neural information processing systems,
+  Risto Vuorio, and Shimon Whiteson. Hypernetworks in              36:64896–64917, 2023.
+  meta-reinforcement learning. In Conference on Robot           [Hegde et al., 2023] Shashank Hegde, Sumeet Batra, K R
+  Learning, pages 1478–1487. PMLR, 2023.                           Zentner, and Gaurav Sukhatme. Generating behaviorally
+[Brohan et al., 2023] Anthony Brohan, Yevgen Chebotar,             diverse policies with latent diffusion models. Advances
+  Chelsea Finn, Karol Hausman, Alexander Herzog, Daniel            in Neural Information Processing Systems, 36:7541–7554,
+  Ho, Julian Ibarz, Alex Irpan, Eric Jang, Ryan Julian, and        2023.
+  Others. Do as i can, not as i say: Grounding language         [Hegde et al., 2024] Shashank Hegde, Satyajeet Das, Gau-
+  in robotic affordances. In Conference on robot learning,         tam Salhotra, and Gaurav S Sukhatme. Latent Weight Dif-
+  pages 287–318. PMLR, 2023.                                       fusion: Generating reactive policies instead of trajectories.
+[Brown et al., 2020] Tom Brown, Benjamin Mann, Nick Ry-            arXiv preprint arXiv:2410.14040, 2024.
+  der, Melanie Subbiah, Jared D Kaplan, Prafulla Dhari-         [Kim et al., 2025] Moo Jin Kim, Karl Pertsch, Siddharth
+  wal, Arvind Neelakantan, Pranav Shyam, Girish Sastry,            Karamcheti, Ted Xiao, Ashwin Balakrishna, Suraj Nair,
+  Amanda Askell, and Others. Language models are few-              Rafael Rafailov, Ethan P Foster, Pannag R Sanketi, Quan
+  shot learners. Advances in neural information processing         Vuong, and Others. OpenVLA: An Open-Source Vision-
+  systems, 33:1877–1901, 2020.                                     Language-Action Model. In Conference on Robot Learn-
+                                                                   ing, pages 2679–2713. PMLR, 2025.
+[Charakorn et al., 2025] Rujikorn Charakorn,         Edoardo
+  Cetin, Yujin Tang, and Robert Tjarko Lange. Text-to-          [Liang et al., 2023] Jacky Liang, Wenlong Huang, Fei Xia,
+  LoRA: Instant Transformer Adaption. arXiv preprint               Peng Xu, Karol Hausman, Brian Ichter, Pete Florence, and
+  arXiv:2506.06105, 2025.                                          Andy Zeng. Code as Policies: Language Model Programs
+                                                                   for Embodied Control. In 2023 IEEE International Con-
+[Chen et al., 2021] Lili Chen, Kevin Lu, Aravind Ra-               ference on Robotics and Automation (ICRA), pages 9493–
+  jeswaran, Kimin Lee, Aditya Grover, Misha Laskin, Pieter         9500. IEEE, 2023.
+  Abbeel, Aravind Srinivas, and Igor Mordatch. Decision
+  transformer: Reinforcement learning via sequence model-       [Liang et al., 2024] Yongyuan Liang, Tingqiang Xu, Kaizhe
+  ing. Advances in neural information processing systems,          Hu, Guangqi Jiang, Furong Huang, and Huazhe Xu.
+  34:15084–15097, 2021.                                            Make-an-agent: A generalizable policy network genera-
+                                                                   tor with behavior-prompted diffusion. Advances in Neural
+[Chi et al., 2025] Cheng Chi, Zhenjia Xu, Siyuan Feng, Eric        Information Processing Systems, 37:19288–19306, 2024.
+  Cousineau, Yilun Du, Benjamin Burchfiel, Russ Tedrake,
+                                                                [Lv et al., 2024] Chuancheng Lv, Lei Li, Shitou Zhang,
+  and Shuran Song. Diffusion policy: Visuomotor policy
+  learning via action diffusion. The International Journal of      Gang Chen, Fanchao Qi, Ningyu Zhang, and Hai-Tao
+  Robotics Research, 44(10-11):1684–1704, 2025.                    Zheng. HyperLoRA: Efficient Cross-task Generalization
+                                                                   via Constrained Low-Rank Adapters Generation. In Yaser
+[Devlin et al., 2019] Jacob Devlin, Ming-Wei Chang, Ken-           Al-Onaizan, Mohit Bansal, and Yun-Nung Chen, editors,
+  ton Lee, and Kristina Toutanova. Bert: Pre-training of           Findings of the Association for Computational Linguistics:
+  deep bidirectional transformers for language understand-         EMNLP 2024, pages 16376–16393, Miami, Florida, USA,
+  ing. In Proceedings of the 2019 conference of the North          nov 2024. Association for Computational Linguistics.
+  American chapter of the association for computational lin-
+                                                                [Mahabadi et al., 2021] Rabeeh Karimi Mahabadi, Sebas-
+  guistics: human language technologies, volume 1 (long
+  and short papers), pages 4171–4186, 2019.                        tian Ruder, Mostafa Dehghani, and James Henderson.
+                                                                   Parameter-efficient Multi-task Fine-tuning for Transform-
+[Driess et al., 2023] Danny Driess, Fei Xia, Mehdi S M Saj-        ers via Shared Hypernetworks. In Proceedings of the 59th
+  jadi, Corey Lynch, Aakanksha Chowdhery, Brian Ichter,            Annual Meeting of the Association for Computational Lin-
+  Ayzaan Wahid, Jonathan Tompson, Quan Vuong, Tianhe               guistics and the 11th International Joint Conference on
+  Yu, and Others. PaLM-E: an embodied multimodal                   Natural Language Processing (Volume 1: Long Papers).
+  language model. In Proceedings of the 40th Interna-              Association for Computational Linguistics, 2021.
+  tional Conference on Machine Learning, pages 8469–            [Ni et al., 2023] Fei Ni, Jianye Hao, Yao Mu, Yifu Yuan, Yan
+  8488, 2023.
+                                                                   Zheng, Bin Wang, and Zhixuan Liang. Metadiffuser: Dif-
+[Gklezakos et al., 2022] Dimitrios C Gklezakos, Rishi Jha,         fusion model as conditional planner for offline meta-rl.
+  and Rajesh P N Rao. Hyper-universal policy approxima-            In International Conference on Machine Learning, pages
+  tion: Learning to generate actions from a single image us-       26087–26105. PMLR, 2023.
+  ing hypernets. arXiv preprint arXiv:2207.03593, 2022.         [Rana et al., 2023] Krishan Rana, Andrew Melnik, and
+[Ha et al., 2016] David Ha, Andrew Dai, and Quoc V Le.             Niko Sünderhauf. Contrastive language, action, and
+  Hypernetworks. arXiv preprint arXiv:1609.09106, 2016.            state pre-training for robot learning. arXiv preprint
+[He et al., 2023] Haoran He, Chenjia Bai, Kang Xu, Zhuo-           arXiv:2304.10782, 2023.
+  ran Yang, Weinan Zhang, Dong Wang, Bin Zhao, and              [Ren et al., ] Hanxiang Ren, Li Sun, Xulong Wang, Pei
+  Xuelong Li. Diffusion model is an effective planner              Zhou, Zewen Wu, Siyan Dong, Difan Zou, Youyi Zheng,
+   and Yanchao Yang. HyPoGen: Optimization-Biased Hy-            [Yu et al., 2020] Tianhe Yu, Deirdre Quillen, Zhanpeng He,
+   pernetworks for Generalizable Policy Generation. In The          Ryan Julian, Karol Hausman, Chelsea Finn, and Sergey
+   Thirteenth International Conference on Learning Repre-           Levine. Meta-World: A Benchmark and Evaluation
+   sentations.                                                      for Multi-Task and Meta Reinforcement Learning. In
+[Rezaei-Shoshtari et al., 2023] Sahand       Rezaei-Shoshtari,      Leslie Pack Kaelbling, Danica Kragic, and Komei Sugiura,
+   Charlotte Morissette, Francois R Hogan, Gregory Dudek,           editors, Proceedings of the Conference on Robot Learn-
+   and David Meger. Hypernetworks for zero-shot transfer            ing, volume 100 of Proceedings of Machine Learning Re-
+   in reinforcement learning. In Proceedings of the AAAI            search, pages 1094–1100. PMLR, 2020.
+   Conference on Artificial Intelligence, volume 37, pages       [Zitkovich et al., 2023] Brianna Zitkovich, Tianhe Yu,
+   9579–9587, 2023.                                                 Sichun Xu, Peng Xu, Ted Xiao, Fei Xia, Jialin Wu, Paul
+[Tang et al., 2023] Yujin Tang, Wenhao Yu, Jie Tan, Heiga           Wohlhart, Stefan Welker, Ayzaan Wahid, and Others.
+   Zen, Aleksandra Faust, and Tatsuya Harada. SayTap: Lan-          Rt-2: Vision-language-action models transfer web knowl-
+   guage to Quadrupedal Locomotion. In Conference on                edge to robotic control. In Conference on Robot Learning,
+   Robot Learning, pages 3556–3570. PMLR, 2023.                     pages 2165–2183. PMLR, 2023.
+[Team et al., 2024] Octo Model Team, Dibya Ghosh, Homer
+   Walke, Karl Pertsch, Kevin Black, Oier Mees, Sudeep
+   Dasari, Joey Hejna, Tobias Kreiman, Charles Xu, and Oth-
+   ers. Octo: An open-source generalist robot policy. arXiv
+   preprint arXiv:2405.12213, 2024.
+[Todorov et al., 2012] Emanuel Todorov, Tom Erez, and Yu-
+   val Tassa. Mujoco: A physics engine for model-based
+   control. In 2012 IEEE/RSJ International Conference on
+   Intelligent Robots and Systems, pages 5026–5033. IEEE,
+   2012.
+[Touvron et al., 2023] Hugo Touvron, Thibaut Lavril, Gau-
+   tier Izacard, Xavier Martinet, Marie-Anne Lachaux, Tim-
+   othée Lacroix, Baptiste Rozière, Naman Goyal, Eric Ham-
+   bro, Faisal Azhar, and Others. LLaMA: Open and Ef-
+   ficient Foundation Language Models. arXiv preprint
+   arXiv:2302.13971, 2023.
+[Venuto et al., 2024] David Venuto, Mohammad Sami Nur
+   Islam, Martin Klissarov, Doina Precup, Sherry Yang, and
+   Ankit Anand. Code as Reward: Empowering Reinforce-
+   ment Learning with VLMs. In International Conference
+   on Machine Learning, pages 49368–49387. PMLR, 2024.
+[Wang et al., 2024] Zhi Wang, Li Zhang, Wenhao Wu, Yuan-
+   heng Zhu, Dongbin Zhao, and Chunlin Chen. Meta-DT:
+   Offline meta-RL as conditional sequence modeling with
+   world model disentanglement. Advances in Neural Infor-
+   mation Processing Systems, 37:44845–44870, 2024.
+[Xiong et al., 2024] Zheng Xiong, Risto Vuorio, Jacob
+   Beck, Matthieu Zimmer, Kun Shao, and Shimon White-
+   son. Distilling morphology-conditioned hypernetworks
+   for efficient universal morphology control. arXiv preprint
+   arXiv:2402.06570, 2024.
+[Xu et al., 2022] Mengdi Xu, Yikang Shen, Shun Zhang,
+   Yuchen Lu, Ding Zhao, Joshua Tenenbaum, and Chuang
+   Gan. Prompting decision transformer for few-shot pol-
+   icy generalization. In international conference on machine
+   learning, pages 24631–24645. PMLR, 2022.
+[Ye and Ren, 2021] Qinyuan Ye and Xiang Ren. Learning to
+   Generate Task-Specific Adapters from Task Description.
+   In Proceedings of the 59th Annual Meeting of the Associ-
+   ation for Computational Linguistics and the 11th Interna-
+   tional Joint Conference on Natural Language Processing
+   (Volume 2: Short Papers), pages 646–653, 2021.
+

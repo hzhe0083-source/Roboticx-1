@@ -1,0 +1,687 @@
+                                          AnySlot: Goal-Conditioned Vision-Language-Action
+                                              Policy for Zero-Shot Slot-Level Placement
+                                                              Zhaofeng Hu                                          Sifan Zhou
+                                                         Stony Brook University                             Carnegie Mellon University
+                                                           Stony Brook, USA                                      Pittsburgh, USA
+                                                     zhaofeng.hu@stonybrook.edu                              sifanjay@gmail.com,
+
+                                                            Qinbo Zhang                                         Rongtao Xu
+                                                        Stony Brook University                                   MBZUAI
+arXiv:2604.10432v3 [cs.RO] 29 May 2026
+
+
+
+
+                                                          Stony Brook, USA                                    Abu Dhabi, UAE
+                                                    qinbo.zhang@stonybrook.edu                           xurongtao2022@gmail.com
+
+                                                           Qi Su                                  Jorge Mendez-Mendez
+                                                      Peking University                           Stony Brook University
+                                                       Beijing, China                               Stony Brook, USA
+                                                  qiisuu@stu.pku.edu.cn                    jorge.mendezmendez@stonybrook.edu
+
+                                                                                   Ci-Jyun Liang
+                                                                               Stony Brook University
+                                                                                 Stony Brook, USA
+                                                                          ci-jyun.liang@stonybrook.edu
+
+
+
+                                                      Setup
+                                                                                                                         Prompt: “Put a
+                                                                UR10e Robot Arm                                          blue sphere in
+                                                                                                                         the second row
+                                                                                                                         and first column
+                                                                                                                         slot. Row from
+                                                                   RealSense D455
+                                                                                                                         top, column
+                                                                    Head Camera
+                                                                                                                         from right.”
+                                                                   RealSense D455
+                                                                    Wrist Camera
+
+
+                                                                                               Generated
+                                                                                               Spatial Visual
+                                                                                               Goal
+
+
+                                                                                    Head Camera
+                                                                                                                                    Low-level Control
+
+
+
+
+                                                                                    Wrist Camera
+
+
+
+
+                                         Figure 1: Real-world goal-guided slot-level placement. (1) Given a language instruction, the
+                                         robot captures a head-camera RGB-D observation. (2) The image-generation module renders a
+                                         spatial visual goal at the instructed slot. (3) The goal is reconstructed and projected into head and
+                                         wrist camera views to guide low-level manipulation, enabling successful placement on a real UR10e
+                                         platform. AnySlot demonstrates real-world generalization and robustness.
+         Abstract: Vision-Language-Action (VLA) policies have emerged as a versatile
+         paradigm for generalist robotic manipulation. However, precise object placement
+         under compositional language remains challenging for end-to-end VLA policies.
+         Slot-level placement requires reliable slot grounding and centimeter-level geo-
+         metric precision. To this end, we propose AnySlot, a framework that reduces
+         compositional complexity by introducing an explicit spatial visual goal between
+         language grounding and control. AnySlot converts language into a visual goal
+         by rendering a spatial marker at the intended slot, then executes this goal with
+         a goal-conditioned VLA policy. This hierarchical design decouples high-level
+         slot selection from low-level execution, improving semantic accuracy and spatial
+         robustness. Furthermore, recognizing the lack of benchmarks for such precision-
+         demanding tasks, we introduce SlotBench, a structured simulation benchmark
+         with nine task categories for evaluating spatial reasoning in slot-level placement.
+         Extensive experiments show that AnySlot significantly outperforms flat VLA
+         baselines and modular grounding methods in zero-shot slot-level placement.
+
+         Keywords: Vision-Language-Action, Robot Manipulation, Slot-level Placement.
+
+
+1   Introduction
+
+Recent robotic policies, including flat Vision-Language-Action (VLA) [1, 2, 3, 4]) and modular
+Vision-Language Model (VLM) [5, 6, 7, 8, 9]) based policies [10, 11, 12, 13, 14, 15], have made
+impressive progress on language-conditioned manipulation. However, many practical placement
+tasks require more than moving an object to an approximately correct region. In settings such as
+assembly, sorting, and tool organization, a robot must place an object into an exact slot among many
+visually similar candidates, which we refer to as slot-level placement [16]. This task requires both
+semantic correctness, i.e., grounding language to the intended slot, and geometric correctness, i.e.,
+executing precise placement within tight slot boundaries. It becomes especially challenging when
+the target is specified by relational, ordinal, functional, or commonsense instructions, such as “place
+it into the most stable compartment” or “avoid the lower-left cells.” Despite recent progress, existing
+language-conditioned robotic policies remain insufficient for such fine-grained placement.
+As shown in Fig. 2 (a), Flat end-to-end policies directly map multi-modal observations and lan-
+guage instructions to control actions. However, their VLM backbones remain limited in composi-
+tional spatial reasoning [17], and the policy must implicitly perform slot grounding while generating
+low-level actions. This entangles slot selection and motor control in a single output space, making
+it difficult to maintain both semantic correctness and geometric precision under dense, unseen slot
+layouts. To reduce policy complexity, VLM-based modular policies adopt a two-stage design that
+first grounds the instruction with a VLM and then executes placement through a downstream con-
+troller, as shown in Fig. 2(b). However, although VLMs exhibit certain spatial reasoning ability [18],
+their grounding outputs are often coarse, token-based, or represented as a single coordinate. Such
+representations make precise localization unreliable and discard local geometric context, such as
+slot boundaries, which is essential for stable alignment under unseen layouts. We provide a broader
+discussion of related VLA policies, modular robotic systems, and placement methods in Appendix.
+To address these challenges, we propose AnySlot, a two-stage framework that converts language
+into a spatial visual goal by an image generation model and uses a VLA policy for precise place-
+ment. Our key insight is that the interface between high-level reasoning and low-level control should
+be a spatially coherent visual goal in the robot’s observation space. Instead of relying on a VLM
+to regress a single coordinate, AnySlot uses an image generation model as a high-level grounding
+module to render a visual goal directly at the intended slot. This turns language grounding into a vi-
+sually explicit and spatially coherent goal representation that can be consumed by a low-level policy
+with strong visuomotor priors. Conditioned on the generated goal, a low-level VLA policy executes
+pick-and-place, leveraging learned robustness to perception noise and contact-rich manipulation.
+
+
+                                                  2
+                         Flat                                    VLM-Based                                 AnySlot:
+                  End-to-End Policy                             Modular Policy                      Goal-Conditioned Policy
+            (Cropped)                                                               (Cropped)                                           (Cropped)
+                                                         (Cropped)
+                                                                        VLM                          (Cropped)     Image Generator
+                             “Move the red                            Grounding                                     generate Goal
+                             block to the second
+                             largest slot. ’’
+
+                                                     “Output the                                “Generate a
+              Large Model Backbone                   second
+                                                                               Motion Planner   blue sphere                  Low Level Policy
+                                                     largest slot’s                             in the second
+                                                     coords. ’’                                 largest slot. ’’
+                        𝐴!                                                           𝐴!                                              𝐴!
+
+         Precision        Generalization            Precision            Generalization         Precision              Generalization
+
+
+                             (a)                                          (b)                                          (c)
+
+Figure 2: Overview of flat (a), modular (b), and (c) our goal-conditioned policy. For slot-level
+placement tasks, our method achieves superior zero-shot generalization by transforming language
+into explicit spatial visual goals for reliable execution.
+
+
+To systematically evaluate slot-level grounding and manipulation, we introduce SlotBench, a bench-
+mark for structured slot-level reasoning in robotic placement comprising nine challenge tasks, de-
+signed to probe zero-shot generalization beyond seen layouts and instructions. SlotBench covers
+ordinal reasoning, size and height comparison, distance reasoning, compositional relations, logical
+negation, vague language, affordance reasoning, and world knowledge. Models must succeed on
+novel slot configurations and previously unseen instructions without task-specific finetuning. As
+shown in Tab. 1, existing flat and modular pipelines struggle to solve these tasks reliably, often fail-
+ing on most categories, while AnySlot achieves nearly 90% average success, demonstrating the
+effectiveness of explicit visual goal construction for precise slot-level placement.
+To summarize, we make three contributions:
+1. We identify slot-level placement as a practical importance yet underexplored VLA problem re-
+   quiring exact language grounding and precise execution under tight geometric constraints.
+2. We propose AnySlot, a two-stage framework that converts language instructions into explicit
+   spatial visual goals, providing a structured reasoning-control interface for slot-level placement.
+3. We introduce SlotBench, a diverse benchmark for evaluating slot-level spatial reasoning and
+   language grounding under zero-shot generalization to unseen layouts and instructions.
+
+
+2     Preliminaries
+
+Policy formulation. At time step t, a robot policy observes o_t=[I_t^{1:m},q_t,\ell _t], where I_t^{1:m} are multi-
+view images, q_t is proprioception, and \ell _t is the language instruction. It outputs either an action a_t or
+an action chunk A_t=[a_t,\dots ,a_{t+H-1}] for the next H steps [19]. Then action generation is modeled
+as the conditional distribution p(A_t\mid o_t), denoted by \pi _\theta (\cdot \mid o_t) for a learned parameterization.
+Vision-Language-Action policies. Vision-Language-Action (VLA) policies extend Vision-
+Language Models (VLMs) from text generation to robot action generation. Given (I,\ell ), a VLM
+models p(\ell ' \mid I,\ell ), typically autoregressively, while a VLA conditions on robot observations o_t and
+models p(A_t \mid o_t) or \pi _\theta (\cdot \mid o_t). Existing VLAs commonly use either ❶ tokenized decoding, where
+actions are discretized and predicted sequentially, e.g., p(A_t \mid o_t) \approx p(\mathrm {tok}(A_t)\mid I_t^{1:m}, q_t, \ell _t) [2, 1],
+or ❷ continuous generative modeling, where actions are generated as continuous variables, e.g.,
+A_t = g_\theta (\varepsilon ;\, o_t), \varepsilon \sim \mathcal {N}(0,I) [3, 4]. Since slot-level placement requires precise continuous control,
+we build on a continuous generative VLA, \pi _{0.5} , for multi-modal execution.
+Problem formulation: slot-level placement. We study slot-level object placement [16] under com-
+positional language instructions in zero-shot environments. Given candidate slots \protect \mathcal  {S}=\{s_i\}_{i=1}^{N} , the
+instruction \ell _t specifies a target slot s^\star \in \mathcal {S}. The task requires ❶ slot selection: identifying s^\star  , and
+❷ precision placement: placing the object with sufficient geometric accuracy. Here, compositional
+
+
+                                                                           3
+                 Stage1: High Level Goal Construction                                                          Stage2: Low Level Control Policy
+
+         User Prompt           Grounding Module            Guidance Image                                                                                     Continuous Action
+
+        “Find the third slot                                                                      Slot-level                                                          𝐴# , 𝐴#$%, 𝐴#$&,
+        from left on the top                                                                      Placement                                                          … , 𝐴#$'(%, 𝐴#$'
+        row and put a blue
+        sphere in it. ’’
+                                                                                                                  Goal-Conditioned VLA Policy
+                                                                                                                                                                            Action
+                                                                                                                     Pali-Gemma 3B Backbone                                 Expert
+                                Nano-Banana 2                Center (𝒖𝒉 , 𝒗𝒉 )                      …                     …                                 …                   …
+
+
+         Head Camera   𝑰𝟎𝒉
+                                                                                                 VIT                  VIT                  VIT           Tokenizer         Projector
+                               3D Reconstruction & Multi-view Overlay
+
+
+                                                                     Project to                                                                         “move the        [ 0.50, … , -0.40 ]
+                                                                                                                                                        object into      [-0.70, … , 0.30 ]
+                                                                     multi-view                                                                                          [ 0.20, … , -0.60 ]
+                                                                                                                                                        the slot with            …
+                                                                                                                                                        blue sphere              …
+                                 Depth Back-                                                                                                                             [-0.60, … , 0.10 ]
+                                  projection          3d world anchor                                                                                   guidance.”       [ 0.40, … , 0.90 ]
+
+         Depth Camera 𝑫𝟎𝒉        with (𝒖𝒉 , 𝒗𝒉 )            𝑷𝒘
+                                                                                           Head Camera 𝑰𝒉𝟎       Left Camera 𝑰𝒍𝟎     Right Camera 𝑰𝒓𝟎   Fixed Prompt Noise Action
+                                                                                             (w/ Goal)             (w/ Goal)            (w/ Goal)
+
+
+
+
+Figure 3: AnySlot overview. We formulate slot-level placement as goal-conditioned control. High-
+level goal construction uses the Nano-Banana image generator to render a blue-sphere goal from the
+language prompt, lifting it to a view-consistent multi-view overlay via depth and camera calibration.
+Low-level control uses a goal-conditioned VLA policy (\pi _{0.5} ) with a PaliGemma-3B backbone and
+action expert, mapping goal-augmented multi-view observations to continuous actions A_t .
+
+
+language denotes instructions that combine spatial, relational, comparative, negation, affordance,
+or commonsense constraints, while zero-shot environments contain unseen language compositions
+and slot layouts without task-specific fine-tuning. Directly mapping such instructions to low-level
+actions is brittle, since small grounding errors can cause placement failures. To reduce composi-
+tional complexity, we introduce an intermediate spatial visual goal G_t , derived from language and
+perception via an image generation model, and model execution as p(A_t \mid o_t, G_t).
+
+
+3     Method
+
+3.1   Method Overview
+
+Fig. 3 provides an overview of AnySlot. At time step t, the robot receives the observation
+            .o_t = [I_t^{1:m}, q_t, \ell _t]
+              The key challenge is to satisfy compositional language constraints while maintaining
+geometric precision under unseen layouts. To reduce this compositional complexity, an explicit
+intermediate goal variable G_t is introduced and the policy is factored through it:
+
+                                        p(A_t \mid o_t) \;=\; \int p(A_t \mid o_t, G_t)\, p(G_t \mid o_t)\, dG_t, \label {eq:anyslot_factorization}                                            (1)
+
+where G_t denotes the intermediate spatial visual goal derived from language and perception,
+   performs goal inference (grounding) and p(A_t \mid o_t, G_t) performs goal-conditioned execution.
+  p(G_t \mid o_t)
+In AnySlot, the goal inference term p(G_t \mid o_t) is instantiated by a generation-based grounding
+module that converts language into an explicit visual goal. Concretely, an out-of-the-box (e.g.,
+Nano-Banana) image generation model renders a colored sphere marker in the head image, and
+the marker is lifted to a world-space anchor using the aligned depth map and camera calibration.
+This anchor is then projected back into all camera streams to form view-consistent overlays, which
+constitute the visual goal G_t consumed by the policy (Sec. 3.2).
+The execution term p(A_t \mid o_t, {G}_t) is instantiated with a continuous generative VLA policy (e.g.,
+\pi _{0.5} ), which conditions on multi-view observations augmented with the rendered sphere overlays
+(Sec. 3.3). To isolate high-level language grounding from low-level control, the low-level instruc-
+tion is kept fixed, and spatial intent, which slot to use, is provided exclusively through the visual
+goal G_t . This design bridges structured language grounding and precise execution while remaining
+compatible with current multi-camera VLA policies.
+
+
+                                                                                           4
+                                           User Prompt:                             User Prompt:                            User Prompt:                                 User Prompt:
+ User Prompt:
+                                           Find the largest slot and put a blue     Find highest slot and put a blue sphere Find the cell is farthest from the red       Locate the grid closest to the red
+ Find the slot located in the top row
+                                           sphere in it.                            in it.                                  block and put a blue sphere in it.           block, then find the grid two grids to
+ and third column from right and
+                                                                                                                                                                         its right, place a blue sphere in it.
+ put a blue sphere in it.
+             2. third column from right
+
+1. Top Row
+                                           Largest                                                                             farthest
+                                                                                     Highest
+
+
+                                                                                                                                                                               1. Nearest 2. two grids
+                                                                                                                                                                                              to its right
+     1. Ordinal Reasoning                         2. Size Comparison                  3. Vertical Reasoning                      4. Distance Reasoning                   5. Compositional Relational
+                     User Prompt:                               User Prompt:                              User Prompt:                                         User Prompt:
+                     Don't put in the left part and lower       Find the suitable cell and put a          Find the stable cell and put a                       Find the cell nearest to the
+                     part, find the available cell and put a    blue sphere in it.                        blue sphere in it.                                   Pepsi and put a blue sphere
+                     blue sphere in it.                                                                                                                        in it.
+                      1. Left Part                                                                                 Stable                                                 Coke
+                                                                 Suitable
+
+
+
+
+                             2. Lower Part                                                                                                                    Pepsi
+                          6. Logical Negation                      7. vague language                        8. Affordance Reasoning                    9. World-knowledge
+
+
+
+
+Figure 4: SlotBench. A slot-level benchmark with nine challenges for spatial reasoning and lan-
+guage grounding in manipulation.
+
+
+3.2          Stage 1: High-level Goal Construction Module
+
+The goal construction module produces an explicit spatial visual goal G_t from the head observation
+and language instruction, and renders it consistently across views for downstream multi-view poli-
+cies (e.g., \pi _{0.5} ). We consider a multi-view setup with a fixed head RGB-D camera c_h and a wrist
+camera c_w(t) mounted on the end-effector. Let K_h,K_w denote camera intrinsics, and let ^{W}\!T_{c_h} de-
+note the calibrated head-camera pose in a shared world frame W . At the beginning of an episode, the
+head RGB image I_h^0 and depth map D_h^0 are captured. An out-of-the-box image generation model
+g_\phi  produces an edited guidance image \protect \tilde  {I}_h^0=g_\phi (I_h^0,\ell ), where a blue sphere marker indicates the
+instructed slot. We extract the marker center (u_h,v_h)=\mathcal {C}(\tilde {I}_h^0) using HSV segmentation, morpho-
+logical filtering, and ellipse fitting.
+Given the marker depth z_h=D_h^0(u_h,v_h), the 2D marker is back-projected into the head-camera
+frame and transformed into a world-space anchor:
+                                            \mathbf {p}^{c_h}=z_hK_h^{-1}[u_h,v_h,1]^\top ,\qquad \mathbf {p}^{W}=\,^{W}\!T_{c_h}[(\mathbf {p}^{c_h})^\top ,1]^\top .                                        (2)
+This single anchor is then re-projected into each camera stream to generate view-consistent goal
+overlays. The wrist-camera pose is obtained from forward kinematics and hand–eye calibration as
+^{W}\!T_{c_w}(t)=\,^{W}\!T_{ee}(q_t)\,^{ee}\!T_{c_w}
+                                                     . For any camera c\in \{c_h,c_w(t)\}, the world anchor is projected as
+                                    \tilde {\mathbf {p}}^{c}=(^{W}\!T_{c})^{-1}[(\mathbf {p}^{W})^\top ,1]^\top ,\qquad \lambda [u,v,1]^\top =K_c[X^c,Y^c,Z^c]^\top ,                                        (3)
+where \protect \tilde  {\mathbf {p}}^{c}=[X^c,Y^c,Z^c,1]^\top  . A blue sphere marker is rendered at (u,v) in each view, with pixel
+radius r_{\mathrm {px}}\approx f_x r/Z^c , producing overlaid observations \ifmmode \lbrace \else \textbraceleft \fi I_h^{\mathrm {ov}}(t),I_w^{\mathrm {ov}}(t)\} consumed by the policy. By
+deriving all overlays from the same world-space anchor, G_t provides an aligned multi-view goal cue
+compatible with current multi-camera VLAs.
+
+3.3          Stage 2: Low-Level Goal-Conditioned Policy
+
+Given the observation ot and the spatial visual goal Gt constructed in Sec. 3.2, execution is modeled
+as a goal-conditioned action distribution p(At | ot , Gt ). In AnySlot, this distribution is instantiated
+with π0.5 , a continuous generative VLA that uses a PaliGemma-3B vision-language backbone and a
+flow-matching action expert. Concretely, π0.5 generates an action chunk as At = gθ (ε; ot , Gt ) with
+ε ∼ N (0, I), where Gt is represented as a rendered sphere overlay in the policy input.
+We fine-tune π0.5 on a synthetic goal-guided dataset Dsyn collected in RoboTwin [20, 21], which
+have 450 episodes contain multi-view observations, robot states (It1:m , qt ), continuous action targets,
+
+
+                                                                                                      5
+and an oracle visual goal G⋆t rendered at the intended slot. This teaches the policy to ground and
+track the blue sphere for precise slot-level execution. Implementation details are provided in Sec. 5.
+To decouple high-level language grounding from low-level control, the low-level instruction is fixed
+and does not require language-based spatial reasoning. The policy is prompted with the instruction
+template “move the \protect \underline  {object} into the slot with blue sphere guidance”, where \protect \underline  {object} specifies only the
+object category. Slot selection is specified solely through Gt , and the low-level policy focuses on
+goal-conditioned execution rather than instruction-level slot reasoning.
+
+
+4     SlotBench: A Slot-Level Placement Benchmark
+
+Overview. To evaluate slot-level reasoning for robotic placement, we introduce SlotBench, a sim-
+ulation benchmark built in RoboTwin [20, 21]. SlotBench comprises nine task categories that test
+distinct forms of structured spatial reasoning for slot-level placement. Fig. 4 provides a visualization
+of SlotBench. Unlike existing manipulation benchmarks that evaluate object-level goal completion,
+SlotBench isolates fine-grained slot selection under compositional language. To our knowledge, no
+benchmark specifically evaluates slot-level placement with explicit slot-level reasoning. Detailed
+task definitions and prompt examples are provided in the appendix.
+Benchmark composition. SlotBench contains nine task categories with diverse scene configura-
+tions. Each task includes at least five randomized scenes with different tray geometries, resulting
+in at least 45 unique scene layouts in total. For each scene, we generate multiple language instruc-
+tions (at least five variants) that describe the target slot for both the high-level module and the flat
+policy. Compared with common VLA benchmarks[22, 23, 24], which emphasize object-level com-
+pletion or continuous pose reaching, SlotBench targets discrete slot-level placement that requires
+structured spatial reasoning. Small changes in language or scene geometry can switch the target
+slot, making SlotBench well-suited for evaluating reasoning-driven manipulation and compositional
+generalization.
+
+
+5     Experimental Evaluation
+
+In this section, we study slot-level placement tasks that couple stringent geometric constraints with
+compositional language guidance in a zero-shot setting. We compare our AnySlot against flat VLA
+baselines and prior modular approaches, which also decompose grounding and execution into sep-
+arate stages. Our experiments are designed to ❶ evaluate slot-level placement under compositional
+language and unseen configurations, ❷ compare against flat VLA and modular baselines, and ❸
+analyze the roles of goal construction and low-level control through ablations.
+
+                                                                  Timeline                                                            Timeline
+
+
+
+   Head
+
+
+                                                                    ✓                                                                 ❌
+  Camera
+
+
+  Left
+ Camera
+
+
+  Right
+ Camera
+
+
+
+                                    AnySlot                                                       VLM-based Method
+
+Figure 5: Comparison between AnySlot and a VLM-based method. AnySlot grounds the target
+slot and succeeds, while the VLM-based method mislocalizes the target and fails.
+
+
+                                                                       6
+Table 1: Performance comparison of different methods on the SlotBench benchmark. Each
+entry reports SR (Success Rate; higher is better, %) and IA (Instruction Accuracy; higher is better,
+%). The yellow rows denote our AnySlot, while the blue rows indicate the oracle upper bound.
+                                            Ord.             Size             Hgt.             Dist.         Comp.          Neg.             Vague             Aff.          World
+   Group             Method
+                                       SR          IA   SR          IA   SR          IA   SR           IA   SR   IA    SR          IA   SR       IA      SR           IA    SR   IA
+
+               Diffusion Policy [25]   16          /    0           /    0           /     0           /    0     /     0          /     0           /    0            /    0        /
+               OpenVLA-OFT [2]         0           /    0           /    0           /     0           /    0     /     0          /     0           /    0            /    0        /
+      Flat
+                      \pi _{0} [3]     12          /    0           /    0           /     0           /    0     /     0          /     0           /    0            /    0        /
+                    \pi _{0.5} [4]     18          /    0           /    0           /     0           /    0     /     0          /     0           /    0            /    0        /
+
+                 RoboPoint [26]        0           0    0           0    0           0     0           0    0    0      0          0     0           0    0            0    0     0
+                 HAMSTER [15]          0           0    0           0    0           0     0           0    0    0      0          0     0           0    0            0    0     0
+   Modular        AnyPlace [27]        12          12   42          42   0           0    38           38   0    0      0          0    16       16       0            0    0     0
+                 AnySlot (Ours)        92          96   80          82   76          84   96           98   88   90    100     100      88       94      96           96    90   94
+                AnySlot (Oracle)       98      100      96      100      82      100      100      100      98   100   100     100      100      100     100          100   98   100
+
+
+
+
+Evaluation benchmark. We evaluate on SlotBench, a zero-shot benchmark for slot-level place-
+ment under compositional language. It contains nine task categories (Sec. 4) with randomized tray
+geometries, distractors, and object poses. Full task specifications are provided in the appendix.
+Baselines. We compare with representative flat and modular policies. ❶ Flat policy. End-to-end
+policies directly map observations and language to actions, without explicit spatial visual goals.
+They are trained on a standard dataset \protect \mathcal  {D}_{\mathrm {std}} with 450 slot-level placement episodes using direct
+row–column language instructions. ❷ Modular policy. Two-stage methods first predict place-
+ment targets using grounding pipelines, such as VLM-based coordinate prediction, and then execute
+placement using motion planning or learned control. ❸ Oracle high-level. An expert-human oracle
+provides the correct target slot, measuring the low-level policy performance under perfect high-level
+grounding. Details of all baselines are provided in the appendix.
+Metrics. We use three metrics. ❶ Success Rate (SR) measures successful placement into the
+ground-truth target slot. ❷ Instruction Accuracy (IA) measures whether the predicted target
+center is within 0.02\,\mathrm {m} of the ground-truth slot center, reflecting SlotBench’s tight geometry and
+centimeter-level precision requirement. ❸ Coarse Accuracy (CA) measures whether the predicted
+center falls inside the target slot region, and is reported in ablations to analyze grounding quality.
+Implementation Details. Our default baseline uses out-of-box Nano-Banana 2 as the high-level
+module and \pi _{0.5} as the low-level policy. We fully fine-tune \pi _{0.5} with \protect \mathcal  {D}_{\mathrm {syn}} for 20,000 steps using
+batch size 64 on a single NVIDIA H200 GPU. More details are summarized in Appendix.
+
+
+
+5.1          Main Results
+
+We compare AnySlot and representative baselines: flat VLA, modular two-stage, and oracle base-
+lines under the same zero-shot evaluation protocol. Following prior work [22], each method is
+evaluated with 50 trials per task. Results are reported in Tab. 1, Fig. 5 and Fig. 1.
+❶ AnySlot excels at slot-level placement. AnySlot is the only method that achieves consistently
+high success across all nine SlotBench categories, from ordinal selection to comparison and logical
+negation. In contrast, flat policies only show sparse success on the ordinal category, while modular
+baselines improve a few categories but remain unreliable overall. ❷ Spatial visual goals are crucial.
+VLM-based coordinate grounding is limited by localization precision, compositional reasoning, and
+generalization to unseen layouts. Our image-generation-based goal construction instead produces
+spatially explicit visual targets, leading to substantially stronger IA and SR. ❸ Oracle guidance
+reveals the bottleneck. The expert-human oracle achieves near-ceiling performance, showing that
+the low-level controller can execute accurately with correct targets. Thus, the remaining gap mainly
+stems from high-level grounding errors, highlighting the importance of robust goal construction.
+
+
+                                                                                               7
+Table 2: Ablation on high-level grounding module. Report Coarse Accuracy (CA, %), Instruction
+Accuracy (IA, %) and Latency (s). † means inference performed on a H200 GPU. The yellow rows
+denote the module used by AnySlot. \ddagger  means fine-tuned and inference performed on a H200 GPU.
+                                                                                       Ord.                 Size                Hgt.             Dist.       Comp.               Neg.        Vague              Aff.              World
+       Group                            Method                                                                                                                                                                                             Latency
+                                                                                   CA     IA            CA     IA           CA     IA       CA       IA      CA        IA   CA         IA   CA       IA   CA           IA     CA      IA
+
+                                   Molmo-7B†                                       44     12            48     42           6          0    38           0   4          0    0          0    0       0     0           0          0   0      2
+                               GPT-5.3-instant                                     8          0         24         6        0          0     6           0   8          2    2          0    4       2     12          2      16      4      25
+       VLM                      GPT-5.2 Think                                      52     34            80     72           52     28       82       40      62        16   78         62   66       40    48          42     72      46    133
+                               Gemini-3.0 Pro                                      80     74            78     52           48     38       56       50      38        24   100        78   82       60    88          76     78      32     89
+                               Gemini-3.1 Pro                                      98     92            90     84           86     60       100      44      92        48   100        72   100      76   100          92     100     62    121
+
+                                   Grok-Image                                      58     58            42     42           54     54       94       94      24        24   32         32   88       88    38          38     88      88     9
+                               GPT-Image-1.5                                       0          0         0          0        0          0     0           0   0          0    0          0    0       0     0           0          0   0      22
+       Image
+      Generator                    Flux2-Dev\ddagger                               12     12            20     20           30     30       30       30      10        10   20         20   30       30    20          20     40      40     4
+                         Stable Diffusion-XL\ddagger                               10     10            10     10           0          0    20       20      20        20    0          0    0       0     10          10     20      20     1
+                             Nano-Banana Pro                                       72     72            84     84           72     72       94       94      92        92   100       100   88       88    96          96     92      92     16
+                              Nano-Banana 2                                        96     96            82     82           84     84       98       98      90        90   100       100   94       94    96          96     94      94     11
+
+
+
+
+Table 3: Effect of the low-level policy. Success Rate (SR, %) on SlotBench. The performance
+varies significantly with different policy choices, and the full fine-tuned π0.5 policy achieves the
+best results. yellow rows denote our proposed AnySlot.
+                                                                                                  Ord.             Size            Hgt.            Dist.      Comp.          Neg.           Vague         Aff.              World
+                                            Method
+                                                                                                  SR               SR                  SR           SR            SR             SR          SR           SR                 SR
+
+                       AnySlot-Diffusion Policy                                                    92                  0               0             0            94             90          98            0                  0
+                       AnySlot-OpenVLA-OFT                                                         0                   0               0             0             0              0              0         0                  0
+                          AnySlot-\pi _{0.5} (PEFT)                                                10                  12              4             8            12              8              2         0                 10
+                  AnySlot-\pi _{0.5} (FT)(Baseline)                                                98                  96              82           100           100            100         100          100                98
+
+
+
+
+Table 4: Effect of the synthetic dataset. Success Rate (SR, %) on SlotBench. Training with Dsyn
+yields significantly higher SR than Dstd across all categories. yellow rows denote AnySlot.
+                                                                                              Ord.                 Size           Hgt.            Dist.       Comp.          Neg.           Vague         Aff.              World
+                                           Method
+                                                                                                  SR               SR              SR              SR             SR             SR          SR           SR                 SR
+
+                            AnySlot (w/ \protect \mathcal  {D}_{\mathrm {std}} )                   2                   0               0            0              0             0            0            0                  0
+                  AnySlot (w/ \protect \mathcal  {D}_{\mathrm {syn}} )(Baseline)                  98               96              82              100            100        100             100          100                98
+
+
+
+
+5.2     Ablation Study
+
+Alternative high-level grounding module. We compare recent VLMs and image generators as
+high-level grounding modules. VLMs output a placement coordinate as the goal center while image
+generators produce an edited guidance image with a spatial marker to define the goal center. Tab. 2
+shows that reasoning VLMs localize slots coarsely and yield moderate CA but substantially lower
+IA. This result indicates insufficient spatial fidelity for sub-centimeter placement, and latency is also
+high. In contrast, image generators achieve consistently strong CA and IA at much lower latency,
+which is critical for robotic manipulation. However, some generators are impractical. Models such
+as GPT-Image-1.5 enforce resizing during generation, which breaks pixel-level alignment.
+Alternative low-level policy. We compare low-level policies for slot-level placement in Tab. 3. We
+use oracle guidance to isolate low-level execution from grounding errors. All policies are trained
+on the same synthetic dataset Dsyn under comparable protocols. Diffusion Policy [25] succeeds
+only when the viewpoint distribution matches training and fails elsewhere, indicating that generic
+behavior cloning lacks the precision required for slot-level insertion. Parameter-efficient tuning
+methods, including OpenVLA-OFT and \pi _{0.5} (PEFT), also perform poorly, suggesting limited adap-
+tation capacity is insufficient. Fully fine-tuned π0.5 achieves high success rates across categories,
+demonstrating that reliable slot-level manipulation requires substantial low-level policy adaptation.
+Training without synthetic dataset. We replace the synthetic dataset \protect \mathcal  {D}_{\mathrm {syn}} , which includes a blue
+guidance sphere, with the standard dataset \protect \mathcal  {D}_{\mathrm {std}} , which provides only language instructions, to quan-
+
+
+                                                                                                                                            8
+Table 5: Effect of in-domain training on SlotBench. Success Rate (SR, %). Directly fine-
+tuning π0.5 in-domain yields limited gains, while AnySlot achieves substantially higher perfor-
+mance across all categories. yellow rows denote our proposed AnySlot.
+                                         Ord.   Size    Hgt.     Dist.    Comp.      Neg.     Vague      Aff.     World
+                     Method
+                                         SR     SR      SR        SR        SR        SR        SR       SR        SR
+
+                \pi _{0.5} (in-domain)    42    38       26       26        18        30        25        32       22
+               AnySlot (Baseline)         98    96       82       100       100      100       100       100       98
+
+
+
+
+tify the benefit of synthetic visual-goal augmentation for low-level training. As shown in Tab. 4,
+policies trained on \protect \mathcal  {D}_{\mathrm {std}} achieve near-zero success across tasks, indicating that synthetic visual-goal
+supervision is critical for learning precise slot-level execution.
+In-domain flat policy training. We fine-tune a flat policy on in-domain data from nine SlotBench
+tasks. For each task, we include at least two tray-shaped variants (of five total) and at least two
+instruction variants (of five total). As shown in Tab. 5, the flat policy succeeds mainly on near-
+duplicates of the training distribution, but mild geometry or language changes cause sharp drops,
+suggesting overfitting. In contrast, AnySlot remains robust under unseen layouts.
+
+5.3    Real-World Experiment
+
+We validate AnySlot on a real UR10e platform with two RealSense D455 RGB-D cameras (Fig. 1),
+using a red block and a 2\times 2 tray. We collect 50 ordinal-reasoning demonstrations covering only
+two of the four slots, and evaluate on 20 trials with instructions covering all slots. AnySlot achieves
+an 82% success rate, showing that the visual goal can be generated, reconstructed, and executed in
+real-world settings while generalizing to unseen slot targets. More results are in Appendix.
+
+6     Conclusion
+
+We showed that slot-level placement remains challenging for current flat and VLM-based modular
+policies because flat policies entangle grounding with action, while modular pipelines suffer from
+imprecise intermediate grounding. We introduced AnySlot, a goal-conditioned framework that con-
+verts language into an explicit visual goal (via image generation) and executes it with a low-level
+policy, decoupling slot selection from precise placement. We also introduced SlotBench, a nine-task
+benchmark for evaluating structured slot-level reasoning under zero-shot transfer to unseen layouts
+and instructions. Across diverse settings, AnySlot consistently improves semantic correctness and
+geometric precision, demonstrating strong zero-shot generalization for slot-level manipulation.
+Limitation. AnySlot has several limitations. First, reliable goal generation currently depends on
+a strong external image-generation model. Although open-source alternatives were evaluated, they
+showed weaker spatial reasoning ability. Second, the zero-shot generalization mainly targets lan-
+guage grounding and unseen slot layouts, rather than general tasks and objects. Finally, depth-based
+goal reconstruction may fail under extreme viewpoints, partial marker visibility or severe occlusion.
+
+
+
+
+                                                                   9
+Acknowledgments
+If a paper is accepted, the final camera-ready version will (and probably should) include acknowl-
+edgments. All acknowledgments go at the end of the paper, including thanks to reviewers who gave
+useful comments, to colleagues who contributed to the ideas, and to funding agencies and corporate
+sponsors that provided financial support.
+
+References
+ [1] B. Zitkovich, T. Yu, S. Xu, P. Xu, T. Xiao, F. Xia, J. Wu, P. Wohlhart, S. Welker, A. Wahid,
+     et al. Rt-2: Vision-language-action models transfer web knowledge to robotic control. In
+     Conference on Robot Learning, pages 2165–2183. PMLR, 2023.
+ [2] M. Kim, K. Pertsch, S. Karamcheti, T. Xiao, A. Balakrishna, S. Nair, R. Rafailov, E. Foster,
+     G. Lam, P. Sanketi, Q. Vuong, T. Kollar, B. Burchfiel, R. Tedrake, D. Sadigh, S. Levine,
+     P. Liang, and C. Finn. Openvla: An open-source vision-language-action model. arXiv preprint
+     arXiv:2406.09246, 2024.
+ [3] K. Black, N. Brown, D. Driess, A. Esmail, M. Equi, C. Finn, N. Fusai, L. Groom, K. Hausman,
+     B. Ichter, et al. π0 : A vision-language-action flow model for general robot control. arXiv
+     preprint arXiv:2410.24164, 2024.
+ [4] P. Intelligence, K. Black, N. Brown, J. Darpinian, K. Dhabalia, D. Driess, A. Esmail, M. Equi,
+     C. Finn, N. Fusai, et al. π0 .5: a vision-language-action model with open-world generalization.
+     arXiv preprint arXiv:2504.16054, 2025.
+ [5] S. Karamcheti, S. Nair, A. Balakrishna, P. Liang, T. Kollar, and D. Sadigh. Prismatic vlms:
+     Investigating the design space of visually-conditioned language models. In Forty-first Interna-
+     tional Conference on Machine Learning, 2024.
+ [6] L. Beyer, A. Steiner, A. S. Pinto, A. Kolesnikov, X. Wang, D. Salz, M. Neumann, I. Alabdul-
+     mohsin, M. Tschannen, E. Bugliarello, et al. Paligemma: A versatile 3b vlm for transfer. arXiv
+     preprint arXiv:2407.07726, 2024.
+ [7] A. Radford, J. W. Kim, C. Hallacy, A. Ramesh, G. Goh, S. Agarwal, G. Sastry, A. Askell,
+     P. Mishkin, J. Clark, et al. Learning transferable visual models from natural language supervi-
+     sion. In International conference on machine learning, pages 8748–8763. PmLR, 2021.
+ [8] A. Steiner, A. S. Pinto, M. Tschannen, D. Keysers, X. Wang, Y. Bitton, A. Gritsenko, M. Min-
+     derer, A. Sherbondy, S. Long, et al. Paligemma 2: A family of versatile vlms for transfer. arXiv
+     preprint arXiv:2412.03555, 2024.
+ [9] M. Deitke, C. Clark, S. Lee, R. Tripathi, Y. Yang, J. S. Park, M. Salehi, N. Muennighoff, K. Lo,
+     L. Soldaini, et al. Molmo and pixmo: Open weights and open data for state-of-the-art vision-
+     language models. In Proceedings of the Computer Vision and Pattern Recognition Conference,
+     pages 91–104, 2025.
+[10] P. Sundaresan, S. Belkhale, D. Sadigh, and J. Bohg. KITE: keypoint-conditioned policies for
+     semantic manipulation. In J. Tan, M. Toussaint, and K. Darvish, editors, Conference on Robot
+     Learning, CoRL 2023, 6-9 November 2023, Atlanta, GA, USA, volume 229 of Proceedings of
+     Machine Learning Research, pages 1006–1021. PMLR, 2023.
+[11] H. Huang, X. Chen, Y. Chen, H. Li, X. Han, Z. Wang, T. Wang, J. Pang, and Z. Zhao.
+     Roboground: Robotic manipulation with grounded vision-language priors. In Proceedings
+     of the Computer Vision and Pattern Recognition Conference, pages 22540–22550, 2025.
+[12] L. X. Shi, B. Ichter, M. Equi, L. Ke, K. Pertsch, Q. Vuong, J. Tanner, A. Walling, H. Wang,
+     N. Fusai, et al. Hi robot: Open-ended instruction following with hierarchical vision-language-
+     action models. arXiv preprint arXiv:2502.19417, 2025.
+
+
+                                                 10
+[13] Y. Yuan, H. Cui, Y. Chen, Z. Dong, F. Ni, L. Kou, J. Liu, P. Li, Y. Zheng, and J. Hao. From
+     seeing to doing: Bridging reasoning and decision for robotic manipulation. arXiv preprint
+     arXiv:2505.08548, 2025.
+[14] C.-P. Huang, Y.-H. Wu, M.-H. Chen, Y.-C. F. Wang, and F.-E. Yang.            Thinkact:
+     Vision-language-action reasoning via reinforced visual latent planning. arXiv preprint
+     arXiv:2507.16815, 2025.
+[15] Y. Li, Y. Deng, J. Zhang, J. Jang, M. Memmel, R. Yu, C. R. Garrett, F. Ramos, D. Fox, A. Li,
+     et al. Hamster: Hierarchical action models for open-world robot manipulation. arXiv preprint
+     arXiv:2502.05485, 2025.
+[16] D. Shan, K. Mo, W. Yang, Y.-W. Chao, D. Fouhey, D. Fox, and A. Mousavian. Slot-
+     level robotic placement via visual imitation from single human video. arXiv preprint
+     arXiv:2504.01959, 2025.
+[17] M. Shukor, E. Fini, V. G. T. da Costa, M. Cord, J. Susskind, and A. El-Nouby. Scaling laws
+     for native multimodal models. In Proceedings of the IEEE/CVF International Conference on
+     Computer Vision, pages 12–23, 2025.
+[18] J. Yang, S. Yang, A. W. Gupta, R. Han, L. Fei-Fei, and S. Xie. Thinking in space: How
+     multimodal large language models see, remember, and recall spaces. In Proceedings of the
+     Computer Vision and Pattern Recognition Conference, pages 10632–10643, 2025.
+[19] T. Z. Zhao, V. Kumar, S. Levine, and C. Finn. Learning fine-grained bimanual manipulation
+     with low-cost hardware. arXiv preprint arXiv:2304.13705, 2023.
+[20] F. Xiang, Y. Qin, K. Mo, Y. Xia, H. Zhu, F. Liu, M. Liu, H. Jiang, Y. Yuan, H. Wang, L. Yi,
+     A. X. Chang, L. J. Guibas, and H. Su. SAPIEN: A simulated part-based interactive environ-
+     ment. In The IEEE Conference on Computer Vision and Pattern Recognition (CVPR), June
+     2020.
+[21] T. Chen, Z. Chen, B. Chen, Z. Cai, Y. Liu, Q. Liang, Z. Li, X. Lin, Y. Ge, Z. Gu, et al.
+     Robotwin 2.0: A scalable data generator and benchmark with strong domain randomization
+     for robust bimanual robotic manipulation. arXiv preprint arXiv:2506.18088, 2025.
+[22] B. Liu, Y. Zhu, C. Gao, Y. Feng, Q. Liu, Y. Zhu, and P. Stone. Libero: Benchmarking knowl-
+     edge transfer for lifelong robot learning. Advances in Neural Information Processing Systems,
+     36:44776–44791, 2023.
+[23] O. Mees, L. Hermann, E. Rosete-Beas, and W. Burgard. Calvin: A benchmark for language-
+     conditioned policy learning for long-horizon robot manipulation tasks. IEEE Robotics and
+     Automation Letters, 7(3):7327–7334, 2022.
+[24] X. Li, K. Hsu, J. Gu, K. Pertsch, O. Mees, H. R. Walke, C. Fu, I. Lunawat, I. Sieh, S. Kir-
+     mani, et al. Evaluating real-world robot manipulation policies in simulation. arXiv preprint
+     arXiv:2405.05941, 2024.
+[25] C. Chi, Z. Xu, S. Feng, E. Cousineau, Y. Du, B. Burchfiel, R. Tedrake, and S. Song. Diffusion
+     policy: Visuomotor policy learning via action diffusion. The International Journal of Robotics
+     Research, 44(10-11):1684–1704, 2025.
+[26] W. Yuan, J. Duan, V. Blukis, W. Pumacay, R. Krishna, A. Murali, A. Mousavian, and D. Fox.
+     Robopoint: A vision-language model for spatial affordance prediction for robotics. arXiv
+     preprint arXiv:2406.10721, 2024.
+[27] Y. Zhao, M. Bogdanovic, C. Luo, S. Tohme, K. Darvish, A. Aspuru-Guzik, F. Shkurti, and
+     A. Garg. Anyplace: learning generalized object placement for robot manipulation. arXiv
+     preprint arXiv:2502.04531, 2025.
+
+
+                                                11
+

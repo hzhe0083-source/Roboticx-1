@@ -1,0 +1,565 @@
+                                          SSI-Policy: Learning Structured Scene Interfaces for Vision-Language
+                                                                  Robotic Manipulation
+                                                   Kaijun Wang†1 , Zikai Ouyang†1,2 , Xuping Wu1 , Jinyi Hong1 , Wei Pan1 , Haibo Lu2 , Jia Pan3 ,
+                                                                             Wei Zhang‡1,4 , and Linfang Zheng‡3
+
+                                            Abstract— Real-world robotic manipulation demands spatial
+                                         grounding, task-aware reasoning, and precise control. Learning                                           Structured Scene Interface   Di usion-based
+                                                                                                                              “Put the bowl                                        Action
+                                         such capabilities becomes particularly challenging in the low-                       on the stove.”
+                                                                                                                                                                                 Generation
+                                         data regime. Prior methods often trade off scalable task-
+                                                                                                                           Language instruction
+                                         level reasoning and explicit physical structure: video-based
+arXiv:2606.26800v2 [cs.RO] 29 Jun 2026
+
+
+
+
+                                         approaches can drift geometrically over long horizons, 3D ap-
+                                         proaches often require depth sensing, and many flow/trajectory
+                                         interfaces emphasize motion without an explicit RGB-only
+                                         geometric representation. We introduce SSI-Policy, a modular                                              Depth    Motion   Object
+                                         framework built around a Structured Scene Interface (SSI)—                            RGB images
+                                         a unified, RGB-only intermediate representation that jointly                            Inputs                      SSI                  Actions
+                                         encodes monocular depth features, language-grounded object
+                                         layouts, and instruction-conditioned 2D motion trajectories.                  Fig. 1: Overview of SSI-Policy. From RGB observations and a lan-
+                                         Critically, SSI is robot-agnostic and trainable from action-             ff   guage instruction, SSI constructs a structured intermediate interface that
+                                                                                                                       encodes monocular geometry cues, language-grounded object layouts, and
+                                         free video, decoupling perception from control so that the                    instruction-conditioned motion trajectories. SSI is robot-agnostic (cross-
+                                         downstream policy can learn from few demonstrations. On the                   embodiment) and can be learned from action-free videos alone (e.g., human-
+                                         LIBERO benchmark with only 10 demonstrations per task, SSI-                   hand videos or robot videos). A diffusion policy is then trained from few
+                                         Policy improves over the strongest prior method by nearly 15%                 robot demonstrations to generate actions conditioned on SSI, enabling data-
+                                         and remains competitive with 50-demo methods that leverage                    efficient manipulation without depth sensors.
+                                         large-scale external pretraining. Ablations show that geometric
+                                         and motion cues provide complementary benefits within the                     based generative methods plan by forecasting future obser-
+                                         shared interface. We further validate on 13 real-world tasks                  vations [1], [2], [3]; while they benefit from large-scale RGB
+                                         spanning spatial reasoning, cross-embodiment transfer, and
+                                         contact-rich manipulation.                                                    pretraining, operating in pixel space makes long-horizon roll-
+                                                                                                                       outs computationally expensive and prone to geometric drift.
+                                                                I. I NTRODUCTION                                       Geometry-centric methods improve spatial reasoning via 3D
+                                            Real-world robotic manipulation requires more than se-                     representations [4], [5], [6], [7], but often rely on RGB-D
+                                         mantic recognition—it demands spatial grounding, task-                        sensing and struggle in situations where multi-task language-
+                                         aware reasoning, and precise control. A robot must under-                     conditioned settings are required. Recent flow/trajectory-
+                                         stand not only what objects are present, but where they are,                  based interfaces provide compact motion abstractions, yet
+                                         how they relate geometrically, and how they are expected to                   each carries notable limitations: ATM [8] treats geometry im-
+                                         move under a given instruction. These requirements become                     plicitly; Im2Flow2Act [9] and GeneralFlow [10] require 3D
+                                         even more challenging in language-conditioned settings and                    anchor initialization from depth or point-cloud observations;
+                                         under limited demonstration data, where both spatial am-                      and FLIP [11] relies on flow-conditioned video generation
+                                         biguity and data scarcity can significantly degrade policy                    with beam-search rollouts at test time.
+                                         performance.                                                                     Despite these advances, to our knowledge, no existing
+                                            Existing approaches often trade off between scalable                       method provides a unified, RGB-only intermediate interface
+                                         task-level reasoning and explicit physical structure. Video-                  that jointly encodes geometric structure and task-conditioned
+                                                                                                                       motion while remaining embodiment-agnostic and trainable
+                                           *This work was supported by the Natural Science Foundation of China
+                                         (62461160309), the NSFC-RGC Joint Research Scheme (N HKU705/24),
+                                                                                                                       without robot action labels—properties critical for data-
+                                         Hong Kong RGC (GRF 17201025, GRF17200924), the National Science               efficient multi-task manipulation.
+                                         and Technology Major Project (2024ZD01NL00100), and the Major Key                In this work, we introduce SSI-Policy, a modular frame-
+                                         Project of PCL (PCL2025A03).
+                                           † denotes equal contribution, ‡ denotes corresponding authors.              work built around a Structured Scene Interface (SSI)—a
+                                           1 Kaijun Wang, Zikai Ouyang, Xuping Wu, Jinyi Hong, Wei Pan, and            unified intermediate representation that explicitly encodes
+                                         Wei Zhang are with the Southern University of Science and Technology,         geometric structure and task-conditioned motion using only
+                                         Shenzhen 518055, China. {12232628, ouyang2022, wuxp,
+                                         12213005, 12211810}@mail.sustech.edu.cn,
+                                                                                                                       RGB inputs. The key idea is not merely to combine useful
+                                         zhangw3@sustech.edu.cn                                                        features, but to define a principled interface layer between
+                                           2 Zikai Ouyang and Haibo Lu are with Peng Cheng Laboratory, Shenzhen
+                                                                                                                       perception and control: one that is robot-agnostic, train-
+                                         518000, China. luhb@pcl.ac.cn                                                 able from action-free RGB videos, and consumable by a
+                                           3 Jia Pan and Linfang Zheng are with The University of Hong Kong,
+                                         Hong Kong SAR, China. jpan@cs.hku.hk, lfzheng@hku.hk                          lightweight policy with minimal demonstrations. Within this
+                                           4 Wei Zhang is also with LimX Dynamics, China.                              interface, SSI jointly models three complementary signals: (i)
+monocular depth features capturing relative scene geometry,       works adopt flow or pixel trajectories as compact motion
+(ii) language-grounded object layout maps highlighting task-      abstractions. ATM [8] and Im2Flow2Act [9] use dense 2D
+relevant regions, and (iii) instruction-conditioned 2D motion     motion cues to guide policy learning without explicit model-
+trajectories modeling anticipated object and manipulator dy-      based planning. Im2Flow2Act further assumes explicit ini-
+namics. This enables the policy to reason explicitly about        tialization of object 3D surface keypoints (absolute anchors)
+what to act on, where to act, and how to move—without             from depth or point-cloud observations and models motion
+depth sensors or test-time video generation.                      relative to these anchors. SKIL [21] extends starting-point
+   Crucially, SSI abstracts visual understanding into a struc-    selection using semantic keypoints extracted from RGB-D
+tured, task-aligned spatial interface that is independent of      inputs, while GeneralFlow [10] learns a 3D flow interface
+embodiment-specific actions. This design allows perception        from RGB-D human videos for cross-embodiment transfer.
+modules to be pretrained from action-free RGB videos              Although these methods improve efficiency by operating
+(without robot action labels), while the downstream policy is     in motion space, they either rely on explicit 3D sens-
+learned from only a small number of task demonstrations. By       ing/initialization or treat geometry implicitly. In contrast,
+decoupling perception from control in this way, SSI-Policy        our approach explicitly encodes geometric structure together
+improves data efficiency and facilitates cross-embodiment         with task-conditioned motion within a unified intermediate
+transfer.                                                         interface under RGB-only sensing.
+   We empirically validate this design on the LIBERO bench-             c) Spatial Representations for Manipulation: Effec-
+mark and real-world tasks. With only 10 demonstrations per        tive manipulation requires accurate spatial understanding of
+task, SSI-Policy achieves leading performance in the few-         objects, contacts, and constraints. Explicit 3D approaches
+shot setting among methods. The structured interface fur-         encode geometry using voxel [6], [22] or point-cloud rep-
+ther supports cross-embodiment transfer, including human-         resentations [23], [24], [25], [26], [27], [28], enabling fine-
+to-robot scenarios. When trained with more demonstrations,        grained spatial reasoning but typically requiring accurate
+SSI-Policy scales competitively with approaches that lever-       depth sensing. Other methods recover geometry from RGB
+age large-scale external pretraining, despite being trained       via depth prediction or large-scale supervision [5], [29], [7],
+solely on LIBERO.                                                 trading sensing requirements for additional data and train-
+   Our contributions are threefold: (i) We propose SSI,           ing complexity. In contrast, large-scale imitation learning
+a robot-agnostic intermediate interface that jointly en-          approaches [30], [31], [32], [33], [34], [35], [36], [37], [38],
+codes monocular geometry, language-grounded layouts, and          [39], [40] learn spatial priors implicitly from RGB, but often
+instruction-conditioned motion from RGB alone, and show           require massive datasets and offer limited interpretability.
+through ablations that these signals provide complementary        Finally, 2D-centric methods based on keypoints or part-level
+benefits that neither achieves in isolation; (ii) We demon-       attention [41], [42], [43], [44] provide lightweight spatial
+strate that this interface design enables data-efficient multi-   cues, but may lack explicit geometric grounding for contact-
+task learning and cross-embodiment transfer by decoupling         rich manipulation.
+perception (trainable from action-free video) from control;          Our method addresses this gap by defining a unified
+and (iii) We validate SSI-Policy on LIBERO [12] and 13 real-      intermediate representation that jointly encodes geometric
+world tasks, achieving strong few-shot performance without        structure and task-conditioned motion under RGB-only sens-
+depth sensors or external pretraining data.                       ing. Unlike flow-based methods that treat geometry implicitly
+                                                                  or require 3D initialization [8], [9], [10], and unlike video-
+                    II. R ELATED W ORK                            based planners that incur heavy generation cost [11], our
+     a) Video-Based Methods for Manipulation: Video pre-          interface preserves geometric structure without depth sen-
+diction has been explored as a way to model manipulation          sors while remaining computationally efficient and robot-
+dynamics. Implicit approaches [13], [14], [15], [16], [17]        agnostic—enabling both data-efficient learning and cross-
+learn latent action representations via video reconstruction,     embodiment transfer.
+but require large datasets and produce latent spaces whose
+                                                                                        III. M ETHODOLOGY
+connection to executable control is often indirect. Explicit
+generative methods [1], [3], [2], [18], [19], [20] instead gen-   A. Problem Formulation
+erate future frames conditioned on task descriptions to guide        We address the problem of vision- and language-
+control, enabling high-level reasoning but incurring sub-         conditioned robotic manipulation, where the agent predicts a
+stantial computational cost and accumulating temporal drift       sequence of future actions given recent sensory observations
+or geometric inconsistencies over long horizons. FLIP [11]        and a natural language instruction. At each timestep t, the
+further performs beam-search-based planning using flow-           agent receives: (i) a sequence of multi-view RGB frames
+                                                                           1:V
+conditioned video generation, relying on repeated generative      It = {It−t   o +1
+                                                                                    , . . . , It1:V } from V cameras, (ii) propriocep-
+rollouts during planning. These approaches highlight the          tive states Pt = {pt−to +1 , . . . , pt }, and (iii) a task instruction
+promise of video-based imagination, yet maintaining geo-          ℓ, where to denotes the temporal window size of the model
+metric consistency and efficiency remains challenging.            input. The goal is to generate a horizon-H action sequence
+     b) Flow-Based Representations for Policy Learning:           At = {at , . . . , at+H−1 }, with the policy defined as:
+To reduce reliance on full-frame video generation, recent                                    π : (It , Pt , ℓ) → At .                 (1)
+                                     Perception Composer                              Di usion Action Planner
+
+                                        MDE        Depth
+                                                                                         Multi-
+                                                                     Proprioception     Modality
+                                                                                        Feature
+                                       LGOL     Object Map     SSI                      Fusion
+                  RGBs
+
+                                       ICMP     Pixel Motion              SSI
+
+              “Put the bowl
+              on the stove.”
+                                                                                                   Predicted
+                                                                                         Action
+                                                                                                     Robot
+           Language Instruction                                                         Di usion
+                                                                         RGBs
+                                                                                                    Actions
+
+
+
+
+          Fig. 2: Framework overview. The Perception Composer con-
+          verts RGB images and language instructions into three structured
+          signals: monocular depth features, task-relevant layout maps, and
+ff
+     ff
+          instruction-conditioned motion trajectories. The Diffusion Action
+          Planner then integrates these signals—together with proprioception
+                                                                                                                     Fig. 3: Multi-modal feature fusion architecture. Per-view visual
+          and optional RGB inputs—to generate multi-step action sequences.
+                                                                                                                     features (RGB, depth, layout map) are encoded with modality-
+          B. Framework Overview                                                                                      specific CNNs and fused via an MLP. The resulting tokens, together
+                                                                                                                     with motion trajectory tokens, are processed by a Transformer. The
+             We propose SSI-Policy, a modular framework that sepa-                                                   output is concatenated with proprioception to form the condition
+          rates perception from control via a mid-level representation                                               vector for action diffusion.
+          termed the Structured Scene Interface (SSI). As shown in
+          Figure 2, the policy is decomposed into a perception module                                                scenes. We adopt Depth Anything V2 [45] without fine-
+          and an action planner:                                                                                     tuning, while remaining compatible with alternative monoc-
+                                                                                                                     ular depth estimators.
+                               St = fpercept (It , ℓ),         At = faction (St , It , Pt ),                   (2)         b) Language-Guided Object Localization Module
+          where fpercept (the Perception Composer) extracts the SSI                                                  (LGOL): To highlight task-relevant regions, this module
+          St from RGB inputs and language instructions, and faction                                                  detects objects and manipulators based on the instruction ℓ.
+          (the Diffusion Action Planner) predicts actions conditioned                                                A language-conditioned object detector proposes bounding
+          on St , raw RGB, and proprioception. This decomposition                                                    boxes, which are aggregated into a dense layout map B by
+          is central to our design: because SSI is robot-agnostic                                                    filling each region with its confidence score (overlapping
+          and requires no action labels, perception modules can be                                                   areas retain the maximum), yielding a spatial salience
+          pretrained from diverse video sources, while the downstream                                                map that guides policy attention. An example layout map
+          policy learns from only a small set of demonstrations.                                                     is shown as an inset in Figure 3. We use Grounding
+             The SSI encodes spatial structure and task intent us-                                                   DINO [46] off the shelf; the formulation is detector-agnostic
+          ing three complementary signals: (i) monocular depth fea-                                                  and compatible with finetuned alternatives.
+          tures D capturing relative scene geometry, (ii) layout maps                                                      c) Instruction-Conditioned Motion Prediction Module
+          B highlighting task-relevant regions, and (iii) instruction-                                               (ICMP): This module complements static cues by forecast-
+          conditioned pixel trajectories T = {τi }N
+                                                  i=1 indicating antici-                                             ing task-relevant motion. Given an RGB frame, instruction,
+          pated object and manipulator motion. Together, these signals                                               and layout map B, it predicts a set of pixel trajectories
+                                                                                                                                   ′
+          convey where relevant objects are, how they relate spatially,                                              τi = {xhi }Hh=1 to model anticipated object and manipulator
+          and how they are expected to move. Each component is                                                       dynamics.
+          independently computable and trainable from action-free                                                        We introduce a hybrid sampling strategy to initialize
+          data, supporting modular pretraining and reuse across tasks,                                               trajectories: half of the starting points are sampled uniformly
+          scenes, and embodiments.                                                                                   across the image, while the rest are drawn from high-
+                                                                                                                     confidence regions in B, covering both object and non-
+          C. Perception Composer
+                                                                                                                     object regions relevant to the task—a concrete benefit of
+             The Perception Composer transforms RGB frames and                                                       cross-modal integration within SSI, where the layout map
+          language instructions into the SSI via three indepen-                                                      directly informs motion prediction. In contrast, ATM [8]
+          dently trained sub-modules: a monocular depth estima-                                                      uses uniform sampling without task-aware concentration;
+          tor, a language-guided object localizer, and an instruction-                                               Im2Flow2Act [9] restricts flow to object-surface keypoints
+          conditioned motion predictor. Each operates per-frame with-                                                initialized from depth data; and SKIL [21] relies on RGB-
+          out temporal or multi-view fusion, enabling pretraining from                                               D inputs to derive semantic regions. Our approach oper-
+          large, robot-agnostic datasets.                                                                            ates purely in 2D from RGB, requiring no depth sensing
+                a) Monocular Depth Estimation Module (MDE): This                                                     or 3D initialization. The predictor architecture builds on
+          module infers relative spatial geometry by predicting depth                                                ATM’s Transformer design, adapted for dense instruction-
+          features D from RGB inputs. Rather than relying on metric                                                  conditioned trajectory forecasting.
+          depth, which can be noisy and hardware-dependent, we use
+          relative depth cues that capture geometric relationships                                                   D. DAP: Diffusion Action Planner
+          between the gripper and surrounding objects—sufficient for                                                    The Diffusion Action Planner (DAP) generates multi-
+          contact-rich reasoning. We extract intermediate feature maps                                               step action sequences conditioned on the Structured Scene
+          rather than final depth estimates to improve stability across                                              Interface (SSI), multi-view RGB inputs, and proprioceptive
+states. It comprises two stages: multi-modal feature fusion        Example Task:
+                                                                   Put a block into
+and conditional diffusion-based action generation.                 the drawer and
+     a) Multi-Modal Feature Fusion: To construct a uni-            close the drawer.
+fied scene representation for action generation, we integrate
+spatial and temporal features across modalities (Figure 3).
+At each observation timestep, RGB images, monocular
+depth features, and layout maps are encoded per view
+using modality-specific CNNs. This yields a tensor of shape
+Rto ×V ×nh ×nw ×128 , where nh × nw is the spatial resolution.
+Features from all modalities are concatenated per view along
+the channel dimension and projected via a shared MLP
+into spatial embeddings. These are flattened into tokens
+and concatenated with trajectory tokens from the motion              Cluttered Environment   Long-horizon
+prediction module.                                                   Cross-embodiment        Contact-rich
+                                                                     Spatial-reasoning       Deformable          Robot Platform
+   A learnable [CLS] token is prepended, and all tokens
+are enriched with positional and modality-type encodings.        Fig. 4: Real-world setup and task suite. Top: time-lapse of
+The sequence is then processed by a Transformer to per-          a representative task. Middle/Bottom-left: representative scenes
+form joint multi-view, multi-modal fusion. The resulting         illustrating the diversity of the 13 real-world tasks, annotated with
+                                                                 colored markers indicating task categories. Bottom-right: full view
+[CLS] tokens across timesteps are concatenated with pro-         of the experimental platform, including the 6-DoF robotic arm and
+prioceptive features, forming the final condition vector st ∈    dual RGB cameras (side-view and eye-in-hand).
+R1×(to ·(128+dp )) , where dp is the proprioceptive feature
+dimension. We refer to st as the structured scene vector,        modal fusion. The Diffusion Action Planner follows the U-
+which summarizes the scene context at time t and conditions      Net structure of Diffusion Policy [47], embedding RGB,
+the diffusion-based action policy.                               depth, and object maps into 8 × 8 spatial grids with 128-
+     b) Action Diffusion: We model action generation as          dimensional tokens. Training uses 100 diffusion steps and
+a conditional denoising diffusion process that transforms        AdamW (lr = 5 × 10−4 ). The policy is trained for 400
+Gaussian noise into action sequences, conditioned on the         epochs (600 for LIBERO-Long), with image augmentations
+fused scene representation. Given condition vector st , the      following ATM [8] (color jitter, random shift) and bounding
+model generates actions {ai }t+H−1
+                              i=t     by iteratively denoising   box augmentations (random translation, scaling, deletion,
+a noisy initialization.                                          insertion). Unless otherwise specified, we train policies with
+   Following the Diffusion Policy framework [47], we train       10 demonstrations per task, while pretraining the instruction-
+the model to predict noise added during forward diffusion.       conditioned motion predictor on all 50 demonstration videos
+Let Akt denote the noised version of ground-truth action At      using only RGB observations and language.
+at denoising timestep k. The objective is:                             b) Real-world Setup: We use a 6-DoF ARX-5 arm with
+                L = MSE(ϵk − ϵθ (st , Akt , k)),           (3)   two RGB cameras (side-view and eye-in-hand), deployed
+         k
+where ϵ is sampled noise, and ϵθ is the model’s prediction.      via ROS at 10 Hz (Figure 4) on a single NVIDIA GeForce
+At test time, the model samples from a standard Gaussian and     RTX 4090. The action space consists of absolute joint and
+performs iterative denoising to produce a coherent action se-    gripper positions, and diffusion inference is performed using
+quence. This generative approach enables the policy to model     16 denoising steps. We evaluate across 13 tasks covering
+diverse, multimodal behaviors and improves generalization        diverse manipulation capabilities, including spatial reasoning
+under limited supervision.                                       (e.g. directional and relational reasoning), deformable ob-
+                                                                 ject handling (e.g., sponge, tissue), contact-rich operations
+                IV. E XPERIMENT R ESULTS                         (e.g., wiping, drawer closing), multi-stage manipulation,
+A. Implementation Details                                        pick-and-place, and cross-embodiment transfer (e.g., human-
+      a) Network Configuration and Training Details: Train-      hand video pretraining). Following ATM [8], we collect 50
+ing and simulation evaluations are performed on four             teleoperated robot demonstrations per task and 100 human-
+NVIDIA A800 GPUs. Input resolution is 128 × 128. We              hand videos for cross-embodiment experiments. Each task
+encode language instructions using BERT [48] and ex-             is evaluated over 20 rollouts; detailed task descriptions are
+tract monocular depth features with DepthAnythingV2-ViT-         provided in the corresponding subsections.
+L [45]. Object bounding boxes are detected by Grounding                c) Simulation Setup: We evaluate on LIBERO [12], a
+DINO-T [46] with a confidence threshold of 0.35. In sim-         widely used multi-task manipulation benchmark with stan-
+ulation, we slightly adjust object prompts to mitigate the       dardized task definitions and evaluation protocols. LIBERO
+visual domain gap caused by low-resolution textures (e.g.,       features a Panda arm performing language-conditioned table-
+replacing “tomato soup can” with “green-orange soup can”).       top manipulation and contains four suites: Spatial, Goal,
+The motion predictor is trained following ATM [8] and            and Object (10 tasks each), as well as LIBERO-100. The
+forecasts 16 future steps for 64 starting pixel points. A 7-     suites emphasize complementary challenges, including spa-
+layer Transformer (8 heads, hidden dim 128) performs multi-      tial relation reasoning (Spatial), goal-conditioned functional
+TABLE I: Few-shot (10 demonstrations) performance on                     TABLE II: Scalability with more demonstrations on LIBERO
+LIBERO. Success rates (%) across four task suites.                       (50 demos per task). Success rates (%) across four suites.
+                                                                         Bold/underline: 1st/2nd (no external data). “Ext. Data” denotes
+Method                  Spatial↑ Object↑ Goal↑ Long↑ Average↑
+                                                                         additional large-scale datasets (e.g., BridgeV2, OXE). External-data
+R3M-finetune [49]        49.17    52.83    5.33     9.17     29.13       methods and single-view variants (*) are included for completeness.
+VPT [2]                  37.83    19.50    3.33     3.83     16.13       Method                   Ext. Data Spatial↑ Object↑ Goal↑ Long↑ Average↑
+UniPi [1]                69.17    59.83    11.83    5.83     36.67
+Diffusion Policy [47]    67.67    78.00    35.00    37.33    54.50       Diffusion Policy* [47]               78.30     92.50       68.30   50.50   72.40
+ATM [8]                  68.50    68.00    77.83    39.33    63.42       MDT [56]                             78.50     87.50       73.50   64.80   76.10
+ATM-DP [8]               79.00    81.00    58.67    44.00    65.67       DepthHelps [4]                       71.20     78.60       66.40   36.40   63.15
+                                                                         OFT [57]                             94.30     95.20       91.70   86.50   91.90
+MaIL [50]                60.90    85.40    56.30    46.00    62.15
+FLIP1 [11]                 -        -        -      ≈50        -         SSI-Policy (Ours)                    94.00     97.50       93.00   80.50   91.25
+
+SSI-Policy (Ours)        83.50    95.00    82.50    60.67    80.42       Methods with additional pretraining data (for reference)
+                                                                         Octo* [32]                  ✔        78.90     85.70       84.60   51.10   75.20
+                                                                         OpenVLA* [33]               ✔        84.70     88.40       79.20   53.70   76.50
+behaviors (Goal), and object-centric manipulation and gener-             SpatialVLA [5]              ✔        88.20     89.90       78.60   55.50   78.10
+alization (Object). LIBERO-100 comprises LIBERO-90 (90                   VLA-Cache [51]              ✔        83.80     85.80       76.40   52.80   74.70
+tasks for pretraining) and LIBERO-10, a long-horizon suite               TraceVLA [53]               ✔        84.60     85.20       75.10   54.40   74.80
+                                                                         OTTER [40]                  ✔        84.00     89.00       82.00     -       -
+with 10 multi-stage tasks for evaluation. Each task provides             GRAPE [54]                  ✔        88.50     92.10       83.10   57.20   80.20
+50 demonstrations with natural-language instructions, multi-             DiT Policy [52]             ✔        84.20     96.30       85.40   63.80   82.40
+                                                                         FAST [58]                   ✔        96.40     96.80       88.60   60.20   85.50
+view RGB observations, and low-level action labels. We                   UniVLA2 [17]                ✔        91.20     94.20       90.20   79.40   88.70
+follow ATM [8] for the few-shot (10-demonstration) eval-                 CLIP-RT [59]                ✔        95.20     99.20       94.20   82.60   92.80
+                                                                         π0 [38]                     ✔        96.80     98.80       95.80   85.20   94.20
+uation protocol: episodes run for 600 steps; for each suite,
+we train a single multi-task policy with three random seeds
+and evaluate each seed with 20 rollouts per task, reporting              our method shows a substantial gain of nearly +15%. The
+the mean success rate across seeds. For diffusion inference,             improvements are especially pronounced on Object (+14.0%)
+we follow Diffusion Policy [47] and use 100 denoising steps.             and Goal (+23.8%), where structured spatial reasoning and
+      d) Baselines: We compare against a wide range of                   object localization are critical. Notably, the 10-demo SSI-
+recent methods. Results for Diffusion Policy [47] (50 demos)             Policy remains competitive with several 50-demo methods
+and Octo [32] are taken from OpenVLA [33]; results for Dif-              that leverage external data (Table II). These results highlight
+fusion Policy (10 demos), R3M [49], VPT [2], and UniPi [1]               the data efficiency enabled by the SSI: by providing a
+are from ATM [8]; remaining baselines use numbers reported               compact, task-aware interface that captures essential spatial
+in their original papers. When multiple training variants are            and motion information, the policy can learn effectively from
+available, we report the version closest to our setup (e.g.,             very few demonstrations, reducing the reliance on large-scale
+OFT trained only on LIBERO, UniVLA trained on LIBERO                     pretraining or additional data.
+with human demonstration enhancement). Some baselines                          b) Scalability with more data: Although SSI-Policy is
+leverage additional large-scale datasets beyond LIBERO for               designed for low-data learning, it scales effectively with
+performance gains, whereas our method is trained solely                  additional demonstrations. As shown in Table II, with 50
+on LIBERO. Our primary quantitative comparisons focus                    demonstrations per task, SSI-Policy achieves 91.25% average
+on methods evaluated on LIBERO under RGB-only sensing                    success, ranking second among methods trained without
+(no depth sensors; monocular depth is allowed). Approaches               external data—just 0.65% behind OFT [57]. It also remains
+that require RGB-D sensing or explicit 3D initialization are             competitive with models that leverage large-scale pretraining
+discussed in Related Work rather than included as direct                 (e.g., SpatialVLA, GRAPE, DiT Policy). Notably, SSI-Policy
+baselines.                                                               attains the third-highest Object (97.50%) and Goal (93.00%)
+                                                                         scores overall, trailing only π0 and CLIP-RT, both of which
+B. Performance Comparison with Existing Methods
+                                                                         rely on massive external datasets.
+   We compare against a broad set of baselines including
+VLA models [33], [51], [52], [53], [54], [40], flow-based                C. Spatial Reasoning Capability
+methods [11], [8], diffusion policies [47], [32], and spatially             While LIBERO-Spatial evaluates spatial reasoning in sim-
+grounded models [4], [5]. Our primary comparisons focus                  ulation, we further assess real-world performance on six
+on methods trained solely on LIBERO under comparable                     tasks: four requiring directional references (e.g., “upper left”)
+sensing assumptions; models leveraging additional large-                 and two requiring disambiguation between identical objects
+scale pretraining data (e.g., BridgeV2 [55], OXE [36]) are               based on spatial relations (e.g., tissue box on the plate vs.
+included for reference.                                                  on the table). The latter also involves deformable object
+      a) Low-data regime (main result): As shown in Ta-
+                                                                         manipulation, increasing task difficulty.
+ble I, SSI-Policy achieves the best overall performance in
+                                                                            We compare against a multi-task Diffusion Policy baseline,
+the low-data regime, with improvements across all four
+                                                                         a widely used and reproducible RGB-only method for real-
+suites. Compared to the strongest prior method, ATM-DP,
+                                                                         world control. For controlled comparison, we reuse the same
+  1 Approximate value estimated from Figure 5 of FLIP (ICLR 2025). The   encoders, architecture, fusion module, and training setup. As
+paper reports results only on LIBERO-LONG (10 tasks) and does not
+provide exact numeric values or per-suite breakdowns.                      2 Full LIBERO + human demonstration pretraining.
+TABLE III: Real-world spatial reasoning evaluation. Success                    TABLE IV: Human-to-robot transfer. Success rates (%) with
+rates (%) comparing our method to Diffusion Policy (DP) on                     SSI trained on human-hand data, robot data, or both.
+six tasks. Tasks include directional reasoning and disambiguation              Task                                                   Human   Robot   Human+Robot
+between identical objects based on spatial context.
+                                                                               Pick up a pot and place it onto the stove              45.00   60.00         70.00
+Task                                                           DP     Ours     Pick up the broom and sweep the toy onto the dustpan   40.00   70.00         80.00
+
+Place the lemon upper right of the red plate onto the plate   55.00   85.00    TABLE V: Robustness on challenging real-world tasks. Success
+Place the lemon upper left of the red plate onto the plate    40.00   80.00
+Place the lemon lower right of the red plate onto the plate   55.00   100.00
+                                                                               rates (%) comparing our multi-task policy to single-task Diffusion
+Place the lemon lower left of the red plate onto the plate    10.00   85.00    Policy (DP).
+Take out a tissue from the tissue box on the plate            50.00   60.00    Task                                                                    DP       Ours
+Take out a tissue from the tissue box on the table            50.00   70.00
+                                                                               Put the sponge onto the plate                                          10.00    65.00
+Average                                                       43.33   80.00    Put the carrot into the basket                                         30.00    75.00
+                                                                               Put a block into the drawer and close the drawer                       25.00    40.00
+                                                                               Put the banana into the basket                                         45.00    50.00
+                                                                               Pick up a sponge, wipe the table and put the sponge onto the plate     35.00    40.00
+                                                                               Average                                                                29.00    54.00
+
+
+                                                                               robot demos, with SSI kept frozen throughout. As shown
+                                                                               in Table IV, our method achieves 40–45% success using
+                                                                               human data alone, improving to 70–80% when combined
+                                                                               with robot data—exceeding the robot-only baseline by over
+Fig. 5: Cross-embodiment results on LIBERO-Spatial. Success                    10%. These results support the claim that SSI provides an
+rates under few-shot and zero-shot settings.                                   embodiment-agnostic abstraction: by separating perception
+                                                                               from embodiment-specific control, it enables motion priors
+shown in Table III, our method outperforms Diffusion Policy                    learned from human-hand videos to transfer effectively to
+by up to 75 percentage points on directional tasks and 10–                     robot policies.
+20% on disambiguation tasks (80.0% vs. 43.3% on average).
+   We attribute this to structured spatial grounding: depth                    E. Robustness in Challenging Scenarios
+cues help resolve directional references, while the SSI com-                      To evaluate robustness in complex real-world settings,
+bines object localization with motion cues to select the                       we design five tasks that are more challenging than the
+correct instance in cluttered scenes. In contrast, Diffusion                   earlier settings. Collectively, these tasks span deformable
+Policy frequently confuses relative spatial ordering or selects                object handling (e.g., sponge), contact-rich interactions (e.g.,
+the incorrect object.                                                          wiping, drawer closing), long-horizon behaviors, and clut-
+                                                                               tered scenes with novel distractors. For pick-and-place tasks,
+D. Embodiment Generalization
+                                                                               we further introduce large variations in object position and
+   We assess SSI’s generalization across embodiments via (1)                   orientation to stress spatial generalization.
+robot-to-robot transfer in simulation and (2) human-to-robot                      SSI-Policy is trained as a single multi-task policy across
+transfer in real-world settings.                                               all five tasks and must therefore resolve potential cross-
+     a) Cross-robot transfer: We construct a dataset of                        task ambiguity. In contrast, Diffusion Policy [47] is trained
+50 videos per task from five non-target robot arms (10                         separately for each task, avoiding such ambiguity and thus
+per arm) to train the SSI motion predictor without action                      enjoying a structural advantage. Nevertheless, as shown in
+labels. The policy is then trained with 10 demonstrations                      Table V, SSI-Policy consistently outperforms the baseline
+from the target robot, with SSI frozen. We compare zero-                       (54% vs. 29% average success), demonstrating robust per-
+shot (non-target data only) and few-shot (adding 10 target-                    formance under challenging conditions.
+robot videos) settings, applying the same protocol to ATM
+for fair comparison. As shown in Figure 5, our method                          F. Ablation Studies
+consistently outperforms ATM in both settings with smaller                        We conduct ablation studies on LIBERO to quantify
+zero-shot degradation. The few-shot SSI achieves 83.0%—                        the contribution of each component in SSI-Policy and to
+comparable to the full-shot version (83.5%)—demonstrating                      assess the importance of jointly modeling geometry and
+strong embodiment transfer enabled by the SSI abstraction.                     task-conditioned motion. All variants are trained with 10
+     b) Human-hand to robot transfer: We further evaluate                      demonstrations per task, and results are averaged over three
+whether human-hand demonstrations can directly support                         random seeds.
+robot learning, a capability not commonly achieved by                                a) Component ablations and complementarity: Ta-
+existing methods. We test this on two real-world tasks: pick-                  ble VI shows that the full model achieves the best overall
+and-place (e.g., pick up a pot and place it onto the stove) and                performance (80.42%). Geometry-only (A0) and motion-
+contact-rich sweeping (e.g., pick up the broom and sweep the                   only baselines (A1–A2) perform substantially worse, espe-
+toy onto the dustpan). For each task, we collect 100 human-                    cially on Long-horizon tasks, indicating that neither cue
+hand videos and 10 robot demonstrations, pretraining SSI’s                     alone is sufficient. Adding depth to motion (A3) yields the
+motion predictor on human data and optionally fine-tuning                      strongest Spatial score (85.83%), while adding layout maps
+with robot data. The policy is trained using the same 10                       (A4) improves Goal tasks (81.50%); however, these partial
+TABLE VI: Ablation studies on LIBERO (10 demos per task).                   Real-world task: Put the sponge onto the plate
+M: motion trajectories, D: monocular depth, L: layout map.
+Variant                    M D L Spatial↑ Object↑ Goal↑ Long↑ Avg.↑
+
+SSI-Policy (Ours)          ✔ ✔ ✔    83.50   95.00   82.50 60.67 80.42
+(A0) DepthHelps [4]        ✗ ✔ ✗    71.20   78.60   66.40   36.40   63.15
+(A1) ATM [8]               ✔ ✗ ✗    68.50   68.00   77.83   39.33   63.42   Real-world task: Pick up a sponge, wipe the table and put the sponge onto the plate
+(A2) ATM-DP [8]            ✔ ✗ ✗    79.00   81.00   58.67   44.00   65.67
+(A3) Motion + Depth        ✔ ✔ ✗    85.83   87.83   76.33   57.67   76.92
+(A4) Motion + Layout map   ✔ ✗ ✔    83.00   89.67   81.50   54.17   77.09
+(VAR) w/o hybrid sampling ✔ ✔ ✔     80.83   94.17   79.33 59.50 78.46
+
+
+                                                                            LIBERO Object: Pick up the cream cheese and place it in the basket
+
+
+
+
+                                                                            LIBERO Goal: Open the middle drawer of the cabinet
+
+
+
+
+Fig. 6: Evaluating SSI as a policy interface. Success rates across
+LIBERO suites comparing the full model (SSI + RGB) with an SSI-             Fig. 7: Qualitative snapshots of task executions. Each row shows
+only variant conditioned on SSI and proprioception.                         frames from a single rollout. Top two rows: real-world experiments
+variants are specialized and do not generalize across suites.               (with SSI overlays in the first row). Bottom two rows: simulated
+                                                                            LIBERO tasks.
+The unified interface performs consistently well across suites,
+indicating complementary benefits from jointly encoding                                                    V. C ONCLUSION
+geometric structure and task-conditioned motion within a
+shared representation. Removing hybrid sampling (VAR)                          We presented SSI-Policy, a framework centered on a
+reduces the average from 80.42% to 78.46%, showing a                        Structured Scene Interface (SSI)—a unified, RGB-only
+consistent but incremental benefit.                                         intermediate representation for vision-language manipula-
+     b) Influence of SSI: To further isolate the role of SSI,               tion. By jointly encoding monocular geometry, language-
+we train a variant conditioned only on SSI and proprio-                     grounded layouts, and instruction-conditioned motion, SSI
+ception, excluding raw RGB input for the diffusion action                   provides a robot-agnostic abstraction that decouples percep-
+planner. As shown in Figure 6, this SSI-only policy achieves                tion from embodiment-specific control—enabling pretraining
+79.3%, retaining ∼98% of the full model’s 80.4%. This                       from action-free video and policy learning from as few as
+confirms that the structured interface captures the majority                10 demonstrations per task. Ablations confirm that geomet-
+of task-relevant spatial and motion information rather than                 ric and motion cues are complementary within the shared
+serving as auxiliary features.                                              interface. Experiments on LIBERO and 13 real-world tasks
+                                                                            demonstrate strong few-shot performance, cross-embodiment
+G. Qualitative Results
+                                                                            transfer, and robustness in contact-rich settings, without
+  We present visualizations of successful executions in both                depth sensors or external pretraining data. Future work will
+LIBERO and real-world settings in Figure 7.                                 address temporally consistent perception and tactile feedback
+H. Failure Cases                                                            for more robust manipulation.
+    While SSI-Policy performs well overall, we observe three                                                  R EFERENCES
+recurring failure modes. First, object detection errors un-
+                                                                             [1] Y. Du, et al., “Learning universal policies via text-guided video
+der clutter or occlusion can lead to missed or inaccu-                           generation,” in Advances in Neural Information Processing Systems,
+rate GroundingDINO boxes, corrupting the layout map and                          A. Oh, et al., Eds., vol. 36. Curran Associates, Inc., 2023, pp. 9156–
+downstream decisions. Second, in tasks involving deformable                      9172.
+or bulky objects (e.g., sponges), grasp failures can occur                   [2] B. Baker, et al., “Video pretraining (vpt): Learning to act by watching
+                                                                                 unlabeled online videos,” Advances in Neural Information Processing
+due to object displacement during execution, exacerbated                         Systems, vol. 35, pp. 24 639–24 654, 2022.
+by limited gripper aperture and friction. Third, temporal                    [3] J. Liang, et al., “Dreamitate: Real-world visuomotor policy learning
+inconsistency in monocular depth or detections can induce                        via video generation,” in 8th Annual Conference on Robot Learning,
+                                                                                 2024.
+jittery motion predictions. Overall, most failures originate                 [4] X. Pang, et al., “Depth helps: Improving pre-trained rgb-based policy
+from upstream perception noise, suggesting the structured                        with depth information injection,” in 2024 IEEE/RSJ International
+interface is reliable when perceptual inputs are stable. These                   Conference on Intelligent Robots and Systems (IROS). IEEE, 2024,
+                                                                                 pp. 7251–7256.
+observations motivate future work on stronger detection                      [5] D. Qu, et al., “SpatialVLA: Exploring Spatial Representations for
+backbones, temporally consistent perception, and improved                        Visual-Language-Action Models,” in Proceedings of Robotics: Science
+physical interaction via compliance or tactile feedback.                         and Systems, LosAngeles, CA, USA, June 2025.
+ [6] M. Shridhar, et al., “Perceiver-actor: A multi-task transformer for         [32] D. Ghosh, et al., “Octo: An Open-Source Generalist Robot Policy,”
+     robotic manipulation,” in Proceedings of the 6th Conference on Robot             in Proceedings of Robotics: Science and Systems, Delft, Netherlands,
+     Learning (CoRL), 2022.                                                           July 2024.
+ [7] W. Wang, et al., “Visual robotic manipulation with depth-aware              [33] M. Kim, et al., “Openvla: An open-source vision-language-action
+     pretraining,” 2024. [Online]. Available: https://arxiv.org/abs/2401.             model,” arXiv preprint arXiv:2406.09246, 2024.
+     09038                                                                       [34] E. Jang, et al., “BC-z: Zero-shot task generalization with robotic
+ [8] C. Wen, et al., “Any-point Trajectory Modeling for Policy Learning,”             imitation learning,” in 5th Annual Conference on Robot Learning,
+     in Proceedings of Robotics: Science and Systems, Delft, Netherlands,             2021.
+     July 2024.                                                                  [35] S. Reed, et al., “A generalist agent,” arXiv preprint arXiv:2205.06175,
+ [9] M. Xu, et al., “Flow as the cross-domain manipulation interface,” in             2022.
+     8th Annual Conference on Robot Learning, 2024.                              [36] A. O’Neill, et al., “Open x-embodiment: Robotic learning datasets and
+[10] C. Yuan, et al., “General flow as foundation affordance for scalable             rt-x models,” in 2024 IEEE International Conference on Robotics and
+     robot learning,” in 8th Annual Conference on Robot Learning, 2024.               Automation (ICRA). IEEE, 2024, pp. 6892–6903.
+                                                                                 [37] H. Liu, et al., “Instruction-following agents with multimodal
+[11] C. Gao, et al., “Flip: Flow-centric generative planning as general-
+                                                                                      transformer,” 2023. [Online]. Available: https://arxiv.org/abs/2210.
+     purpose manipulation world model,” 2025. [Online]. Available:
+                                                                                      13431
+     https://arxiv.org/abs/2412.08261
+                                                                                 [38] K. Black, et al., “π0: A vision-language-action flow model for general
+[12] B. Liu, et al., “Libero: Benchmarking knowledge transfer for lifelong            robot control, 2024,” URL https://arxiv. org/abs/2410.24164.
+     robot learning,” arXiv preprint arXiv:2306.03310, 2023.                     [39] D. Driess, et al., “Palm-e: An embodied multimodal language model,”
+[13] A. Edwards, et al., “Imitating latent policies from observation,” in             2023. [Online]. Available: https://arxiv.org/abs/2303.03378
+     Proceedings of the 36th International Conference on Machine Learn-          [40] H. Huang, et al., “Otter: A vision-language-action model with text-
+     ing, ser. Proceedings of Machine Learning Research, K. Chaudhuri                 aware visual feature extraction,” arXiv preprint arXiv:2503.03734,
+     and R. Salakhutdinov, Eds., vol. 97. PMLR, 09–15 Jun 2019, pp.                   2025.
+     1755–1763.                                                                  [41] ——, “Copa: General robotic manipulation through spatial constraints
+[14] D. Schmidt and M. Jiang, “Learning to act without actions,” in Second            of parts with foundation models,” in 2024 IEEE/RSJ International
+     Agent Learning in Open-Endedness Workshop, 2023.                                 Conference on Intelligent Robots and Systems (IROS), 2024, pp. 9488–
+[15] J. Bruce, et al., “Genie: generative interactive environments,” in Pro-          9495.
+     ceedings of the 41st International Conference on Machine Learning,          [42] W. Huang, et al., “Rekep: Spatio-temporal reasoning of rela-
+     ser. ICML’24. JMLR.org, 2024.                                                    tional keypoint constraints for robotic manipulation,” arXiv preprint
+[16] S. Ye, et al., “Latent action pretraining from videos,” in The Thirteenth        arXiv:2409.01652, 2024.
+     International Conference on Learning Representations, 2025.                 [43] Y. Ju, et al., “Robo-abc: Affordance generalization beyond categories
+[17] Q. Bu, et al., “Learning to Act Anywhere with Task-centric Latent Ac-            via semantic correspondence for robot manipulation,” 2024. [Online].
+     tions,” in Proceedings of Robotics: Science and Systems, LosAngeles,             Available: https://arxiv.org/abs/2401.07487
+     CA, USA, June 2025.                                                         [44] R. Xu, et al., “An affordance keypoint detection network for robot
+[18] C. Zhang, et al., “Generative visual foresight meets task-agnostic               manipulation,” IEEE Robotics and Automation Letters, vol. 6, no. 2,
+     pose estimation in robotic table-top manipulation,” in 9th Annual                pp. 2870–2877, 2021.
+     Conference on Robot Learning, 2025.                                         [45] L. Yang, et al., “Depth anything v2,” arXiv:2406.09414, 2024.
+[19] Y. Luo and Y. Du, “Grounding video models to actions through goal           [46] S. Liu, et al., “Grounding dino: Marrying dino with grounded
+     conditioned exploration,” in The Thirteenth International Conference             pre-training for open-set object detection,” arXiv preprint
+     on Learning Representations, 2025.                                               arXiv:2303.05499, 2023.
+                                                                                 [47] C. Chi, et al., “Diffusion policy: Visuomotor policy learning via action
+[20] P.-C. Ko, et al., “Learning to act from actionless videos through
+                                                                                      diffusion,” in Proceedings of Robotics: Science and Systems (RSS),
+     dense correspondences,” in The Twelfth International Conference on
+                                                                                      2023.
+     Learning Representations, 2024.
+                                                                                 [48] J. Devlin, et al., “Bert: Pre-training of deep bidirectional transformers
+[21] S. Wang, et al., “SKIL: Semantic Keypoint Imitation Learning                     for language understanding,” 2019. [Online]. Available: https:
+     for Generalizable Data-efficient Manipulation,” in Proceedings of                //arxiv.org/abs/1810.04805
+     Robotics: Science and Systems, LosAngeles, CA, USA, June 2025.              [49] S. Nair, et al., “R3m: A universal visual representation for robot
+[22] S. James, et al., “ Coarse-to-Fine Q-attention: Efficient Learning for           manipulation,” in Conference on Robot Learning. PMLR, 2023, pp.
+     Visual Robotic Manipulation via Discretisation,” in 2022 IEEE/CVF                892–909.
+     Conference on Computer Vision and Pattern Recognition (CVPR). Los           [50] X. Jia, et al., “Mail: Improving imitation learning with mamba,”
+     Alamitos, CA, USA: IEEE Computer Society, June 2022, pp. 13 729–                 2024. [Online]. Available: https://arxiv.org/abs/2406.08234
+     13 738.                                                                     [51] S. Xu, et al., “Vla-cache: Towards efficient vision-language-action
+[23] L. Li, et al., “Lift3d: Synthesize 3d training data by lifting 2d gan to         model via adaptive token caching in robotic manipulation,” arXiv
+     3d generative radiance field,” in Proc. IEEE Conf. on Computer Vision            preprint arXiv:2502.02175, 2025.
+     and Pattern Recognition (CVPR), 2023.                                       [52] Z. Hou, et al., “Diffusion transformer policy,” arXiv preprint
+[24] M. Liu, et al., “Frame mining: a free lunch for learning robotic                 arXiv:2410.15959, 2024.
+     manipulation from 3d point clouds,” 2022. [Online]. Available:              [53] R. Zheng, et al., “Tracevla: Visual trace prompting enhances spatial-
+     https://arxiv.org/abs/2210.07442                                                 temporal awareness for generalist robotic policies,” arXiv preprint
+[25] S. Chen, et al., “Polarnet: 3d point clouds for language-                        arXiv:2412.10345, 2024.
+     guided robotic manipulation,” 2023. [Online]. Available: https:             [54] Z. Zhang, et al., “Grape: Generalizing robot policy via preference
+     //arxiv.org/abs/2309.15596                                                       alignment,” 2025. [Online]. Available: https://arxiv.org/abs/2411.
+[26] Y. Ze, et al., “3d diffusion policy: Generalizable visuomotor policy             19309
+     learning via simple 3d representations,” in Proceedings of Robotics:        [55] H. Walke, et al., “Bridgedata v2: A dataset for robot learning at scale,”
+     Science and Systems (RSS), 2024.                                                 in Conference on Robot Learning (CoRL), 2023.
+[27] C. Wang, et al., “Rise: 3d perception makes real-world robot imitation      [56] M. Reuss, et al., “Multimodal diffusion transformer: Learning versatile
+     simple and effective,” arXiv preprint arXiv:2404.12281, 2024.                    behavior from multimodal goals,” in Robotics: Science and Systems,
+[28] T. Gervet, et al., “Act3d: 3d feature field transformers for                     2024.
+     multi-task robotic manipulation,” 2023. [Online]. Available: https:         [57] M. J. Kim, et al., “Fine-tuning vision-language-action models: Opti-
+     //arxiv.org/abs/2306.17817                                                       mizing speed and success,” arXiv preprint arXiv:2502.19645, 2025.
+                                                                                 [58] K. Pertsch, et al., “FAST: Efficient Action Tokenization for Vision-
+[29] H. Zhen, et al., “3d-vla: A 3d vision-language-action generative world
+                                                                                      Language-Action Models,” in Proceedings of Robotics: Science and
+     model,” 2024. [Online]. Available: https://arxiv.org/abs/2403.09631
+                                                                                      Systems, LosAngeles, CA, USA, June 2025.
+[30] A. Brohan, et al., “Rt-1: Robotics transformer for real-world control       [59] G.-C. Kang, et al., “CLIP-RT: Learning Language-Conditioned
+     at scale,” in arXiv preprint arXiv:2212.06817, 2022.                             Robotic Policies from Natural Language Supervision,” in Proceedings
+[31] ——, “Rt-2: Vision-language-action models transfer web knowledge                  of Robotics: Science and Systems, LosAngeles, CA, USA, June 2025.
+     to robotic control,” in arXiv preprint arXiv:2307.15818, 2023.
+

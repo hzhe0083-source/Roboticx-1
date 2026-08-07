@@ -1,0 +1,1565 @@
+                                                                                                                                                                                                             1
+
+
+
+
+                                             Action QFormer: Structured Representation Shaping under Action
+                                                                  Supervision in Vision-Language-Action Models
+                                                         Yufeng Ji1,2,3,∗ , Wenhao Tang4 , Haoyi Niu5 , Koushil Sreenath5 , Yi Wu4 , Zhongyu Li3,2,∗
+
+                                                                                                                    ∂La
+                                                                                                                                         Direct                                ∂La
+                                                                                                                   ∂θpath               Shaping                               ∂θvFuse
+                                                                                                                                                                                                  loss La
+
+
+
+
+                                                                                                                                           inherited repr.
+                                              (a) Direct-fusion:
+                                                                                                                                                                                                   actions
+                                               direct action-loss
+                                                   backprop
+
+                                                                                                                                                             direct fusion               policy
+                                                                                             inherited multimodal pathway
+                                                                                                                                      Structured                              ∂La
+                                                                                                                ∂La                    Shaping                               ∂θAQF
+                                                                                                               ∂θpath
+
+
+
+
+                                                                                                                                          inherited repr.
+                                            (b) Action QFormer:                                                                                                  query interface         policy   loss La
+                                               query-mediated
+                                             action-loss backprop
+arXiv:2607.14635v1 [cs.AI] 16 Jul 2026
+
+
+
+
+                                                                                                                                                                                                   actions
+                                                                                              inherited multimodal pathway
+                                                                                                                                                                        𝑄෨
+                                                                       forward             ∂La     Action-loss                                                                     ∂La
+                                                                                                                             multimodal
+                                                                     computation           ∂θ    backpropagation              input x                                              ∂Q
+                                                                                                                                                             𝑄
+
+                                         Fig. 1. Direct versus structured action-loss shaping. Both the direct-fusion baseline and Action QFormer use the same inherited multimodal pathway
+                                         and downstream policy objective, but induce different action-loss gradient routes. (a) In direct shaping, inherited representations are fused into an action-
+                                         facing representation, so action-loss gradients pass through the fusion interface and broadly act on inherited representations. (b) In structured shaping, Action
+                                         QFormer inserts a trainable query interface before the policy head, giving action-loss signals an intermediate query-based route before they reach the inherited
+                                         multimodal pathway. Gradients to θpath , θFuse , θAQF , and Q denote action-loss updates to the inherited pathway, interface parameters, and query states.
+
+                                            Abstract—Action supervision in vision-language-action (VLA)                     representation learning.
+                                         models is often treated as a downstream objective for learning
+                                         action prediction. In this paper, we study it instead as a force
+                                         that shapes inherited multimodal representations. We show that                                                      I. I NTRODUCTION
+                                         this shaping has a dual effect: it is necessary for forming                           Recent vision-language-action (VLA) models commonly
+                                         action-compatible representations, but when action supervision
+                                         is applied too directly to the inherited multimodal pathway, it                    build action generation on top of pretrained vision-language
+                                         can also destabilize representations that support language-side                    backbones [1]–[3], enabling rapid progress by reusing rich
+                                         processing and object grounding. To address this tension, we                       multimodal representations for embodied control. However,
+                                         introduce Action QFormer, a query-based action-facing interface                    this design also exposes a structural mismatch: the inherited
+                                         that uses instruction-conditioned queries to reorganize inherited                  multimodal pathway is asked to support both language-side
+                                         multimodal information into action-facing representations before
+                                         downstream action generation. In zero-shot sim-to-real naviga-                     processing and action-side control. For language-side process-
+                                         tion, Action QFormer improves average closed-loop task success                     ing, the pathway must preserve rich semantic and grounding
+                                         from 18.8% to 56.3%, raises fixed-instruction action-generation                    structure for instruction understanding and generation. For
+                                         correctness from 22.5% to 75.5%, and nearly eliminates out-of-                     action generation, it must abstract behaviorally consequential
+                                         distribution instruction generations. Further analyses show that                   factors into stable and robust control signals. A representation
+                                         Action QFormer changes how action supervision shapes inherited
+                                         multimodal representations, reducing broad upstream rewriting                      that is useful for vision-language understanding may therefore
+                                         while preserving targeted and sometimes constructive action-                       still be poorly organized for action, not because it lacks
+                                         supervised adaptation. These results suggest that improving VLA                    semantic information, but because it does not expose that
+                                         performance requires not only stronger pretrained backbones,                       information in an action-compatible form.
+                                         but also better ways of selecting and organizing inherited                            This mismatch makes action supervision not merely a down-
+                                         multimodal information while controlling how it is shaped under
+                                         action supervision.                                                                stream training signal, but a representation-shaping force. Dur-
+                                                                                                                            ing action finetuning, action-loss gradients can flow through
+                                            Index Terms—Vision-language-action models, robot learning,                      the inherited multimodal pathway and reshape it toward action-
+                                                                                                                            compatible organization. The action interface is therefore not a
+                                           1 Shanghai Qizhi Institute; 2 The Chinese University of Hong Kong; 3 Hong
+                                                                                                                            passive readout of inherited multimodal features, but the point
+                                         Kong Embodied AI Lab; 4 Tsinghua University; 5 University of California,
+                                         Berkeley. ∗ Corresponding authors: Yufeng Ji (jiyf@sqz.ac.cn) and                  where action-loss gradients reshape—and can also disrupt—
+                                         Zhongyu Li (zhongyuli@cuhk.edu.hk).                                                representations inherited from vision-language pretraining.
+                                                                                                                                    2
+
+
+
+   This gives rise to the dual effect we study: action-supervised   inherited multimodal representations.
+shaping is necessary for forming action-compatible representa-         Our contributions are as follows. First, we formulate struc-
+tions, but when applied too directly to the inherited multimodal    tured representation shaping under action supervision
+pathway, it can also destabilize representations that support       as a mechanism-level problem in VLA, identifying a cen-
+language-side processing and object grounding.                      tral tension between forming action-compatible representa-
+   This motivates the central question of the paper: during ac-     tions and preserving multimodal representations inherited
+tion finetuning, how can VLA systems allow action supervision       from pretraining. Second, we introduce Action QFormer,
+to reshape multimodal representations inherited from vision-        a query-based action-facing interface that mediates action-
+language pretraining without destabilizing them? We address         supervised shaping through instruction-conditioned queries,
+this question through structured representation shaping             reorganizing inherited multimodal information into action-
+under action supervision: rather than letting action-loss           facing representations before downstream action prediction.
+gradients act directly on the inherited multimodal pathway, we      Third, using zero-shot sim-to-real robot navigation as a chal-
+introduce an intermediate module that mediates where action-        lenging test scenario for representation stability, we show
+supervised shaping occurs.                                          that Action QFormer improves closed-loop task success and
+   We instantiate this view with Action QFormer, a query-           fixed-instruction action-generation correctness, while nearly
+based action-facing interface inserted between the pretrained       eliminating out-of-distribution instruction generations. Finally,
+multimodal backbone and the downstream policy head. Ac-             through mechanistic analyses, we show that Action QFormer
+tion QFormer uses learnable queries to reorganize inherited         changes how action supervision reshapes inherited multimodal
+multimodal information before action prediction. At the same        representations, making adaptation more controlled, localized,
+time, this query interface also changes the backward route of       and aligned with downstream action generation.
+action supervision, giving action-loss gradients an intermediate
+adaptation path before they propagate upstream to reshape
+                                                                                         II. R ELATED W ORK
+inherited multimodal representations.
+   We study Action QFormer in zero-shot sim-to-real nav-
+                                                                    Vision-Language-Action Models and Action Interfaces.
+igation, a challenging setting that places high demands
+                                                                    Recent VLA models extend pretrained vision-language or
+on representation stability. In our closed-loop perception-to-
+                                                                    multimodal backbones to embodied control through different
+instruction-to-action pipeline, the model must generate stable
+                                                                    action interfaces. Representative systems include transformer
+intermediate instructions and execute actions sequentially un-
+                                                                    policies trained on large-scale robot data in RT-1 [1], action-
+der changing real-scene observations. This makes represen-
+                                                                    as-text token prediction in RT-2 [4], discrete action binning
+tation instability behaviorally explicit: instruction-generation
+                                                                    in OpenVLA [2], flow-matching continuous action generation
+instability, weak object grounding, or directional-control er-
+                                                                    in π0 [3], and discrete action tokens for scalable pretraining
+rors can accumulate into trajectory divergence and final task
+                                                                    in π0.5 [5]. Another line of work focuses on the action
+failure. By dissecting the full pipeline, we find that baseline
+                                                                    interface itself: frequency-space action sequence tokenization
+degradation appears at two levels: unstable instruction gen-
+                                                                    in FAST [6], vector-quantized action tokenization in VQ-
+eration under real-scene visual shift, and weaker directional
+                                                                    VLA [7], latent actions learned from unlabeled videos in
+control and object grounding during instruction-conditioned
+                                                                    LAPA [8], task-centric latent actions for cross-embodiment
+execution. Action QFormer improves both levels, maintaining
+                                                                    transfer in UniVLA [9], and continuous rotational latent ac-
+more stable intermediate instructions in closed-loop deploy-
+                                                                    tions in RotVLA [10]. These approaches improve VLA scal-
+ment while producing stronger directional control and object-
+                                                                    ability, action decoding, and cross-embodiment generalization
+grounded execution.
+                                                                    by changing how actions are represented or generated, but
+   Representation-level analyses further show that these be-
+                                                                    leave how action supervision reshapes inherited multimodal
+havioral gains are accompanied by more controlled action-
+                                                                    representations largely unexplored. We address this gap with
+supervised adaptation: Action QFormer strengthens action-
+                                                                    an action-facing interface that structures this shaping process.
+facing directional distinctions while reducing broad upstream
+rewriting and stabilizing instruction-to-visual attention.          Query-Based Interfaces and Multimodal Alignment. Multi-
+   Together, these results support a mechanism-level thesis: ac-    modal alignment has been a central mechanism for connecting
+tion supervision reshapes multimodal representations inherited      visual and language representations, from contrastive image-
+from pretrained backbones; this shaping is necessary for form-      text alignment in CLIP [11], align-before-fuse representa-
+ing action-compatible representations, but direct shaping can       tion learning in ALBEF [12], and unified understanding-
+cause broad upstream disruption. Query-based action-facing          generation pretraining in BLIP [13], to visual instruction
+interfaces can mediate this interaction by expressing part of       tuning in LLaVA [14]. Another line of work introduces
+the action-loss update through learnable queries, optimizing        intermediate query or resampling interfaces to bridge pre-
+the organization of multimodal information for action predic-       trained encoders and downstream language modules, including
+tion before the update propagates back as upstream shaping.         latent bottleneck processing in Perceiver [15], visual resam-
+This reframes action-interface design from the perspective of       pling for few-shot multimodal learning in Flamingo [16],
+representation shaping under action supervision: the challenge      learnable visual queries for frozen image-to-language transfer
+is not only to build richer visual backbones or stronger action     in BLIP-2 [17], and instruction-conditioned visual querying
+decoders, but to control how action supervision interacts with      in InstructBLIP [18]. Recent robotics work further studies
+                                                                                                                                                         3
+
+
+
+alignment toward action-relevant structure, including visual-          Vision Encoder                           Vision Encoder
+encoder grounding alignment for spatially aware VLA models
+in VEGA [19], dynamics-aware flow-language-image pretrain-
+ing in DynaFLIP [20], human-robot aligned representation                      Language Backbone                        Language Backbone
+learning for VLA pretraining in HARP-VLA [21], latent-
+action representation alignment in LARA [22], and action-                  Image           Instruction              Image           Instruction
+grounded representation alignment for World Action Models              Representation     Representation        Representation     Representation
+in AGRA [23]. Together, these works suggest that pretrained
+multimodal representations should be reused through inter-                                                                               stop gradient
+faces designed to match the downstream objective; for VLA,                Action-facing Representation             Action-facing Representation
+we use learnable queries to reorganize inherited image and
+instruction representations for downstream action prediction.
+                                                                               Action Generation                           Action Loss
+Foundation Models in Robot Navigation. Classical and
+                                                                           (a) Direct-fusion baseline           (b) Selective gradient blocking
+structured learning-based navigation methods rely on explicit
+                                                                     Fig. 2. Direct-fusion baseline as a diagnostic reference for action-facing
+planning, from graph-search planning in A* [24] and dynamic          interfaces. (a) The baseline instantiates a common VLA interface pattern:
+local collision avoidance [25] to planning-guided visual nav-        image-side and instruction-side representations inherited from the multimodal
+igation in ViKiNG [26], rather than fully end-to-end action          backbone are directly fused into an action-facing representation for down-
+                                                                     stream policy prediction. (b) One representative stop-gradient configuration in
+learning. More recent methods learn scalable visual and goal-        baseline, where action-loss gradients are blocked before reaching the extracted
+conditioned policies, including cross-embodiment navigation          image-side and instruction-side representations.
+in GNM [27], foundation visual navigation in ViNT [28],
+and goal-masked diffusion policies in NoMaD [29]. Another            Problem setup. We consider a single-frame navigation setting
+line brings pretrained foundation models into navigation,            to focus on how current visual and language information is
+including model composition in LM-Nav [30], video-based              organized into an action-compatible form. At each timestep,
+VLM planning in NaVid [31], video-based VLA navigation               navigation is modeled as an instruction-conditioned action
+in Uni-NaVid [32], navigation foundation modeling in Nav-            prediction problem: the model first produces an intermediate
+FoM [33], and future-observation prediction in Navigation            instruction st , and then predicts an H-step action trajectory
+World Models [34]. Together, these methods highlight that            conditioned on it. Each timestamp-level sample contains a
+navigation depends on robust language- or goal-conditioned           current-frame image observation It , a task text gt , a super-
+visual grounding across changing scenes, making it a sensitive       vised navigation instruction st , and an H-step future action
+setting for studying representation instability. We further stress   trajectory At in the local robot frame, where H = 8:
+this setting through zero-shot sim-to-real navigation, deriving                Xt = (It , gt , st , At ),       At = (a1t , . . . , aH
+                                                                                                                                     t ).          (1)
+training data from the Habitat [35] ObjectNav benchmark [36]
+and evaluating behavior in real indoor scenes.                       Each sample is formatted as a multimodal sequence Xt and
+                                                                     processed by the pretrained multimodal backbone:
+
+                     III. M ETHODOLOGY                                                  Ht = Fθ (Xt ),          Ht ∈ RNt ×d ,
+
+   We present the methodology for studying action-supervised         where Nt is the sequence length and d is the hidden dimension.
+representation shaping in VLA models. We first define the            We define the image-side and instruction-side representa-
+terminology used throughout the paper, then specify the prob-        tions by extracting hidden states from image-observation and
+lem setting, direct-fusion baseline, Action QFormer interface,       supervised-instruction spans:
+representation-shaping mechanism, diagnostics, and training                      HtI = {Ht,i }i∈It ,           HtS = {Ht,j }j∈St ,
+and inference pipeline.
+                                                                     where the span indices It and St are determined by boundary
+Terminology. Throughout the paper, we use inherited multi-           markers in the multimodal sequence. Here, HtI ∈ RNI ×d
+modal representations to refer to image-side and instruction-        and HtS ∈ RNS ×d denote image-side and instruction-side
+side representations produced by the pretrained multimodal           representations inherited from the multimodal backbone.
+backbone. During action finetuning, action-loss gradients can          Each action step is represented by a local relative position
+reshape these representations; we refer to this process as           and a heading vector:
+action-supervised representation shaping. We use action-
+                                                                             aht = pht , uht ,
+                                                                                            
+facing representation to denote the representation that di-                                        h = 1, . . . , H,
+                                                                               h      h h
+                                                                                                                                (2)
+                                                                                                  uht = yawhdx,t , yawhdy,t
+                                                                                                                            
+rectly conditions the downstream policy head. An action-                     pt = (xt , yt ),
+facing interface is an intermediate module that maps inherited
+image-side and instruction-side representations into an action-      where pht denotes local relative position and uht denotes
+facing representation before trajectory prediction. Under this       heading direction.
+terminology, Action QFormer implements structured repre-             Direct-fusion baseline. As shown in Fig. 2(a), we first define
+sentation shaping by mediating action-supervised adaptation          a direct-fusion baseline to isolate a common VLA interface
+through a query-based action-facing interface before action-         pattern: inherited image-side and instruction-side representa-
+loss gradients propagate back to inherited representations.          tions are fused into an action-facing representation and directly
+                                                                                                                                                                     4
+
+
+
+         Image                                   Instruction
+     Representation           Queries          Representation
+                                                                                intermediate output of the action-facing interface. For direct
+                                                                                fusion, Φt is the fused representation; for Action QFormer, it
+                                                                                is the query-organized output initialized from Q0 . Let θpath
+                                                                                denote the trainable parameters of the inherited multimodal
+                                     Self Attention                             pathway. For both interfaces, the upstream gradient route is:
+
+                          Cross Attention                          xK                     ∂Laction
+                                                                                                   =
+                                                                                                      ∂Laction ∂(HtI , HtS )
+                                                                                           ∂θpath    ∂(HtI , HtS ) ∂θpath
+                           Feed Forward         Feed Forward                                         ∂Laction ∂zt    ∂Φt     ∂(HtI , HtS )
+                                                                                                   =                                       .
+                                                                                                       ∂zt ∂Φt ∂(HtI , HtS ) ∂θpath
+         Action-facing
+        Representation                                                          The chain through zt and Φt also determines how action-
+                                                                                loss updates are routed through the action-facing interface. For
+                         Action Generation                                      Action QFormer, these updates act on both the trainable query-
+Fig. 3. Action QFormer as a query-based action-facing interface.                interface parameters and the learnable query initialization:
+Action QFormer conditions learnable queries on the instruction representation
+and uses the updated queries to selectively extract action-relevant visual                        ∂Laction   ∂Laction ∂zt ∂Φt
+information. The resulting query outputs carry instruction-conditioned visual                              =                    ,
+information and are combined with the instruction-side representation to form
+                                                                                                   ∂θAQF       ∂zt ∂Φt ∂θAQF
+action-facing representations for conditioning downstream action generation.                      ∂Laction   ∂Laction ∂zt ∂Φt
+                                                                                                       0
+                                                                                                           =                  .
+                                                                                                    ∂Q         ∂zt ∂Φt ∂Q0
+exposed to action-loss optimization. Given HtI and HtS , the
+                                                                                Here, θAQF denotes the trainable parameters of the Action
+baseline implements this interface with self-attention:
+                                                                                QFormer interface, and Q0 denotes the learnable query ini-
+          ZtFuse = SelfAttnFuse Concat(HtI , HtS ) ,
+                                                   
+                                                                                tialization, shown as Q in Fig. 1. This gradient structure gives
+            ztFuse = Pool(ZtFuse ) ≡ Fuse(HtI , HtS ).                          action-loss updates an additional query-specific adaptation
+                                                                                path, so action supervision need not be expressed only through
+Action QFormer architecture. As shown in Fig. 3, Action                         shaping the upstream pathway. By updating the learnable
+QFormer replaces the direct-fusion interface with a query-                      queries, Action QFormer can change how the interface selects
+based intermediate interface. It maintains a set of M learnable                 and organizes image-side and instruction-side information be-
+query states:                                                                   fore gradients propagate back to the inherited pathway. In this
+                                                                                sense, Action QFormer changes the role of the action-facing
+              Q0 = {q10 , . . . , qM
+                                   0
+                                     },       Q0 ∈ RM ×d .                      interface from passively passing inherited representations to
+Given the inherited representations HtI and HtS , Action                        actively organizing their action-supervised adaptation.
+QFormer updates these query states through a stack of K                                                   TABLE I
+layers. At layer k, the queries first absorb instruction context                  G RADIENT SETTINGS FOR REPRESENTATION - SHAPING ANALYSIS .
+and then attend to visual evidence:                                             Setting                  Action-loss exposure
+              h                                i
+       Qe k = SelfAttnk Concat(Qk−1 , HtS )             ,                       Action update blocked  Action-loss gradients are stopped before reaching the ex-
+                                                           query                                       tracted image-side and instruction-side representations.
+                                                                                Lang. backbone blocked The language backbone is blocked from action-loss updates.
+        Qk = CrossAttnk (Q
+                         e k , HtI ),             k = 1, . . . , K.             Vision encoder frozen  The vision encoder is frozen during action finetuning.
+                                                                                Full update            Action-loss gradients fully propagate through the inherited
+The self-attention update conditions the queries on instruction-                                       multimodal pathway.
+side representations, while the cross-attention update lets the
+instruction-conditioned queries select visual evidence from                     Diagnostics for the dual effect. To diagnose how gradient-
+image-side representations. After K layers, the final query                     route differences affect the dual effect of action-supervised
+states carry instruction-conditioned visual information and are                 shaping, we apply stop-gradient interventions to selected parts
+pooled and combined with the instruction-side representation                    of the backpropagation path. For each module or route r, we
+to form the final action-facing representation zt used by the                   denote the corresponding action-loss update gradient as
+policy head. We denote the overall interface as                                                      ∂Laction
+                                                                                                ger = mr       ,     mr ∈ {0, 1}.
+                    ztAQF = AQF(Q0 , HtS , HtI ).                                                        ∂r
+                                                                                Here, mr = 1 allows route r to receive action-loss updates,
+Compared with direct fusion, this design changes how visual                     while mr = 0 applies a stop-gradient operation on that route.
+information enters action prediction: image-side information
+                                                                                   In Sec. V, we selectively apply stop-gradient operations to
+is first selected and abstracted through instruction-conditioned
+                                                                                gradient routes from the action-facing representation to the
+queries before combined with instruction-side representations.
+                                                                                inherited multimodal pathway. We first use the direct-fusion
+Representation-shaping mechanism. As illustrated in Fig. 1,                     baseline to examine how action-loss gradients reshape inher-
+another key difference between the two interfaces is the                        ited pathways when forming action-facing representations, and
+route through which action-loss gradients propagate back to                     then apply the same diagnostics to Action QFormer to test
+inherited representations. Let zt denote the action-facing repre-               whether its additional adaptation path reduces the disruptive
+sentation that conditions the policy head, and let Φt denote the                effect of this shaping. Table I summarizes the diagnostic
+                                                                                                                                  5
+
+
+
+gradient settings used in our analysis. As an illustrative ex-     This design makes it easy to adjust the training emphasis:
+ample, Fig. 2(b) shows where stop-gradient operations are          when r = 1, the action branch is skipped and training is
+applied in the action-update-blocked setting for the direct-       language-only; when r = 0, the language loss is ignored and
+fusion baseline.                                                   training is action-only; and when 0 < r < 1, both branches
+Supervision and sequence construction. We use the same             are evaluated and combined by interpolation. In the main
+supervision and sequence construction for both models. Each        training runs, r is cosine-scheduled from a high language-side
+sample provides two supervision targets: a GPT-generated           weight to a lower value, giving stronger weight to instruction-
+navigation instruction st and an H-step future action trajectory   generation supervision early in training and gradually increas-
+At in the local coordinate frame. The GPT instruction is           ing the contribution of action-prediction supervision.
+generated from the same observation and future trajectory          Inference. At inference time, the model is deployed in a
+using a constrained prompt, which encourages diverse phras-        closed-loop perception-to-instruction-to-action pipeline. Given
+ing while keeping the instruction spatially grounded in the        the current real-scene observation It and task text gt , the
+future navigation target. For backbone training, each sample       multimodal backbone first generates an intermediate instruc-
+is formatted as a multimodal sequence:                             tion sbt . The resulting sequence is processed by the backbone,
+                                                                 and the boundary markers are used to extract image-side and
+          Xt = BI , It , EI , P (gt ), BS , st , ES ,
+                                                                   instruction-side representations. The action interface, either
+where (BI , EI ) and (BS , ES ) are boundary markers that          direct fusion or Action QFormer, maps these parsed represen-
+define the visual and supervised-instruction spans, and P (gt )    tations to an action-facing representation zt . The policy head
+denotes the prompt prefix containing the task text. Following      then samples an H-step local-frame action trajectory:
+the standard teacher-forcing recipe, the image observation and                            bt ∼ πψ (· | zt ).
+task context are treated as conditioning context, and language                            A
+loss is applied only to the supervised instruction span:           The predicted trajectory is executed by the controller, and the
+                                                                   resulting new observation is used for the next closed-loop step.
+                         X
+              Llang = −       log pθ (xt,j | xt,<j ) ,
+                        j∈St
+
+where St denotes the token indices of the instruction span.                             IV. E XPERIMENTS
+
+Action prediction objective. Let zt denote the action-facing       A. Experimental Overview
+representation used by the downstream policy head:                    We evaluate Action QFormer in zero-shot sim-to-real goal-
+                 (                                                 conditioned navigation. Following the ObjectNav formulation,
+                   ztFuse , direct-fusion baseline,
+            zt =                                                   the goal is specified by a target object category rather than
+                   ztAQF , Action QFormer.                         a fixed coordinate, requiring the model to ground the target
+The policy head predicts the local-frame action trajectory con-    in the current observation and translate this grounding into
+ditioned on zt . When implemented as a conditional diffusion       executable motion. In our setting, the VLA model receives
+policy, the policy head is trained with a denoising objective.     a real-scene observation and a language goal, generates an
+Given a ground-truth action chunk At , a diffusion timestep τ ,    intermediate instruction, and predicts a local-frame action
+and Gaussian noise ϵ, the noised action chunk is                   trajectory to move toward the goal while avoiding obstacles.
+                       √           √                                  All models are trained in simulation and directly deployed
+                  Aτt = ᾱτ At + 1 − ᾱτ ϵ.                        in real scenes without additional finetuning. This zero-shot
+The policy head predicts the noise conditioned on the noised       sim-to-real setting exposes the pipeline to large visual vari-
+action chunk, timestep, and action-facing representation:          ation, making it a sensitive testbed for representation-level
+                                                                   instability: disruptions in inherited grounding or directional
+                      ϵ = ϵψ (Aτt , τ, zt ).
+                      b                                            representations can surface as invalid or unstable intermediate
+The action-prediction loss is                                      instructions, or as weakened instruction-following ability in
+                          h                        i               downstream action generation. Closed-loop execution further
+                                                 2
+           Laction = Eτ,ϵ ∥ϵ − ϵψ (Aτt , τ, zt )∥2 .               increases the difficulty, as early instruction or action errors
+                                                                   can compound into target loss, trajectory drift, wrong-direction
+During training, we keep the downstream training formulation       commitment, collisions, or final task failure.
+identical, so that the comparison isolates how the action-facing      We organize the experiments at two levels. First, closed-
+representation zt is formed.                                       loop evaluation tests the full perception-to-instruction-to-
+Overall training objective. Training combines instruction-         action pipeline as the model repeatedly generates instructions
+generation supervision and local-frame action-prediction su-       and actions from changing real-scene observations. Second,
+pervision. The overall objective is controlled by a scalar         fixed-instruction action generation diagnoses where Action
+language-loss weight r ∈ [0, 1]:                                   QFormer improves instruction-conditioned execution under the
+                                                                  same observations and instructions. Together, these evaluations
+             Laction ,
+                                        r = 0,                    test whether Action QFormer improves zero-shot real-scene
+        L = Llang ,                      r = 1,                    behavior by stabilizing instruction generation, strengthening
+             
+             
+               (1 − r)Laction + rLlang , 0 < r < 1.                instruction-conditioned action execution, or both.
+                                                                                                                                                                                                   6
+
+
+
+                 (a) Far-End Target Grounding Consistency                                                                  (b) Obstacle-Aware Target Grounding
+
+ Observation                                                                                           Observation
+   Image                                                                                                 Image
+
+  Generated       “ Move   “ Move towards the open        “ Move      “ Move                           Generated “ Move towards the “ Move towards    “ Move towards   “ Move towards
+                                                                                      “ Stop ”                                                                                          “ Stop ”
+    Text         Forward ” doorway on the right ”        Forward ”   Forward ”                           Text     door on the right ”  the door ”        the door ”       the door ”
+    Progress                                                                                             Progress
+
+
+
+
+                                                                                                                                                   Camera
+                                                                                 Camera
+                End
+                                                                                                                                                                          End
+
+                                                                                    Start
+ Task: Find The Fridge                                                                                Task: Find The Door                    Start
+                  (c) Weak Initial-Cue Directional Inference                                                          (d) Sharp-Turn Recovery under Visual OOD
+
+ Observation                                                                                           Observation
+   Image                                                                                                 Image
+
+  Generated    “ Make a sharp   “ Move towards the        “ Move      “ Move                           Generated     “ Make a sharp     “ Move           “ Move          “ Move
+                                                                                      “ Stop ”                                                                                          “ Stop ”
+    Text          left turn ”    chair on the left ”     Forward ”   Forward ”                           Text           left turn ”    Forward ”        Forward ”       Forward ”
+    Progress                                                                                             Progress
+
+
+
+
+                                                       Camera
+                                         Start                                                                                  Camera
+                                                                                                                                                     End
+                                                                                                                             Start
+
+ Task: Find The Chair                             End                                                 Task: Find The Table
+
+Fig. 4. Four closed-loop real-scene test scenarios (Sec. IV-B). Each panel shows a third-person rollout overlay together with selected first-person observations
+and generated instructions along the timeline. The four scenarios stress complementary aspects of closed-loop stability: (a) far-end target grounding consistency
+tests whether a distant target near the edge of the field of view remains grounded despite early directional errors; (b) obstacle-aware target grounding tests
+whether target-oriented guidance remains executable in cluttered, collision-prone local geometry; (c) weak initial-cue directional inference tests whether the
+model can recover from weak directional evidence while resisting visually salient distractors; and (d) sharp-turn recovery under visual OOD tests whether the
+instruction-to-action loop remains executable after an abrupt out-of-distribution visual transition.
+                                                                    TABLE II
+         F ULL PERCEPTION - TO - INSTRUCTION - TO - ACTION RESULTS IN ZERO - SHOT SIM - TO - REAL CLOSED - LOOP NAVIGATION (S EC . IV-B).
+
+                                                                                             Without provided instructions                                  Given instructions
+                                                                      Instruction Instruction  Action     Average       Task     Average       Task
+                     Model                             Scenario
+                                                                      Direction ↑ OOD Rate ↓ Direction ↑ Collisions ↓ Success ↑ Collisions ↓ Success ↑
+                                            Fridge (far target)          80.3%            100.0%         65.6%              0.50           25.0%              0.25           75.0%
+                                            Door (obstacle)              75.0%             97.2%         72.2%              1.75           25.0%              1.75           87.5%
+                Direct Fusion
+                                            Chair (turn-around)          46.4%            100.0%         53.6%              0.62           25.0%              0.75           25.0%
+                                            Table (sharp turn)           22.9%            100.0%         16.7%              0.75            0.0%              0.62           25.0%
+                                            Fridge (far target)          95.9%              0.0%         93.2%              0.62          37.5%               0.00          100.0%
+                                            Door (obstacle)              97.6%              0.0%         90.5%              1.50          62.5%               0.38           87.5%
+               Action QFormer
+                                            Chair (turn-around)          58.8%              0.0%         82.4%              0.50          62.5%               0.12           87.5%
+                                            Table (sharp turn)          100.0%              0.0%         93.0%              0.38          62.5%               0.12           87.5%
+
+
+B. Zero-shot Sim-to-Real Closed-Loop Experiment                                                      distribution (OOD) instruction rate. Action-side quality is
+   We first evaluate the full perception-to-instruction-to-action                                    measured by action-direction correctness under the generated
+loop in zero-shot sim-to-real ObjectNav. At each step, the                                           instruction. We also report average collisions and final task
+model observes the current real scene, generates an interme-                                         success to summarize closed-loop execution quality.
+diate instruction, and predicts a local-frame action trajectory                                         As shown in Table II, the direct-fusion baseline exhibits
+conditioned on that instruction. Because each predicted action                                       high instruction OOD frequency across all four scenarios,
+changes the next observation, this closed-loop setting provides                                      together with weaker instruction-direction correctness. This
+a stress test of whether instruction generation and action                                           indicates that the closed-loop pipeline often becomes unstable
+execution remain stable under real-scene visual shift.                                               at the intermediate instruction stage. The instability further
+   To localize failures within the full pipeline, we report                                          coincides with weaker action-direction accuracy and lower
+metrics at all three levels: instruction-side quality, action-side                                   final task success, suggesting that instruction-side errors can
+quality, and final rollout outcomes. Instruction-side quality                                        propagate into downstream action execution. By contrast,
+is measured by instruction-direction correctness and out-of-                                         Action QFormer nearly eliminates instruction OOD outputs,
+                                                                                                                                                                           7
+
+
+
+
+Task: find the chair
+consecutive instruction
+OOD outputs → target
+leaves view → wrong
+object commitment.
+                              Output:                       Output:                                        Output:                         Output:
+                              <|im_start|> <|im_start|>     <|im_start|> <|im_start|>                      <|im_start|> <|im_start|>       <|im_start|> <|im_start|>
+                              move towards the left         <|im_start|> ...                               <|im_start|> ...                move towards the TV stand
+                              side of the table
+
+
+
+
+Task: find the fridge
+Early instruction–execution
+mismatch → target leaves
+view → wrong direction
+commitment.
+                              Output:                      Output:                                        Output:                         Output:
+                              <|im_start|> <|im_start|>    <|im_start|> veer                              <tool_call> <tool_call>         <|im_start|> move forward
+                              arc right                    slightly right                                 <tool_call> ...
+Fig. 5. Failure progression patterns in representative closed-loop rollouts (Sec. IV-B). Each row shows one real-scene closed-loop rollout of the direct-
+fusion baseline, with selected frames arranged from left to right. The left column summarizes the task and dominant failure chain, while the compact tags
+below each frame preserve the key generated instruction fragment. The two examples illustrate complementary failure modes: consecutive instruction OOD
+outputs followed by wrong-object commitment, and early instruction–execution mismatch followed by target loss and wrong-direction commitment.
+
+produces more stable directional instructions, and preserves
+stronger action-direction accuracy under the same real-scene
+                                                                                CORRECTNESS RATE
+
+
+observations. These improvements consistently translate into
+higher end-to-end success across the four test scenarios.
+Scenario-level Failure Progression. We next examine repre-
+sentative full-chain rollouts of the direct-fusion baseline to un-
+derstand how instruction-side instability develops into closed-
+loop failure. As shown in Fig. 4, the real-scene scenarios                                         DI RE CTI ONA L CONTROL   OBJECT GROU ND ING      MOTI ON TE MPLATE S
+contain visual variation, including distant targets, distractors,                        Baseline    Image-latent      Query-only     Action QFormer
+cluttered local geometry, weak initial directional cues, and                  Fig. 6. Fixed-instruction action generation across scenario families
+abrupt viewpoint changes. Under these conditions, the baseline                (Sec. IV-C). Family-level correctness under fixed-instruction probes on repre-
+instruction-generation stage can become unstable, producing                   sentative real-scene observations. Action QFormer improves most strongly on
+                                                                              directional control and object grounding, while gains are smaller on motion-
+non-executable instruction OOD outputs, direction switches,                   template instructions that require less perceptual disambiguation.
+target mismatches, or wrong-object guidance. Fig. 5 shows
+how such instruction-side errors compound through closed-                     viewpoint, rather than simply execute a memorized motion
+loop execution: an initially recoverable trajectory can collapse              pattern. This indicates that Action QFormer’s gains are not
+after a distractor or unfamiliar visual cue enters view, and an               explained by instruction quality alone, but also reflect stronger
+early instruction–execution mismatch can push the target out                  visually grounded instruction-conditioned action execution.
+of view before the rollout commits to the wrong direction.                       The closed-loop results, together with the given-instruction
+                                                                              control, also clarify the boundary of Action QFormer’s im-
+Controlling for Instruction Instability. To test how much of
+                                                                              provement. The query-based interface improves stability under
+the closed-loop degradation comes from unstable intermediate
+                                                                              real-scene visual variation, reducing instruction OOD outputs
+instructions, we evaluate the same scenarios again with given
+                                                                              and strengthening instruction-to-action alignment. However, it
+instructions, while keeping the real-scene observations and
+                                                                              does not by itself solve obstacle-aware instruction planning:
+downstream action-generation problem unchanged. As shown
+                                                                              when safe execution requires explicitly routing around nearby
+in Table II, the gap becomes substantially smaller in this
+                                                                              obstacles, failures can still occur if the model does not select
+controlled setting. The direct-fusion baseline recovers much
+                                                                              a suitable grounding target to describe the avoidance behavior.
+of its performance once unstable intermediate instructions
+are removed, indicating that instruction instability under real-
+scene visual shift is a major source of behavioral degradation.               C. Fixed-Instruction Action Generation
+At the same time, Action QFormer still retains an advantage in                   Next, we evaluate fixed-instruction action generation on rep-
+scenarios with large real-scene visual variation, most notably                resentative real-scene observations from challenging closed-
+the Weak Initial-Cue Directional Inference case. Even with                    loop cases. By providing the same observation and in-
+fixed intermediate instructions, this case requires the model to              termediate instruction to each model, this setting controls
+infer and maintain the correct local direction across changing                for instruction-generation instability and isolates whether the
+observations from a cluttered scene and an unfamiliar oblique                 model can produce the intended local action.
+                                                                                                                                                         8
+
+
+           Real Scene                   Baseline                   Image-latent QFormer       Query-only QFormer        Action QFormer
+
+
+
+
+                (a) Testing scenario: directional control. Example Instructions: “make a left turn”(orange) and “make a right turn”(blue)
+           Real Scene                   Baseline                   Image-latent QFormer       Query-only QFormer        Action QFormer
+
+
+
+
+                        (b) Testing scenario: object grounding. Example Instruction: “move towards the whiteboard in the corner”
+           Real Scene                   Baseline                   Image-latent QFormer       Query-only QFormer        Action QFormer
+
+
+
+
+                                    (c) Testing scenario: motion template. Example Instruction: “go through the hallway”
+Fig. 7. Representative qualitative comparisons for fixed-instruction action generation (Sec. IV-C). Rows correspond to the three probe families: (a)
+directional control, (b) object grounding, and (c) motion-template following. In each row, the leftmost image shows the third-person scene context, and the
+remaining columns show action predictions generated from the same first-person observation and fixed instruction. The prediction columns compare, from
+left to right, the Direct-fusion Baseline, Image-latent Action QFormer, Query-only Action QFormer, and Action QFormer. Thin trajectories show 8
+stochastic inference samples from the same model, and the bold trajectory denotes the selected representative action trajectory used for comparison.
+
+   We organize testing scenarios into three families: directional                only variant often still produces visually plausible motion, but
+control, which tests whether the model follows left- or right-                   loses reliable instruction-following ability. This suggests that
+oriented local motion; object grounding, which tests whether                     the updated queries mainly carry instruction-conditioned vi-
+the model moves toward the instructed visual target rather than                  sual information extracted through cross-attention, but explicit
+a distractor or irrelevant object; and motion templates, which                   instruction context remains necessary for forming a complete
+test whether the model follows simple instruction-specified                      action-facing representation. Representative qualitative com-
+motion patterns that depend less on visual disambiguation.                       parisons for both ablations are shown in Fig. 7.
+   As shown in Fig. 6, family-level correctness reveals a clear
+                                                                                    Overall, Action QFormer achieves consistent behavioral
+pattern: once instruction-generation instability is controlled,
+                                                                                 gains in zero-shot real-scene navigation. Compared with the
+Action QFormer shows its strongest advantage on directional
+                                                                                 baseline, it improves closed-loop stability by reducing instruc-
+control, a smaller but still substantial gain on object grounding,
+                                                                                 tion OOD outputs and strengthens fixed-instruction action gen-
+and a much smaller gap on motion templates, where the
+                                                                                 eration when behavior depends on directional disambiguation
+baseline remains comparatively competitive. Fig. 7 provides
+                                                                                 or target-grounded visual evidence.
+representative qualitative comparisons from each family across
+model variants. This indicates that the main action-side benefit
+of Action QFormer is not generic trajectory smoothing, but a                                        V. M ECHANISTIC A NALYSIS
+more reliable action-facing representation when behavior de-                        We now examine the dual effect of action-supervised shap-
+pends on directional disambiguation or target-directed motion.                   ing behind the behavioral gains observed above: action-loss
+Interface ablations. We next ablate two parts of the Action                      updates can form behaviorally consequential distinctions, but
+QFormer interface to test where this fixed-instruction advan-                    may also induce disruptive upstream rewriting.
+tage comes from. The first ablation replaces the default visual                     Across the analyses, we first use the direct-fusion baseline
+source of Action QFormer—the image embedding output                              to expose how direct shaping acts on inherited multimodal
+directly by the vision encoder before language-backbone fu-                      pathways, and then use the same diagnostic settings to examine
+sion—with the image latent, i.e., the image-side representation                  structured shaping in Action QFormer. To isolate shaping
+after it has been processed by the language backbone. The                        caused by action supervision, we use the gradient settings
+image-latent variant retains part of the competence of the full                  in Table I. The action-update-blocked setting serves as an
+model, but loses much of its distinctive advantage, especially                   instruction-supervision-only reference, so comparisons against
+on directional control and object grounding. This suggests that                  action-loss-exposed settings reveal the additional upstream
+the image latent still contains useful visual information, but                   shaping induced by action supervision.
+may no longer expose control-relevant spatial information in                        We analyze this dual effect at three levels. First, we ex-
+a form sufficient to support the full Action QFormer benefit.                    amine its constructive side by studying how action-supervised
+   The second ablation removes the instruction-side represen-                    shaping forms directional distinctions. Second, we measure
+tation combined with the query outputs, sending only the                         upstream token rewriting to assess whether the same adap-
+updated queries to downstream action generation. This query-                     tation is accompanied by disruptive rewriting of inherited
+                                                                                                                                                                                                                               9
+
+
+
+                           Full update          Action update blocked             Image pathway blocked                Instr. pathway blocked                              Lang. backbone blocked       Vision frozen
+
+
+                                  (a) Left--right Fisher score                                         (b) Left--right cosine similarity                                              (c) Action-loss gradient strength
+
+
+
+
+                                                                                                                                                  Action-loss grad. norm
+                    0.15                                                                   1.000                                                                           −2.0
+   Fisher score ↑
+
+
+
+
+                                                                           Cosine sim. ↓
+                                                                                           0.975
+                    0.10
+                                                                                           0.950                                                                           −2.5
+
+                    0.05                                                                   0.925
+
+                                                                                           0.900                                                                           −3.0
+                    0.00
+                           0             2000          4000        6000                            0           2000        4000            6000                                   0          2000        4000           6000
+                                           Training step                                                          Training step                                                                Training step
+Fig. 8. The left–right distinction becomes clearest when both visual and language-side pathways are shaped by action-loss gradients (Sec. V-A). We
+train the direct-fusion baseline while selectively blocking gradients from the action loss to different parts of the multimodal pathway. This plot additionally
+includes two route-level variants that block gradients to the fused image or instruction representation. (a) Left–right Fisher score between action-facing
+representations; higher values indicate a clearer distinction. (b) Left–right cosine similarity between the same representations; lower values indicate a clearer
+distinction. (c) Action-loss gradient norm in the shared multimodal backbone, measuring how strongly the action objective updates the inherited representation
+pathway. The dotted vertical line marks the 2K training step, after which the action-loss gradient norm rises and the left–right distinction becomes more
+pronounced. Together, these trends indicate that left–right distinction emerges through joint action-loss gradient exposure of the visual and language pathways.
+
+                             TABLE III
+  L EFT– RIGHT COSINE SIMILARITY ACROSS INTERFACE AND GRADIENT
+                                                                                                                      the pretrained representation or formed by the policy head
+   SETTINGS . L OWER INDICATES CLEARER LEFT– RIGHT DISTINCTION .                                                      alone. Instead, the clearest action-facing directional distinction
+                                                                                                                      appears when visual and language-side pathways are jointly
+ Gradient Setting                         Action ↓    Action Repr. ↓    Instr. Repr. ↓             Img. Repr. ↓
+                                                                                                                      shaped by gradients from the action loss.
+ Direct-fusion baseline                                                                                                  Having shown in the baseline that action-supervised shaping
+ Action update blocked                     0.895           0.941              0.969                    0.958
+ Vision encoder frozen                     0.894           0.940              0.971                    0.958          is critical in forming directional distinctions, we now use
+ Lang. backbone blocked                    0.901           0.953              0.969                    0.969          the same diagnostic settings to test whether Action QFormer
+ Full update                               0.891           0.931              0.976                    0.976          preserves this constructive effect. Table III reports left–right
+ Action QFormer                                                                                                       cosine similarity at four locations: visual representation, in-
+ Action update blocked                     0.898           0.967              0.960                    0.958
+ Vision encoder frozen                     0.924           0.959              0.958                    0.958
+                                                                                                                      struction representation, action-facing representation, and final
+ Lang. backbone blocked                    0.923           0.979              0.963                    0.963          action output. Consistent with the gradient-blocking result
+ Full update                               0.470           0.520              0.936                    0.966          above, the full-update setting produces the clearest left–right
+                                                                                                                      distinction among the representative gradient settings. Under
+multimodal representations. Third, we analyze instruction-to-                                                         this setting, Action QFormer sharpens the distinction in both
+visual attention to understand how upstream rewriting affects                                                         Action Repr. and Action. By contrast, the differences
+attention to visual evidence for object grounding.                                                                    in Img. Repr. and Instr. Repr. between the two in-
+                                                                                                                      terfaces are much smaller. This suggests that Action QFormer
+A. Action-facing Directional Distinction                                                                              does not simply inherit a stronger upstream left–right distinc-
+                                                                                                                      tion, but reorganizes visual and language information into a
+   We begin with the constructive side of action-supervised
+                                                                                                                      clearer action-facing directional distinction.
+shaping by using left–right directional control as a minimal
+diagnostic distinction. This distinction is linguistically close
+but behaviorally consequential: in a local frame, predicting a                                                        B. Reduced Upstream Rewriting with Targeted Adaptation
+leftward trajectory instead of a rightward one corresponds to                                                            We next examine the disruptive side of action-supervised
+a substantially different action target. It therefore provides a                                                      shaping: whether the same action-loss updates may also induce
+focused setting for testing whether action-loss gradients make                                                        broad upstream rewriting. Using the action-update-blocked
+this distinction more explicit in action-facing representations,                                                      model as the reference, we measure upstream token rewriting
+and through which update routes.                                                                                      as changes in token representations under action-loss-exposed
+   For each diagnostic configuration in Table I, we extract                                                           training settings.
+action-facing representations from samples with explicit left                                                            We analyze token rewriting through two complementary as-
+or right instructions and measure their separation in repre-                                                          pects: rewriting magnitude and rewriting spread. For each to-
+sentation space. Fig. 8 shows that the left–right distinction                                                         ken representation ht ∈ Rd , we quantify rewriting magnitude
+emerges during direct-fusion baseline training only when                                                              using token-wise drift energy, computed as the mean squared
+action-loss updates are allowed to shape upstream multimodal                                                          representation change relative to the reference, d1 ∥ht − href 2
+                                                                                                                                                                                 t ∥2 .
+representations. Blocking either the visual pathway or the                                                            We quantify rewriting spread using active-dimension fraction,
+language-side pathway weakens the distinction, while blocking                                                         computed as the fraction of hidden dimensions with nonzero
+all action-loss updates almost prevents the separation from                                                           change relative to the reference. This distinguishes broad high-
+forming. Moreover, under the full-update setting, the distinc-                                                        dimensional rewriting from sparser, more targeted adaptation.
+tion emerges rapidly only in the later stage of optimization,                                                            Fig. 9(b) shows that Action QFormer has substantially lower
+closely aligned with the rise of action-loss gradient magni-                                                          rewriting magnitude than the direct-fusion baseline, especially
+tude in the shared backbone. Together, these trends show                                                              under the full-update setting. This indicates that the action-
+that the left–right distinction is not simply inherited from                                                          facing query interface reduces the overall strength of upstream
+                                                                                                                                                                                             10
+
+
+
+
+                    Directional Keywords                Spatial Relations
+         Baseline
+    Vision Frozen
+                                                                                                                                                      Larger L2 Drift Energy
+        Baseline
+   Lang. Blocked
+        Baseline
+     Full Update                                              Broad Rewrite                                                                          Smaller L2 Drift Energy
+         QFormer
+    Vision Frozen                                                                                                  (b) Rewriting magnitude
+       QFormer
+   Lang. Blocked
+       QFormer
+     Full Update                                          Targeted Rewrite                                                                   Higher Active-dim. Fraction
+
+                             Tokens (ordered by category, then frequency)
+                      (a) Targeted control/spatial-token rewriting                                                                                Lower Active-dim Fraction
+                                                                                                                       (c) Rewriting spread
+Fig. 9. Action QFormer reduces upstream token rewriting while preserving targeted adaptation (Sec. V-B). All panels compare the same six gradient
+settings shown in panel (a). (a) A control/spatial-token view measures token-level cosine distance from the action-update-blocked reference; higher values
+indicate stronger targeted token modification. The baseline broadly rewrites control-related token groups, whereas Action QFormer concentrates adaptation on
+a more selective subset of key tokens, including directional and motion tokens such as left, right, turn, around, and stop. (b) Rewriting magnitude, measured by
+token-wise drift energy, shows that the direct-fusion baseline undergoes larger-scale token rewriting, whereas Action QFormer reduces the overall magnitude
+of rewriting. (c) Rewriting spread, measured by active-dimension fraction, captures how broadly rewriting extends across hidden dimensions within each token.
+
+rewriting across token representations. The rewriting-spread                                         Mean Sq. Drift Energy ↓                               Effective Rank ↑
+                                                                                             12                                              70
+view in Fig. 9(c) further shows that this reduction is not
+                                                                                 Thousands
+                                                                                             10                                              60
+only about magnitude: the direct-fusion baseline rewrites many                                                                               50
+                                                                                             8
+tokens across a larger fraction of hidden dimensions, whereas                                                                                40
+                                                                                             6
+Action QFormer keeps rewriting substantially more confined.                                                                                  30
+                                                                                             4
+                                                                                                                                             20
+   However, reduced global rewriting alone does not show                                     2                                               10
+whether Action QFormer still preserves useful action-driven                                  0                                                0
+adaptation. To test this, we zoom in on control and spatial                                       Vision Frozen Lang. Blocked Full Update          Vision Frozen Lang. Blocked Full Update
+
+tokens, where action-driven shaping should remain visible if                                              Top 5 Variance ↓                               Tail@20 Variance ↑
+                                                                                      75%                                                   35%
+the model is still forming useful action-facing distinctions.
+                                                                                      70%                                                   30%
+For this targeted view, we measure token-level cosine dis-                                                                                  25%
+                                                                                      65%
+tance from the action-update-blocked reference, defined as                                                                                  20%
+                                                                                      60%
+1 − cos(ht , href
+               t ); higher values indicate stronger directional                                                                             15%
+                                                                                      55%
+                                                                                                                                            10%
+changes in token representations. Fig. 9(a) shows that Action
+                                                                                      50%                                                   5%
+QFormer preserves targeted rewriting on key control and
+                                                                                      45%                                                   0%
+spatial tokens, including left, right, turn, around, and stop,                                    Vision Frozen Lang. Blocked Full Update          Vision Frozen Lang. Blocked Full Update
+
+while avoiding the broad rewriting observed in the baseline.                                                                 Baseline       Action Qformer
+   The subspace statistics of token rewriting in Fig. 10 further                  Fig. 10. Pairwise subspace structure of upstream token rewriting
+show that this effect is not merely a reduction in rewriting                      (Sec. V-B). (a) Drift energy measures the overall magnitude of representation
+magnitude. Action QFormer also increases the effective rank                       rewriting. (b) Effective rank measures how broadly rewriting spans inde-
+                                                                                  pendent representation directions. (c) Top-5 variance concentration measures
+of the rewriting directions while lowering top-5 variance con-                    whether rewriting is dominated by a small set of principal directions. (d)
+centration and increasing Tail@20 variance, indicating that the                   Tail@20 variance measures how much drift energy remains outside the
+remaining adaptation is less dominated by a few principal di-                     top 20 principal directions, reflecting the long-tail spread of adaptation.
+                                                                                  Action QFormer reduces rewriting magnitude while increasing effective rank,
+rections. Fig. 11 shows that this change in rewriting structure is                lowering top-5 concentration, and increasing long-tail variance, indicating a
+accompanied by a shift in rewrite energy allocation: rather than                  less low-rank and more distributed adaptation pattern.
+broadly rewriting control and spatial tokens, Action QFormer
+allocates more rewriting to boundary tokens while preserving                      reference visual region, and constructive adaptation, assessing
+targeted adaptation on selected action-relevant tokens.                           whether action-supervised training sharpens attention toward
+                                                                                  visual evidence for object grounding.
+C. Stable Attention with Constructive Adaptation
+                                                                                  Attention stability. We quantify attention stability using two
+   Finally, we examine whether action-supervised shaping also                     phrase-level metrics. Given the top-10% high-attention visual
+changes how instruction tokens attend to visual evidence. We                      region in the action-update-blocked reference, reference-region
+therefore analyze phrase-level instruction-to-visual attention                    mass measures how much attention from the action-loss-
+maps as an observable proxy for visual grounding. For each                        exposed model remains inside this region, while center shift
+action-loss-exposed model, we compare its attention map                           measures the distance between the two attention centers.
+against the corresponding action-update-blocked reference.                        Higher reference-region mass and lower center shift indicate
+   We examine this behavior from two complementary per-                           more stable attention. Together, these metrics capture whether
+spectives: attention stability, measuring alignment with the                      attention remains on the reference visual region and whether
+                                                                                                                                                                11
+
+
+
+
+                                                                                           (a) Baseline. Full update vs. action-update-blocked reference
+
+  Fig. 11. Token rewrite share across token groups (Sec. V-B). We partition
+  tokens into boundary, control, spatial, and other groups, and report the
+  percentage share of total token rewriting assigned to each group. Boundary
+  tokens denote the special tokens inserted at the beginning and end of the
+  instruction span. Compared with the baseline, Action QFormer allocates a
+  larger fraction of rewriting to boundary tokens while reducing broad allocation
+  to control and spatial token groups. This indicates that Action QFormer shifts
+  action-loss-driven shaping toward more localized boundary-level adaptation           (b) Action QFormer. Full update vs. action-update-blocked reference
+  and reduces collateral rewriting over semantically meaningful content tokens.
+                                                                                    Fig. 13. Action QFormer can sharpen visual attention under action-
+                                                                                    loss exposure (Sec. V-C). For the instruction move towards the staircase,
+                High                              High                              we compare the full-update model with the action-update-blocked reference.
+                Risk                              Risk                              In the baseline, action-loss exposure shifts attention away from the staircase
+Center Shift
+
+
+
+
+               Region                            Region                             region toward an irrelevant visual-token region, whereas in Action QFormer
+                                                                                    it strengthens attention around the staircase region relative to its reference.
+
+                                                                                    remains grounded in task-relevant visual evidence, instruction
+                                                                                    generation is less likely to drift toward irrelevant regions or
+                Reference-region Mass Fraction    Reference-region Mass Fraction
+                                                                                    non-executable outputs.
+               (a) Direct-fusion Baseline           (b) Action QFormer
+                                                                                       Taken together, these analyses characterize the dual effect
+  Fig. 12. Action QFormer preserves more stable instruction-to-visual
+  attention (Sec. V-C). Each point compares a full-update model with its            of action-supervised representation shaping and show that
+  action-update-blocked reference counterpart. Points in the lower-right region     Action QFormer changes this process toward more structured
+  correspond to more stable attention, while the shaded upper-left region marks     adaptation. It preserves the constructive effect by strengthening
+  high-risk attention changes with low reference-region mass and large spatial
+  drift. Compared with the baseline, Action QFormer produces fewer high-risk        control-relevant distinctions such as left–right directionality,
+  cases and remains more concentrated in the stable-attention region.               while reducing the disruptive effect through more targeted
+                                                                                    token-level shaping and less broad drift over semantically
+  its spatial center remains stable.                                                meaningful content tokens. At the attention level, it reduces
+     As shown in Fig. 12, the baseline produces many high-                          high-risk attention shifts and preserves more stable instruction-
+  risk attention cases under the full-update setting, with low                      to-visual grounding, consistent with the reduced instruction
+  reference-region mass and large center shift. Action QFormer                      instability observed in closed-loop experiments.
+  shifts the distribution toward higher reference-region mass
+  and smaller center shift, indicating more stable instruction-to-                                              VI. D ISCUSSION
+  visual attention under the same full-update setting. Additional
+                                                                                       This work establishes structured representation shaping un-
+  gradient-blocking variants, reported in the Supplementary Ma-
+                                                                                    der action supervision as a mechanism-level problem in VLA
+  terials, show the same overall stability trend, although the
+                                                                                    systems. Rather than treating action supervision only as a
+  vision-frozen Action QFormer variant exhibits larger attention
+                                                                                    downstream training objective, our results suggest a different
+  shifts, suggesting that attention stability is strongest when
+                                                                                    view: when action-loss gradients propagate through inherited
+  representations are shaped jointly through visual and language-
+                                                                                    multimodal pathways, they reshape the representation space on
+  side action-loss pathways.
+                                                                                    which both language-side processing and action-side control
+  Constructive adaptation. Beyond preserving attention stabil-                      depend. This shaping is necessary for forming behaviorally
+  ity, Action QFormer sometimes produces a qualitative atten-                       consequential distinctions, such as left–right directionality, but
+  tion focus effect, where action-supervised training sharpens                      can become disruptive when applied too directly through the
+  instruction-to-visual attention toward the target object region.                  inherited multimodal pathway. Thus, action-interface design
+  We do not treat this effect as a universal mechanism, but                         should consider not only how to decode actions from multi-
+  as qualitative evidence that action-supervised shaping can                        modal representations, but also how to allow action supervi-
+  sometimes produce constructive upstream adaptation. Fig. 13                       sion to reshape those representations during action finetuning.
+  shows a representative staircase example comparing the full-                         This question reflects a deeper tension in how inherited mul-
+  update model with the action-update-blocked reference: under                      timodal representations are used. Language-side processing
+  the same action-loss exposure, the baseline remains weakly                        emphasizes semantic and contextual structure, whereas action
+  grounded with substantial attention mass away from the stair-                     generation requires stable control-relevant distinctions such as
+  case, whereas Action QFormer sharpens attention toward the                        direction, target location, and small spatial changes. Part of
+  staircase itself. This effect may help reduce instruction in-                     this tension appears in how visual evidence is attended to: the
+  stability in closed-loop experiments: when upstream attention                     regions useful for language-side grounding are not always the
+                                                                                                                                                  12
+
+
+
+same as those needed for action execution. Action QFormer al-                                ACKNOWLEDGMENTS
+leviates this tension by introducing a query-based action-facing       This work was in part supported by Shanghai Qizhi Institute.
+interface that mediates bidirectionally between the inherited       This work was also in part supported by the InnoHK initiative
+multimodal space and the action-facing representation space.        of the Innovation and Technology Commission of the Hong
+Its instruction-conditioned queries provide an action-facing        Kong Special Administrative Region Government via the
+route for accessing visual evidence, allowing control-relevant      Hong Kong Centre for Logistics Robotics. We thank Jingzhi
+visual selection to form without directly disrupting inherited      Cui, Yunfei Li, Shusheng Xu, and Chao Yu for insightful
+representations. By concentrating part of the control-relevant      discussions.
+learning pressure within this query interface, Action QFormer
+allows the remaining upstream shaping to become more se-
+lective, preserving representations and attention patterns that                                    R EFERENCES
+support language-side grounding while still permitting useful,       [1] A. Brohan et al., “RT-1: Robotics transformer for real-world control at
+and sometimes constructive, action-supervised adaptation.                scale,” in Proc. Robot. Sci. Syst., 2023.
+                                                                     [2] M. J. Kim et al., “OpenVLA: An open-source vision-language-action
+   This perspective also suggests a complementary way to                 model,” in Proc. Conf. Robot Learn., 2025.
+understand visual robustness in VLA models. Real-scene               [3] K. Black et al., “π0 : A vision-language-action flow model for general
+                                                                         robot control,” arXiv:2410.24164, 2024.
+brittleness is often treated primarily as a domain-transfer          [4] B. Zitkovich et al., “RT-2: Vision-language-action models transfer web
+problem, where changes in lighting, viewpoint, texture, or               knowledge to robotic control,” in Proc. Conf. Robot Learn., 2023.
+background appearance are expected to require more diverse           [5] K. Black et al., “π0.5 : A vision-language-action model with open-world
+                                                                         generalization,” in Proc. Conf. Robot Learn., 2025.
+real-world data. Our results suggest another factor: visual          [6] K. Pertsch et al., “FAST: Efficient action tokenization for vision-
+information must also be abstracted into the control-relevant            language-action models,” arXiv:2501.09747, 2025.
+factors needed for action. Even when the inherited multimodal        [7] Y. Wang et al., “VQ-VLA: Improving vision-language-action models
+                                                                         via scaling vector-quantized action tokenizers,” in Proc. IEEE/CVF Int.
+pathway contains useful visual evidence, it may still carry              Conf. Comput. Vis., 2025.
+appearance-level variation irrelevant to action, making the          [8] S. Ye et al., “Latent action pretraining from videos,” in Proc. Int. Conf.
+downstream policy more sensitive to real-scene visual changes.           Learn. Represent., 2025.
+                                                                     [9] Q. Bu et al., “Learning to act anywhere with task-centric latent actions,”
+Thus, improving VLA reliability may require not only richer              in Proc. Robot. Sci. Syst., 2025.
+visual data or stronger visual backbones, but also better action-   [10] Q. Li et al., “RotVLA: Rotational latent action for vision-language-
+oriented abstraction of visual information.                              action models,” arXiv:2605.13403, 2026.
+                                                                    [11] A. Radford et al., “Learning transferable visual models from natural
+                                                                         language supervision,” in Proc. Int. Conf. Mach. Learn., 2021.
+                                                                    [12] J. Li et al., “Align before fuse: Vision and language representation
+                                                                         learning with momentum distillation,” in Adv. Neural Inf. Process. Syst.,
+                      VII. C ONCLUSION                                   2021.
+                                                                    [13] ——, “BLIP: Bootstrapping language-image pre-training for unified
+                                                                         vision-language understanding and generation,” in Proc. Int. Conf. Mach.
+   We studied how action supervision reshapes inherited multi-           Learn., 2022.
+modal representations in vision-language-action models. Start-      [14] H. Liu et al., “Visual instruction tuning,” in Adv. Neural Inf. Process.
+ing from a direct-fusion baseline, we showed that action-                Syst., 2023.
+loss updates can form action-facing distinctions, but can also      [15] A. Jaegle et al., “Perceiver: General perception with iterative attention,”
+                                                                         in Proc. Int. Conf. Mach. Learn., 2021.
+induce broad upstream rewriting and unstable instruction-to-        [16] J.-B. Alayrac et al., “Flamingo: A visual language model for few-shot
+visual attention. To address this tension, we introduced Action          learning,” in Adv. Neural Inf. Process. Syst., 2022.
+QFormer, a query-based action-facing interface that mediates        [17] J. Li et al., “BLIP-2: Bootstrapping language-image pre-training with
+                                                                         frozen image encoders and large language models,” in Proc. Int. Conf.
+how inherited multimodal information is reorganized before               Mach. Learn., 2023.
+downstream action generation. Across zero-shot sim-to-real          [18] W. Dai et al., “InstructBLIP: Towards general-purpose vision-language
+navigation experiments, Action QFormer improves instruction              models with instruction tuning,” in Adv. Neural Inf. Process. Syst., 2023.
+                                                                    [19] H. Wang et al., “VEGA: Visual encoder grounding alignment
+stability, instruction-conditioned action execution, and robust-         for spatially-aware vision-language-action models,” arXiv:2605.10485,
+ness to visual variation, especially for behaviors requiring             2026.
+directional control and object grounding.                           [20] J. Lee et al., “DynaFLIP: Rethinking robotics perception via tri-modal-
+                                                                         dynamics guided representation,” arXiv:2605.30350, 2026.
+   While this work mainly uses navigation as a challenging          [21] X. Zhu et al., “HARP-VLA: Human-robot aligned representation learn-
+embodied setting for studying representation stability, future           ing for vision-language-action model,” arXiv:2605.31234, 2026.
+                                                                    [22] M. Liu et al., “LARA: Latent action representation alignment for vision-
+work can extend Action QFormer to manipulation, loco-                    language-action models,” arXiv:2606.07100, 2026.
+manipulation, and humanoid control, where contact dynamics,         [23] L. Qiu et al., “Making foresight actionable: Repurposing representation
+whole-body coordination, and high-dimensional action spaces              alignment in world action models,” arXiv:2606.12217, 2026.
+                                                                    [24] P. E. Hart, N. J. Nilsson, and B. Raphael, “A formal basis for the heuristic
+may place stronger demands on action-compatible multimodal               determination of minimum cost paths,” IEEE Trans. Syst. Sci. Cybern.,
+representations.                                                         1968.
+   More broadly, these results suggest that reliable embodied       [25] D. Fox, W. Burgard, and S. Thrun, “The dynamic window approach to
+                                                                         collision avoidance,” IEEE Robot. Autom. Mag., 1997.
+behavior depends not only on representation quality, but also       [26] D. Shah et al., “ViKiNG: Vision-based kilometer-scale navigation with
+on how multimodal information is selected, organized, and                geographic hints,” in Proc. Robot. Sci. Syst., 2022.
+reshaped under action supervision. These findings highlight         [27] ——, “GNM: A general navigation model to drive any robot,” in Proc.
+                                                                         IEEE Int. Conf. Robot. Autom., 2023.
+action-supervised representation shaping as an important lens       [28] ——, “ViNT: A foundation model for visual navigation,” in Proc. Conf.
+for understanding and improving robustness in VLA systems.               Robot Learn., 2023.
+                                                                                 13
+
+
+
+[29] A. Sridhar et al., “NoMaD: Goal masked diffusion policies for naviga-
+     tion and exploration,” arXiv:2310.07896, 2023.
+[30] D. Shah et al., “LM-Nav: Robotic navigation with large pre-trained
+     models of language, vision, and action,” in Proc. Conf. Robot Learn.,
+     2022.
+[31] J. Zhang et al., “NaVid: Video-based vlm plans the next step for vision-
+     and-language navigation,” in Proc. Robot. Sci. Syst., 2024.
+[32] ——, “Uni-NaVid: A video-based vision-language-action model for
+     unifying embodied navigation tasks,” in Proc. Robot. Sci. Syst., 2025.
+[33] ——, “Embodied navigation foundation model,” arXiv:2509.12129,
+     2025.
+[34] A. Bar et al., “Navigation world models,” in Proc. IEEE/CVF Conf.
+     Comput. Vis. Pattern Recognit., 2025.
+[35] M. Savva et al., “Habitat: A platform for embodied ai research,” in Proc.
+     IEEE/CVF Int. Conf. Comput. Vis., 2019, pp. 9339–9347.
+[36] D. Batra et al., “ObjectNav revisited: On evaluation of embodied agents
+     navigating to objects,” in Proc. IEEE/CVF Conf. Comput. Vis. Pattern
+     Recognit., 2020, pp. 6675–6684.
+                                                                                                                                           14
+
+
+
+          S UPPLEMENTARY M ATERIAL OVERVIEW                          C. Language Supervision and Data Curation Principle
+   This supplementary material provides additional implemen-            In addition to action supervision, each timestamp is paired
+tation, experimental, and mechanistic analysis details. Sec-         with a GPT-generated navigation instruction. The instruction
+tion A describes training and implementation details. Section B      labels are generated from two inputs: (1) the current single-
+provides additional experimental settings and results. Sec-          frame observation image, and (2) the corresponding future
+tion C reports additional representation and attention analyses      8-step action trajectory in the local frame. The prompt is
+supporting the mechanism-level findings in the main paper.           manually designed to produce exactly one concise navigation
+                                                                     command rather than free-form text.
+                      A PPENDIX A                                       The GPT-based instruction generation prompt contains three
+         T RAINING AND DATA C URATION D ETAILS                       key components: (1) a role definition that asks the model to
+                                                                     translate the current view and future trajectory into a single in-
+A. Training Pipeline and Model Comparison
+                                                                     door navigation command, (2) explicit trajectory-interpretation
+   All main experiments use the same instruction-training            rules that map local-frame position changes to motion se-
+setup and the same ObjectNav training dataset. At a high             mantics such as turning, veering, backward movement, and
+level, the training pipeline consists of three stages: a pre-        stopping, and (3) a constrained output space consisting of two
+trained vision-language backbone first produces inherited mul-       template families: object-oriented templates and non-object-
+timodal representations from the current observation and task-       oriented templates.
+conditioned language input; an intermediate interface module            The object-oriented templates encourage the instruction to
+reorganizes these representations into a compact action-facing       ground motion in visible landmarks, pathways, intersections,
+representation; and a downstream policy head predicts the fu-        or doorways whenever a near-field and unambiguous goal
+ture navigation trajectory from the projected interface output.      is available. The non-object-oriented templates are used for
+   In the main experiments, the pretrained multimodal back-          trajectory patterns better described by pure motion seman-
+bone is Qwen2.5-VL. The baseline and Action QFormer                  tics, such as sharp turns, arcs, turn-around behavior, or stop
+differ only in the intermediate interface module: the direct-        commands. This constrained generation process is not fully
+fusion baseline uses a self-attention-pooling-based latent-fuser     deterministic: multiple valid template instantiations and lexical
+module to fuse inherited multimodal representations into an          realizations are allowed for similar trajectories. As a result,
+action-facing latent, whereas Action QFormer replaces this           the generated labels retain controlled linguistic diversity while
+module with a lightweight query-based interface for reorga-          remaining grounded, concise, and geometrically consistent
+nizing inherited image-side and instruction-side features. The       with the future control target.
+projector, action target, and downstream policy architecture are          Input: current observation image + future 8-step local-
+otherwise kept unchanged across the main comparison.                      frame trajectory.
+   The following subsections provide the main implementation              Output: exactly one concise navigation instruction.
+details of this pipeline, including the training data source, lan-        Template families:
+                                                                            • FORMAT_OBJECT: move towards {goal}, follow
+guage supervision, sequence construction, parsing procedure,
+                                                                              {pathway}, go through {doorway}, go around
+joint language–action supervision, and optimization settings.                 {obstacle}, ...
+                                                                            • FORMAT_NO_OBJECT: move forward, veer slightly
+                                                                              left/right, turn left/right, make a sharp left/right turn,
+B. Training Data Source and Action Representation
+                                                                              arc left/right, turn around, stop
+   All main experiments are trained on the same ObjectNav
+training dataset. We do not mix in additional navigation
+datasets for the main comparison. Each training sample is con-       D. Sequence Construction, Parsing, and Joint Training
+structed at the timestamp level and contains three components:          This subsection explains how each timestamp-level sam-
+(1) the current observation image, (2) the future action label       ple is converted into a multimodal training sequence, how
+associated with that timestamp, and (3) a GPT-generated nav-         the parsed representations used by the intermediate interface
+igation instruction used for instruction-generation supervision.     module are extracted, and how language-side and action-side
+   Importantly, the main training setting uses only the current      supervision are jointly applied during training.
+single-frame observation and does not include historical visual         1) Sequence Construction and Data Flow: Each training
+context. This design keeps the representation problem focused:       sample is organized around a single current-frame observation,
+the model must organize the currently available visual and           together with its paired language supervision and future action
+language information into a form suitable for downstream             target. The raw language input is first formatted through a chat-
+control, without relying on temporal context accumulation.           style template that encodes the navigation task context, while
+   The downstream action supervision is given as a future nav-       the image input is processed jointly through the pretrained
+igation trajectory represented in the local coordinate frame of      multimodal backbone. When special-token output mode is
+the current timestamp. For each sample, the model predicts the       used, we additionally insert a short generation bridge before
+next 8 future action steps. Each individual action step is repre-    the target text to stabilize decoding into the structured instruc-
+sented by a 4-dimensional tuple (x, y, yawdx , yawdy ), where        tion format.
+(x, y) denotes the local relative position and (yawdx , yawdy )         If language targets are present, they are appended in teacher-
+denotes the heading direction in vector form.                        forcing style, with loss applied only on the supervised output
+                                                                                                                                 15
+
+
+
+span rather than on the prompt prefix. In parallel, action-side    a separate weight.
+supervision is attached as a separate numeric target constructed      The total training objective is controlled by a scalar
+from a fixed-horizon future trajectory segment in the local        language-loss weight r         ∈     [0, 1], implemented as
+coordinate frame of the current timestamp. For each sample,        r_loss_weight in the model. Let Llang denote the
+future positions are transformed into local-frame action targets   language-side loss after optional format and margin terms are
+and paired with a validity mask that distinguishes real future     added, and let Laction denote the action-side loss returned by
+steps from padded terminal repetitions near the end of a           the diffusion policy head. The overall loss is then
+trajectory. This design keeps sequence construction unified at                  
+the sample level while preserving a clean separation between                    Laction ,
+                                                                                                              r = 0,
+language-side and action-side supervision.                                 L = Llang ,                         r = 1,
+                                                                                
+   2) Instruction Parsing and Representation Extraction:                          (1 − r) Laction + r Llang , 0 < r < 1.
+                                                                                
+After the multimodal backbone produces token-level hidden
+                                                                   This implementation differs slightly from a generic weighted
+states, we parse them into the components used by the
+                                                                   sum: when r = 1, the action branch forward pass is skipped
+intermediate interface module before action generation. In
+                                                                   entirely and training becomes language-only; when r = 0, the
+the main training setup, this parsing uses the special-token
+                                                                   language-side loss is ignored and training becomes action-
+branch exclusively. Concretely, the sequence contains explicit
+                                                                   only; and when 0 < r < 1, both branches are evaluated
+boundary markers for instruction and visual spans, so that
+                                                                   and combined as a convex interpolation. This design makes
+the relevant components can be extracted through a fixed and
+                                                                   the coupling between language-side supervision and action-
+reproducible parsing rule.
+                                                                   side supervision explicit, while still allowing controlled ex-
+   The parser extracts instruction-side and image-side token
+                                                                   periments in which one branch is emphasized, suppressed, or
+groups and packages them into a standardized parse_pack.
+                                                                   scheduled over training.
+Both the baseline latent fuser and Action QFormer con-
+                                                                      4) Loss Weight Scheduling: In addition to standard
+sume this same parsed representation interface rather than re-
+                                                                   optimizer-side scheduling, our training pipeline also supports
+implementing span parsing internally. As a result, differences
+                                                                   loss-side scheduling for balancing language-side and action-
+between the direct-fusion baseline and Action QFormer arise
+                                                                   side supervision over training. In the main instruction-training
+from how they reorganize inherited multimodal information
+                                                                   setup, the language-side loss weight is dynamically updated
+after parsing, rather than from different token-selection logic.
+                                                                   during optimization rather than kept fixed. Concretely, the
+   The parser also supports selective gradient detachment for
+                                                                   scalar r_loss_weight, which controls the interpolation
+chosen components, such as instruction-side or image-side
+                                                                   between language-side and action-side supervision in the joint
+representations. These options are used in the gradient-routing
+                                                                   objective, is updated by a dedicated training callback as a
+analyses to control which parsed components remain trainable
+                                                                   function of the current global step. The scheduling frame-
+under action-loss updates while keeping the parsing procedure
+                                                                   work is defined over the total number of optimization steps
+itself fixed.
+                                                                   and supports both linear and sigmoid-shaped schedules. This
+   3) Joint Language and Action Supervision: Training com-
+                                                                   makes it possible to gradually shift the effective emphasis
+bines language-side supervision and action-side supervision in
+                                                                   between structured instruction generation and downstream
+a single forward pass. On the language side, the pretrained
+                                                                   action learning during training, rather than assuming that a
+multimodal backbone is trained under teacher forcing to
+                                                                   single fixed weighting is optimal throughout.
+generate the structured instruction target sequence, with loss
+                                                                      The same callback mechanism is also available for auxil-
+computed only on supervised target positions after the prompt
+                                                                   iary language-side terms. In particular, the codebase supports
+prefix. In our implementation, the language-side loss is taken
+                                                                   dynamic scheduling for the overall format-loss weight, the
+directly from the backbone, and can be further augmented
+                                                                   start/end token weights used inside the format-focused loss,
+by optional format-focused and margin-based terms. When
+                                                                   and the weight and margin value of the start-token margin
+special-token parsing is used, the format term upweights the
+                                                                   objective. In the main instruction-training configuration, these
+instruction-boundary tokens, while the margin term explicitly
+                                                                   scheduling options are enabled together with language-loss
+stabilizes the prediction of the instruction-start token against
+                                                                   scheduling, so that the contribution of format-sensitive super-
+competing vocabulary items.
+                                                                   vision can evolve with training progress rather than remaining
+   On the action side, the intermediate interface module first
+                                                                   static. All such updates are applied directly on the model
+converts the parsed multimodal hidden states into a compact
+                                                                   at step boundaries through training callbacks, which keeps
+action-facing representation, which is then projected into the
+                                                                   the optimization recipe synchronized across the direct-fusion
+policy input space and passed to the downstream diffusion
+                                                                   baseline and Action QFormer variants.
+policy head. The diffusion policy head is trained with a de-
+noising objective over future actions: Gaussian noise is added
+to the ground-truth future trajectory, the model predicts the      E. Optimization Details
+corresponding noise residual, and the resulting per-step mean-        Within the common training framework described above,
+squared error is averaged under the valid-step action mask.        all main experiments use the same optimizer and training
+When progress-to-go supervision is enabled, an additional          schedule family across the direct-fusion baseline and Action
+masked regression loss is applied to a lightweight progress        QFormer variants. In particular, the main runs share the
+head, and this term is added to the action denoising loss with     same learning rate, scheduler type, warmup ratio, gradient
+                                                                                                                                   16
+
+
+
+                          TABLE IV                                                          A PPENDIX B
+ M AIN TRAINING HYPERPARAMETERS FOR THE INSTRUCTION - TRAINING                         E XPERIMENT D ETAILS
+                           SETUP.
+                                                                     The raw counts corresponding to the percentage results in
+    Hyperparameter                          Value                  Sec. IV-B are listed in Table V.
+    Training dataset              ObjectNav training dataset
+    Observation context           Single current frame only
+    Image resizing                  max pixels = 200,000
+                                                                   A. Probe Scenes and Evaluation Rules for Action Generation
+    Action horizon                          8 steps                   For the action-generation probes in the main text, we use
+    Action representation           (x, y, yawdx , yawdy )         representative real-scene observations and evaluate repeated
+    Scheduler                               Cosine
+                                                                   stochastic action predictions under fixed instructions. Each
+    Warmup ratio                             0.05
+    Learning rate                          2 × 10−4                image–instruction pair is sampled 8 times, and we report three
+    Max grad norm                             0.5                  complementary metrics: correctness, collision, and quality.
+    Max training steps                       6000                  Correctness measures whether the predicted trajectory satisfies
+    Direct-fusion batch setup               16 × 4                 the intended control behavior of the instruction; collision
+    Action QFormer batch setup               8×8                   measures whether the trajectory enters scene-specific collision-
+    Attention implementation          FlashAttention 2
+                                                                   prone regions; and quality measures trajectory smoothness.
+                                                                      We use three probe families. For directional control, the
+                                                                   probe scene contains a bifurcating layout with a right-front
+clipping rule, and overall training horizon. This keeps the        curved wall, and correctness is defined by whether the tra-
+optimization setting aligned across model families, so that the    jectory commits to the intended left/right side under the given
+main comparison remains focused on representation structure        directional instruction. For object grounding, the probe scenes
+rather than training recipe differences.                           contain visually specified targets embedded in cluttered indoor
+   Concretely, we use cosine learning-rate scheduling with         layouts, and correctness is defined by whether the trajectory
+warmup ratio 0.05, gradient clipping with max norm 0.5, a          reaches a manually specified endpoint region corresponding
+learning rate of 2×10−4 , and a maximum of 6000 optimization       to the target object. For motion templates, the probe scene
+steps. Input images are resized with a maximum pixel budget        is a hallway view, and correctness is defined by whether the
+of 200,000. The direct-fusion baseline and Action QFormer          predicted trajectory exhibits the intended template-compatible
+models use different batch configurations due to their different   forward traversal behavior.
+memory footprints, while keeping the same overall optimiza-           Collision is evaluated using manually specified forbidden
+tion family and training horizon. For the main direct-fusion       regions that approximate wall-adjacent or obstacle-prone areas
+baseline, we use a batch configuration of 16 × 4. For the          in each probe scene. Quality is measured by a trajectory
+main Action QFormer run, we use a batch configuration of           smoothness score, averaged across repeated samples for each
+8 × 8. The two batch configurations have the same effective        image–instruction pair.
+batch size. In both cases, the downstream policy architecture
+and action supervision remain matched. The main training
+hyperparameters are summarized in Table IV.                        B. Additional Interface Ablations on Action Generation
+                                                                      Beyond the direct-fusion baseline and the full Action
+                                                                   QFormer, we evaluate two capacity-reduced variants: a
+F. Action QFormer Configuration                                    reduced-depth Action QFormer and a reduced-query Action
+                                                                   QFormer. This allows us to test whether the action-generation
+   Unless otherwise noted, Action QFormer uses a fixed de-         gain comes merely from inserting a structured intermediate
+fault configuration across the main experiments. Inspired by       interface, or whether the capacity of that interface also matters
+the query-interface design of BLIP-2 and InstructBLIP, the         for organizing inherited multimodal information into an action-
+module uses a set of learnable query tokens that interact          compatible representation. The corresponding qualitative com-
+with instruction-side representations through self-attention and   parisons are shown in Fig. 14.
+extract control-relevant visual evidence from inherited image-        Both reduced variants already improve over the direct-fusion
+side features through cross-attention [18]. The updated queries    baseline on the more diagnostic probe families, indicating that
+form compact action-facing representations that are passed         the benefit of Action QFormer does not depend on a single
+to the downstream policy head together with the instruction        full-capacity configuration. At the same time, the full Action
+representation.                                                    QFormer remains strongest overall, with the clearest advantage
+   In the main configuration, Action QFormer uses 16 learn-        on directional control and a consistent competitive edge on
+able query tokens and 4 transformer layers. We do not per-         object grounding. This suggests that a structured action-facing
+form extensive module-specific hyperparameter tuning. The          interface is already beneficial, but that interface capacity still
+downstream projector, policy head, action target, and training     affects how reliably control-relevant information is organized.
+objective are kept matched with the direct-fusion baseline.           The contrast between the two reduced variants is also
+This choice keeps the comparison focused on the role of            informative. Both reductions retain part of the gain over the
+the structured action-facing interface itself rather than on       direct-fusion baseline, but the reduced-query variant remains
+aggressive architectural search.                                   consistently stronger than the reduced-depth variant, especially
+                                                                                                                                                                 17
+
+
+
+                                                                        TABLE V
+                              R AW- COUNT CLOSED - LOOP SIM - TO - REAL RESULTS IN CHALLENGING O BJECT NAV SCENARIOS .
+
+                                                                          Without provided instructions                         Given instructions
+                                                        Instruction Instruction  Action    Number of      Task    Number of      Task
+                   Model               Scenario
+                                                        Direction ↑ OOD Rate ↓ Direction ↑ Collisions ↓ Success ↑ Collisions ↓ Success ↑
+                                 Fridge (far target)       49/61         61/61          40/61           4            2/8           2            6/8
+                                 Door (obstacle)           27/36         35/36          26/36           14           2/8           14           7/8
+              Direct Fusion
+                                 Chair (turn-around)       13/28         28/28          15/28            5           2/8           6            2/8
+                                 Table (sharp turn)        11/48         48/48           8/48            6           0/8           5            2/8
+                                 Fridge (far target)       70/73          0/73          68/73           5            3/8           0            8/8
+                                 Door (obstacle)           41/42          0/42          38/42           12           5/8           3            7/8
+             Action QFormer
+                                 Chair (turn-around)       20/34          0/34          28/34            4           5/8           1            7/8
+                                 Table (sharp turn)        57/57          0/57          53/57            3           5/8           1            7/8
+
+
+
+
+                       (a) Testing scenario: directional control. Example instructions: “make a left turn” and “make a right turn”.
+
+
+
+
+                       (b) Testing scenario: object grounding. Example instruction: “move towards the whiteboard in the corner”.
+
+
+
+
+                                  (c) Testing scenario: motion template. Example instruction: “go through the hallway”.
+Fig. 14. Representative qualitative comparisons for interface-capacity ablations under fixed-instruction action generation. Each row shows one testing
+scenario, with the third-person real scene on the left and action predictions from the same first-person observation and fixed instruction in the remaining columns.
+Prediction columns compare the Direct-fusion baseline, Reduced-depth Action QFormer, Reduced-query Action QFormer, and Action QFormer. Thin
+trajectories show multiple inference samples from the same model, and the bold trajectory shows the selected action trajectory used for comparison.
+
+
+on directional control. This suggests that, in the current                         Thus, the reported changes should be read as action-loss-
+navigation probe setting, the benefit of Action QFormer is                         induced changes relative to a matched reference, not as com-
+more sensitive to depth reduction than to query reduction.                         parisons between unrelated models.
+                                                                                      The appendix follows the same structure as the main
+                        A PPENDIX C                                                mechanistic analysis. We first define the gradient-routing
+             A DDITIONAL M ECHANISTIC A NALYSIS                                    settings used for the architecture-matched comparisons. We
+   This appendix provides additional details and supporting                        then provide additional evidence for action-facing directional
+evidence for the mechanistic analyses in Sec. V. The goal is                       distinctions, upstream token rewriting and targeted adapta-
+to complement the main results rather than introduce separate                      tion, and instruction-to-visual attention stability. Together,
+model families or new evaluation settings. All analyses use                        these analyses support the main claim that Action QFormer
+the same two interface families studied in the main text: the                      changes where and how action supervision reshapes inherited
+direct-fusion baseline and Action QFormer.                                         multimodal representations: it preserves constructive action-
+   We organize the analyses around how action supervision                          supervised adaptation while reducing broad upstream rewriting
+interacts with the inherited multimodal pathway. For repre-                        and instruction-to-visual attention shifts.
+sentation and attention comparisons, each action-loss-exposed
+setting is compared against an architecture-matched action-                        A. Gradient-Routing Settings
+update-blocked reference, in which action-loss gradients are                          Our mechanistic analyses are organized around how action-
+prevented from updating the inherited multimodal pathway.                          loss gradients interact with the inherited multimodal pathway.
+                                                                                                                                   18
+
+
+
+The goal is not only to determine whether representations          which measures changes induced by joint action-loss expo-
+change under action supervision, but also to characterize how      sure of the language-side and vision-side pathways. These
+they change: whether behaviorally consequential distinctions       comparisons should be interpreted as changes relative to an
+become clearer, whether upstream token rewriting is broad or       action-update-blocked reference, not as comparisons between
+targeted, and whether instruction-to-visual attention remains      independent model families.
+stable.                                                               4) Use in Mechanistic Analyses: Directional-distinction
+   1) Interface Families: We compare two interface fami-           analysis uses these settings to test whether behaviorally conse-
+lies throughout the mechanistic analyses. The direct-fusion        quential distinctions are formed in the action-facing represen-
+baseline uses the minimal shared-context interface described       tation. Token-wise rewriting and rewriting-subspace analyses
+in Sec. III, in which inherited image-side and instruction-        examine how strongly the inherited pathway is rewritten and
+side representations are fused directly into an action-facing      whether that rewriting is broad or targeted. Attention analyses
+representation. The Action QFormer family replaces direct          examine whether stronger action-supervised shaping desta-
+fusion with a query-based action-facing interface that reorga-     bilizes or preserves instruction-to-visual attention. Together,
+nizes inherited image-side and instruction-side representations    these settings provide a controlled framework for studying how
+into an action-facing representation before downstream policy      Action QFormer changes where and how action supervision
+prediction. Across all variants, both families share the same      reshapes the inherited multimodal pathway.
+pretrained Qwen2.5-VL backbone, downstream action target,
+and policy head; the main architectural difference lies in how
+                                                                   B. Additional Evidence for Upstream Token Rewriting and
+the action-facing representation is formed.
+                                                                   Targeted Adaptation
+   2) Gradient-Routing Settings: Within each interface family,
+we use four descriptive gradient-routing settings. These set-         The main text presents the primary evidence for upstream
+tings differ in which parts of the inherited multimodal pathway    token rewriting through rewriting magnitude, active-dimension
+are exposed to action-loss gradients.                              fraction, and focused control- and spatial-token visualizations.
+   Action-update-blocked prevents action-loss gradients from       Here we provide complementary numerical summaries and
+updating the inherited multimodal pathway and serves as the        structural statistics for the same contrast between broad up-
+reference setting for representation and attention comparisons.    stream rewriting and targeted adaptation. These results are
+Vision-encoder-frozen keeps the vision encoder fixed while         intended to support, rather than replace, the main visual analy-
+allowing action-loss gradients to update the language backbone     ses: they summarize token-level rewriting, rewriting-subspace
+and downstream interface modules. Language-backbone-               statistics, rewrite-share allocation across token groups, and
+blocked prevents action-loss gradients from updating the           active-dimension usage under the same architecture-matched
+language backbone while allowing the vision encoder and            gradient-routing comparisons.
+downstream interface modules to remain exposed to the action          The goal of this section is to distinguish broad upstream
+objective. Full-update allows action-loss gradients to update      rewriting from targeted adaptation. Broad upstream rewriting
+both the language-side and vision-side pathways, correspond-       refers to action-loss-induced changes that spread across many
+ing to the strongest action-loss exposure among the settings       tokens and hidden dimensions in the inherited multimodal
+considered.                                                        pathway. Targeted adaptation refers to a more selective pattern
+   Together, these settings let us separate two effects: whether   in which rewriting is less broadly distributed, while meaning-
+action-loss exposure is needed to form behaviorally con-           ful changes remain concentrated on selected control and spatial
+sequential distinctions, and whether stronger exposure also        tokens or limited representation subspaces.
+induces broader upstream rewriting or less stable instruction-        1) Token-Level Rewriting Statistics: We first provide com-
+to-visual attention.                                               pact statistics that quantify the upstream token-rewriting trends
+   3) Pairwise Comparison Protocol: Mechanistic quantities         summarized in the main text. These statistics are supporting
+such as token-wise rewriting, rewriting-subspace statistics, and   measurements: they are not intended to replace the token-level
+attention drift are computed by comparing each action-loss-        visualizations in Sec. V-B, but instead provide complementary
+exposed setting against the action-update-blocked reference        comparisons across gradient-routing settings.
+within the same interface family. Each comparison therefore           Table VI reports token-level cosine-similarity and L2 -
+measures how a given gradient-routing setting changes rep-         distance statistics relative to the architecture-matched ref-
+resentations or attention relative to an architecture-matched      erence. Across comparable gradient-routing settings, Action
+reference in which upstream action-loss updates are blocked.       QFormer generally reduces token-level L2 rewriting magni-
+   We consider three main comparisons: language-backbone-          tude relative to the direct-fusion baseline, with the clearest gap
+blocked vs. action-update-blocked, which measures changes          appearing in the full-update comparison. This is consistent
+induced when the language backbone is protected while the          with the main-text heatmaps, where the direct-fusion baseline
+vision encoder and downstream interface modules remain             exhibits stronger broad upstream rewriting under the strongest
+trainable under the action objective; vision-encoder-frozen        action-loss exposure setting.
+vs. action-update-blocked, which measures changes induced             Table VII summarizes the subspace structure of token
+when the vision encoder is fixed while the language backbone       rewriting, including mean-squared drift energy, effective rank,
+and downstream interface modules remain trainable under the        and top-k variance concentration. In the full-update compari-
+action objective; and full-update vs. action-update-blocked,       son, Action QFormer exhibits lower mean-squared drift energy
+                                                                                                                                                                             19
+
+
+
+                               TABLE VI                                                                            TABLE VIII
+   T OKEN - LEVEL COSINE - SIMILARITY AND L2 - DISTANCE STATISTICS                                 T OKEN REWRITE SHARE ACROSS TOKEN GROUPS .
+        ACROSS PAIRWISE GRADIENT- ROUTING COMPARISONS .
+                                                                                            Interface          Comparison      Boundary    Control   Spatial   Others
+ Interface          Comparison      Cosine Mean     Cosine Std   L2 Mean    L2 Std
+                                                                                            Direct-fusion      Vision frozen       0.425     0.285    0.191    0.099
+ Direct-fusion      Vision frozen       0.934         0.089       65.76      38.15          Direct-fusion      Lang. blocked       0.540     0.161    0.139    0.160
+ Direct-fusion      Lang. blocked       0.946         0.067       74.17      29.32          Direct-fusion      Full update         0.423     0.269    0.168    0.139
+ Direct-fusion      Full update         0.913         0.083       93.90      33.82
+                                                                                            Action QFormer     Vision frozen       0.699     0.125    0.095    0.081
+ Action QFormer     Vision frozen       0.940         0.089       56.80      40.41          Action QFormer     Lang. blocked       0.606     0.158    0.104    0.133
+ Action QFormer     Lang. blocked       0.950         0.060       57.03      34.03          Action QFormer     Full update         0.717     0.110    0.083    0.090
+ Action QFormer     Full update         0.913         0.128       75.18      52.15     Note: All comparisons are computed relative to the action-update-blocked reference
+ Note: All comparisons are computed relative to the action-update-blocked reference    within the same interface family. Each row reports the fraction of total token-wise
+ within the same interface family.                                                     rewriting allocated to boundary, control, spatial, and other token groups.
+                                TABLE VII
+             R EWRITING - SUBSPACE STATISTICS ACROSS PAIRWISE                            Fig. 15(a) reports token-level active-dimension fractions
+                    GRADIENT- ROUTING COMPARISONS .
+                                                                                      across gradient-routing settings. This view aggregates the
+ Interface         Comparison       Mean Sq. Eff. Rank Top-5 Var. Top-10 Var.         token-level active-dimension patterns into sorted curves. The
+ Direct-fusion     Vision frozen    5779.49       22.86       0.697        0.765      direct-fusion baseline remains higher across much of the
+ Direct-fusion     Lang. blocked    6360.11       33.02       0.646        0.721
+ Direct-fusion     Full update      9960.78       29.41       0.666        0.747
+                                                                                      curve, indicating that many tokens are rewritten along a
+                                                                                      larger number of hidden dimensions. Action QFormer yields
+ Action QFormer Vision frozen       4859.10       40.08       0.592        0.674
+ Action QFormer Lang. blocked       4410.74       36.83       0.588        0.664      noticeably lower curves, supporting the interpretation that per-
+ Action QFormer Full update         8371.07       65.68       0.521        0.610      token rewriting is more selective.
+ Note: All comparisons are computed relative to the action-update-blocked reference      Fig. 15(b) presents the complementary hidden-dimension
+ within the same interface family.
+                                                                                      perspective. Rather than asking how many dimensions rewrite
+than the direct-fusion baseline, together with substantially                          each token, it measures how many tokens are affected by each
+higher effective rank and lower top-k variance concentration.                         hidden dimension. In the direct-fusion baseline, a subset of di-
+This suggests that action-loss-induced rewriting under Action                         mensions becomes active across many tokens, consistent with
+QFormer is less dominated by a small number of principal                              more globally shared rewriting directions. Action QFormer
+directions. We treat these rewriting-subspace statistics as sup-                      yields lower and more compact curves, indicating that most
+porting evidence for the token-level analysis: they reinforce                         hidden dimensions affect fewer tokens.
+the view that direct fusion produces more directionally concen-                          Together, these views suggest that Action QFormer makes
+trated upstream rewriting, whereas Action QFormer distributes                         action-loss-induced rewriting more selective from both the
+the remaining rewriting across a less concentrated subspace.                          token and hidden-dimension perspectives. They provide ad-
+   2) Token Rewrite Share Across Token Groups: We further                             ditional evidence that action-supervised shaping is expressed
+analyze how total token-level rewriting is allocated across                           through more localized token–dimension patterns rather than
+token groups. We partition tokens into boundary, control,                             broad rewriting across the inherited multimodal pathway.
+spatial, and other groups, and report each group’s share of
+the total rewriting budget in Table VIII. This group-level view
+                                                                                      C. Additional Evidence for Instruction-to-Visual Attention
+complements the focused control- and spatial-token visualiza-
+tion in Sec. V-B: rather than showing which individual tokens                            Sec. V-C reports the main instruction-to-visual attention
+are rewritten, it asks how total rewriting is distributed across                      analysis under the full-update comparison. Here we provide
+semantically meaningful token groups.                                                 complementary evidence, including the full gradient-exposure
+   In the full-update comparison, the direct-fusion baseline                          sweep, visual-source variants, representative attention-focus
+places a substantially larger fraction of the total rewriting                         cases, selected per-head examples, and auxiliary alignment
+budget on control and spatial token groups. Action QFormer                            statistics. The goal is to characterize two aspects of instruction-
+reduces this group-level allocation, while the focused heatmap                        to-visual attention under action supervision: attention stability,
+in the main text shows that meaningful rewriting is still                             where Action QFormer reduces high-risk attention shifts, and
+retained on a smaller subset of key control and spatial to-                           constructive adaptation, a qualitative and non-universal effect
+kens. Together, these results support the targeted-adaptation                         in which action-loss exposure sharpens attention toward task-
+interpretation: Action QFormer does not eliminate action-loss-                        relevant visual regions in representative cases.
+induced rewriting, but reduces broad upstream rewriting while                            Unless otherwise noted, attention is analyzed at the phrase
+preserving more focused adaptation.                                                   level using maps from instruction tokens to visual tokens.
+   3) Active-Dimension Structure: The preceding analyses                              Each action-loss-exposed setting is compared against its
+show that Action QFormer reduces broad upstream token                                 architecture-matched action-update-blocked reference, allow-
+rewriting. We next ask whether this selectivity is also reflected                     ing us to measure how closely its attention remains aligned
+in how rewritten dimensions are organized. Rather than exam-                          with the corresponding reference pattern.
+ining individual token-level heatmaps, we summarize active-                              1) Full Attention-Stability Results Across Gradient-Routing
+dimension usage from two complementary perspectives: how                              Settings: The main text focuses on the full-update comparison,
+many hidden dimensions change for each token, and how many                            where attention drift in the direct-fusion baseline is most
+tokens are affected by each hidden dimension.                                         pronounced. In Fig. 16, we report the full gradient-exposure
+                                                                                                                                                  20
+
+
+
+                                                                                  interface modules to adapt jointly; this is also the setting in
+                                                                                  which baseline attention drift becomes most severe and Action
+                                                                                  QFormer exhibits its clearest attention-stability advantage. We
+                                                                                  treat this explanation as an interpretive hypothesis rather than
+                                                                                  a definitive causal claim, and use the full sweep primarily to
+                                                                                  contextualize the full-update comparison in the main text.
+                                                                                     2) Additional Attention Statistics: To complement the joint
+                                                                                  reference-region-mass and center-shift analysis, we also report
+                                                                                  auxiliary attention-alignment statistics. These statistics provide
+                                                                                  additional views of how closely an action-loss-exposed atten-
+                                                                                  tion map remains aligned with its action-update-blocked refer-
+                                                                                  ence. Specifically, we measure global heatmap correlation, top-
+                                                                                  region intersection-over-union, top-region recall with respect
+                (a) Token-level active-dimension fraction.                        to the reference, and attention mass outside the reference
+                                                                                  region, as reported in Figs. 17 and 18.
+                                                                                     3) Distributional Attention Statistics: Fig. 18 provides
+                                                                                  complementary distributional views of attention stability
+                                                                                  across the full set of phrase-level comparisons. Unlike the
+                                                                                  joint scatter plots, which expose relationships between pairs
+                                                                                  of attention metrics, the cumulative distributions summarize
+                                                                                  how frequently different levels of alignment and spatial drift
+                                                                                  occur within each interface and gradient-routing setting.
+                                                                                     Across the auxiliary metrics, Action QFormer generally
+                                                                                  shifts the distributions toward smaller center shifts, stronger
+                                                                                  reference-pattern similarity, higher reference-region mass,
+                                                                                  lower non-reference-region mass, and greater overlap with
+                                                                                  high-response regions in the action-update-blocked reference.
+               (b) Hidden-dimension active-token fraction.
+                                                                                  These differences are most pronounced in the full-update
+Fig. 15. Active-dimension structure across gradient-routing comparisons.          comparison, consistent with the joint reference-region-mass
+(a) Token-level active-dimension fraction measures how many hidden dimen-
+sions are significantly rewritten per token; lower curves indicate sparser per-
+                                                                                  and center-shift analysis in Fig. 16. The remaining gradient-
+token rewriting. (b) Hidden-dimension active-token fraction measures how          routing settings provide context for how the distribution of
+many tokens are significantly affected by each hidden dimension; lower curves     attention changes varies with action-loss exposure.
+indicate that most hidden dimensions affect fewer tokens.
+                                                                                     4) Additional Attention-Focus Examples: We also include
+                                                                                  representative attention-focus examples in Fig. 19. These ex-
+sweep together with two Action QFormer visual-source vari-                        amples provide qualitative illustrations that complement the
+ants. The contrast is clearest in the full-update comparison; the                 staircase example in the main text. They cover three regimes:
+remaining settings provide context for how attention changes                      severe baseline attention collapse, baseline attention drift away
+vary with action-loss exposure rather than indicating a strictly                  from the relevant region, and a partially aligned case in which
+monotonic trend.                                                                  both interfaces retain task-relevant attention. Because these
+   We use the same phrase-level attention-stability metrics de-                   examples are selectively chosen, they should be interpreted
+fined in Sec. V-C: reference-region mass and center shift, with                   as illustrations of possible attention behaviors rather than as
+low reference-region mass and large center shift indicating                       distributional evidence.
+a high-risk attention change. Fig. 16 shows the full joint                           5) Additional Per-Head Attention-Focus Visualization: The
+distribution. In the full-update comparison, the direct-fusion                    per-head visualization in Fig. 20 shows that the all-head
+baseline produces many high-risk cases with low reference-                        average can hide substantial head-level heterogeneity. Some
+region mass and large spatial drift. Action QFormer shifts the                    baseline heads exhibit constructive adaptation by concentrating
+distribution toward higher reference-region mass and smaller                      attention near the target object, whereas other heads shift
+center shifts, and this qualitative trend remains visible for both                toward irrelevant visual-token regions. For the selected heads
+variants.                                                                         exhibiting severe baseline shifts, Action QFormer maintains a
+   The vision-encoder-frozen comparison shows a more nu-                          more stable target-oriented attention pattern. These examples
+anced pattern: both Action QFormer variants still contain a                       therefore illustrate both that the baseline is not uniformly
+noticeable number of shifted or collapsed attention cases. One                    collapsed across all heads and that Action QFormer can
+possible explanation is that exposing the language backbone                       reduce severe head-level shifts while preserving task-relevant
+and downstream interface modules to action-loss gradients                         attention. We treat this visualization as qualitative evidence of
+while keeping the vision encoder fixed may create a mismatch                      head-level heterogeneity rather than as a general claim about
+between the updated instruction-side pathway and fixed visual                     specialization across all attention heads.
+representations. By contrast, the full-update comparison al-
+lows the language backbone, vision encoder, and downstream
+                                                                                                                                                         21
+
+
+
+
+Fig. 16. Full joint distribution of reference-region mass and spatial drift. The x-axis measures reference-region mass, defined as the fraction of attention
+from the action-loss-exposed setting that remains inside the action-update-blocked reference’s top-10% attention region. The y-axis measures center shift,
+defined as the center-of-mass distance between the action-loss-exposed and reference attention maps. The shaded region indicates high-risk attention changes
+with low reference-region mass and large spatial drift. The strongest baseline attention drift appears in the full-update comparison, whereas Action QFormer
+shifts the distribution toward higher reference-region mass and smaller center shifts. Action QFormer–Embedding uses the vision-encoder output as its visual
+source, whereas Action QFormer–Latent uses the image-side representation after language-backbone processing.
+
+
+
+
+                      (a) corr vs. center_shift                                                 (b) topk_iou_10 vs. center_shift
+Fig. 17. Additional attention-alignment scatter statistics. These supporting plots complement the joint analysis in Fig. 16. Across the auxiliary metrics,
+Action QFormer generally exhibits stronger reference-pattern similarity and smaller spatial shifts than the direct-fusion baseline.
+                                                                                                                                                                  22
+
+
+
+
+                      Direct Fusion       QFormer Embedding            QFormer Latent            Vision Frozen          Lang. Blocked       Full Update
+                                             Line style denotes the interface; color denotes the gradient-routing setting.
+
+
+
+
+              (a) Center shift CDF                                     (b) Correlation CDF                                     (c) Reference-region mass CDF
+
+
+
+
+       (d) Non-reference-region mass CDF                             (e) Top-k IoU@10 CDF                                    (f) Reference-region recall@10 CDF
+Fig. 18. Additional attention-alignment CDF statistics. The CDF plots provide distributional views of attention stability under different gradient-routing
+comparisons. Relative to the direct-fusion baseline, Action QFormer generally exhibits smaller spatial shifts, stronger reference-pattern similarity, higher
+reference-region mass, lower non-reference-region mass, and stronger overlap with high-response reference regions. These statistics provide supporting evidence
+for the attention-stability trend observed in the joint reference-region-mass and center-shift analysis.
+
+
+
+
+                                                            (a) Toilet: baseline attention collapse.
+
+
+
+
+                                                   (b) Doorway straight ahead: baseline attention drift.
+
+
+
+
+                                            (c) Open doorway: partially aligned attention in both interfaces.
+Fig. 19. Additional representative instruction-to-visual attention examples. Each case compares the full-update model with its action-update-blocked
+reference for the direct-fusion baseline and Action QFormer. (a) The toilet case shows severe baseline attention collapse toward irrelevant visual regions,
+whereas Action QFormer preserves stronger attention around the target object. (b) The doorway-straight-ahead case shows baseline attention drifting away
+from the relevant region, whereas Action QFormer remains more closely aligned with the reference attention pattern. (c) The open-doorway case shows that
+the baseline is not uniformly collapsed: both interfaces retain attention toward the relevant doorway region, with Action QFormer exhibiting stronger reference
+alignment. Together, these examples complement the distributional attention-stability results by illustrating several qualitative regimes of attention change.
+                                                                                                                                                            23
+
+
+
+
+                                                            (a) Head 7. Baseline vs. Action QFormer
+
+
+
+
+                                                            (b) Head 8. Baseline vs. Action QFormer
+
+
+
+
+                                                            (c) Head 19. Baseline vs. Action QFormer
+
+
+
+
+                                                            (d) Head 20. Baseline vs. Action QFormer
+Fig. 20. Selected per-head instruction-to-visual attention changes for the staircase case in Fig. 13. Each row shows one attention head for the instruction
+move towards the staircase; direct-fusion baseline results are shown on the left and Action QFormer results on the right. Within each panel, the full-update
+model is compared with its action-update-blocked reference. Heads 7 and 8 show severe baseline attention shifts toward irrelevant visual-token regions, whereas
+Action QFormer retains more stable target-oriented attention. Heads 19 and 20 show that the baseline is not uniformly collapsed, as selected heads in both
+interfaces continue to concentrate attention toward the target object.
+

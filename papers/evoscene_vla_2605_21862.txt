@@ -1,0 +1,1015 @@
+                                              EvoScene-VLA: Evolving Scene Beliefs Inside the
+                                                Action Decoder for Chunked Robot Control
+
+                                             Chushan Zhang1 Ruihan Lu2 Jinguang Tong1 Xuesong Li1 Yikai Wang3 Hongdong Li1
+                                                 1                                    2                                  3
+                                                     Australian National University       The University of Queensland       Beijing Normal University
+arXiv:2605.21862v1 [cs.RO] 21 May 2026
+
+
+
+
+                                                                                               Abstract
+                                                      Chunked vision-language-action (VLA) policies predict multi-step robot controls,
+                                                      conditioning each update on the current visual observation alone. Yet robot actions
+                                                      cause contact, occlusion, and object motion, and the geometry that later decisions
+                                                      depend on can change before the next visual update arrives. Spatial VLAs improve
+                                                      current-frame geometry. Temporal VLAs aggregate past frames. Neither maintains
+                                                      an action-updated scene prior across chunks. We argue for a persistent action-
+                                                      updated scene state across control calls, and introduce EvoScene-VLA. Its recurrent
+                                                      scene prefix carries a geometry-aware scene state across chunks. At each vision-
+                                                      language model (VLM) call, the VLM combines scene information from the
+                                                      current observation with the action-updated prior from the previous chunk; the
+                                                      action decoder outputs both the next action chunk and a compact scene update. This
+                                                      update becomes the next prior, which the VLM corrects against the new observation
+                                                      when the next call arrives. Each control call therefore starts from a scene prior
+                                                      that reflects both recent actions and fresh visual evidence. During training, Scene
+                                                      Predictor supplies future scene-token targets, and Geometric Anchor aligns scene
+                                                      slots with frozen depth and 3D teachers. We discard both modules at deployment.
+                                                      On 31 RoboTwin tasks, EvoScene-VLA raises average success from 87.2% to
+                                                      89.1% in fixed evaluation and from 86.1% to 88.5% in randomized evaluation. On
+                                                      the Galaxea R1-Lite real robot, EvoScene-VLA outperforms all baselines.
+
+
+                                         1    Introduction
+                                         Chunked vision-language-action policies predict multi-step robot controls, but they usually condition
+                                         scene context on observations rather than on the robot’s own actions. Yet actions can change the
+                                         scene before the next observation arrives: wiping the counter changes the surface state, closing a
+                                         drawer hides its contents, and lifting a cup leaves the shelf slot below it empty. Within a chunk, the
+                                         visual context may not reflect such changes at all. Across chunks, fresh observations do arrive, but
+                                         the policy still lacks a compact record of how its recent actions transformed the scene, and must
+                                         re-infer those changes from partial, noisy, or occluded visual evidence.
+                                         Spatial VLAs [28, 19, 17, 18, 46] improve geometric reasoning within a single image through depth
+                                         supervision, 3D encoding, or multi-view features. These methods help when the full scene is visible,
+                                         but they reason from current observations alone and do not update scene geometry once actions
+                                         have changed it. Temporal VLAs [30, 15, 20, 6, 44] retain past observations through memory banks,
+                                         trace prompts, or recurrent states, yet past observations alone do not specify how recent or planned
+                                         actions should update the scene. Action-conditioned prediction methods [45, 43] anticipate future
+                                         representations, but consume each prediction inside the current decision and discard it afterwards.
+                                         The missing piece, we argue, is an action-updated scene representation. The policy should pass this
+                                         representation to the next control call as a prior.
+                                         A useful scene representation for chunked control needs three properties. It should persist across
+                                         chunks, so the policy is not forced to re-infer it from each new observation. It should update under
+                                         the actions the policy generates, since those actions change the scene. And it should correct against
+
+                                         Preprint.
+                                                           LingBot-VLA∗                                                      EvoScene-VLA (Ours)
+   Task          Initial Scene
+                                       Start                       Middle                  End                 Start                     Middle                End
+
+
+
+  Open
+Microwave
+
+                                                                            ✗
+
+Stack Three
+   Blocks
+
+                                                                            ✗
+
+Put Object
+ Cabinet
+
+                                                                            ✗
+          changed / ambiguous region     LingBot-VLA next action                EvoScene-VLA next action   ✗     action-scene mismatch             recovered
+
+
+
+
+Figure 1: Qualitative analysis of chunked-control failures. During one action chunk, the scene
+can drift from the planning observation, so an action-only baseline commits to a stale target. In three
+RoboTwin tasks (microwave handle, block stacking, cabinet placement), the baseline follows this
+stale target and stalls mid-chunk (×). EvoScene-VLA carries an action-updated scene prior into the
+chunk, so each predicted action uses the scene state for its own step and completes the rollout (✓).
+
+
+
+each new observation, so prediction errors do not accumulate. Missing any one of these undermines
+the design: no persistence means no cross-chunk context, no action update means no post-action
+prior, and no correction means errors compound.
+We propose EvoScene-VLA, which implements this action-updated scene prior as a recurrent scene
+prefix. The prefix contains two groups of scene tokens at each step: one read from the current
+observation, and one inherited from the previous chunk. At each vision-language model call, the
+model refines both groups against the new image. The action decoder then co-denoises the action
+chunk and a matched scene chunk in a single flow-matching pass. After denoising, the resulting
+scene chunk becomes the inherited group in the next chunk’s prefix. The deployed model therefore
+carries an action-updated prior into each new chunk without any separate online module for memory,
+prediction, or correction.
+The action decoder needs supervision for the co-denoised scene chunk, but the deployed model should
+not depend on an auxiliary predictor. Prefix scene tokens also need geometric grounding, or they risk
+encoding generic appearance. We address both issues with two training-only modules: a Geometric
+Anchor that grounds scene tokens in 3D, and a Scene Predictor that supplies future-frame targets.
+Geometric Anchor operates at two levels: a local depth anchor [29] aligns each scene token with
+per-pixel depth, while a global 3D-foundation-model (3DFM) anchor [36] aligns it with scene-
+level features through a shared decoder that handles both current and future representations. Scene
+Predictor maps the current scene and action sequence to future scene representations, supervised by
+future-frame 3DFM features; flow matching then distills these targets into the action decoder’s scene
+chunk. At inference, both modules are discarded, leaving only the recurrent scene prefix and the
+scene chunk co-denoised by the action decoder.
+On 31 RoboTwin tasks [25], EvoScene-VLA raises the average success rate from 87.2% to 89.1%
+under fixed evaluation and from 86.1% to 88.5% under randomized initial conditions. The gain is in
+fact larger under randomized conditions than under fixed ones, suggesting the scene prior is robust to
+pose and layout variation. Closed-loop trials on a Galaxea R1-Lite [12] dual-arm platform confirm
+similar gains under real-world deployment. Ablations further show cumulative contributions from
+future-scene supervision with the global anchor, local depth anchoring, and the recurrent prior.
+Our contributions are threefold.
+
+
+              • We show that an action expert can produce an action-updated scene prior for the next control
+                call. It uses a recurrent scene prefix and action–scene co-denoising, without an auxiliary
+                online predictor at inference.
+
+
+                                                                                     2
+       • We introduce a two-level Geometric Anchor that combines local depth supervision with a
+         global 3D-foundation-model anchor, sharing one decoder to ground both current and future
+         scene latents.
+       • We report consistent gains on the RoboTwin benchmark and on a Galaxea R1-Lite real-robot
+         platform, with ablations showing cumulative contributions from future-scene supervision,
+         geometric anchoring, and the recurrent prior.
+
+2     Related Work
+VLA policies use VLM backbones to map images and language instructions to chunked motor
+controls. RT-2 [3], π0 [1], and OpenVLA [13] establish this paradigm. EvoScene-VLA adds a
+recurrent scene prefix to the chunked decoder. We review geometric, temporal, and flow-based
+foundations for this design.
+
+Geometric scene representation. Spatial VLAs add geometry to the VLM prefix or visual encoder.
+SpatialVLA [28] projects 3D-aware features into a spatial token grid, QDepth-VLA [19] supervises
+quantized depth tokens, Spatial Forcing [17] enforces geometric consistency, and 3DS-VLA [18]
+and VLA-4D [46] add multi-view or temporal 3D features. A parallel line uses 3D scene state for
+manipulation: PerAct [31], RVT [8, 9], 3D Diffusion Policy [42], and ManiGaussian [24]. Persistent
+reconstruction systems such as DUSt3R [35], MASt3R [16], and CUT3R [34] maintain state tokens
+for dense 3D reconstruction. These methods improve current or observation-driven geometry. They
+do not advance a policy-facing scene prior with the robot’s own action chunk. EvoScene-VLA
+updates a compact geometric prior along the generated action sequence, so the next VLM call can
+correct an already-advanced scene state.
+
+Temporal memory and action-conditioned prediction. Temporal VLAs retain observed history
+across control calls. MemoryVLA [30] maintains a summary-token memory, HAMLET [15] and
+HiF-VLA [20] use history-aware attention, Embodied-SlotSSM [6] applies slot state-space models,
+TraceVLA [44] prompts the VLM with visual traces, and AVA-VLA [41] aligns action and visual
+history. Related approaches learn trajectory representations from video [37, 11] or transfer across
+heterogeneous demonstrations [33]. Other methods predict future state from actions. FLARE [45]
+inserts learnable future tokens into the VLM, UP-VLA [43] uses action-conditioned image or feature
+prediction, world models [39, 10, 38, 4] roll out latent futures, and video-prediction policies [7, 2, 14]
+generate or condition on pixel-level futures. These methods record observed history or predict a
+future for the current decision. They do not keep a self-correcting prior across chunk boundaries.
+EvoScene-VLA persists an action-updated scene prior through the recurrent scene prefix and corrects
+it with the next observation.
+
+Flow matching and diffusion policies. Flow-matching and diffusion policies model robot control
+as trajectory denoising. Diffusion Policy [5] popularized diffusion-based continuous control. π0 [1],
+RDT [22], Octo [26], and flow-matching VLAs [21, 23] scale this formulation to pretrained VLAs.
+Consistency Policy [27] accelerates sampling. These methods denoise actions only, so their decoders
+do not evolve scene state. EvoScene-VLA co-denoises the action chunk and the evolved scene
+representation in one flow-matching pass. This joint denoising grounds each action in the recurrent
+scene prior without adding an inference-time predictor.
+
+3     Method
+3.1   Overview
+
+EvoScene-VLA extends LingBot-VLA [40] with a recurrent scene prefix for chunked control. As
+shown in Fig. 2, we add two slot groups to the VLM prefix: observation slots that gather evidence
+from the current image, and prior slots that inherit the scene state denoised by the action expert in the
+previous chunk. The action expert then co-denoises the next action chunk together with a matched
+scene chunk in a single flow-matching pass, and the denoised scene token at the executed step is
+fed back as the prior for the next call. Two training-only modules supervise this loop: Geometric
+Anchor (Sec. 3.3) grounds scene slots in metric geometry, and Scene Predictor (Sec. 3.4) supplies
+
+
+                                                    3
+ Local depth anchor                     cross-view masked reconstruction                                                                                                 Scene Predictor
+                                                                                                                                                                         future scene representation
+                                                                                                                                                                                              s ×K
+                                              depth head                                       ℒ!"#                                                                                                          p copy
+                                                                                                                                                                          rt                           ...
+          masked target
+
+ Global 3D anchor                                                                                                                                                        at:t+H                        ...
+                                    align decoded scene to frozen 3DFM
+
+                                                                                                                                                                         q1:1+K                        ...
+  s!                   scene
+                      decoder
+                                                             match
+                                                                                               ℒ$"%
+                                                                                                                                                                𝑠̂&'(
+                                                decoded 3D               3DFM teacher
+                                                                                                                                                                                      Causal Transformer
+
+
+
+           Asymmetric                                                                                                  s$             Action         Scene               key-frame queries
+          Attention Mask                                                                                                              tokens         tokens
+
+                                                                                                                                                                               𝑠̂!"#          𝑠̂!"$            𝑠̂!"%
+                                                                                                                                                                                                             ℒ%$"&
+                                                                                                                                                                         future scene latents
+                                                                                                                                                                                                      ...
+
+
+
+                                                                                                                                                                                  Training-time cues
+
+                                                                                                                                                                                         Solid arrows / boxes
+                                                                                                                                                                                         online rollout path
+
+       image attends lang tokens + image
+                                                                 Image tokens 𝑥!        Language                                                                                         Dashed arrows / boxes
+
+       lang attends image tokens + lang                                                  tokens ℓ              s!"#                                                                      Training auxiliary routing
+
+                                                                                                                                                              ℒ'(")"*+
+                                                                                                                                                                                         Various losses
+       𝑠obs attends to image + 𝑠obs                                                                                                                                            ℒ!"#
+                                                                                                                                        Co-denoise                             ℒ$"%      optimized during training
+
+       s̅ ! attends + 𝑠obs + s̅ !
+                                                                              ‘’Clean the sink”                       s"%                                                       The action expert acts the
+
+                                                                                                                            Replace                                            scene predictor at inference
+
+                                                                                                                                                                              Inference keeps only
+                                                                                                                                                                          Understanding + Action Experts
+
+
+
+
+Figure 2: Pipeline Overview. The policy receives multi-view images, an instruction, and the
+robot state. The VLM prefix contains image and language tokens, per-view observation slots, and
+recurrent prior slots. An asymmetric attention mask lets observation slots read the current views and
+lets prior slots absorb this evidence while preserving the pretrained image and language pathways.
+During training, Geometric Anchor grounds the scene slots with Monocular Depth Teacher and
+3D-foundation-model features, and Scene Predictor supplies future scene-token targets to train the
+action expert. At inference, the action expert denoises the actions and matched scene tokens together
+in the flow-matching sampling. The scene token at the executed step becomes the prior for the next
+VLM call, so each action chunk starts from an action-updated, observation-corrected scene prior.
+
+
+future scene-token targets. At inference, EvoScene-VLA discards both training-only modules and
+retains only the recurrent scene prefix and action–scene co-denoising.
+
+3.2       Recurrent Scene Prefix
+
+Let D denote the VLM hidden dimension, V the fixed camera views (head, left wrist, right wrist),
+and N the number of slots in each observation or prior group. EvoScene-VLA augments the VLM
+                                                                    (v)
+prefix with two groups of scene slots: per-view observation slots sobs ∈ RN ×D , v ∈ {1, . . . , V },
+which gather geometric evidence from each camera, and a single set of prior slots s̄t ∈ RN ×D , which
+inherit the action-updated scene state from the previous chunk. Together with the multi-view image
+input xt and language instruction ℓ, the prefix is ordered:
+                                                                                                      (1:V )
+                                            [ xt , sobs , s̄t , ℓ ].                                 (1)
+At the first chunk, s̄t is initialized from learnable scene embeddings; for later chunks, it carries the
+recurrent state denoised by the action expert at the previous step (Sec. 3.5). The VLM thus consumes
+a prior when one exists and falls back to learned embeddings otherwise.
+An asymmetric attention mask routes information through this prefix as illustrated in Fig. 2. Image
+and language tokens ignore scene slots, preserving pretrained visual and linguistic paths. Each
+observation slot attends to its own view’s image tokens and to other slots in its own observation group.
+Prior slots attend to all observation slots and to themselves, but not to image or language tokens, and
+no other token attends back to them. Current image evidence therefore reaches the prior slots only
+through the observation slots. This isolation preserves the pretrained image–language pathway intact
+while giving the scene state a dedicated bottleneck: only observation slots feed into the prior, and the
+prior never leaks back into image or language tokens. Let sp ∈ RN ×D denote the VLM output at the
+prior-slot positions, which we take as the corrected scene representation for the current chunk:
+
+                                                                                            (1:V )   
+                                                                     sp = VLMscene xt , ℓ, sobs , s̄t prior .                                                                                                (2)
+
+The representation sp thus serves as a recurrent scene state. The prefix defines where this state
+lives in the architecture, but not what it should encode; the next two modules supply that content by
+
+
+                                                                                                         4
+grounding the representation in geometry and training the action expert to write the next recurrent
+state.
+
+3.3     Two-Level Geometric Anchor
+
+The recurrent prefix specifies where the scene state lives but not what it should encode; without
+targeted supervision, the slots are free to absorb generic image features rather than 3D structure.
+Geometric Anchor addresses this gap with two complementary training-only branches. One branch,
+                                                            (v)
+called Local Anchor, supervises each observation slot sobs through cross-view masked depth
+reconstruction. The other branch, called Global Anchor, distills a frozen 3D foundation model into
+the aggregated representation sp .
+
+3.3.1    Local Anchor: Cross-View Masked Depth Reconstruction
+The local branch grounds each observation slot in per-view geometry while forcing it to integrate
+evidence from the other views, so that no slot can rely on its own image tokens alone. To do so, we
+mask one view at a time and require the head to recover its depth representation from the remaining
+views and the cross-view representation sp .
+Concretely, observation slots are pooled from a 256-token query bank qtmpl , which we also use as
+the query set for a lightweight cross-attention head gdepth . For each target view i ∈ {1, . . . , V },
+we mask its VLM image tokens himg                                                    D
+                                   t,vi by broadcasting a learned embedding m ∈ R and pass the
+masked multi-view tokens together with sp to gdepth :
+                                                                            (
+                      
+                                 img,(i)          img,(i)
+                                                            
+                                                                  img,(i)    m,      j = i,
+        fˆt,i
+           d
+                                                          
+              = gdepth qtmpl , h̃t,v1 , . . . , h̃t,vV , sp , h̃t,vj      =                         (3)
+                                                                             himg
+                                                                              t,vj , j ̸= i.
+
+Masking the target view removes the shortcut of copying its own VLM features, forcing gdepth to
+aggregate cross-view evidence from the unmasked tokens and from sp . We supervise each prediction
+with a frozen Monocular Depth Teacher (MDT) [32] applied to the unmasked target image:
+                              V
+                           1 X                        
+                  Lgeo =         SmoothL1 fˆt,i
+                                             d      d
+                                                , ft,i   ,       d
+                                                               ft,i = MDT(xt,vi ).                 (4)
+                           V i=1
+                                                                                           (v)
+The cross-view masking loss trains observation slots and prior positions together: each sobs summa-
+rizes view-level depth, and sp encodes geometry across views.
+
+3.3.2    Global Anchor: 3D Foundation Model Decoding
+The global branch grounds the cross-view representation sp in metric 3D by distilling a frozen
+multi-view 3DFM [36]. A lightweight view-conditioned decoder g3D takes a set of learnable queries
+qdec and uses sp from Eq. (2) as keys and values; a linear projector Wproj then maps the decoder
+output to the foundation-model feature space:
+                             Ht = g3D (qdec ; sp ) ,    Pt = Wproj Ht .                            (5)
+We supervise Pt to match the frozen foundation model’s features on the same multi-view input via an
+ℓ1 loss:
+                                  V
+                               1 X (v)         (v)
+                     Lrep =           P − Zt 1 ,           Zt = 3DFM(xt ).                      (6)
+                              V v=1 t
+The ℓ1 objective regresses the foundation-model features element-wise, providing dense token-
+level supervision that is robust to outliers and preserves both direction and magnitude of the target
+representation.
+
+3.4     Scene Predictor
+
+Scene Predictor produces the future scene-token targets that the action expert later distills into its
+scene branch. Let H denote the final action offset of the action chunk. Conditioned on the current
+scene representation sp and the action sequence at:t+H , it predicts a sequence of absolute future
+
+
+                                                   5
+scene latents at sparse key-frame steps, supervised against features from the 3D foundation model on
+the corresponding future frames.
+The module is a causal Transformer that takes as input the robot state rt , the current scene representa-
+tion sp , the action sequence at:t+H , and K key-frame query groups initialized from sp :
+              [ rt , sp , at , . . . , at+H , q1 , . . . , qK ],        qi = copy(sp ), i = 1, . . . , K.           (7)
+
+Under a causal mask, each query group qi attends to rt , sp , the action prefix at:t+ki up to its target
+step, and earlier query groups, so that the prediction at step t + ki is conditioned only on actions
+executed up to that step. The output is a sequence of absolute future scene latents ŝt+k1 :t+kK at
+sparse key-frame steps {k1 , . . . , kK } ⊆ {1, . . . , H}, with each ŝt+ki ∈ RN ×D .
+Scene Predictor reuses the view-conditioned decoder (g3D , Wproj ) from Eq. (5): the same operator
+that grounds sp , also decodes each predicted future latent and matches it to foundation-model features
+on the corresponding future multi-view frame. Let Zt+ki = 3DFM(xt+ki ) denote the future-frame
+teacher features:
+                         K V
+                   1 X X (v)            (v)                                                                 
+        Lpred =                P̃    − Zt+ki 1 ,                         P̃t+ki = Wproj g3D (qdec ; ŝt+ki ) .      (8)
+                  K · V i=1 v=1 t+ki
+
+3.5   Joint Action–Scene Denoising
+
+The action expert learns to denoise actions and future scene latents jointly under a single flow-
+matching vector field. During training, this couples motor and scene targets on a shared denoising
+schedule. At inference, the same denoising loop produces both the action chunk and the next recurrent
+prior, replacing Scene Predictor and closing the recurrence loop without any auxiliary online module.
+Given the Scene Predictor outputs ŝt+k1 :t+kK , we stack them into future-scene targets z0 ∈
+RK×N ×D . We then sample a single flow-matching time τ ∈ [0, 1] shared between the action
+and scene paths, draw independent Gaussian noises ϵa and ϵs , and form straight-line interpolants
+            aτt:t+H = τ ϵa + (1 − τ ) at:t+H ,                 z τ = τ ϵ̃s + (1 − τ ) z0 ,     ϵ̃s := σ ϵs ,        (9)
+where σ rescales the scene noise to match the empirical magnitude of z0 , which differs from that of
+the action targets. The action expert receives the suffix
+                                                  [ rt z τ         aτt:t+H ]                                       (10)
+Under a causal suffix mask, the action expert attends to the VLM prefix cache that contains image,
+language, observation, and prior slots. It predicts a per-token velocity vθ for each action and scene
+block. We stop gradients through both targets, so velocity matching uses
+                    (s)                             2                          (a)                             2
+   LsceneFM = vθ (z τ , τ ) − (ϵ̃s − z0 ) 2 ,                 LactFM = vθ (aτ , τ ) − (ϵa − at:t+H ) 2 .           (11)
+LactFM is the standard π0.5 action FM loss. LsceneFM distills future scene representations into the
+action expert. The action expert then serves as the inference-time scene updater. At deployment,
+each chunk runs one VLM forward followed by one Euler-step denoising pass; the robot executes the
+resulting action chunk, and the scene token at the final key-frame offset kK becomes the prior s̄t+1
+for the next chunk. The VLM call at the next chunk corrects this prior against the new observation,
+closing the recurrent loop.
+
+3.6   Training Objective
+
+The full training objective combines the action flow-matching loss with the four scene-grounding and
+scene-transfer terms introduced above:
+                      L = LactFM + λ1 Lgeo + λ2 Lrep + λ3 Lpred + λ4 LsceneFM .                                    (12)
+The four scene-side losses play three roles: Lgeo and Lrep ground current scene representations in
+geometry, Lpred trains future representations in the same coordinate, and LsceneFM transfers those
+representations into the action expert. We train end-to-end in a single stage. All loss weights, the
+number of key frames K, and the final action offset H are reported in Appendix A.
+
+
+                                                              6
+Table 1: Success rates (%) on 31 RoboTwin tasks. C and R denote Clean and Rand evaluation settings,
+respectively. LingBot-VLA∗ denotes the depth-augmented LingBot-VLA. The 31 tasks are split
+across three blocks for readability.
+                                 Avg.↑            Place Mouse            Click           Open       Place       Put Obj. Stack Blocks Beat Block Turn                              Open
+ Method                           (%)                 Pad                Bell          Microwave    Shoe        Cabinet     Three      Hammer Switch                              Laptop
+                             C           R         C         R           C        R    C    R       C     R     C    R    C         R          C           R       C        R     C     R
+ π0.5                       81.2       75.9       60        39           99       66   34   77      92    93    80   79   91        76        96           93      62       54    90    96
+ LingBot-VLA                85.3       84.1       84        88           68       60   66   54      97    95    82   80   95        90        90           85      64       75    98    97
+ LingBot-VLA∗               87.2       86.1       84        87           95       96   70   58      97    98    82   83   95        88        87           83      71       71    97    98
+ Ours                       89.1       88.5       85        91           96       97   82   61      95    99    85   87   96        95        93           84      72       75    99    99
+
+ Place Dual Pick Dual Stack Bowls Place A2B Place A2B Place Empty Move Can Place Cont. Press Place Phone                                                                             Place
+   Shoes     Bottles     Three       Left     Right       Cup       Pot       Plate    Stapler  Stand                                                                                 Fan
+    C    R         C         R     C          R         C            R        C        R     C       R         C     R     C        R         C        R       C        R         C     R
+ 75      75        93       63     77         71        87        82          87       84   100      99        51    55   99        95        87    83      81         81         87    85
+ 90      89        88       85     72         76        76        80          77       70   100     100        75    66   96        98        90    95      84         96         94    89
+ 75      87        93       88     75         82        79        77          76       76   100      99        82    90   95        96        92    94      91         91         93    86
+ 91      93        87       88     83         76        80        83          81       79   100     100        75    75   100       98        92    95      91         96         97    91
+
+ Rotate Place Obj.                 Shake           Scan          Pick Diverse Place Bread Place Bread Place Burger Place Cans Put Bottles Hanging
+ QRcode   Stand                    Bottle          Obj.             Bottles      Skillet    Basket        Fries    Plasticbox  Dustbin     Mug
+    C   R     C         R          C     R         C    R        C            R        C     R       C         R      C        R         C         R        C       R            C      R
+ 89     87    91        85        99 97            18   17       81          71        85   66      77         64    94        87        94        84       84      79           77    71
+ 78     86    96        90       100 99            57   47       78          69        91   91      90         90    96        96        98        98       80      83           72    76
+ 83     87    96        85        98 99            56   38       80          74        89   91      91         91    95        99        99        96       88      87           75    82
+ 88     87    98        96       100 100           49   57       83          80        89   87      92         91    99        97        99        99       94      93           83    76
+
+
+
+
+4       Experiments
+
+4.1     Setup
+
+Testbeds. We evaluate EvoScene-VLA on two testbeds: the RoboTwin simulated benchmark [25]
+and the Galaxea R1-Lite real-robot platform. In simulation, our main evaluation uses 31 tasks; for
+ablations, we use a 5-task subset (RoboTwin-5Task) that spans single-arm, dual-arm, short-horizon,
+and long-horizon task types while keeping the ablation budget tractable, with the exact task list
+provided in Appendix D. We test two simulation settings. Clean fixes initial object positions to the
+training distribution. Rand randomizes initial positions and orientations within the task workspace.
+This randomization keeps the task goal unchanged but increases pose and layout variation.
+
+Baselines. We fine-tune EvoScene-VLA from the public LingBot-VLA [40] pretrained checkpoint
+with the same 50-step action chunk. We compare against three baselines: π0.5 [1], LingBot-VLA,
+and LingBot-VLA∗ . LingBot-VLA∗ adds depth supervision to LingBot-VLA.
+
+4.2     Main Results
+
+Tab. 1 reports per-task and average success rates on the 31 RoboTwin tasks. EvoScene-VLA improves
+the LingBot-VLA∗ average from 87.2 to 89.1 under Clean (+1.9) and from 86.1 to 88.5 under Rand
+(+2.4). The gain is larger under Rand (+2.4) than under Clean (+1.9). Two factors in Rand plausibly
+contribute: varied initial layouts make the scene harder to perceive from a single observation, and
+the resulting per-chunk perception errors are more likely to compound across chunks. The recurrent
+scene prefix is designed to mitigate both issues.
+Fig. 1 examines the failure mode at the rollout level. For each of three tasks, the figure shows the
+LingBot-VLA∗ rollout next to ours from the same initial scene at three time slices (start, middle,
+end). Because chunked baselines plan the entire chunk from the start-state observation, they lack any
+view of the intermediate state that the chunk itself produces: in Open Microwave, the gripper retracts
+before reaching the door handle. EvoScene-VLA, whose action expert co-denoises a scene update
+alongside the action chunk, conditions on this intermediate scene state and continues the motion
+through to completion. The benefit also shows in motion quality. Fig. 3 plots end-effector trajectories
+in 3D for four episodes; EvoScene-VLA produces noticeably smoother paths than LingBot-VLA.
+
+
+                                                                                                7
+                               Figure 3: Trajectory plots in 3D space.
+
+
+Table 2: Ablations study. Success rates averaged   Table 3: Real-robot experiments. Success rates (%) on
+over the RoboTwin-5Task subset.                    Galaxea indoor-cleaning tasks.
+Variant                       Clean        Rand                             LingBot    LingBot
+                                                   Task             π0.5                           Ours
+              ∗                                                              VLA        VLA∗
+LingBot-VLA                   87.8         84.6
+baseline                      81.6         75.8    Mirror            28       27          26        29
+                                                   Sink              42       44          49        51
++ Lpred & Lrep                89.3         86.2
+                                                   Cutting-board     44       34          37        46
++ Lgeo                        90.1         86.5
++ prior info at inference     90.8         87.8    Avg.↑(%)         38.0     35.0        37.3      42.0
+
+
+Co-denoising ties each predicted action to a consistent scene context, so the action expert avoids the
+abrupt corrections of action-only chunked baselines.
+
+4.3   Ablations
+
+Tab. 2 reports additive ablations on RoboTwin-5Task. The first two rows show the LingBot-VLA and
+LingBot-VLA∗ baselines. Both lack our Geometric Anchor, Scene Predictor, and recurrent prior. The
+first step adds the global anchor (Lrep ) and Scene Predictor (Lpred ) jointly, since the two share the
+view-conditioned decoder and only become useful together. The local depth anchor (Lgeo ) further
+improves performance by grounding each observation slot in per-view geometry, complementing the
+cross-view supervision from the global anchor. Finally, propagating the recurrent prior across chunks
+at inference, rather than reinitializing s̄t from learnable embeddings at every chunk, further improves
+performance and isolates the contribution of cross-chunk recurrence.
+
+4.4   Real-Robot Evaluation
+
+Platform and dataset. We evaluate EvoScene-VLA on the Galaxea R1-Lite dual-arm platform,
+training on the indoor-cleaning subset of the Galaxea Open-World Dataset [12] (mirror, sink, and
+cutting-board cleaning). Following the standard VLA interface, the policy uses one head stream and
+two wrist streams as its three-view input. The subset spans 7 recording sessions, 439 episodes, 48,419
+frames, and 1,756 video clips, totaling approximately 9 hours of bimanual demonstrations at 15 fps.
+We use all demonstrations for training and evaluate on the physical robot.
+
+Training and evaluation protocol. We initialize from the public LingBot-VLA checkpoint and
+fine-tune on the Galaxea indoor-cleaning subset with the same single-stage schedule. We evaluate
+on the Galaxea R1-Lite robot rather than replaying the dataset. We run all real-robot inference on a
+
+
+                                                   8
+                    head stereo
+                     cameras
+
+
+
+                   wrist cameras
+
+
+
+                    6-DoF arms
+                   1-DoF grippers
+
+
+
+                    3-DoF torso
+
+
+
+                  3 omnidirectional
+                   steering wheels
+
+
+
+
+    (a) Robot platform.                         (b) Real-robot experimental setup.
+Figure 4: Real-robot platform and experimental setup. (a) The Galaxea R1-Lite platform uses three
+policy cameras for manipulation. (b) We evaluate the dual-arm robot on three cleaning tasks: wiping
+the mirror, cleaning the sink, and cleaning the cutting board. Ketchup serves as the removable stain.
+
+
+single NVIDIA RTX 4090 GPU. The three long-horizon tasks (Wipe The Mirror, Clean The Sink,
+Clean The Cutting Board) require the robot to track how its tool changes the surface: the surface
+state evolves during wiping, and subsequent controls must target unwiped regions that can be subtle,
+occluded, or ambiguous in the current view. For each task, we run 100 closed-loop rollouts with
+randomized object placements, lighting, and initial robot state, and report task success rate.
+
+Real-robot Results. Tab. 3 reports success rates on the Galaxea cleaning tasks. EvoScene-VLA
+improves average success from 37.3% to 42.0%. These gains show the same pattern as simulation:
+the method helps when the robot changes the scene as it acts.
+
+5    Discussion
+The experiments suggest a specific failure mode in chunked VLA control: the policy does not only
+need better current-frame geometry or longer observation history; it needs a prior for the scene after
+its own actions have changed it. EvoScene-VLA improves most in settings where this mismatch
+should matter, including randomized RoboTwin evaluation and real cleaning tasks with evolving
+surface state. This pattern supports the central design choice: the action decoder is a natural place to
+update scene state because it already generates the action sequence that will reshape the scene. The
+resulting prior does not need to be a dense reconstruction. A compact policy-facing latent can help if
+training grounds it in 3D structure and the next VLM call corrects it with fresh observations.
+This view also clarifies the limits of the method. Because the recurrent state is latent, we judge its
+geometric content through downstream behavior and ablations. Because future scene targets come
+from future-frame 3D foundation-model features through Scene Predictor, target quality can limit the
+prior that the action decoder learns. Longer chunks may increase the value of recurrence by creating
+larger scene changes, but they also push Scene Predictor targets farther into the future, so the net
+effect of chunk length on prior quality remains an open question. A useful next step is to use the
+mismatch between observation slots and prior slots as an uncertainty signal for replanning or adaptive
+chunk execution. More broadly, the results suggest that action decoders can carry not only motor
+commands but also task-relevant scene priors, without adding an online world model at deployment.
+
+6    Conclusion
+EvoScene-VLA gives a chunked VLA a recurrent latent scene interface. The VLM prefix carries
+two slot groups. Observation slots read the current image. Prior slots inherit the evolved scene
+representation from the previous chunk. The action decoder jointly denoises motor commands and
+scene tokens at different key frames in one flow-matching pass. The scene token at the executed step
+becomes the next chunk’s prior. Training uses two-level Geometric Anchor and a training-only Scene
+Predictor to supply geometric and latent supervision; inference retains only the recurrent scene prefix
+and the action–scene co-denoising. On 31 RoboTwin tasks, EvoScene-VLA lifts average success
+from 87.2 to 89.1 under clean evaluation and from 86.1 to 88.5 under randomized initial conditions.
+Real-robot cleaning trials on Galaxea R1-Lite show the same pattern: the robot’s own actions evolve
+the scene state. For chunked VLAs, the action decoder should take the latent prior into account for
+the next visual update, rather than rebuilding it from each observation alone.
+
+
+                                                   9
+References
+ [1] Kevin Black, Noah Brown, Danny Driess, Adnan Esmail, Michael Equi, Chelsea Finn, Niccolo
+     Fusai, et al. π0 : A vision-language-action flow model for general robot control. arXiv preprint
+     arXiv:2410.24164, 2024.
+ [2] Kevin Black, Mitsuhiko Nakamoto, Pranav Atreya, Homer Walke, Chelsea Finn, Aviral Kumar,
+     and Sergey Levine. Zero-shot robotic manipulation with pretrained image-editing diffusion
+     models. In International Conference on Learning Representations (ICLR), 2024.
+ [3] Anthony Brohan, Noah Brown, Justice Carbajal, Yevgen Chebotar, Xi Chen, Krzysztof Choro-
+     manski, et al. RT-2: Vision-language-action models transfer web knowledge to robotic control.
+     In Conference on Robot Learning (CoRL), 2023.
+ [4] Chilam Cheang, Guangzeng Chen, Ya Jing, Tao Kong, Hang Li, Yifeng Li, Yuxiao Liu, Hongtao
+     Wu, Jiafeng Xu, Yichu Yang, Hanbo Zhang, and Minzhao Zhu. GR-2: A generative video-
+     language-action model with web-scale knowledge for robot manipulation. arXiv preprint
+     arXiv:2410.06158, 2024.
+ [5] Cheng Chi, Siyuan Feng, Yilun Du, Zhenjia Xu, Eric Cousineau, Benjamin Burchfiel, and
+     Shuran Song. Diffusion policy: Visuomotor policy learning via action diffusion. In Robotics:
+     Science and Systems (RSS), 2023.
+ [6] Nhat Chung, Taisei Hanyu, Toan Nguyen, Huy Le, Frederick Bumgarner, Duy Minh Ho
+     Nguyen, Khoa Vo, Kashu Yamazaki, Chase Rainwater, Tung Kieu, Anh Nguyen, and Ngan Le.
+     Rethinking progression of memory state in robotic manipulation: An object-centric perspective.
+     arXiv preprint arXiv:2511.11478, 2025. Method named “Embodied-SlotSSM” inside the paper.
+ [7] Yilun Du, Mengjiao Yang, Bo Dai, Hanjun Dai, Ofir Nachum, Joshua B. Tenenbaum, Dale
+     Schuurmans, and Pieter Abbeel. Learning universal policies via text-guided video generation.
+     In International Conference on Machine Learning (ICML), 2023.
+ [8] Ankit Goyal, Jie Xu, Yijie Guo, Valts Blukis, Yu-Wei Chao, and Dieter Fox. RVT: Robotic
+     view transformer for 3d object manipulation. In Conference on Robot Learning (CoRL), 2023.
+ [9] Ankit Goyal, Valts Blukis, Jie Xu, Yijie Guo, Yu-Wei Chao, and Dieter Fox. RVT-2: Learning
+     precise manipulation from few demonstrations. arXiv preprint arXiv:2406.08545, 2024.
+[10] Danijar Hafner, Jurgis Pasukonis, Jimmy Ba, and Timothy Lillicrap. Mastering diverse domains
+     through world models. arXiv preprint arXiv:2301.04104, 2023.
+[11] Yucheng Hu, Yanjiang Guo, Pengchao Wang, Xiaoyu Chen, Yen-Jen Wang, Jianke Zhang,
+     Koushil Sreenath, Chaochao Lu, and Jianyu Chen. Video prediction policy: A generalist robot
+     policy with predictive visual representations. arXiv preprint arXiv:2412.14803, 2024.
+[12] Tao Jiang, Tianyuan Yuan, Yicheng Liu, Chenhao Lu, Jianning Cui, Xiao Liu, Shuiqi Cheng,
+     Jiyang Gao, Huazhe Xu, and Hang Zhao. Galaxea open-world dataset and G0 dual-system
+     VLA model. arXiv preprint arXiv:2509.00576, 2025. URL https://arxiv.org/abs/2509.
+     00576. https://github.com/OpenGalaxea/GalaxeaVLA.
+[13] Moo Jin Kim, Karl Pertsch, Siddharth Karamcheti, Ted Xiao, Ashwin Balakrishna, Suraj
+     Nair, et al. OpenVLA: An open-source vision-language-action model. arXiv preprint
+     arXiv:2406.09246, 2024.
+[14] Po-Chen Ko, Jiayuan Mao, Yilun Du, Shao-Hua Sun, and Joshua B. Tenenbaum. Learning
+     to act from actionless videos through dense correspondences. In International Conference on
+     Learning Representations (ICLR), 2024.
+[15] Myungkyu Koo, Daewon Choi, Taeyoung Kim, Kyungmin Lee, Changyeon Kim, Younggyo Seo,
+     and Jinwoo Shin. HAMLET: Switch your vision-language-action model into a history-aware
+     policy. arXiv preprint arXiv:2510.00695, 2025.
+[16] Vincent Leroy, Yohann Cabon, and Jerome Revaud. Grounding image matching in 3d with
+     MASt3R. arXiv preprint arXiv:2406.09756, 2024.
+
+
+                                                 10
+[17] Fuhao Li, Wenxuan Song, Han Zhao, Jingbo Wang, Pengxiang Ding, Donglin Wang, Long
+     Zeng, and Haoang Li. Spatial forcing: Implicit spatial representation alignment for vision-
+     language-action model. arXiv preprint arXiv:2510.12276, 2025.
+
+[18] Xiaoqi Li, Liang Heng, Jiaming Liu, Yan Shen, Chenyang Gu, Zhuoyang Liu, Hao Chen,
+     Nuowei Han, Renrui Zhang, Hao Tang, Shanghang Zhang, and Hao Dong. 3DS-VLA: A 3d
+     spatial-aware vision language action model for robust multi-task manipulation. In Conference
+     on Robot Learning (CoRL), 2025.
+
+[19] Yixuan Li, Yuhui Chen, Mingcai Zhou, Haoran Li, Zhengtao Zhang, and Dongbin Zhao.
+     QDepth-VLA: Quantized depth prediction as auxiliary supervision for vision-language-action
+     models. arXiv preprint arXiv:2510.14836, 2025.
+
+[20] Minghui Lin, Pengxiang Ding, Shu Wang, Zifeng Zhuang, Yang Liu, Xinyang Tong, Wenxuan
+     Song, Shangke Lyu, Siteng Huang, and Donglin Wang. HiF-VLA: Hindsight, insight and
+     foresight through motion representation for vision-language-action models. arXiv preprint
+     arXiv:2512.09928, 2025.
+
+[21] Yaron Lipman, Ricky T. Q. Chen, Heli Ben-Hamu, Maximilian Nickel, and Matt Le. Flow
+     matching for generative modeling. In International Conference on Learning Representations
+     (ICLR), 2023.
+
+[22] Songming Liu, Lingxuan Wu, Bangguo Li, Hengkai Tan, Huayu Chen, Zhengyi Wang, Ke Xu,
+     Hang Su, and Jun Zhu. RDT-1B: A diffusion foundation model for bimanual manipulation.
+     arXiv preprint arXiv:2410.07864, 2024.
+
+[23] Xingchao Liu, Chengyue Gong, and Qiang Liu. Flow straight and fast: Learning to generate
+     and transfer data with rectified flow. In International Conference on Learning Representations
+     (ICLR), 2023.
+
+[24] Guanxing Lu, Shiyi Zhang, Ziwei Wang, Changliu Liu, Jiwen Lu, and Yansong Tang. Mani-
+     Gaussian: Dynamic gaussian splatting for multi-task robotic manipulation. arXiv preprint
+     arXiv:2403.08321, 2024.
+
+[25] Yao Mu, Tianxing Chen, Shijia Peng, Zanxin Chen, Zeyu Gao, Yude Zou, Lunkai Lin, Zhiqiang
+     Xie, and Ping Luo. RoboTwin: Dual-arm robot benchmark with generative digital twins. arXiv
+     preprint arXiv:2409.02920, 2024.
+
+[26] Octo Model Team, Dibya Ghosh, Homer Walke, Karl Pertsch, et al. Octo: An open-source
+     generalist robot policy. arXiv preprint arXiv:2405.12213, 2024.
+
+[27] Aaditya Prasad, Kevin Lin, Jimmy Wu, Linqi Zhou, and Jeannette Bohg. Consistency policy:
+     Accelerated visuomotor policies via consistency distillation. arXiv preprint arXiv:2405.07503,
+     2024.
+
+[28] Delin Qu et al. SpatialVLA: Exploring spatial representations for visual-language-action models.
+     arXiv preprint arXiv:2501.15830, 2025.
+
+[29] Robbyant Team. LingBot-Depth: Masked depth modeling for spatial perception. https:
+     //huggingface.co/robbyant/lingbot-depth, 2026. Open-source RGB-D representation
+     model used as the frozen depth teacher.
+
+[30] Hao Shi, Bin Xie, Yingfei Liu, Lin Sun, Fengrong Liu, Tiancai Wang, Erjin Zhou, Haoqiang
+     Fan, Xiangyu Zhang, and Gao Huang. MemoryVLA: Perceptual-cognitive memory in vision-
+     language-action models for robotic manipulation. arXiv preprint arXiv:2508.19236, 2025.
+
+[31] Mohit Shridhar, Lucas Manuelli, and Dieter Fox. Perceiver-actor: A multi-task transformer for
+     robotic manipulation. In Conference on Robot Learning (CoRL), 2022.
+
+[32] Bin Tan, Changjiang Sun, Xiage Qin, Hanat Adai, Zelin Fu, Tianxiang Zhou, Han Zhang,
+     Yinghao Xu, Xing Zhu, Yujun Shen, et al. Masked depth modeling for spatial perception. arXiv
+     preprint arXiv:2601.17895, 2026.
+
+
+                                                 11
+[33] Lirui Wang, Xinlei Chen, Jialiang Zhao, and Kaiming He. HPT: Scaling proprioceptive-visual
+     learning with heterogeneous pre-trained transformers. arXiv preprint arXiv:2409.20537, 2024.
+[34] Qianqian Wang, Yifei Zhang, Aleksander Holynski, Alexei A. Efros, and Angjoo Kanazawa.
+     Continuous 3D perception model with persistent state. arXiv preprint arXiv:2501.12387, 2025.
+[35] Shuzhe Wang, Vincent Leroy, Yohann Cabon, Boris Chidlovskii, and Jerome Revaud. DUSt3R:
+     Geometric 3D vision made easy. In IEEE/CVF Conference on Computer Vision and Pattern
+     Recognition (CVPR), 2024.
+[36] Yifan Wang, Jianjun Zhou, Haoyi Zhu, Wenzheng Chang, Yang Zhou, Zizun Li, Junyi Chen,
+     Jiangmiao Pang, Chunhua Shen, and Tong He. π 3 : Permutation-equivariant visual geometry
+     learning. In International Conference on Learning Representations (ICLR), 2026.
+[37] Chuan Wen, Xingyu Lin, John So, Kai Chen, Qi Dou, Yang Gao, and Pieter Abbeel. Any-point
+     trajectory modeling for policy learning. arXiv preprint arXiv:2401.00025, 2024.
+[38] Hongtao Wu, Ya Jing, Chilam Cheang, Guangzeng Chen, Jiafeng Xu, Xinghang Li, Minghuan
+     Liu, Hang Li, and Tao Kong. Unleashing large-scale video generative pre-training for visual
+     robot manipulation. arXiv preprint arXiv:2312.13139, 2023.
+[39] Philipp Wu, Alejandro Escontrela, Danijar Hafner, Pieter Abbeel, and Ken Goldberg. Day-
+     Dreamer: World models for physical robot learning. In Conference on Robot Learning (CoRL),
+     2022.
+[40] Wei Wu, Fan Lu, Yunnan Wang, Shuai Yang, Shi Liu, Fangjing Wang, Qian Zhu, He Sun, Yong
+     Wang, Shuailei Ma, Yiyu Ren, Kejia Zhang, Hui Yu, Jingmei Zhao, Shuai Zhou, Zhenqi Qiu,
+     Houlong Xiong, Ziyu Wang, Zechen Wang, Ran Cheng, Yong-Lu Li, Yongtao Huang, Xing Zhu,
+     Yujun Shen, and Kecheng Zheng. LingBot-VLA: A pragmatic vla foundation model. arXiv
+     preprint arXiv:2601.18692, 2026.
+[41] Lei Xiao, Jifeng Li, Juntao Gao, Feiyang Ye, Yan Jin, Jingjing Qian, Jing Zhang, Yong Wu, and
+     Xiaoyuan Yu. AVA-VLA: Improving vision-language-action models with active visual attention.
+     arXiv preprint arXiv:2511.18960, 2025.
+[42] Yanjie Ze, Gu Zhang, Kangning Zhang, Chenyuan Hu, Muhan Wang, and Huazhe Xu. 3D
+     diffusion policy: Generalizable visuomotor policy learning via simple 3D representations. arXiv
+     preprint arXiv:2403.03954, 2024.
+[43] Jianke Zhang, Yanjiang Guo, Yucheng Hu, Xiaoyu Chen, Xiang Zhu, and Jianyu Chen. UP-
+     VLA: A unified understanding and prediction model for embodied agent. arXiv preprint
+     arXiv:2501.18867, 2025.
+[44] Ruijie Zheng, Yongyuan Liang, Shuaiyi Huang, Jianfeng Gao, Hal Daumé III, Andrey Kolobov,
+     Furong Huang, and Jianwei Yang. TraceVLA: Visual trace prompting for generalist robot
+     policies. arXiv preprint arXiv:2412.10345, 2024.
+[45] Ruijie Zheng, Jing Wang, Scott Reed, Johan Bjorck, Yu Fang, Fengyuan Hu, Joel Jang, Kaushil
+     Kundalia, Zongyu Lin, Loic Magne, Avnish Narayan, You Liang Tan, Guanzhi Wang, Qi Wang,
+     Jiannan Xiang, Yinzhen Xu, Seonghyeon Ye, Jan Kautz, Furong Huang, Yuke Zhu, and Linxi
+     Fan. FLARE: Robot learning with implicit world modeling. arXiv preprint arXiv:2505.15659,
+     2025.
+[46] Hanyu Zhou, Chuanhao Ma, and Gim Hee Lee. VLA-4D: Embedding 4d awareness into vision-
+     language-action models for spatiotemporally coherent robotic manipulation. arXiv preprint
+     arXiv:2511.17199, 2025.
+
+
+
+
+                                                12
+Overview
+This appendix supplements the main paper with implementation, evaluation, and discussion details.
+Appendix A reports the optimization recipe, hyperparameters (Tab. 4), and frozen-teacher pipeline.
+Appendix B (Tab. 5) consolidates the symbols used throughout the method, and Appendix C provides
+pseudocode for one training step (Algorithm 1) and one inference chunk (Algorithm 2). Appendix D
+lists the 31 RoboTwin tasks, the RoboTwin-5Task ablation subset, and baseline configurations, while
+Appendix E presents additional 3D end-effector trajectory comparisons (Fig. 5). We close with
+limitations (Appendix F) and broader impact (Appendix G).
+
+A    Implementation
+Optimisation recipe. Following LingBot-VLA’s recipe (Tab. 4), the action expert is held in fp32
+while the rest of the model runs in bf16 storage with fp32 reductions. The full model optimizes
+Eq. (12); the w/o Geometric Anchor variant drops the local and global anchor losses.
+
+Hyperparameters. The loss weights λ1 –λ4 in Tab. 4 are tuned on RoboTwin-5Task and reused on
+the full RoboTwin and Galaxea evaluations without further sweeping.
+
+Table 4: Hyperparameters introduced by EvoScene-VLA. Optimisation values are inherited from the
+LingBot-VLA recipe; loss weights are EvoScene-VLA-specific.
+                      Optimisation
+                      Optimiser                      AdamW
+                      Learning rate (constant)       1×10−4
+                      Effective batch size           256
+                      Total update steps             20,000
+                      Mixed precision                bf16 storage / fp32 reductions
+                      Hardware                       8×A800
+                      Architecture
+                      VLM backbone                   Qwen2.5-VL-3B-Instruct
+                      Hidden dimension D             2048
+                      Camera views V                 3 (head, left wrist, right wrist)
+                      Image resolution               224×224
+                      Template bank size             256
+                      Observation / prior slots N    16
+                      Key frames K                   3
+                      Action chunk length            50
+                      Loss weights (Eq. (12))
+                      λ1 on Lgeo                     0.04
+                      λ2 on Lrep                     0.10
+                      λ3 on Lpred                    0.10
+                      λ4 on LsceneFM                 0.01
+                      Inference
+                      Flow-matching Euler steps      10
+                      Re-observation period          1 chunk (50 steps)
+
+
+Frozen teachers. The local depth head gdepth reuses the LingBot-Depth alignment block, super-
+vised by LingBot-VLA’s MoRGBD pipeline [32] (MoGe-2 ViT-B normal variant combined with
+the LingBot-Depth masked-depth-modeling teacher) on the unmasked target view. The global 3D
+supervisor is the frozen Pi3 multi-view 3D foundation model [36], applied to the current-frame
+multi-view input for Lrep and to the future-frame multi-view input for Lpred .
+
+B    Notation
+Tab. 5 consolidates the symbols used throughout Secs. 3.2 to 3.5.
+
+
+                                                    13
+    Table 5: Notation used in EvoScene-VLA. Shapes are written as R(dimensions) where applicable.
+          Symbol            Meaning
+          Indices and dimensions
+          t                  Discrete time index of the current control chunk
+          D                  VLM hidden dimension (Qwen2.5-VL-3B: D=2048)
+          V                  Number of camera views (V =3: head, left wrist, right wrist)
+          N                  Number of slots per observation or prior group (N =16)
+          K                  Number of scene key-frame query groups (K=3)
+          H                  Final action offset of the chunk; chunk length H+1=50
+          {k1 , . . . , kK } Sparse key-frame offsets, ki ∈ {1, . . . , H}
+          Inputs
+          xt                Multi-view image input at step t
+          xt,vi             Image of view i ∈ {1, . . . , V }
+          ℓ                 Language instruction
+          rt                Robot proprioceptive state
+          at:t+H            Ground-truth action chunk
+          Recurrent scene prefix
+            (v)
+          sobs ∈ RN ×D      Observation slots for view v, gather geometric evidence per camera
+          s̄t ∈ RN ×D       Prior slots inherited from the previous chunk
+          sp ∈ RN ×D        VLM output at the prior-slot positions; cross-view scene representation
+          himg
+            t,v             VLM image tokens for view v
+          m ∈ RD            Learned mask embedding for cross-view masking
+          Geometric Anchor (training only)
+          qtmpl           256-token template query bank reused for gdepth
+          gdepth          Cross-attention head producing per-view depth representations
+          fˆt,i
+             d
+                          Predicted depth representation for masked target view i
+          MDT             Frozen Monocular Depth Teacher (MoGe-2 + LingBot-Depth)
+          g3D             View-conditioned cross-attention decoder for the global anchor
+          qdec            Learnable view-aware queries for g3D
+          Wproj           Linear projector to the 3D foundation-model feature space
+          Pt , Zt         Projected output / frozen 3DFM features for the current frame
+          Scene Predictor (training only)
+          q1 , . . . , qK   Key-frame query groups initialized from sp , each of size N
+          ŝt+ki ∈ RN ×D Predicted absolute future scene latent at offset ki
+          P̃t+ki , Zt+ki    Projected predicted feature / frozen 3DFM feature on the future frame
+          Joint action–scene flow matching
+          z0 ∈ RK×N ×D Standardised future-scene targets (LayerNorm of ŝ)
+          τ ∈ [0, 1]        Shared flow-matching time
+          ϵa , ϵs           Independent Gaussian noises on action / scene paths
+          aτt:t+H , z τ     Straight-line interpolants
+           (a)    (s)
+          vθ , vθ           Predicted velocities for action / scene blocks
+          Losses (Eq. (12))
+          Lgeo              Cross-view masked depth reconstruction loss
+          Lrep              Global anchor ℓ1 loss for the current frame
+          Lpred             Future-scene ℓ1 loss for the K key frames
+          LsceneFM          Scene flow-matching loss in the action expert
+          LactFM            Action flow-matching loss in the action expert
+          λ1 , λ2 , λ3 , λ4 Loss weights (0.04, 0.10, 0.10, 0.01)
+
+
+
+
+C     Algorithms
+
+
+Algorithm 1 states one training step. Algorithm 2 states the deployed forward path.
+
+
+                                                     14
+Algorithm 1 EvoScene-VLA training step.
+                                                              
+Require: Sample xt , ℓ, rt , at:t+H , xt+k1 , . . . , xt+kK and prior carry s̄t (learnable embedding
+    for the first chunk in an episode).
+                           (1:V )
+ 1: Form prefix [ xt , sobs , s̄t , ℓ ] with the asymmetric attention mask (Sec. 3.2).
+ 2: Run VLM forward; read sp from the prior-slot positions (Eq. (2)).
+ 3: for each view i ∈ {1, . . . , V } do                                           ▷ Local depth anchor
+ 4:      Mask himg
+                 t,vi ←   m,  keep  other   views  unchanged.
+                                     img,(i)
+ 5:      fˆt,i
+            d
+               ← gdepth (qtmpl , [ h̃t,v1 :V , sp ])
+ 6: end for
+ 7: Lgeo ← V1                        ˆd
+                 P                                       
+                    i SmoothL1 ft,i , MDT(xt,vi )                                               ▷ Eq. (4)
+ 8: Pt ← Wproj g3D (qdec ; sp )                                                          ▷ Global anchor
+                          (v)
+ 9: Lrep ← V1                  − 3DFM(xt )(v) 1
+                 P
+                    v Pt
+10: ŝt+k1 :t+kK ← ScenePredictor(rt , sp , at:t+H , q1 , . . . , qK )
+11: P̃t+ki ← Wproj g3D (qdec ; ŝt+ki ) for each i
+                 1
+                    P           (v)                     (v)
+12: Lpred ← KV          i,v P̃t+ki − 3DFM(xt+ki )           1
+13: z0 ← LayerNorm(ŝt+k1 :t+kK )                                      ▷ Standardise future-scene targets
+14: Sample τ ∼ U [0, 1], ϵa , ϵs ∼ N (0, I)
+15: aτ ← τ ϵa + (1−τ )at:t+H , z τ ← τ ϵs + (1−τ )z0
+      (a) (s)                                                   
+16: vθ , vθ ← ActionExpert [ rt | z τ | aτ ]; prefix cache
+                    (a)
+17: LactFM ← ∥vθ − (ϵa − at:t+H )∥22
+                       (s)
+18: LsceneFM ← ∥vθ − (ϵs − z0 )∥22
+19: L ← LactFM + λ1 Lgeo + λ2 Lrep + λ3 Lpred + λ4 LsceneFM
+20: Backpropagate L; update VLM, action expert, and all training-only modules.
+
+
+Algorithm 2 EvoScene-VLA inference per chunk.
+Require: Current observation xt , instruction ℓ, robot state rt , prior buffer s̄t (learnable embedding
+    for the first chunk).
+Ensure: Action chunk ât:t+H executed on the robot; updated prior s̄t+1 .
+                          (1:V )
+ 1: Form prefix [ xt , sobs , s̄t , ℓ ] and run one VLM forward.
+ 2: Read sp at the prior-slot positions; cache the prefix KV. ▷ Geometric Anchor / Scene Predictor
+    not loaded.
+ 3: Initialise a1 ∼ N (0, I), z 1 ∼ N (0, I).
+ 4: for each Euler step τ ∈ {1, 1−∆τ, . . . , ∆τ } (10 steps total) do
+ 5:      v (a) , v (s) ← ActionExpert([ rt | z τ | aτ ]; prefix cache)
+ 6:      aτ −∆τ ← aτ − ∆τ v (a) , z τ −∆τ ← z τ − ∆τ v (s)
+ 7: end for
+ 8: ât:t+H ← a0 ; ŝt+k1 :t+kK ← z 0                                          ▷ Joint denoised outputs
+ 9: Execute ât:t+H on the robot.
+10: s̄t+1 ← ŝt+kK                           ▷ Write the executed end-point token back as the next prior
+11: Re-observe xt+1 and return to step 1 for the next chunk.
+
+
+
+
+D    Datasets and Tasks
+
+RoboTwin 31 tasks. We use 31 language-conditioned manipulation tasks from RoboTwin 2.0 [25],
+covering single-arm and dual-arm, short-horizon and long-horizon settings. The full task list is:
+place_mouse_pad, click_bell, open_microwave, place_shoe, put_object_cabinet,
+stack_blocks_three,           beat_block_hammer,          turn_switch,          open_laptop,
+place_dual_shoes,       pick_dual_bottles,        stack_bowls_three,        place_a2b_left,
+place_a2b_right,       place_empty_cup,        move_can_pot,       place_container_plate,
+press_stapler, place_phone_stand, place_fan, rotate_qrcode, place_object_stand,
+shake_bottle,       scan_object,       pick_diverse_bottles,          place_bread_skillet,
+place_bread_basket,              place_burger_fries,               place_cans_plasticbox,
+
+
+                                                   15
+put_bottles_dustbin, and hanging_mug.                Each task uses RoboTwin’s standard episode
+length and the 50-step action chunk.
+
+RoboTwin-5Task ablation subset. For ablations we use a 5-task subset that spans single-arm, dual-
+arm, short-horizon, and long-horizon types and keeps the ablation budget controlled: click_bell,
+open_microwave, place_shoe, put_object_cabinet, and stack_blocks_three.
+
+Baselines. LingBot-VLA∗ is the depth-augmented LingBot-VLA, corresponding to the
+robotwin_load20000h_depth configuration of the LingBot-VLA repository. EvoScene-VLA
+shares its training data, chunk length, and compute budget with all baselines.
+
+E    Additional Trajectory Visualizations
+Fig. 5 shows additional 3D end-effector trajectory comparisons complementing Fig. 3.
+
+
+
+
+                (a) grab_roller                                     (b) place_bread_skillet
+
+
+
+
+            (c) place_burger_fries                                (d) place_cans_plasticbox
+Figure 5: Additional 3D end-effector trajectory comparisons on four RoboTwin tasks, complementing
+Fig. 3. EvoScene-VLA produces noticeably smoother paths than LingBot-VLA across all four cases.
+
+
+F    Limitations
+EvoScene-VLA carries a latent recurrent state across chunk boundaries, so its geometric content
+is not directly interpretable; the value of the prior must be judged through downstream behavior
+and through the controlled ablation in Tab. 2. Future-scene supervision flows through a frozen 3D
+foundation model on future frames, so target quality upper-bounds the prior the action expert can
+learn. We train Scene Predictor and the action expert’s scene branch only at a fixed set of key-frame
+offsets {k1 , . . . , kK }. Deployments that re-observe at intervals diverging from these offsets therefore
+receive a temporally misaligned prior at the next chunk. Real-robot evaluation is currently limited
+to three indoor-cleaning tasks on a single dual-arm platform; behavior under category shift, novel
+scenes, and multi-step task chaining remains future work.
+
+G    Broader Impact
+EvoScene-VLA is a manipulation policy aimed at indoor household assistance. Robots that run such
+policies inside homes raise standard considerations around physical safety, user privacy from on-robot
+camera streams, and potential displacement of routine paid labor. These considerations apply to
+vision–language–action policies broadly and are not specific to the recurrent scene prefix introduced
+
+
+                                                    16
+here. All training data in this work come from public datasets or platform-provided demonstrations
+under their respective licences; real-robot evaluation is conducted in a controlled lab setting with no
+human subjects.
+
+
+
+
+                                                  17
+

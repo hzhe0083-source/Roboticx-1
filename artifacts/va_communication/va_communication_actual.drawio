@@ -1,0 +1,194 @@
+<mxfile host="app.diagrams.net" modified="2026-08-03T08:15:00.000Z" agent="Codex" version="24.7.17" type="device">
+  <diagram id="va-communication" name="VA communication">
+    <mxGraphModel dx="1900" dy="1080" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1900" pageHeight="1080" math="0" shadow="0" background="#FFFFFF">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <mxCell id="title" value="VA 通讯机制与问题（当前实现）" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontSize=27;fontStyle=1;fontColor=#0F172A;fontFamily=Helvetica;whiteSpace=wrap;" vertex="1" parent="1">
+          <mxGeometry x="40" y="18" width="760" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="subtitle" value="彩色数据流 = 当前代码事实　｜　红虚线 = 缺失回路　｜　底部红卡 = 待验证" style="text;html=1;strokeColor=none;fillColor=none;align=right;verticalAlign=middle;fontSize=14;fontColor=#475569;fontFamily=Helvetica;whiteSpace=wrap;" vertex="1" parent="1">
+          <mxGeometry x="1240" y="24" width="620" height="28" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="secA" value="A · 同一 VACouplingLayer：V↔A 的实际通信矩阵" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#F8FAFC;strokeColor=#64748B;strokeWidth=1.5;fontColor=#0F172A;fontSize=16;fontStyle=1;align=left;spacingLeft=14;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="40" y="75" width="1820" height="38" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="inputLabel" value="进入第 i 层的输入状态" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontSize=12;fontStyle=1;fontColor=#475569;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="60" y="127" width="250" height="24" as="geometry"/>
+        </mxCell>
+        <mxCell id="projLabel" value="独立投影" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontSize=12;fontStyle=1;fontColor=#475569;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="340" y="127" width="260" height="24" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="vInput" value="&lt;b&gt;V&lt;sup&gt;i−1&lt;/sup&gt;&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;current visual tokens&lt;/font&gt;" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#E0F2FE;strokeColor=#64748B;strokeWidth=1.8;fontColor=#0C4A6E;fontSize=15;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="60" y="155" width="240" height="64" as="geometry"/>
+        </mxCell>
+        <mxCell id="vProj" value="LN → Q&lt;sub&gt;V&lt;/sub&gt;, K&lt;sub&gt;V&lt;/sub&gt;, U&lt;sub&gt;V&lt;/sub&gt;" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#E0F2FE;strokeColor=#64748B;strokeWidth=1.5;fontColor=#075985;fontSize=14;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="340" y="155" width="270" height="64" as="geometry"/>
+        </mxCell>
+        <mxCell id="mInput" value="&lt;b&gt;M&lt;sub&gt;t−1&lt;/sub&gt;&lt;sup&gt;i&lt;/sup&gt;&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;previous visual memory · t=0 absent&lt;/font&gt;" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#FEF3C7;strokeColor=#64748B;strokeWidth=1.8;fontColor=#78350F;fontSize=15;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="60" y="235" width="240" height="64" as="geometry"/>
+        </mxCell>
+        <mxCell id="mProj" value="LN → K&lt;sub&gt;M&lt;/sub&gt;, U&lt;sub&gt;M&lt;/sub&gt;" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#FEF3C7;strokeColor=#64748B;strokeWidth=1.5;fontColor=#78350F;fontSize=14;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="340" y="235" width="270" height="64" as="geometry"/>
+        </mxCell>
+        <mxCell id="aInput" value="&lt;b&gt;A&lt;sup&gt;i−1&lt;/sup&gt;&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;latent action-condition tokens&lt;/font&gt;" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#EDE9FE;strokeColor=#64748B;strokeWidth=1.8;fontColor=#4C1D95;fontSize=15;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="60" y="315" width="240" height="64" as="geometry"/>
+        </mxCell>
+        <mxCell id="aProj" value="LN → Q&lt;sub&gt;A&lt;/sub&gt;, K&lt;sub&gt;A&lt;/sub&gt;, U&lt;sub&gt;A&lt;/sub&gt;" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#EDE9FE;strokeColor=#64748B;strokeWidth=1.5;fontColor=#4C1D95;fontSize=14;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="340" y="315" width="270" height="64" as="geometry"/>
+        </mxCell>
+        <mxCell id="lInput" value="&lt;b&gt;L&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;language hidden states&lt;/font&gt;" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#FEF3C7;strokeColor=#64748B;strokeWidth=1.8;fontColor=#78350F;fontSize=15;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="60" y="395" width="240" height="64" as="geometry"/>
+        </mxCell>
+        <mxCell id="lProj" value="LN → cached K&lt;sub&gt;L&lt;/sub&gt;&lt;sup&gt;i&lt;/sup&gt;, U&lt;sub&gt;L&lt;/sub&gt;&lt;sup&gt;i&lt;/sup&gt;" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#FEF3C7;strokeColor=#64748B;strokeWidth=1.5;fontColor=#78350F;fontSize=14;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="340" y="395" width="270" height="64" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="matrixTitle" value="共享 Attention：Q=[Q&lt;sub&gt;V&lt;/sub&gt;; Q&lt;sub&gt;A&lt;/sub&gt;]，K/U=[V; M; A; L]　·　行 = Query 角色" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#F8FAFC;strokeColor=#64748B;strokeWidth=1.5;fontColor=#0F172A;fontSize=14;fontStyle=1;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="660" y="135" width="700" height="55" as="geometry"/>
+        </mxCell>
+        <mxCell id="rowHeader" value="Query" style="whiteSpace=wrap;html=1;fillColor=#E2E8F0;strokeColor=#64748B;fontColor=#334155;fontSize=12;fontStyle=1;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="680" y="200" width="120" height="42" as="geometry"/>
+        </mxCell>
+        <mxCell id="colV" value="V source" style="whiteSpace=wrap;html=1;fillColor=#E0F2FE;strokeColor=#64748B;fontColor=#075985;fontSize=12;fontStyle=1;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="820" y="200" width="120" height="42" as="geometry"/>
+        </mxCell>
+        <mxCell id="colM" value="M source" style="whiteSpace=wrap;html=1;fillColor=#FEF3C7;strokeColor=#64748B;fontColor=#78350F;fontSize=12;fontStyle=1;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="960" y="200" width="120" height="42" as="geometry"/>
+        </mxCell>
+        <mxCell id="colA" value="A source" style="whiteSpace=wrap;html=1;fillColor=#EDE9FE;strokeColor=#64748B;fontColor=#4C1D95;fontSize=12;fontStyle=1;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="1100" y="200" width="120" height="42" as="geometry"/>
+        </mxCell>
+        <mxCell id="colL" value="L source" style="whiteSpace=wrap;html=1;fillColor=#FEF3C7;strokeColor=#64748B;fontColor=#78350F;fontSize=12;fontStyle=1;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="1240" y="200" width="120" height="42" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="qv" value="&lt;b&gt;Q&lt;sub&gt;V&lt;/sub&gt;&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;updates V&lt;/font&gt;" style="whiteSpace=wrap;html=1;fillColor=#E0F2FE;strokeColor=#64748B;strokeWidth=1.5;fontColor=#075985;fontSize=14;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="680" y="255" width="120" height="88" as="geometry"/>
+        </mxCell>
+        <mxCell id="qvV" value="V self" style="whiteSpace=wrap;html=1;fillColor=#E0F2FE;strokeColor=#64748B;fontColor=#334155;fontSize=12;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="820" y="255" width="120" height="88" as="geometry"/>
+        </mxCell>
+        <mxCell id="qvM" value="temporal&lt;br&gt;M → V" style="whiteSpace=wrap;html=1;fillColor=#FEF3C7;strokeColor=#64748B;fontColor=#334155;fontSize=12;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="960" y="255" width="120" height="88" as="geometry"/>
+        </mxCell>
+        <mxCell id="qvA" value="&lt;b&gt;A → V&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;latent A 条件 → ΔV&lt;/font&gt;" style="whiteSpace=wrap;html=1;fillColor=#EDE9FE;strokeColor=#2563EB;strokeWidth=2.5;fontColor=#4C1D95;fontSize=15;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="1100" y="255" width="120" height="88" as="geometry"/>
+        </mxCell>
+        <mxCell id="qvL" value="goal&lt;br&gt;L → V" style="whiteSpace=wrap;html=1;fillColor=#FEF3C7;strokeColor=#64748B;fontColor=#334155;fontSize=12;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="1240" y="255" width="120" height="88" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="qa" value="&lt;b&gt;Q&lt;sub&gt;A&lt;/sub&gt;&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;updates A&lt;/font&gt;" style="whiteSpace=wrap;html=1;fillColor=#EDE9FE;strokeColor=#64748B;strokeWidth=1.5;fontColor=#4C1D95;fontSize=14;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="680" y="356" width="120" height="88" as="geometry"/>
+        </mxCell>
+        <mxCell id="qaV" value="&lt;b&gt;V → A&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;视觉写入动作条件&lt;/font&gt;" style="whiteSpace=wrap;html=1;fillColor=#E0F2FE;strokeColor=#2563EB;strokeWidth=2.5;fontColor=#075985;fontSize=15;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="820" y="356" width="120" height="88" as="geometry"/>
+        </mxCell>
+        <mxCell id="qaM" value="memory&lt;br&gt;M → A" style="whiteSpace=wrap;html=1;fillColor=#FEF3C7;strokeColor=#64748B;fontColor=#334155;fontSize=12;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="960" y="356" width="120" height="88" as="geometry"/>
+        </mxCell>
+        <mxCell id="qaA" value="A self" style="whiteSpace=wrap;html=1;fillColor=#EDE9FE;strokeColor=#64748B;fontColor=#334155;fontSize=12;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="1100" y="356" width="120" height="88" as="geometry"/>
+        </mxCell>
+        <mxCell id="qaL" value="goal&lt;br&gt;L → A" style="whiteSpace=wrap;html=1;fillColor=#FEF3C7;strokeColor=#64748B;fontColor=#334155;fontSize=12;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="1240" y="356" width="120" height="88" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="attnV" value="softmax(Q&lt;sub&gt;V&lt;/sub&gt;K&lt;sub&gt;all&lt;/sub&gt;&lt;sup&gt;T&lt;/sup&gt;)U&lt;sub&gt;all&lt;/sub&gt;&lt;br&gt;&lt;b&gt;→ ΔV&lt;/b&gt;" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#E0F2FE;strokeColor=#64748B;strokeWidth=1.8;fontColor=#075985;fontSize=13;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="1380" y="255" width="185" height="88" as="geometry"/>
+        </mxCell>
+        <mxCell id="outV" value="Residual + FFN&lt;br&gt;&lt;b&gt;V&lt;sup&gt;i&lt;/sup&gt;&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;→ next layer; → M&lt;sub&gt;t&lt;/sub&gt;&lt;sup&gt;i&lt;/sup&gt;&lt;/font&gt;" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#E0F2FE;strokeColor=#64748B;strokeWidth=2;fontColor=#075985;fontSize=13;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="1585" y="255" width="245" height="88" as="geometry"/>
+        </mxCell>
+        <mxCell id="attnA" value="softmax(Q&lt;sub&gt;A&lt;/sub&gt;K&lt;sub&gt;all&lt;/sub&gt;&lt;sup&gt;T&lt;/sup&gt;)U&lt;sub&gt;all&lt;/sub&gt;&lt;br&gt;&lt;b&gt;→ ΔA&lt;/b&gt;" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#EDE9FE;strokeColor=#64748B;strokeWidth=1.8;fontColor=#4C1D95;fontSize=13;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="1380" y="356" width="185" height="88" as="geometry"/>
+        </mxCell>
+        <mxCell id="outA" value="Residual + FFN&lt;br&gt;&lt;b&gt;A&lt;sup&gt;i&lt;/sup&gt;&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:10px&quot;&gt;→ next layer; A&lt;sup&gt;4&lt;/sup&gt; → C&lt;sub&gt;t&lt;/sub&gt;&lt;/font&gt;" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#EDE9FE;strokeColor=#64748B;strokeWidth=2;fontColor=#4C1D95;fontSize=13;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="1585" y="356" width="245" height="88" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="maskCallout" value="&lt;b&gt;Role mask&lt;/b&gt;　bidir_va：Q&lt;sub&gt;V&lt;/sub&gt; / Q&lt;sub&gt;A&lt;/sub&gt; 都可读取 V,M,A,L　｜　uni_a：Q&lt;sub&gt;V&lt;/sub&gt; 只能读取当前 V；Q&lt;sub&gt;A&lt;/sub&gt; 仍读取全部来源" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#F8FAFC;strokeColor=#64748B;strokeWidth=1.5;fontColor=#334155;fontSize=13;align=left;verticalAlign=middle;spacingLeft=12;spacingRight=10;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="660" y="465" width="700" height="82" as="geometry"/>
+        </mxCell>
+        <mxCell id="parallelCallout" value="&lt;b&gt;关键时序事实&lt;/b&gt;&lt;br&gt;同层 V&lt;sup&gt;i&lt;/sup&gt; 与 A&lt;sup&gt;i&lt;/sup&gt; 都由旧的 V&lt;sup&gt;i−1&lt;/sup&gt; / A&lt;sup&gt;i−1&lt;/sup&gt; 并行算出；新状态要到 Layer i+1 才再次互相读取。" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#E0F2FE;strokeColor=#2563EB;strokeWidth=2;fontColor=#1E3A8A;fontSize=13;align=left;verticalAlign=middle;spacingLeft=12;spacingRight=10;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="1380" y="465" width="450" height="82" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="secB" value="B · A 的真实含义：latent action-condition，不是 candidate action" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#F8FAFC;strokeColor=#64748B;strokeWidth=1.5;fontColor=#0F172A;fontSize=16;fontStyle=1;align=left;spacingLeft=14;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="40" y="575" width="1820" height="38" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="initA" value="learned queries [H=8, 512]&lt;br&gt;&lt;b&gt;+ state_projection&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;(proprio, previous_action)&lt;/font&gt;" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#EDE9FE;strokeColor=#64748B;strokeWidth=1.8;fontColor=#4C1D95;fontSize=13;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="80" y="640" width="260" height="105" as="geometry"/>
+        </mxCell>
+        <mxCell id="vaLayers" value="VA layers ×4&lt;br&gt;&lt;b&gt;latent A tokens&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;read V / M / A / L&lt;/font&gt;" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#EDE9FE;strokeColor=#64748B;strokeWidth=1.8;fontColor=#4C1D95;fontSize=13;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="410" y="640" width="235" height="105" as="geometry"/>
+        </mxCell>
+        <mxCell id="condition" value="C&lt;sub&gt;t&lt;/sub&gt; = LN(A&lt;sup&gt;4&lt;/sup&gt;)&lt;br&gt;&lt;b&gt;[B, 8, 512]&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;computed once / observation&lt;/font&gt;" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#EDE9FE;strokeColor=#2563EB;strokeWidth=2.2;fontColor=#4C1D95;fontSize=13;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="715" y="640" width="235" height="105" as="geometry"/>
+        </mxCell>
+        <mxCell id="flowHead" value="&lt;b&gt;FlowMatchingHead&lt;/b&gt;&lt;br&gt;C&lt;sub&gt;t&lt;/sub&gt; + projection(a&lt;sup&gt;τ&lt;/sup&gt;) + time(τ)&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;TransformerEncoder ×2 → velocity&lt;/font&gt;" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#F8FAFC;strokeColor=#64748B;strokeWidth=1.8;fontColor=#0F172A;fontSize=13;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="1020" y="640" width="350" height="105" as="geometry"/>
+        </mxCell>
+        <mxCell id="solver" value="Euler ×8 &lt;font style=&quot;font-size:10px&quot;&gt;(default)&lt;/font&gt;&lt;br&gt;&lt;b&gt;reuse fixed C&lt;sub&gt;t&lt;/sub&gt;&lt;/b&gt;" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#F8FAFC;strokeColor=#64748B;strokeWidth=1.8;fontColor=#334155;fontSize=13;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="1435" y="640" width="170" height="105" as="geometry"/>
+        </mxCell>
+        <mxCell id="actionsOut" value="action chunk&lt;br&gt;&lt;b&gt;[B, 8, 7]&lt;/b&gt;" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#DCFCE7;strokeColor=#64748B;strokeWidth=2;fontColor=#14532D;fontSize=14;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="1670" y="640" width="160" height="105" as="geometry"/>
+        </mxCell>
+        <mxCell id="noFeedback" value="&lt;b&gt;当前代码没有这条回路：&lt;/b&gt; a&lt;sup&gt;τ&lt;/sup&gt; / sampled action ↛ VA / Vision。8 次求解只反复调用轻量 Flow Head，条件 C&lt;sub&gt;t&lt;/sub&gt; 保持不变。" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#FEE2E2;strokeColor=#DC2626;strokeWidth=2;fontColor=#7F1D1D;fontSize=14;align=center;verticalAlign=middle;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="410" y="765" width="1195" height="54" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="secC" value="C · 通讯风险与最小实验（从左到右按优先级；以下是 hypotheses，不是已确认 bug）" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#F8FAFC;strokeColor=#64748B;strokeWidth=1.5;fontColor=#0F172A;fontSize=16;fontStyle=1;align=left;spacingLeft=14;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="40" y="840" width="1820" height="38" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="risk1" value="&lt;b&gt;P0 · A→V 是否真被用到&lt;/b&gt;&lt;br&gt;代码有路径，不等于模型会利用。&lt;br&gt;&lt;font style=&quot;font-size:12px&quot;&gt;固定 V/M/L，仅扰动 A，测 ΔV；再做 A→V mask ablation。&lt;/font&gt;" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#FEE2E2;strokeColor=#DC2626;strokeWidth=1.5;fontColor=#7C2D12;fontSize=14;align=left;verticalAlign=top;spacingTop=10;spacingLeft=12;spacingRight=10;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="85" y="895" width="326" height="128" as="geometry"/>
+        </mxCell>
+        <mxCell id="risk2" value="&lt;b&gt;P1 · 一层延迟&lt;/b&gt;&lt;br&gt;Layer 1 的 A→V 主要是 query + robot state。&lt;br&gt;&lt;font style=&quot;font-size:12px&quot;&gt;实验：逐层扰动 A，比较 ΔV / Δaction。&lt;/font&gt;" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#FEE2E2;strokeColor=#DC2626;strokeWidth=1.5;fontColor=#7C2D12;fontSize=14;align=left;verticalAlign=top;spacingTop=10;spacingLeft=12;spacingRight=10;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="441" y="895" width="326" height="128" as="geometry"/>
+        </mxCell>
+        <mxCell id="risk3" value="&lt;b&gt;P1 · latent / physical gap&lt;/b&gt;&lt;br&gt;VA 内的 A 不是候选动作 a&lt;sup&gt;τ&lt;/sup&gt;。&lt;br&gt;&lt;font style=&quot;font-size:12px&quot;&gt;实验：将 a&lt;sup&gt;τ&lt;/sup&gt; 投影后注入 VA 做消融。&lt;/font&gt;" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#FEE2E2;strokeColor=#DC2626;strokeWidth=1.5;fontColor=#7C2D12;fontSize=14;align=left;verticalAlign=top;spacingTop=10;spacingLeft=12;spacingRight=10;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="797" y="895" width="326" height="128" as="geometry"/>
+        </mxCell>
+        <mxCell id="risk4" value="&lt;b&gt;P2 · 无 solver feedback&lt;/b&gt;&lt;br&gt;采样中 C&lt;sub&gt;t&lt;/sub&gt; 固定，候选轨迹不重新查询 VA/Vision。&lt;br&gt;&lt;font style=&quot;font-size:12px&quot;&gt;实验：fixed C&lt;sub&gt;t&lt;/sub&gt; vs 周期性 re-encode。&lt;/font&gt;" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#FEE2E2;strokeColor=#DC2626;strokeWidth=1.5;fontColor=#7C2D12;fontSize=14;align=left;verticalAlign=top;spacingTop=10;spacingLeft=12;spacingRight=10;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="1153" y="895" width="326" height="128" as="geometry"/>
+        </mxCell>
+        <mxCell id="risk5" value="&lt;b&gt;P2 · token competition&lt;/b&gt;&lt;br&gt;共享 softmax 中 A=8，V/M/L token 更多。&lt;br&gt;&lt;font style=&quot;font-size:12px&quot;&gt;实验：按来源记录 attention mass / entropy，并检查 A→V 梯度。&lt;/font&gt;" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#FEE2E2;strokeColor=#DC2626;strokeWidth=1.5;fontColor=#7C2D12;fontSize=14;align=left;verticalAlign=top;spacingTop=10;spacingLeft=12;spacingRight=10;fontFamily=Helvetica;" vertex="1" parent="1">
+          <mxGeometry x="1509" y="895" width="321" height="128" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="footer" value="Source: va_compound/model.py, README.md, tests/test_model.py　｜　现有测试覆盖 L→V、M→V 与 memory→action；尚无直接 A-intervention→V sensitivity 测试。" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontSize=11;fontColor=#64748B;fontFamily=Helvetica;whiteSpace=wrap;" vertex="1" parent="1">
+          <mxGeometry x="60" y="1040" width="1770" height="22" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#2563EB;strokeWidth=2;" edge="1" parent="1" source="vInput" target="vProj"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#2563EB;strokeWidth=2;" edge="1" parent="1" source="mInput" target="mProj"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#2563EB;strokeWidth=2;" edge="1" parent="1" source="aInput" target="aProj"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#2563EB;strokeWidth=2;" edge="1" parent="1" source="lInput" target="lProj"><mxGeometry relative="1" as="geometry"/></mxCell>
+
+        <mxCell id="e5" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#2563EB;strokeWidth=2;" edge="1" parent="1" source="qvL" target="attnV"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e6" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#2563EB;strokeWidth=2;" edge="1" parent="1" source="attnV" target="outV"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e7" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#2563EB;strokeWidth=2;" edge="1" parent="1" source="qaL" target="attnA"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e8" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#2563EB;strokeWidth=2;" edge="1" parent="1" source="attnA" target="outA"><mxGeometry relative="1" as="geometry"/></mxCell>
+
+        <mxCell id="e9" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#2563EB;strokeWidth=2.2;" edge="1" parent="1" source="initA" target="vaLayers"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e10" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#2563EB;strokeWidth=2.2;" edge="1" parent="1" source="vaLayers" target="condition"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e11" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#2563EB;strokeWidth=2.2;" edge="1" parent="1" source="condition" target="flowHead"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e12" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#64748B;strokeWidth=2.2;" edge="1" parent="1" source="flowHead" target="solver"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e13" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeColor=#2563EB;strokeWidth=2.2;" edge="1" parent="1" source="solver" target="actionsOut"><mxGeometry relative="1" as="geometry"/></mxCell>
+
+        <mxCell id="noFeedbackLine" value="NO VA RE-ENCODE" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;endArrow=cross;endFill=0;dashed=1;dashPattern=6 4;strokeColor=#DC2626;strokeWidth=2;fontColor=#991B1B;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="solver" target="vaLayers">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="1400" y="625"/><mxPoint x="528" y="625"/></Array></mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

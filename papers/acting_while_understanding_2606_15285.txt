@@ -1,0 +1,972 @@
+                                                     Acting While Understanding: Asynchronous
+                                                     Semantic-Action Decoupling for Real-Time
+                                                           Vision-Language-Action Models
+                                                       Shenhao Yan1,2,* Ge Wang2,3,* Qi Liu2             Weilin Meng2 Jiahao Yang2
+                                                    Chengsi Yao2 Fan Feng2 Xiaoguang Ma1,†               Yiming Zhao2,† Yatong Han2,†
+                                                                                  1
+                                                                                      Northeastern University
+                                                                                            2
+                                                                                             Ising AI
+                                                                                      3
+                                                                                          CUHK-Shenzhen
+arXiv:2606.15285v1 [cs.RO] 13 Jun 2026
+
+
+
+
+                                                     Abstract: Vision-Language-Action models (VLAs) have demonstrated strong
+                                                     task understanding and generalization in robotic manipulation, yet the high com-
+                                                     putational cost of full-model inference limits their deployment in low-latency,
+                                                     high-frequency closed-loop control. We propose an asynchronous semantic-action
+                                                     decoupling framework that separates semantic understanding from action gener-
+                                                     ation along the internal semantic-action interface of existing VLAs, without re-
+                                                     designing the vision-language backbone or introducing an external planner. A
+                                                     low-frequency understanding module asynchronously updates reusable semantic
+                                                     conditions, while a high-frequency action module continuously outputs control
+                                                     actions without repeatedly invoking the full model. To mitigate the temporal mis-
+                                                     match between stale semantics and the current execution state, we further intro-
+                                                     duce historical action conditioning and time-misalignment training, which provide
+                                                     short-horizon execution context and improve feedback control robustness under
+                                                     stale semantic conditions. Experiments on LIBERO with π0.5 and UniVLA, to-
+                                                     gether with real-robot deployment using UniVLA, show that the proposed frame-
+                                                     work achieves up to 35.6 Hz server-side action-module inference throughput and
+                                                     offers a low-intrusion path to high-frequency closed-loop control without running
+                                                     full VLA inference at control rate.
+
+                                                     Keywords:     Vision-Language-Action Models, Asynchronous Inference,
+                                                     Semantic-Action Decoupling, Real-Time Robot Control, Robot Manipula-
+                                                     tion
+
+
+                                         1       Introduction
+
+                                         Vision-Language-Action models (VLAs) are becoming an important class of policies for robotic ma-
+                                         nipulation. Compared with conventional task-specific imitation learning methods such as ACT [1]
+                                         and Diffusion Policy [2], VLA models jointly use visual observations, language instructions, and
+                                         robot states for action generation, thereby exhibiting stronger potential in task understanding, cross-
+                                         scene generalization, and long-horizon manipulation. Recent robot foundation models and VLAs,
+                                         including RT-1, RT-2, PaLM-E, Open X-Embodiment / RT-X, Octo, RoboCat, vision-language
+                                         foundation models as robot imitators, OpenVLA, SmolVLA, TinyVLA, Gemini Robotics, GR00T
+                                         N1, π0 , π0.5 , and UniVLA, have substantially improved semantic reasoning, cross-task general-
+                                         ization, and cross-embodiment manipulation [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17].
+                                         These advances have also been supported by large-scale embodied datasets and benchmarks
+                                         such as Open X-Embodiment, BridgeData V2, DROID, RLBench, CALVIN, RoboCasa, and
+                                             * Equal contribution.
+                                             †
+                                                 Corresponding authors. Contact: rstanten@alumni.stanford.edu.
+Figure 1: Comparison between conventional chunk-wise VLA execution and our asynchronous
+semantic-action decoupling. Conventional VLAs refresh semantics only at chunk boundaries,
+whereas our method refreshes semantics sparsely while continuously replanning actions from the
+latest semantic cache, current state, and action history.
+
+
+LIBERO [6, 18, 19, 20, 21, 22, 23]. However, real-world robot control usually requires low-latency,
+high-frequency closed-loop action outputs, whereas full VLA inference often depends on computa-
+tionally expensive vision-language backbones and action decoding. As a result, coordinating low-
+frequency semantic understanding with high-frequency action control has become a key challenge
+in deploying large VLAs on real robots.
+Earlier language-conditioned and imitation-based manipulation systems such as SayCan, BC-Z,
+CLIPort, PerAct, RVT, Transporter Networks, Behavior Transformer, and Implicit Behavioral
+Cloning also established important ingredients for grounded manipulation and closed-loop visuo-
+motor control [24, 25, 26, 27, 28, 29, 30, 31].
+Existing VLA systems commonly adopt action chunking to mitigate the mismatch between full-
+model inference frequency and robot control frequency: a single inference step generates an action
+sequence over a future horizon, and a lower-level controller executes it at a fixed frequency. Al-
+though this strategy increases action density on the execution side and maintains continuous motion,
+it does not fundamentally remove the synchronous coupling between semantic understanding and
+action control. During chunk execution, the model’s semantic judgment about the current task, goal,
+and scene usually remains unchanged; therefore, when the environment changes or task execution
+has already progressed, the robot may still rely on semantic and action intentions generated at an
+earlier time. Prior studies have attempted to alleviate this issue through model inference acceler-
+ation [32, 33], action chunk continuation and correction [34, 35], and asynchronous inference or
+slow-fast control [36, 37]. Many of these methods, however, still rely on future-state compensa-
+tion, diffusion-specific micro-loops, action-stream reordering, or additional execution modules. In
+contrast, we focus on a more direct question: under reusable but potentially stale semantic condi-
+tions, can we decouple action generation from full forward inference with minimal modification to
+existing VLAs while preserving high-frequency state-feedback control?
+To this end, we propose an asynchronous semantic-action decoupling framework that abstracts an
+existing VLA into two asynchronous execution roles: a low-frequency understanding module that
+processes visual observations and language instructions and updates cached semantic conditions,
+and a high-frequency action module that continuously generates actions conditioned on the latest
+available semantics, the current robot state, and recent execution history. Because cached semantics
+are often stale at deployment time, we further introduce historical action conditioning and time-
+
+
+                                                 2
+Figure 2: Overview of the proposed asynchronous semantic-action decoupling framework. A low-
+frequency understanding module asynchronously refreshes a semantic cache, while a high-frequency
+action module replans from the latest cached semantic condition, current robot state, and recent
+action history; delay-aware training exposes the action module to stale semantics, and ACT-style
+temporal integration merges overlapping replanned predictions.
+
+
+
+
+misalignment training to mitigate the mismatch between outdated semantics and the current control
+state.
+Our framework differs from prior asynchronous VLA systems in three aspects. First, we decouple
+along the internal semantic-action interface of an existing VLA, rather than operating on the out-
+put action chunk stream after full-model inference. Second, the reused object is an intermediate
+semantic condition—such as a last-layer hidden state or KV-cache—rather than a future action se-
+quence to be continued, reordered, or corrected. Third, our main challenge is not merely how to
+reuse cached semantics, but how to maintain stable control when those semantics become stale; this
+is addressed by combining current-state feedback with historical action conditioning and explicit
+time-misalignment training.
+We validate the proposed method in both simulation and real-robot settings. In LIBERO, we in-
+stantiate asynchronous variants of both π0.5 and UniVLA to evaluate cross-backbone applicability.
+We further deploy UniVLA on real robots to verify practical closed-loop value. Experimental re-
+sults show that the framework maintains strong semantic guidance while achieving up to 35.6 Hz
+server-side action-module inference throughput, enabling high-frequency closed-loop control with-
+out running full VLA inference at control rate.
+Our contributions are threefold. First, we propose a low-intrusion asynchronous semantic-action
+decoupling framework along the internal semantic-action interface of pre-trained VLAs, letting a
+heavyweight understanding module run at low frequency while an action module runs at control
+rate. Second, we introduce historical action conditioning and time-misalignment training to improve
+robustness under stale semantic conditions. Third, we validate the framework on π0.5 , UniVLA, and
+real robots.
+
+
+                                                3
+2     Related Work
+Efficient VLA Inference and Real-Time Action Chunk Execution. As VLA models scale
+up, reducing inference cost and improving execution continuity have become central deploy-
+ment challenges. Existing methods improve efficiency through caching, speculative decoding,
+scheduling, pruning, routing, and sparsification [32, 33, 38, 39, 40, 41], while another line
+of work studies how to continue, correct, or reorder predicted action chunks during execu-
+tion [34, 42, 43, 35, 44, 45]. Beyond VLA-specific acceleration, practical deployment also ben-
+efits from strong vision-language backbones and efficient adaptation / serving techniques such
+as CLIP, Flamingo, DINOv2, PaliGemma, LoRA, QLoRA, FlashAttention, PagedAttention, and
+FAST [46, 47, 48, 49, 50, 51, 52, 53, 54]. These approaches alleviate the mismatch between
+full-model inference and control frequency, but they still largely center on full-model calls, output
+action-stream processing, or extra execution modules. In contrast, we target the temporal mismatch
+between semantic understanding and action generation inside existing VLAs, allowing the action
+module to run independently at high frequency from cached semantic conditions.
+Asynchronous and Slow-Fast VLA Control. The closest direction is asynchronous VLA ex-
+ecution and slow-fast robotic control, which separate high-level reasoning from fast motor up-
+dates [55, 56, 57, 58, 36, 37, 59]. Representative systems such as HiRT, Fast-in-Slow, OneTwoVLA,
+VLASH, TIDAL, and DynamicVLA explore this direction from hierarchical, dual-system, or asyn-
+chronous execution perspectives. These works recognize the multi-timescale nature of robotic con-
+trol, but typically operate through hierarchical loops, future-state-aware inference, or action stream-
+ing. Our method instead decouples at the internal semantic-action interface, reuses intermediate
+semantic conditions rather than future action sequences, and explicitly trains the action side to tol-
+erate stale semantics through history conditioning and delay simulation.
+Language-Conditioned Manipulation and Generalist Imitation Learning. Before recent
+VLAs, grounded robot control was advanced by language-conditioned imitation and visuomotor
+policies such as SayCan, BC-Z, CLIPort, PerAct, RVT, and Transporter Networks [24, 25, 26, 27,
+28, 29]. These methods connect semantic cues to closed-loop manipulation through affordance
+grounding, spatial reasoning, or structured visual representations. Behavior Transformer and Im-
+plicit Behavioral Cloning further show that strong sequence modeling and multimodal action learn-
+ing from demonstrations can substantially improve policy expressiveness [30, 31]. These works
+establish important foundations for grounded manipulation and feedback control, but they typically
+do not separate semantic reasoning from action generation inside a single pre-trained VLA or ex-
+plicitly study stale semantic reuse under asynchronous deployment.
+Generalist Robot Data, Policies, and Benchmarks. Recent progress in robot foundation mod-
+els has also been enabled by broader datasets and evaluation suites. Open X-Embodiment / RT-X,
+BridgeData V2, and DROID expand data scale and embodiment diversity [6, 18, 19], while Octo,
+RoboCat, and SmolVLA explore increasingly accessible generalist robot policies [7, 8, 11]. Bench-
+marks such as RLBench, CALVIN, RoboCasa, and LIBERO provide complementary testbeds for
+long-horizon, language-conditioned, and transfer-oriented manipulation [20, 21, 22, 23]. Our work
+is complementary to this trend: rather than proposing a new dataset or base policy, we study how to
+deploy existing large VLAs more effectively in high-frequency closed-loop settings.
+
+3     Method
+3.1   Problem Formulation and Overview
+
+We start from the standard VLA formulation, where a policy predicts actions from current ob-
+servations, language instructions, and optional robot state. Denoting by Uθ the semantic under-
+standing computation and by Gϕ the action generation computation, we abstract the policy as
+zt = Uθ (ot , l, s̃t ) and At = Gϕ (zt , st ), where zt is a reusable intermediate condition before action
+generation and s̃t denotes optional state input to the understanding side. Here, the understanding
+and action modules refer to asynchronous functional roles rather than MoE-style experts or inde-
+
+
+                                                    4
+Figure 3: Temporal redundancy and action variation in consecutive VLA inference. Neighboring
+observations often share similar visual-semantic focus, while action predictions still vary with exe-
+cution progress and local state, motivating high-frequency replanning under cached semantics.
+
+
+pendently trained subnetworks. Unless otherwise specified, we inherit the original training protocol
+and action learning objective of the base VLA, without introducing an external planner or a complex
+multi-stage training pipeline.
+At deployment time, zt primarily carries visual-language conditions, while real-time robot state
+feedback is always read by the action module at the current step. Concretely, we instantiate zt as the
+reusable condition immediately after visual-language grounding and before action generation: it is
+the last-layer VLM hidden state for UniVLA and the full cached KV-cache for π0.5 .
+
+3.2   Asynchronous Semantic-Action Decoupling
+
+The core observation behind asynchronous semantic-action decoupling is that high-level semantic
+understanding and low-level action control naturally evolve on different time scales: the former
+changes relatively slowly, while the latter requires frequent updates. As illustrated in Fig. 3, neigh-
+boring frames in continuous control often exhibit only limited change in observations and attention
+focus, whereas substantial action adjustments are more likely to occur when the execution phase or
+target semantics changes. This suggests that intermediate semantic conditions can be reused across
+multiple control steps.
+Based on this observation, we decouple a synchronous VLA into a low-frequency understanding
+module and a high-frequency action module. Let τk denote the time at which the k-th semantic
+update is completed and committed to the cache. The asynchronously updated semantic condition
+and the corresponding naive high-frequency action prediction can be written as
+                     zτk = Uθ (oτk , l, s̃τk ),   Ât = Gϕ (zτk , st ),   τk ≤ t.                  (1)
+That is, at every control step the action module reads the latest committed semantic condition instead
+of waiting for a new full understanding result. When a new semantic condition arrives, subsequent
+action predictions automatically switch to the new condition without interrupting the current control
+loop. This formulation already removes the need to run the full VLA end-to-end at robot control
+frequency. However, relying only on the latest cached semantic condition and the current state still
+leaves progress ambiguity when the semantic condition becomes stale. We therefore treat this as a
+naive asynchronous reuse baseline, and then extend it with additional temporal context.
+
+3.3   Historical Action-Conditioned Action Module
+
+Although asynchronous decoupling allows the action module to run at high frequency under the
+latest available semantic condition, the semantic representation it reads may come from an earlier
+time step. Therefore, relying only on cached semantics and the current state is often insufficient to
+
+
+                                                   5
+accurately reflect the current execution progress and local motion context. In continuous control,
+even when the high-level task semantics remain unchanged, the relative pose of the end-effector,
+contact state, and short-horizon motion trend continue to evolve over time.
+To alleviate this temporal misalignment, we provide the action module with recent historical actions.
+Let ht = [at−m , . . . , at−1 ] denote a history window of length m. The full action generation process
+is then written as
+                                    Ât = Gϕ (zτk , st , ht ), τk ≤ t.                              (2)
+In practice, we inject historical actions through a lightweight conditioning pathway on the action-
+generation side: UniVLA uses an additional projection layer, whereas π0.5 introduces historical
+actions as an extra condition to the flow-matching action head. Cached semantics provide high-
+level task goals, while ht supplies recent execution trajectories and local temporal context that helps
+disambiguate execution progress under stale semantics. The understanding module and its output
+interface remain unchanged, so structural modifications are confined to the action-generation side.
+
+3.4   Training and Inference
+
+If training always uses semantically synchro-
+                                                Model             Spatial Object Goal Long Avg.
+nized conditions aligned with the current ac-
+tion, the action module may struggle at de-     π 0                96.8    98.8 95.8 85.2 94.2
+                                                π0.5               98.8    98.2 98.0 92.4 96.9
+ployment time when semantic conditions be-      UniVLA             96.5    96.8 95.6 92.0 95.2
+come stale. We therefore explicitly simulate    π0.5 -15k          97.2    98.4 97.2 91.6 96.1
+temporal misalignment during training. For      UniVLA-Async 95.2          94.0 94.8 91.2 93.8
+action prediction at time t, instead of always  π0.5 -Async-15k 99.2       98.0 99.0 96.0 98.1
+conditioning on zt , we use a stale semantic Table 1: Main LIBERO results. The 15k-step π0.5
+condition zt−∆ from an earlier time, where variants use a reduced training budget relative to the
+∆ is sampled from {0, . . . , H − 1}. Here, H publicly reported full-training baseline.
+is the action chunk length; in our setup, one
+chunk typically spans about 1 s of future control, so this sampling approximates a stale semantic
+delay of up to one action chunk. The action module is trained to learn
+                                        Ât = Gϕ (zt−∆ , st , ht ),                                (3)
+under the base action learning objective
+                                                                       
+                              L = Et,∆ ℓbase (Gϕ (zt−∆ , st , ht ), At ) ,                         (4)
+where ℓbase denotes the original training objective of the backbone VLA, which may correspond to
+token prediction, flow matching, or action regression depending on the model. All experiments fol-
+low the official LIBERO fine-tuning configurations of the corresponding backbones, use the same
+datasets, and keep the default chunk length / action horizon settings. During training, ht is con-
+structed from historical actions in the trajectory and perturbed with small Gaussian noise to approx-
+imate the mismatch between executed and expert actions; during inference, ht is built from actually
+executed actions.
+At inference time, the understanding module asynchronously refreshes the semantic cache at a lower
+frequency, while the action module runs at every control step using the latest available semantic con-
+dition, current robot state, and recent action history. At each control step, the action module replans
+an action chunk, and ACT-style temporal integration combines temporally overlapping predictions
+into the executed action. In this way, the system no longer needs to run the full VLA at control
+frequency while still maintaining high-frequency state-feedback control under stale semantic condi-
+tions.
+
+4     Experiments
+
+We evaluate the proposed framework from three perspectives: simulation, real-robot deployment,
+and ablation analysis. We ask whether it preserves strong task success across backbones, improves
+
+
+                                                    6
+                                Kinova Gen2                           SO100
+  Method                                                                                       Avg.
+                        pick        stack     pour          pick          stack     open
+                       banana       cube      water      cube move        cube     drawer
+  SmolVLA               70.0        70.0      30.0         70.0            70.0      80.0       65.0
+  A2C2                  40.0        50.0       0.0         40.0            60.0      50.0       40.0
+  UniVLA                80.0        90.0      70.0         70.0            80.0      80.0       78.3
+  UniVLA-Async          90.0       100.0      90.0         100.0           90.0      90.0       93.3
+  π0.5                 100.0       100.0      90.0         90.0           100.0      90.0       95.0
+Table 2: Main real-robot results. We report task-level success rates (%) over 10 trials and the average
+success rate across six tasks.
+
+
+
+real closed-loop behavior, and whether historical action conditioning and time-misalignment train-
+ing are necessary under stale semantics.
+
+4.1   Experimental Setup
+
+Simulation experiments use LIBERO [23] with asynchronous variants of both π0.5 and UniVLA;
+task success rate is the primary metric. We report the official 96.9 π0.5 result and use our π0.5 -15k
+variants as reduced-budget references. Since asynchronous π0.5 is not deployed on our current robot
+setup, the real-world study focuses on synchronous versus asynchronous UniVLA.
+Real-robot experiments use SO100 and Kinova Gen2, with three tasks per platform and 10 trials
+per task. The controlled real-world comparison is UniVLA versus UniVLA-Async under the same
+backbone, data, hardware, and action horizon; SmolVLA [11], A2C2 [35], and synchronous π0.5
+serve as reference baselines. We report success rate, weighted SO100 completion time, and server-
+side inference throughput under the same A100 setting, while the robot control loop is fixed at 20 Hz.
+Since asynchronous π0.5 is not deployed on our current robot setup, we report only its server-side
+throughput.
+
+4.2   Main Results on LIBERO
+
+We first report the main LIBERO results for asynchronous variants of UniVLA and π0.5 .
+Table 1 shows that asynchronous semantic-action decoupling works across both UniVLA and π0.5 .
+For UniVLA, replacing synchronized semantic refresh with stale semantic reuse yields the expected
+moderate accuracy-real-time trade-off. π0.5 -Async remains highly competitive under only 15k train-
+ing steps; because the official π0.5 baseline uses a different training budget, we interpret this as
+evidence of non-degradation rather than a direct improvement. We conjecture that its robustness
+partly comes from reusing the full KV-cache rather than only the final hidden state before action
+generation.
+
+4.3   Real-World Experiments
+
+We further evaluate the deployability and cross-embodiment applicability of the framework on real
+robots. The core real-world comparison is UniVLA versus UniVLA-Async, while synchronous π0.5
+serves as a strong reference baseline under standard chunk-wise execution.
+Table 2 reports the main real-world success rates across the six tasks.
+Table 3 further characterizes runtime behavior in real closed-loop execution. On SO100, UniVLA-
+Async reduces the weighted average completion time from 17.4s to 13.1s, indicating that the benefit
+of asynchronous deployment appears not only in success rate but also in more continuous execution.
+Synchronous UniVLA reaches 3.4 Hz server-side throughput, UniVLA-Async reaches 35.6 Hz, and
+asynchronous π0.5 reaches 19.7 Hz; by contrast, A2C2 is faster but substantially less successful,
+indicating that throughput alone is insufficient. On Kinova, timing is less discriminative because
+
+
+                                                  7
+                      SO100 Avg. Throughput                    Method                 LIBERO-Long
+      Method
+                       Time (s)     (Hz)                       Sync UniVLA               92.0
+      SmolVLA             15.7          3.9                    Naive cache reuse         85.2
+      A2C2                20.3         61.6                    Cache + history           86.4
+      UniVLA              17.4          3.4                    Cache + delay train.      89.0
+      UniVLA-Async        13.1         35.6                    Ours                      91.2
+      π0.5                14.6          8.7                 Table 4: Ablation on LIBERO-Long un-
+      π0.5 -Async          –           19.7                 der stale semantic conditions.
+Table 3: Runtime summary on real robots. SO100
+completion time and server-side throughput.
+
+
+physical joint speed limits dominate the overall episode duration, so we focus primarily on success
+rate.
+
+4.4   Ablation on Stale Semantic Robustness
+
+To verify that our method is not merely simple
+cache reuse, we perform an ablation study cen-
+tered on stale semantic conditions. Because se-
+mantic delay is most pronounced in long-horizon
+tasks, we focus on UniVLA on LIBERO-Long
+and compare the naive asynchronous reuse base-
+line, history-only conditioning, delay-only train-
+ing, and the full method.
+Table 4 shows that directly replacing synchro-
+nized semantics with stale cached semantics leads
+to clear degradation: naive cache reuse drops
+from 92.0 to 85.2, indicating that reusing cached
+semantics alone is insufficient for stable control.
+Adding only historical action conditioning recov-
+ers performance to 86.4, while adding only delay
+training reaches 89.0, suggesting that both mech- Figure 4: Representative real-world task snap-
+anisms help mitigate errors induced by stale se- shots on Kinova Gen2 and SO100.
+mantics, with explicit modeling of train-test tem-
+poral misalignment being especially important. Combining both historical action conditioning and
+time-misalignment training raises performance to 91.2, close to the synchronous UniVLA score of
+92.0. This shows that the key of the proposed method lies not in caching itself, but in enabling the
+action module to control stably under stale semantic conditions by combining current-state feedback
+with recent execution context.
+
+5     Limitations and Discussion
+
+Although the proposed method performs well in both simulation and real-robot experiments, it still
+has several limitations. First, the framework depends on the existence of a reusable intermediate
+condition before action generation, so its applicability remains tied to the internal interface form
+of the base VLA. Second, although historical action conditioning and time-misalignment training
+alleviate performance degradation under stale semantic conditions, the action module may still be
+limited when semantic cache age becomes too large or when the environment changes significantly.
+In particular, the current fixed semantic refresh schedule is not always optimal: when scene changes,
+execution phase transitions, or uncertainty spikes occur rapidly, stale semantics may still mislead
+the controller before the next refresh. Finally, our experiments are mainly concentrated on single-
+arm manipulation tasks; although they cover long-horizon, multi-stage, and perturbation-sensitive
+scenarios, we have not yet validated the method on fast dynamic manipulation, mobile manipulation,
+or more complex contact-rich interactions.
+
+
+                                                 8
+Future work includes adaptive semantic refresh and broader validation across VLA architectures
+and real-world tasks. Overall, our results suggest that low-intrusion asynchronous decoupling is a
+practical path toward deploying large VLAs for real-time robot control.
+
+
+
+
+                                                9
+References
+ [1] T. Z. Zhao, V. Kumar, S. Levine, and C. Finn. Learning fine-grained bimanual manipulation
+     with low-cost hardware. arXiv preprint arXiv:2304.13705, 2023.
+
+ [2] C. Chi, Z. Xu, S. Feng, E. Cousineau, Y. Du, B. Burchfiel, R. Tedrake, and S. Song. Diffusion
+     policy: Visuomotor policy learning via action diffusion. The International Journal of Robotics
+     Research, 44(10-11):1684–1704, 2025.
+
+ [3] A. Brohan, N. Brown, J. Carbajal, Y. Chebotar, J. Dabis, C. Finn, K. Gopalakrishnan, K. Haus-
+     man, A. Herzog, J. Hsu, et al. Rt-1: Robotics transformer for real-world control at scale. arXiv
+     preprint arXiv:2212.06817, 2022.
+
+ [4] B. Zitkovich, T. Yu, S. Xu, P. Xu, T. Xiao, F. Xia, J. Wu, P. Wohlhart, S. Welker, A. Wahid,
+     et al. Rt-2: Vision-language-action models transfer web knowledge to robotic control. In
+     Conference on Robot Learning, pages 2165–2183. PMLR, 2023.
+
+ [5] D. Driess, F. Xia, M. S. Sajjadi, C. Lynch, A. Chowdhery, B. Ichter, A. Wahid, J. Tompson,
+     Q. Vuong, T. Yu, et al. Palm-e: An embodied multimodal language model. arXiv preprint
+     arXiv:2303.03378, 2023.
+
+ [6] A. O’Neill, A. Rehman, A. Maddukuri, A. Gupta, A. Padalkar, A. Lee, A. Pooley, A. Gupta,
+     A. Mandlekar, A. Jain, et al. Open x-embodiment: Robotic learning datasets and rt-x models:
+     Open x-embodiment collaboration 0. In 2024 IEEE International Conference on Robotics and
+     Automation (ICRA), pages 6892–6903. IEEE, 2024.
+
+ [7] O. M. Team, D. Ghosh, H. Walke, K. Pertsch, K. Black, O. Mees, S. Dasari, J. Hejna,
+     T. Kreiman, C. Xu, et al. Octo: An open-source generalist robot policy. arXiv preprint
+     arXiv:2405.12213, 2024.
+
+ [8] K. Bousmalis, G. Vezzani, D. Rao, C. Devin, A. X. Lee, M. Bauzá, T. Davchev, Y. Zhou,
+     A. Gupta, A. Raju, et al. Robocat: A self-improving generalist agent for robotic manipulation.
+     arXiv preprint arXiv:2306.11706, 2023.
+
+ [9] X. Li, M. Liu, H. Zhang, C. Yu, J. Xu, H. Wu, C. Cheang, Y. Jing, W. Zhang, H. Liu, et al.
+     Vision-language foundation models as effective robot imitators. In International Conference
+     on Learning Representations, volume 2024, pages 26703–26721, 2024.
+
+[10] M. J. Kim, K. Pertsch, S. Karamcheti, T. Xiao, A. Balakrishna, S. Nair, R. Rafailov, E. Foster,
+     G. Lam, P. Sanketi, et al. Openvla: An open-source vision-language-action model. arXiv
+     preprint arXiv:2406.09246, 2024.
+
+[11] M. Shukor, D. Aubakirova, F. Capuano, P. Kooijmans, S. Palma, A. Zouitine, M. Aractingi,
+     C. Pascal, M. Russi, A. Marafioti, et al. Smolvla: A vision-language-action model for afford-
+     able and efficient robotics. arXiv preprint arXiv:2506.01844, 2025.
+
+[12] J. Wen, Y. Zhu, J. Li, M. Zhu, Z. Tang, K. Wu, Z. Xu, N. Liu, R. Cheng, C. Shen, et al.
+     Tinyvla: Towards fast, data-efficient vision-language-action models for robotic manipulation.
+     IEEE Robotics and Automation Letters, 2025.
+
+[13] G. R. Team, S. Abeyruwan, J. Ainslie, J.-B. Alayrac, M. G. Arenas, T. Armstrong, A. Balakr-
+     ishna, R. Baruch, M. Bauza, M. Blokzijl, et al. Gemini robotics: Bringing ai into the physical
+     world. arXiv preprint arXiv:2503.20020, 2025.
+
+[14] J. Bjorck, F. Castañeda, N. Cherniadev, X. Da, R. Ding, L. Fan, Y. Fang, D. Fox, F. Hu,
+     S. Huang, et al. Gr00t n1: An open foundation model for generalist humanoid robots. arXiv
+     preprint arXiv:2503.14734, 2025.
+
+
+                                                 10
+[15] K. Black, N. Brown, D. Driess, A. Esmail, M. Equi, C. Finn, N. Fusai, L. Groom, K. Hausman,
+     B. Ichter, et al. π0 : A Vision-Language-Action Flow Model for General Robot Control. arXiv
+     preprint arXiv:2410.24164, 2024.
+
+[16] P. Intelligence, K. Black, N. Brown, J. Darpinian, K. Dhabalia, D. Driess, A. Esmail, M. Equi,
+     C. Finn, N. Fusai, et al. π0.5 : A Vision-Language-Action Model with Open-World General-
+     ization. arXiv preprint arXiv:2504.16054, 2025.
+
+[17] Q. Bu, Y. Yang, J. Cai, S. Gao, G. Ren, M. Yao, P. Luo, and H. Li. Univla: Learning to act
+     anywhere with task-centric latent actions. arXiv preprint arXiv:2505.06111, 2025.
+
+[18] H. R. Walke, K. Black, T. Z. Zhao, Q. Vuong, C. Zheng, P. Hansen-Estruch, A. W. He, V. My-
+     ers, M. J. Kim, M. Du, et al. Bridgedata v2: A dataset for robot learning at scale. In Conference
+     on Robot Learning, pages 1723–1736. PMLR, 2023.
+
+[19] A. Khazatsky, K. Pertsch, S. Nair, A. Balakrishna, S. Dasari, S. Karamcheti, S. Nasiriany,
+     M. K. Srirama, L. Y. Chen, K. Ellis, et al. Droid: A large-scale in-the-wild robot manipulation
+     dataset. arXiv preprint arXiv:2403.12945, 2024.
+
+[20] S. James, Z. Ma, D. R. Arrojo, and A. J. Davison. Rlbench: The robot learning benchmark &
+     learning environment. IEEE Robotics and Automation Letters, 5(2):3019–3026, 2020.
+
+[21] O. Mees, L. Hermann, E. Rosete-Beas, and W. Burgard. Calvin: A benchmark for language-
+     conditioned policy learning for long-horizon robot manipulation tasks. IEEE Robotics and
+     Automation Letters, 7(3):7327–7334, 2022.
+
+[22] S. Nasiriany, A. Maddukuri, L. Zhang, A. Parikh, A. Lo, A. Joshi, A. Mandlekar, and Y. Zhu.
+     Robocasa: Large-scale simulation of everyday tasks for generalist robots. arXiv preprint
+     arXiv:2406.02523, 2024.
+
+[23] B. Liu, Y. Zhu, C. Gao, Y. Feng, Q. Liu, Y. Zhu, and P. Stone. Libero: Benchmarking knowl-
+     edge transfer for lifelong robot learning. Advances in Neural Information Processing Systems,
+     36:44776–44791, 2023.
+
+[24] M. Ahn, A. Brohan, N. Brown, Y. Chebotar, O. Cortes, B. David, C. Finn, C. Fu, K. Gopalakr-
+     ishnan, K. Hausman, et al. Do as i can, not as i say: Grounding language in robotic affordances.
+     arXiv preprint arXiv:2204.01691, 2022.
+
+[25] E. Jang, A. Irpan, M. Khansari, D. Kappler, F. Ebert, C. Lynch, S. Levine, and C. Finn. Bc-z:
+     Zero-shot task generalization with robotic imitation learning. In conference on Robot Learning,
+     pages 991–1002. PMLR, 2022.
+
+[26] M. Shridhar, L. Manuelli, and D. Fox. Cliport: What and where pathways for robotic manipu-
+     lation. In Conference on robot learning, pages 894–906. PMLR, 2022.
+
+[27] M. Shridhar, L. Manuelli, and D. Fox. Perceiver-actor: A multi-task transformer for robotic
+     manipulation. In Conference on Robot Learning, pages 785–799. PMLR, 2023.
+
+[28] A. Goyal, J. Xu, Y. Guo, V. Blukis, Y.-W. Chao, and D. Fox. Rvt: Robotic view transformer
+     for 3d object manipulation. In Conference on Robot Learning, pages 694–710. PMLR, 2023.
+
+[29] A. Zeng, P. Florence, J. Tompson, S. Welker, J. Chien, M. Attarian, T. Armstrong, I. Krasin,
+     D. Duong, V. Sindhwani, et al. Transporter networks: Rearranging the visual world for robotic
+     manipulation. In Conference on Robot Learning, pages 726–747. PMLR, 2021.
+
+[30] N. M. Shafiullah, Z. Cui, A. A. Altanzaya, and L. Pinto. Behavior transformers: Cloning k
+     modes with one stone. Advances in neural information processing systems, 35:22955–22968,
+     2022.
+
+
+                                                 11
+[31] P. Florence, C. Lynch, A. Zeng, O. A. Ramirez, A. Wahid, L. Downs, A. Wong, J. Lee, I. Mor-
+     datch, and J. Tompson. Implicit behavioral cloning. In Conference on robot learning, pages
+     158–168. PMLR, 2022.
+[32] S. Xu, Y. Wang, C. Xia, D. Zhu, T. Huang, and C. Xu. Vla-cache: Towards efficient vision-
+     language-action model via adaptive token caching in robotic manipulation. arXiv e-prints,
+     pages arXiv–2502, 2025.
+[33] S. Wang, R. Yu, Z. Yuan, C. Yu, F. Gao, Y. Wang, and D. F. Wong. Spec-vla: speculative
+     decoding for vision-language-action models with relaxed acceptance. In Proceedings of the
+     2025 Conference on Empirical Methods in Natural Language Processing, pages 26916–26928,
+     2025.
+[34] K. Black, M. Galliker, and S. Levine. Real-time execution of action chunking flow policies.
+     Advances in Neural Information Processing Systems, 38:33383–33407, 2026.
+[35] K. Sendai, M. Alvarez, T. Matsushima, Y. Matsuo, and Y. Iwasawa. Leave no observation
+     behind: Real-time correction for vla action chunks. arXiv preprint arXiv:2509.23224, 2025.
+[36] J. Tang, Y. Sun, Y. Zhao, S. Yang, Y. Lin, Z. Zhang, J. Hou, Y. Lu, Z. Liu, and
+     S. Han. Vlash: Real-time vlas via future-state-aware asynchronous inference. arXiv preprint
+     arXiv:2512.01031, 2025.
+[37] Y. Sun, H. Wang, R. Bai, Z. Li, J. Li, M. Yee, W. Y. Yau, et al. Tidal: Temporally interleaved
+     diffusion and action loop for high-frequency vla control. arXiv preprint arXiv:2601.14945,
+     2026.
+[38] Y. Li, Y. Meng, Z. Sun, K. Ji, C. Tang, J. Fan, X. Ma, S. Xia, Z. Wang, and W. Zhu. Sp-vla: A
+     joint model scheduling and token pruning approach for vla model acceleration. arXiv preprint
+     arXiv:2506.12723, 2025.
+[39] W. Li, R. Zhang, R. Shao, J. He, and L. Nie. Cogvla: Cognition-aligned vision-language-
+     action models via instruction-driven routing & sparsification. Advances in neural information
+     processing systems, 38:137646–137675, 2026.
+[40] Y. Jiang, S. Cheng, Y. Ding, F. Gao, and B. Qi. Asyncvla: Asynchronous flow matching for
+     vision-language-action models. arXiv preprint arXiv:2511.14148, 2025.
+[41] W. Jiang, J. Clemons, K. Sankaralingam, and C. Kozyrakis. How fast can i run my vla?
+     demystifying vla inference performance with vla-perf. arXiv preprint arXiv:2602.18397, 2026.
+[42] K. Black, A. Z. Ren, M. Equi, and S. Levine. Training-time action conditioning for efficient
+     real-time chunking. arXiv preprint arXiv:2512.05964, 2025.
+[43] Y. Liu, H. Yu, J. Zhao, B. Li, D. Zhang, M. Li, W. Wu, Y. Hu, J. Xie, J. Guo, et al. Learning
+     native continuation for action chunking flow policies. arXiv preprint arXiv:2602.12978, 2026.
+[44] Y. Zhao, L. Zhao, B. Cheng, G. Yao, X. Wen, and H. Gao. Vla-rail: A real-time asynchronous
+     inference linker for vla models and robots. arXiv preprint arXiv:2512.24673, 2025.
+[45] Y. Lu, Z. Liu, X. Fan, Z. Yang, J. Hou, J. Li, K. Ding, and H. Zhao. Faster: Rethinking
+     real-time flow vlas. arXiv preprint arXiv:2603.19199, 2026.
+[46] A. Radford, J. W. Kim, C. Hallacy, A. Ramesh, G. Goh, S. Agarwal, G. Sastry, A. Askell,
+     P. Mishkin, J. Clark, et al. Learning transferable visual models from natural language supervi-
+     sion. In International conference on machine learning, pages 8748–8763. PmLR, 2021.
+[47] J.-B. Alayrac, J. Donahue, P. Luc, A. Miech, I. Barr, Y. Hasson, K. Lenc, A. Mensch, K. Mil-
+     lican, M. Reynolds, et al. Flamingo: a visual language model for few-shot learning. Advances
+     in neural information processing systems, 35:23716–23736, 2022.
+
+
+                                                12
+[48] M. Oquab, T. Darcet, T. Moutakanni, H. Vo, M. Szafraniec, V. Khalidov, P. Fernandez, D. Haz-
+     iza, F. Massa, A. El-Nouby, et al. Dinov2: Learning robust visual features without supervision.
+     arXiv preprint arXiv:2304.07193, 2023.
+[49] L. Beyer, A. Steiner, A. S. Pinto, A. Kolesnikov, X. Wang, D. Salz, M. Neumann, I. Alabdul-
+     mohsin, M. Tschannen, E. Bugliarello, et al. Paligemma: A versatile 3b vlm for transfer. arXiv
+     preprint arXiv:2407.07726, 2024.
+[50] E. J. Hu, Y. Shen, P. Wallis, Z. Allen-Zhu, Y. Li, S. Wang, L. Wang, W. Chen, et al. Lora:
+     Low-rank adaptation of large language models. Iclr, 1(2):3, 2022.
+[51] T. Dettmers, A. Pagnoni, A. Holtzman, and L. Zettlemoyer. Qlora: Efficient finetuning of
+     quantized llms. Advances in neural information processing systems, 36:10088–10115, 2023.
+[52] T. Dao, D. Fu, S. Ermon, A. Rudra, and C. Ré. Flashattention: Fast and memory-efficient
+     exact attention with io-awareness. Advances in neural information processing systems, 35:
+     16344–16359, 2022.
+[53] W. Kwon, Z. Li, S. Zhuang, Y. Sheng, L. Zheng, C. H. Yu, J. Gonzalez, H. Zhang, and I. Sto-
+     ica. Efficient memory management for large language model serving with pagedattention. In
+     Proceedings of the 29th symposium on operating systems principles, pages 611–626, 2023.
+[54] K. Pertsch, K. Stachowicz, B. Ichter, D. Driess, S. Nair, Q. Vuong, O. Mees, C. Finn, and
+     S. Levine. Fast: Efficient action tokenization for vision-language-action models. arXiv preprint
+     arXiv:2501.09747, 2025.
+
+[55] J. Zhang, Y. Guo, X. Chen, Y.-J. Wang, Y. Hu, C. Shi, and J. Chen. Hirt: Enhancing robotic
+     control with hierarchical robot transformers. arXiv preprint arXiv:2410.05273, 2024.
+[56] H. Chen, J. Liu, C. Gu, Z. Liu, R. Zhang, X. Li, X. He, Y. Guo, C.-W. Fu, S. Zhang, et al. Fast-
+     in-slow: A dual-system foundation model unifying fast manipulation within slow reasoning.
+     arXiv preprint arXiv:2506.01953, 2025.
+
+[57] F. Lin, R. Nai, Y. Hu, J. You, J. Zhao, and Y. Gao. Onetwovla: A unified vision-language-action
+     model with adaptive reasoning. arXiv preprint arXiv:2505.11917, 2025.
+[58] H. Xue, J. Ren, W. Chen, G. Zhang, Y. Fang, G. Gu, H. Xu, and C. Lu. Reactive diffusion
+     policy: Slow-fast visual-tactile policy learning for contact-rich manipulation. arXiv preprint
+     arXiv:2503.02881, 2025.
+[59] H. Xie, B. Wen, J. Zheng, Z. Chen, F. Hong, H. Diao, and Z. Liu. Dynamicvla: A vision-
+     language-action model for dynamic object manipulation. arXiv preprint arXiv:2601.22153,
+     2026.
+
+
+
+
+                                                 13
+A     Implementation Details
+
+This appendix summarizes implementation details omitted from the main paper, including the con-
+crete instantiation of the semantic-action interface, the way historical actions are injected, the train-
+ing protocol inherited from each backbone, and the asynchronous deployment procedure used at
+inference time.
+
+A.1   Instantiating the Semantic-Action Interface
+
+For UniVLA, we follow the original design and instantiate the reusable semantic condition zt using
+the last-layer hidden states on the vision and additional output tokens, excluding the prompt tokens.
+These hidden states are then passed through the original projection interface before entering the ac-
+tion head. In the real-robot UniVLA setup, the current robot state is additionally re-introduced on the
+action side, since the original UniVLA action head does not explicitly read state input. Concretely,
+this state input consists of the current joint state together with the gripper state. In the LIBERO
+simulation experiments, by contrast, we follow the original UniVLA simulation setup without this
+extra action-side state input.
+For π0.5 , the reusable semantic condition is instantiated as the vision-language-conditioned prefix
+KV-cache. During asynchronous deployment, this cache is reused by the action-generation side,
+while the architectural modification is confined to the action head. This design follows the central
+principle of our framework: decoupling is introduced at the semantic-action interface with minimal
+intrusion to the original backbone.
+Across both backbones, the language instruction is fixed during inference. Visual observations
+are refreshed only by the low-frequency understanding module. The action module itself does not
+perform a new full visual-language forward pass, but instead reuses the latest available semantic
+condition provided by the understanding side.
+
+A.2   Historical Action Injection
+
+We provide the action module with a short history of previously executed actions to compensate
+for the temporal mismatch between stale semantic conditions and the current execution phase. The
+history length is chosen to match approximately one second of control, following the chunking
+configuration of each backbone. In LIBERO, this corresponds to a history length of 8 for UniVLA
+and 10 for π0.5 . In real-robot deployment, the history window is set to 20 control steps, matching
+approximately one second under the 20 Hz control loop.
+The history is represented in the same action space as the policy output. That is, end-effector policies
+use end-effector action histories, joint-space policies use joint-space action histories, and gripper
+actions are included when present. We do not apply extra normalization beyond the backbone’s
+original action representation.
+For UniVLA, the historical actions are mapped through a lightweight projection layer and then
+injected into the action-generation side as an additional conditioning input. For π0.5 , the historical
+actions are introduced as an extra condition embedding for the action head. In both cases, the
+understanding module remains unchanged, and the modification is restricted to the action side.
+During training, the action history is constructed from ground-truth trajectory actions with small
+Gaussian perturbations to better approximate the mismatch between executed and demonstrated
+actions. During inference, the history is maintained online from the actually executed actions.
+
+A.3   Training Details
+
+Unless otherwise specified, all training protocols follow the official backbone configurations. For
+UniVLA, we follow the original LIBERO training recipe: the VLM is adapted with LoRA and
+then frozen, while the action expert is trained from scratch. In LIBERO simulation, UniVLA-based
+
+
+                                                   14
+models are trained on 8 A100 GPUs with a global batch size of 128 for 30k steps on each of the four
+LIBERO suites.
+For π0.5 , our asynchronous LIBERO experiments are conducted as reduced-budget runs. We fully
+fine-tune the model on 2 A100 GPUs with a global batch size of 64 for 15k steps. For reference, the
+official full-training result is obtained under a larger setup with 8 A100 GPUs, a global batch size of
+256, and 30k training steps.
+Time-misalignment training follows the formulation in the main text. Specifically, the semantic
+delay ∆ is uniformly sampled over one action chunk, i.e., ∆ ∼ Uniform{0, . . . , H − 1} where
+H is the chunk size of the corresponding backbone. This setting is shared across both backbones.
+All methods use the same simulation splits and evaluation protocol, and final results are reported as
+averages over repeated evaluation runs.
+
+A.4   Inference and Temporal Integration
+
+During deployment, the understanding module and the action module run as asynchronous pro-
+cesses. The understanding side typically refreshes the semantic cache at about 3–5 Hz, and a new
+semantic update is started immediately after the previous one finishes. In contrast, the action mod-
+ule runs at every control step and replans a full action chunk using the latest available semantic
+condition, the current robot state, and the recent action history.
+At each step, the replanned chunk is not executed directly as-is. Instead, we follow ACT-style
+temporal integration to merge temporally overlapping predictions and output the final action sent to
+the robot. The integration window follows the dataset FPS / chunking configuration, and we use the
+same temporal weighting rule in both simulation and real-robot deployment.
+During asynchronous execution, the action side always reads the latest committed semantic cache
+rather than any in-progress semantic update. Newly produced semantic outputs become visible
+to the action module only after the corresponding semantic refresh is complete and committed.
+For temporal integration, we follow the original ACT-style exponential weighting rule with decay
+coefficient 0.1 in both simulation and real-robot deployment.
+Our real-robot system uses a server-client architecture in which an A100 server performs model
+inference and the robot side maintains the control loop. Communication is handled over an Ethernet
+network using an HTTP(S)-based protocol. The model-throughput numbers reported in the main
+paper reflect pure server-side inference throughput and do not include communication overhead,
+whereas the real-world control loop naturally includes the end-to-end communication latency, which
+is typically around 10–15 ms.
+
+
+B     Additional Experimental Settings
+
+This appendix provides additional settings for LIBERO and real-world experiments, including the
+inherited backbone configurations, reduced-budget training conditions, deployment protocol, and
+the fairness criteria used for comparison.
+
+B.1   LIBERO Setup and Training Protocol
+
+Unless otherwise specified, all LIBERO experiments use the four standard suites: LIBERO-Spatial,
+LIBERO-Object, LIBERO-Goal, and LIBERO-Long. We follow the original task splits and do
+not exclude or specially reprocess any tasks. Observation formatting, image inputs, and language
+instruction templates are inherited from the corresponding backbone implementations.
+The asynchronous variants also keep the default action chunk / action horizon settings of their orig-
+inal backbones. In LIBERO, UniVLA uses a chunk size of 8, while π0.5 uses a chunk size of
+10. For UniVLA, the LIBERO simulation results follow the original simulation setup without extra
+
+
+                                                  15
+action-side state input, whereas the real-robot experiments follow the original UniVLA real-robot
+convention that reintroduces joint state and gripper state on the action side.
+Evaluation follows the standard suite-level success-rate protocol. Each suite contains 10 tasks, and
+each task is evaluated over 50 rollout episodes from the same checkpoint, resulting in 500 rollouts
+per suite. The reported success rate is computed at the suite level under this repeated-rollout proto-
+col. Random seed handling is aligned with the OpenVLA / UniVLA evaluation environment so that
+all compared methods follow the same seed protocol.
+In Table 1, the 96.9 result of π0.5 is the publicly reported number from the official repository. By con-
+trast, π0.5 -15k and π0.5 -Async-15k are trained under a substantially reduced budget on two GPUs,
+compared with the official 8-GPU configuration. The 15k-step synchronous and asynchronous π0.5
+results therefore serve as matched reduced-budget references under the same evaluation protocol.
+Accordingly, we do not interpret the reduced-budget asynchronous π0.5 results as a direct improve-
+ment over the official full-training baseline. Instead, this comparison is intended to show that asyn-
+chronous semantic reuse remains competitive and does not introduce obvious degradation even un-
+der a smaller training budget.
+
+B.2   Real-World Deployment Protocol
+
+Each real-world task uses a fixed language instruction across all compared methods. Trials are
+initialized with small random perturbations in object configuration, while the human perturbation
+protocol is applied only in the SO100 pick cube move task. After each trial, the scene is manually
+reset before the next rollout.
+We evaluate six real-world tasks in total, three on SO100 and three on Kinova Gen2, with 10 trials
+per task. Task success is determined by manual judgment based on whether the target manipulation
+objective is completed. Concretely, pick banana requires moving the banana onto the target plate,
+stack cube requires a stable cube stack, pour water requires pouring the water into the bowl and
+returning the cup to its original place, pick cube move requires placing the cube onto the blue
+plate, and open drawer requires opening the drawer, placing the cube inside, and closing it again.
+
+  Platform Task             Description                                     Characteristic
+  Kinova pick banana        Move the banana from the table to the silver Pick-and-place
+                            plate.
+  Kinova     stack cube     Stack the green cube on top of the white cube. Precision-sensitive stack-
+                                                                            ing
+  Kinova     pour water     Pour the water from the metal cup into the Long-horizon task with
+                            bowl.                                           an extended waiting stage
+  SO100      pick cube move Move the orange cube to the blue plate under Perturbation-sensitive
+                            human perturbation.                             pick-and-place
+  SO100      stack cube     Stack the orange cube on top of the black cube. Precision-sensitive stack-
+                                                                            ing
+  SO100      open drawer    Open the drawer, place the cube inside, then Multi-stage long-horizon
+                            close it.                                       manipulation
+
+           Table 5: Task descriptions and key characteristics of the real-robot experiments.
+
+For SO100, completion time is measured from the onset of action execution until successful task
+completion, and failed trajectories are excluded from this timing statistic. The weighted average
+completion time reported in the main paper is computed by weighting each task according to its
+number of successful trajectories rather than by taking a simple arithmetic mean. Both robot plat-
+forms run with a fixed 20 Hz control loop.
+Deployment follows a server-client setup, with an A100 server used for inference and a robot-side
+control loop fixed at 20 Hz. At every control step, the robot sends the latest state to the server-side
+action module, which replans an action chunk under the latest committed semantic condition and
+returns the temporally integrated action for execution. The average inference frequency reported
+
+
+                                                   16
+in Table 3 corresponds to the throughput of the server-side action module, rather than the actual
+command dispatch rate on the robot side. By contrast, real-world execution naturally includes com-
+munication latency, which is typically around 10–15 ms in our setup.
+The Kinova Gen2 platform is additionally constrained by the official driver-side joint speed limits,
+specifically J1–J3 at 36 deg/s (0.628 rad/s) and J4–J6 at 48 deg/s (0.838 rad/s). These limits are part
+of the standard platform configuration rather than an extra restriction introduced by our system. As a
+result, physical arm motion dominates overall episode duration on Kinova, which is why completion
+time is less informative there than success rate.
+
+B.3   Baseline Fairness and Evaluation Scope
+
+Across both simulation and real-robot experiments, all methods use the same task data and keep the
+default chunk size / action horizon under their official configurations. SmolVLA, A2C2, UniVLA,
+and synchronous π0.5 all follow standard chunk-wise execution, whereas UniVLA-Async performs
+online replanning at each control step and applies temporal integration to generate the executed ac-
+tion. The most controlled real-world comparison is between UniVLA and UniVLA-Async, since
+these two methods share the same backbone, data, hardware, and action horizon. For fairness, the
+synchronous UniVLA baseline in this real-world comparison uses the same state-conditioned action-
+side interface as the asynchronous UniVLA setup, following the original UniVLA real-robot deploy-
+ment convention; the main difference is whether semantic conditions are refreshed synchronously
+or reused asynchronously.
+For π0.5 , the asynchronous variant is not deployed on the real robots. The reported 19.7 Hz figure
+reflects only server-side throughput rather than end-to-end real-robot closed-loop execution. This
+distinction is important in practice: after accounting for communication overhead, the throughput
+gain from asynchronous decoupling is more limited for the 2B π0.5 model than for the 7B UniVLA
+model, and is not sufficient to stably track the full 20 Hz robot-side control loop in our current setup.
+By contrast, the asynchronous gain is substantially larger for UniVLA, where decoupling the heavier
+backbone produces a much larger practical benefit.
+All throughput numbers reported in the main paper are measured under the same A100 server-side
+setting. The average inference frequency of A2C2 is measured according to its original corrective-
+head inference procedure; therefore, higher throughput does not necessarily imply better closed-loop
+performance, which is also reflected in its lower task success in the real-robot study.
+Finally, the reduced-budget π0.5 results should be interpreted carefully. Our conclusion is not that
+asynchronous π0.5 directly outperforms the official full-budget baseline under a matched setup.
+Rather, the result suggests that asynchronous decoupling remains effective even under a much
+smaller training budget, likely benefiting from the strong pretrained foundation of π0.5 and the
+richer intermediate information retained in its KV-cache representation. More broadly, our real-
+world study focuses on single-arm manipulation and does not yet cover mobile manipulation or
+highly dynamic tasks.
+
+
+C     Additional Quantitative Results
+
+This appendix reports additional quantitative results not expanded in the main paper, including task-
+level real-world descriptions, task-wise timing statistics, and clarifications on the runtime and abla-
+tion analyses.
+
+C.1   Detailed Real-World Results
+
+Table 5 summarizes the task descriptions and key characteristics of the two real-robot platforms.
+In addition to the platform-level average success rates in the main text, Table 6 reports task-wise
+average completion times on SO100 over successful trajectories.
+
+
+                                                   17
+                Task           SmolVLA A2C2 UniVLA UniVLA-Async π0.5
+                pick cube move   14.5  20.4  17.6      11.2     11.8
+                stack cube       10.5  14.6  11.1       9.2     12.8
+                open drawer      21.2  26.8  23.2      19.1     19.3
+   Table 6: Task-wise average completion time on SO100 over successful trajectories (seconds).
+
+
+C.2   Additional Runtime Statistics
+
+Table 3 already summarizes the weighted average completion time on SO100 and the average server-
+side inference throughput. Here the weighted average is computed according to the number of
+successful trajectories in each task, rather than as a simple arithmetic mean across tasks:
+                                                      P
+                                                          ni Ti
+                                          Tweighted = Pi        ,                            (5)
+                                                          i ni
+where Ti is the average completion time of task i over successful trajectories and ni is the number
+of successful trajectories for that task.
+The SO100 task-wise timing statistics in Table 6 further show that the improvement of UniVLA-
+Async is consistent across perturbation-sensitive, precision-sensitive, and multi-stage tasks, rather
+than being driven by only a single category.
+
+                 Metric                          Mean     Std     P50     P95     Unit
+                 Semantic module latency         319.1     7.5   319.3   325.0     ms
+                 Action-side inference latency    4.63    0.24   4.62     4.98     ms
+                 Policy step latency             11.22   26.50    8.34    9.99     ms
+                 End-to-end control latency      11.62   26.50   8.74    10.42     ms
+                 VLA enqueue delay                45.0    53.4    33.5    69.9     ms
+                 Semantic age at control step    163.9    93.0   163.1   308.3     ms
+                 Latent lag                       8.27    2.03   8.00    11.00   frames
+
+Table 7: Additional runtime statistics of the asynchronous UniVLA deployment collected over a
+100-step run. Semantic refresh is observed at 3.07 Hz in this run. The reported action-side inference
+latency includes action-decoder invocation overhead and CUDA synchronization, but excludes tem-
+poral integration, communication, and semantic-module execution.
+
+Table 7 provides a more detailed runtime view of the asynchronous UniVLA deployment. The
+semantic module remains the dominant cost, with a mean latency of about 319 ms, whereas the
+action-side inference latency is about 4.6 ms on average. This separation is exactly what enables the
+asynchronous design: the heavy semantic refresh proceeds at low frequency, while the lightweight
+action side continues to replan at control rate using the most recent committed semantic condition.
+The action-side latency in Table 7 should not be interpreted as the inverse of the effective throughput
+reported in Table 3. The former measures the latency of one action-side inference invocation, in-
+cluding decoder-side overhead and CUDA synchronization, whereas the latter reflects the effective
+server-side action-generation frequency of the deployed asynchronous loop, which is additionally af-
+fected by queueing, scheduling, semantic-cache coordination, and other per-step system overheads
+outside the action-side timing window.
+The relatively large standard deviation of policy-step latency and end-to-end control latency is
+caused by rare scheduling outliers beyond the 95th percentile, while the bulk of control steps re-
+mains concentrated near the reported median and 95th-percentile values.
+We further note that the reported π0.5 -Async throughput reflects only server-side model throughput
+and does not correspond to a real-robot deployment result. This distinction is important because
+server-side throughput alone does not determine whether a method can stably follow the full 20
+Hz robot-side control loop once communication overhead is included. In particular, although asyn-
+chronous decoupling improves the server-side throughput of the 2B π0.5 model from 8.7 Hz to 19.7
+Hz, the remaining communication and control overhead still makes stable 20 Hz closed-loop track-
+ing less reliable in our current setup.
+
+
+                                                   18
+The absence of Kinova timing statistics is not due to missing data, but because the platform’s strict
+joint speed limits amplify physical execution time to the point that inference-induced timing differ-
+ences become much less discriminative in the total episode duration. For this reason, Kinova is used
+primarily to evaluate robustness and cross-platform deployability through success rate rather than
+completion time.
+
+C.3   Additional Ablation Clarifications
+
+The main paper focuses on the ablation results on LIBERO-Long in Table 4, because stale semantic
+conditions are most pronounced in long-horizon tasks. Among the four LIBERO suites, LIBERO-
+Long is relatively more difficult and yields consistently lower scores across methods, making it the
+most direct testbed for stale-semantic robustness.
+The ablation is designed to isolate the contribution of the two key robustness components under
+stale semantics. “Naive cache reuse” directly replaces synchronized semantic refresh with stale
+cached semantics while keeping the rest of the policy unchanged. “Cache + history” additionally
+provides recent action history to the action module. “Cache + delay train.” instead keeps the asyn-
+chronous formulation but exposes the model to semantic delay during training. “Ours” combines
+both historical-action conditioning and time-misalignment training.
+The resulting pattern is consistent with the main claim of the paper: naive semantic reuse alone is in-
+sufficient, while combining short-horizon execution context with explicit delay simulation recovers
+most of the lost performance. In particular, the stronger gain from delay training than from history-
+only conditioning suggests that train-test temporal mismatch is the central difficulty introduced by
+asynchronous semantic reuse, while historical actions act as a complementary local progress signal.
+In the current version, we do not further expand ablations over different history lengths, semantic
+refresh intervals, or integration settings, and we do not include a separate π0.5 ablation. This keeps
+the ablation section focused on the clearest question raised by the paper: whether the two proposed
+robustness mechanisms are both necessary when semantics become stale.
+
+D     Additional Qualitative Results
+
+This appendix provides additional qualitative material for the real-robot experiments. Since static
+figures are better suited to illustrating task stages than to evaluating motion smoothness, we focus
+here on representative task progressions across platforms and reserve continuous motion compar-
+isons for the supplementary videos.
+
+D.1   Real-World Rollout Visualizations
+
+Figure 5 shows representative task progressions for three real-robot tasks: pour water on Kinova
+Gen2, and open drawer and pick cube move on SO100. These tasks are chosen because they
+cover three qualitatively different execution patterns in our study: long-horizon pouring, multi-stage
+object placement with drawer interaction, and perturbation-sensitive pick-and-place.
+Within each row, the frames are ordered chronologically from left to right and illustrate the main
+stages of task execution. The goal of this figure is to make the task structure and deployment sce-
+narios visually concrete, rather than to claim that static images alone can faithfully characterize
+motion continuity. In particular, pick cube move highlights the human-perturbation setting used
+on SO100, while open drawer and pour water emphasize multi-stage execution under longer
+manipulation horizons.
+
+
+
+
+                                                  19
+Figure 5: Representative real-world task progressions on Kinova Gen2 and SO100. From top to
+bottom, the rows correspond to pour water, open drawer, and pick cube move. Within each
+row, frames are arranged from left to right in chronological order to illustrate key execution stages
+of the task. These static visualizations are intended to show representative task progression and
+deployment context; continuous motion smoothness and recovery behavior are better reflected in
+the supplementary videos.
+
+
+D.2   Additional Qualitative Observations
+
+Across both platforms, all six real-world tasks were recorded for qualitative inspection. The exam-
+ples in Fig. 5 are selected as representative cases because they most clearly expose long-horizon
+execution, stage transitions, and perturbation-sensitive behavior. They therefore complement the
+quantitative results in the main paper by showing the concrete manipulation scenarios behind the
+reported success rates and completion times.
+For the purposes of the appendix, we emphasize representative task progression rather than dense
+motion-level comparison. Static figures are sufficient for showing the sequence of sub-tasks and the
+overall deployment context, whereas subtle differences in action continuity, hesitation, or recovery
+are better conveyed through full rollout videos. Additional real-robot videos across all tasks and
+models can therefore be included as supplementary material when needed.
+
+
+
+
+                                                 20
+

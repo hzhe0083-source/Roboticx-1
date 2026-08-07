@@ -1,0 +1,1146 @@
+                                                                          FutureRTC: Real-Time Robot Execution with
+                                                                           Anticipatory-Conditioned Action Chunking
+                                                   Hai Jiang1 , Yixian Zou2 , Binbin Liang1 , Boqian Liu3 , Fanman Meng2 , Shuaicheng Liu2∗
+                                                                              1
+                                                                                School of Aeronautics and Astronautics, Sichuan University
+                                                                               2
+                                                                                 University of Electronic Science and Technology of China
+                                                                                                  3
+                                                                                                    University of Alberta
+                                                                         jianghai@stu.scu.edu.cn, {zouyixian@std., liushuaicheng@}uestc.edu.cn
+
+
+
+
+                                                   Start                                                                                                                   Finish
+arXiv:2607.24008v1 [cs.RO] 27 Jul 2026
+
+
+
+
+                                                   Start                                                                                                    Finish
+
+
+
+
+                                                   Start                                                                                      Finish
+
+
+
+
+                                                                                                                                                                                  𝑡
+
+                                         Figure 1: Comparison of the inference-time method RTC (Black, Galliker, and Levine 2025), training-time method VLASH (Tang
+                                         et al. 2025), and our FutureRTC on the real-world “Hang Cups” task with π0.5 (Black et al. 2025a) as the VLA backbone. Top:
+                                         Task completion progress under asynchronous execution. Bottom: Average robot kinematics during task execution.
+                                                                        Abstract                                 ule that forecasts execution-time visual representations by
+                                                                                                                 leveraging robot motion as an explicit physical prior through
+                                           Real-time deployment of Vision-Language-Action (VLA)                  motion-aware feature transport and reconstruction. Further-
+                                           policies necessitates asynchronous execution, wherein sub-            more, we introduce a policy consistency loss to align the ac-
+                                           sequent action chunks are computed concurrently with the ex-          tion chunks generated from predicted contexts with those pro-
+                                           ecution of the current chunk, leading to prediction-execution         duced under the expected execution-time inputs of the VLA
+                                           misalignment and manifesting as inter-chunk discontinu-               policy. Extensive experiments across simulated and real-world
+                                           ities. Existing methods either superficially smooth chunk             environments demonstrate that FutureRTC achieves superior
+                                           boundaries, require costly policy optimization, or exclusively        robustness to inference delays, resulting in smoother trajec-
+                                           forward-predict proprioceptive states yet neglect critical vi-        tories, faster execution, and consistently higher task success
+                                           sual observations. In this paper, we propose FutureRTC, a             rates. Project Website.
+                                           plug-and-play adaptation framework that predicts execution-
+                                           time observations and states for asynchronous VLA control
+                                           without modifying the underlying policy. Specifically, Futur-                              Introduction
+                                           eRTC features a state correction module to compensate for          Vision-Language-Action (VLA) models have recently
+                                           the discrepancy between rolled-forward and actual execution-       emerged as an attractive paradigm for robot learning by uni-
+                                           time proprioceptive states and an observation prediction mod-
+                                                                                                              fying deep visual-linguistic reasoning with expressive action
+                                            ∗                                                                 generation (Kim et al. 2024; Black et al. 2025b,a). To rec-
+                                                Corresponding author.
+                                                                                                              oncile the substantial computational cost of VLA inference
+with the high-frequency requirements of low-level robot con-      tion as the physical prior, the module spatially transports
+trol, action chunking (Zhao et al. 2023) has become a widely      existing visual features through motion-aware warping and
+adopted strategy, which enables the policy to generate a se-      reconstructs newly exposed content during the delay inter-
+quence of future actions in a single forward pass, thereby        val. Furthermore, we introduce a policy consistency loss to
+amortizing the inference overhead through open-loop exe-          encourage the action chunk generated by the untouched pol-
+cution. However, as VLA models continue to scale in size          icy from the predicted observation and corrected state to
+and are deployed on resource-constrained edge platforms or        match the one generated from the actual execution-time pair.
+remote servers, inference latency has become a fundamen-          As shown in Fig. 1, our method presents smoother trajecto-
+tal challenge for real-time deployment (Black, Galliker, and      ries and faster task completion speed. Extensive experiments
+Levine 2025; Ma et al. 2025). In standard synchronous exe-        across simulated and real-world settings demonstrate that our
+cution, the robot is forced to idle during chunk computation,     FutureRTC delivers faster execution, robust delay tolerance,
+resulting in stop-and-go behaviors that severely degrade real-    and consistently higher success rates.
+time responsiveness and manipulation precision.                      Our contributions can be summarized as follows:
+   To circumvent execution stalls, recent systems adopt asyn-      • We propose FutureRTC, a plug-and-play adaptation
+chronous execution (Black, Galliker, and Levine 2025),               framework that generates execution-time observations
+wherein the policy generates future action chunks in par-            and states to mitigate asynchronous prediction-execution
+allel with the execution of the current chunk. While im-             misalignment for real-time robot execution.
+proving computational efficiency, conducting mutations at
+chunk boundaries causes inter-chunk discontinuities that ac-       • We propose a state correction module to compensate for
+cumulate errors and lead to task failures. Existing efforts to       the residual discrepancy between rolled-forward and ac-
+mitigate discontinuities generally fall into inference-time and      tual execution-time states, and an observation prediction
+training-time strategies. The former (Zhao et al. 2023; Liu          module to forecast execution-time visual observations, us-
+et al. 2025b; Black, Galliker, and Levine 2025; Ho et al. 2026)      ing a policy consistency loss to align the predicted context
+utilize heuristic post-processing to smooth chunk bound-             with the distribution expected by the untouched policy.
+aries without retraining the policy, often introducing addi-       • Extensive evaluations demonstrate that FutureRTC
+tional computational overhead. In contrast, most training-           achieves superior robustness under varying inference de-
+time methods (Black et al. 2025c; Wang et al. 2026a,b) ex-           lays, smoother trajectories, faster task completion, and
+plicitly adapt the policy to asynchronous execution, while           consistently improved task success rates.
+requiring costly retraining or fine-tuning the VLA model.
+   However, neither of the above approaches resolves the                                Related Work
+fundamental prediction-execution misalignment, where the
+executed actions remain conditioned on observations and           VLA and Action Chunking
+proprioceptive states from an earlier time step, causing them     Vision-Language-Action models have advanced robot learn-
+to deviate from the evolving scene as inference delay grows.      ing by integrating visual perception, language understand-
+VLASH (Tang et al. 2025) attempts to reduce the misalign-         ing, and action prediction within a unified policy frame-
+ment by forward-predicting the execution-time propriocep-         work (Kawaharazuka et al. 2024). Representative meth-
+tive state while still relying on outdated visual observations.   ods (Kim et al. 2024; Black et al. 2025b; Liu et al. 2025a;
+Since the visual scene evolves alongside the robot config-        Bjorck et al. 2025; Shukor et al. 2025; Black et al. 2025a;
+uration during the delay interval, correcting the state alone     Wen et al. 2025; Zhong et al. 2026; Wu et al. 2026)
+is insufficient to provide the execution time context required    leverage large-scale multimodal pre-training and integrate
+by the policy. As shown in Fig. 1, both the inference-time        deep visual-linguistic representations with expressive action
+method RTC and the training-time method VLASH exhibit             generation paradigms, including diffusion models and flow
+jerky trajectories and slower task completion speed.              matching (Lipman et al. 2023; Ze et al. 2024; Chi et al. 2025),
+   To this end, we propose FutureRTC, a plug-and-play             to improve cross-task generalization. However, the sheer
+adaptation framework that anticipates the execution-time          scale of these models, with substantial computational costs,
+observation and state that the policy should condition on         makes inference latency a critical bottleneck for real-time
+to address prediction-execution misalignment for real-time        robotic control. In synchronous control loops, such latency
+robotic control while leaving the base VLA untouched.             forces robots to wait for the next action prediction, thereby
+Specifically, we first introduce a state correction module        reducing closed-loop responsiveness in dynamic scenes.
+that compensates for the residual discrepancy between the            To alleviate the computational bottleneck and mitigate
+state obtained by rolling the committed actions forward and       the compounding errors associated with step-wise execu-
+the actual execution-time proprioceptive state. Subsequently,     tion, action chunking has been widely adopted as the stan-
+we observe that correcting the state alone is insufficient, as    dard paradigm in VLAs. By generating multi-step action se-
+the stale observation is itself a critical factor whose neglect   quences in parallel, it bridges the gap between low-frequency
+causes substantial performance degradation that intensifies       policy inference and high-frequency robot control. However,
+as the inference delay increases. To this end, we propose an      open-loop execution of long chunks weakens short-term re-
+observation prediction module that predicts the execution-        sponsiveness to environmental perturbations, whereas ex-
+time visual representation from the stale observation, com-       ecuting shorter chunks often introduces boundary discon-
+mitted actions, and corrected state. By leveraging robot mo-      tinuities and jerky motions. Therefore, balancing temporal
+                                                                                     𝐀0 = 𝜋𝜃 (𝑎0:4 |𝑜0 , 𝑠0 )                                                      𝐀0 = 𝜋𝜃 (𝑎0:4 |𝑜0 , 𝑠0 )
+                                                                                                                𝑎4
+                                                                                                      𝑎3 𝑠4          𝑠5                                  𝑎0          𝑎1        𝑎2
+                   Infer 𝐀1                     ′                                                                                                   𝑠0
+                                                                                                                                                              𝑠1          𝑠2
+                                                                                                                                                                                    𝑠3      𝑎3 𝑠 𝑎4 𝑠5
+                                      𝐀1 = 𝜋𝜃 (𝑎0:4 |𝑜5 , 𝑠5 )                                𝑎 𝑠                                                                                                4
+                                                                           𝑠0 𝑎         𝑎1 𝑠2 2 3 Discontinued                                                                                ′
+                                                                                                                                                                                         𝑎0′ 𝑠1
+              𝑠2           Delay                                                  0 𝑠
+                   𝑎2 𝑠3                                                     𝑠0                                                                   Infer 𝐀1
+                                                                                      1
+                                                                                          ′  𝑠1′     𝑠2′                                                                                      𝑎1′ 𝑠2′        𝑎′′
+      𝑠1 𝑎1             𝑎3 𝑠4     𝑎0′ ′                                                  𝑎0                      ′
+                                                                                                                                                                                                          𝑠3′ 0 𝑠1′′
+                                                                                                         𝑎2′ 𝑠3 𝑎3 𝑠4′ 𝑎4 𝑠 ′
+                                                                                                              ′
+                                                                     𝑠5′     Infer 𝐀1            𝑎1′                    ′
+     𝑎0                               𝑠1                                                                                                                                                              𝑎2′            ′
+𝑠0
+                            𝑎4
+                               𝑠5                                    𝑎4′                            Misalign
+                                                                                                                           5                                                                                 𝑎3′ 𝑠4 ′ 𝑠5′
+                                      𝑎1′ 𝑠2′                  𝑠4′                                                                                            𝜙(∙)                                                     𝑎4
+                                                      𝑠3′ 𝑎′                                           ′                                                                                               ′
+                                                𝑎2′        3                                 𝐀1 = 𝜋𝜃 (𝑎0:4 |𝑜1 , 𝑠1 )                           {𝓏Ƹ 3 , 𝑠Ƹ3 } = 𝜙 (𝓏1 , 𝑎1:2 )               𝐀1 = 𝜋𝜃 (𝑎0:4 |𝓏Ƹ 3 , 𝑠Ƹ3 )
+     𝐀0 = 𝜋𝜃 (𝑎0:4 |𝑜0 , 𝑠0 )
+              Accurate yet slow and present stall                                   Fast yet discontinuity and misalignment                                                         Fast, smooth, and accurate
+                 (a) Synchronous Inference                                                (b) Naive Async. Inference                                                                  (c) FutureRTC (Ours)
+
+
+Figure 2: Comparison between our method and existing execution paradigms, illustrated with prediction horizon H = 5,
+execution horizon K = 3, and inference delay d = 2. (a) Synchronous: The robot stalls during inference, yielding accurate
+but stop-and-go motion. (b) Naive Asynchronous: Chunk A1 is conditioned on the stale observation-state pair (o1 , s1 ) yet
+executed at step 3, suffering from prediction-execution misalignment and inter-chunk discontinuities. (c) FutureRTC (Ours):
+Our plug-and-play adapter ϕ(·) forecasts the execution-time context (ẑ3 , ŝ3 ) = ϕ(z1 , a1:2 ) from the stale o1 and committed
+actions a1:2 , where z is the latent feature of the observation o obtained by the vision encoder of the pretrained VLA. Conditioning
+the policy on this anticipated pair promotes continuous, reactive, and smooth execution.
+
+
+consistency with environmental responsiveness remains a                                                                   where m indexes successive chunks and H represents the
+central challenge in chunk-based VLA deployment.                                                                          prediction horizon (Zhao et al. 2023). To circumvent the
+                                                                                                                          computational burden of per-step replanning, the controller
+Asynchronous VLA Inference                                                                                                executes a subset of K actions (K ≤ H) from Am prior
+                                                                                                                          to the next policy query, where K denotes the execution
+To mitigate execution stalls, recent systems adopt asyn-                                                                  horizon. While such a chunking paradigm mitigates infer-
+chronous inference, in which the robot continues execut-                                                                  ence costs and promotes temporal consistency, it introduces
+ing the remaining actions of the previously generated chunk                                                               a structural dependency between the control loop frequency
+while the policy computes the next chunk in parallel, which                                                               and sequence generation latency.
+may amplify inter-chunk discontinuities and introduce syn-                                                                Flow-matching Generation. In line with recent VLA mod-
+chronization challenges between prediction and execution.                                                                 els (Black et al. 2025b,a; Shukor et al. 2025), we parameterize
+Existing remedies fall into inference-time and training-time                                                              the action generation process of our policy via flow match-
+strategies. The former (Zhao et al. 2023; Black, Galliker,                                                                ing (Lipman et al. 2023). To generate an action chunk, an
+and Levine 2025; Liu et al. 2025b; Ho et al. 2026) operate                                                                initial latent state A0m ∼ N (0, I) is transformed by inte-
+only during inference by modifying the generated actions                                                                  grating a learned velocity field vθ over a flow-matching time
+or execution procedure without updating the policy param-                                                                 τ ∈ [0, 1] using n Euler steps as:
+eters, but often introduce additional runtime computation,
+thus making it undesirable for low-latency robotic control.                                                                              τ+ 1                                  1
+                                                                                                                                      Am n = Aτm +                               vθ (Aτm , ot , st , τ ),                   (2)
+In contrast, training-time methods (Black et al. 2025c; Sendai                                                                                                                 n
+et al. 2025; Wang et al. 2026a; Liu et al. 2026; Wang et al.
+2026b) require extra optimization stages, by fine-tuning, re-                                                             yielding the final iterate A1m as the predicted action sequence.
+training, or augmenting the VLA policy with trainable mod-                                                                Inference Delay. Generating an action chunk incurs a non-
+ules, to explicitly adapt the policy to asynchronous execu-                                                               negligible wall-clock time δ. Given a base controller period
+tion. Nevertheless, asynchronous inference inherently in-                                                                 ∆t, we define the inference delay as d = ⌊δ/∆t⌋, which
+troduces prediction-execution misalignment, as actions are                                                                quantifies the number of control steps that elapse between ac-
+generated from observations that are stale before execution.                                                              quiring the observation-state pair (ot , st ) and the chunk Am
+VLASH (Tang et al. 2025) alleviates this issue by condi-                                                                  being ready for execution (Black, Galliker, and Levine 2025).
+tioning on future proprioceptive states, but it still relies on                                                           As VLAs scale in model capacity and shift toward remote or
+outdated visual observations and therefore remains insensi-                                                               edge-constrained inference, the latency δ, and consequently
+tive to environmental changes. In this paper, we present an                                                               the inference delay d, inevitably increases.
+asynchronous inference framework in which a plug-and-play                                                                 Synchronous and Asynchronous Execution. In syn-
+adapter is constructed to predict execution-time observations                                                             chronous execution, the control loop blocks during the gen-
+and states from their stale counterparts, thereby enabling                                                                eration of Am , while ensuring each action chunk is condi-
+smoother, faster, and more accurate execution.                                                                            tioned on the recent state (ot , st ), it introduces robot stalls for
+                                                                                                                          d steps between chunks, thereby breaking real-time control
+                                                                                                                          continuity, as shown in Fig. 2 (a). Asynchronous execution
+                                            Preliminaries                                                                 removes this stall by generating the subsequent chunk in the
+Action Chunking Policy. For a given control timestep t, the                                                               background. To ensure that the next chunk Am+1 is ready
+VLA policy maps the visual observation ot and propriocep-                                                                 precisely when the current K actions conclude, its inference
+tive state st to a trajectory of H future actions as:                                                                     must be initiated d steps in advance. Consequently, the new
+                                                                                                                          chunk is conditioned on the stale (ot+K−d , st+K−d ), yet ex-
+              Am = (at , at+1 , . . . , at+H−1 ) ∼ πθ (· | ot , st ),                                 (1)                 ecutes at step t + K. The first d actions in Am+1 would
+be discarded since they overlap with the committed tail of
+the current chunk, only the remainder Am+1 [d:d+K − 1] is
+spliced on and executed, as shown in Fig. 2 (b).                                 𝑠𝑡+𝐾−𝑑                                         +                                                        +
+Prediction-Execution Misalignment. Formulating the sub-                                ⋯                          ∑                       𝑠ǁ𝑡+𝐾
+                                                                                                                                                            MLP                𝑠ǁ△                     𝑠Ƹ𝑡+𝐾
+                                                                             [𝑎𝑡+𝐾−𝑑 : 𝑎𝑡+𝐾−1 ]
+sequent chunk as Am+1 = πθ (· | ot+K−d , st+K−d ), the                                                                     (a) State Correction Module
+actions executed from step t + K relies on an observation
+and state that are d steps obsolete. This temporal gap between
+the conditioning time t + K − d and the execution time t + K                     +          +           +                                                                        𝓏0
+
+constitutes a critical prediction-execution misalignment that        𝓏𝑡+𝐾−𝑑          𝐞cam       𝐞pos 𝑠Ƹ𝑡+𝐾
+                                                                                                                                                                      𝓏𝑡+𝐾−𝑑
+
+
+
+
+                                                                                                                  Fusion
+
+
+
+
+                                                                                                                                 Linear
+
+
+
+
+                                                                                                                                                                                Linear
+                                                                                                                                                   Eq.(6)
+                                                                                                                                           Convs
+
+
+
+
+                                                                                                                                                                                         Convs
+manifests as inter-chunk discontinuities. Furthermore, since                                                                                                           −                                +
+the scene and robot would evolve during the d-step window,                                                                                                   𝓏trans                              𝛽∙𝐫           𝓏Ƹ 𝑡+𝐾
+
+
+
+
+                                                                                            Temporal
+                                                                                                                            ℱ
+
+
+
+
+                                                                                            Attention
+it causes the executed actions to deviate from the intended
+
+
+
+
+                                                                     ⋯
+                                                                                ⋯
+behavior, exacerbating the error as d grows.                                                            𝐜motion
+                                                                     {𝑎𝑖 }     {𝐮𝑖 }                              (b) Observation Prediction Module
+                       Methodology
+Given a flow-matching VLA πθ (· | ot , st ), our objective is to    Figure 3: Illustration of the detailed architecture of the pro-
+mitigate the discrepancy of asynchronous execution, wherein         posed adapter, which consists of a State Correction Mod-
+the policy is conditioned on the stale pair (ot+K−d , st+K−d )      ule and an Observation Prediction Module to generate the
+prior to its execution at step t + K. To rectify this prediction-   execution-time observation and state from stale information.
+execution misalignment and realize reliable closed-loop per-
+formance, we introduce FutureRTC, which incorporates
+a plug-and-play anticipatory adapter ϕ(·) to forecast the           observation ot+K , we introduce an Observation Prediction
+execution-time observation and state from their stale counter-      Module (OPM) ϕOPM (·), as shown in Fig. 3 (b), which lever-
+parts, promoting highly reactive and kinematically smooth           ages the stale observations, the committed actions, and the
+robotic control, as shown in Fig. 2 (c).                            corrected state to generate the execution-time observation.
+                                                                    Instead of reconstructing high-dimensional pixels, our OPM
+State Correction Module                                             operates within the latent space, i.e., the feature z = E(o)
+The execution-time state st+K remains unobservable at the           obtained from the vision encoder E(·) of the pretrained VLA,
+generation step t+K −d, while it can be estimated by rolling        ensuring the computational overhead is relatively limited
+forward the stale state st+K−d using the committed actions          compared to policy inference while generating representa-
+[at+K−d : at+K−1 ] following (Tang et al. 2025) as:                 tions that are inherently compatible with VLA policies.
+                                                                       Since the primary visual variation is induced by the physi-
+                                      t+K−1
+                                       X                            cal displacement of the robot, we model feature evolution as
+               s̃t+K = st+K−d ⊕                ai .          (3)    spatial transportation rather than synthesizing it from scratch.
+                                    i=t+K−d                         The committed action sequence within the delay window
+However, whether under absolute or relative posture con-            [at+K−d : at+K−1 ] dictates the physical motion responsi-
+trol, forward integration inevitably accumulates bias due to        ble for scene changes and thus serves as an explicit motion
+the inherent deviation between the commanded motion and             prior indicating where existing content should be transported.
+the actual robot motion. To this end, we introduce a State          However, feeding the action sequence directly would force
+Correction Module (SCM) ϕSCM (·) that consists of MLP               the network to implicitly learn forward integration. We in-
+layers, as shown in Fig. 3 (a), to predict a compensatory           stead map the action trajectory into an explicit physical fea-
+                                  d
+residual as s̃∆ = ϕSCM (s̃t+K , dmax ), to complement the for-      ture space. For each committed action ai within the window,
+ward integration process. The final execution-time state is         we construct a physical feature vector ui as:
+obtained as ŝt+K = s̃t+K ⊕ s̃∆ , with the orientation up-                     h                                           i
+                                                                        ui = ai , j≤i aj , ai − ai−1 , j≤i |aj |, di ,
+                                                                                     P                      P
+dated through relative-rotation composition, which serves                                                                        (5)
+simultaneously as the conditioning signal for the observation
+predictor and the state input for the VLA policy. During the        which respectively encode the instantaneous command, cu-
+training phase, we employ a state correction loss Lstate to         mulative displacement, action increment, accumulated path
+minimize the discrepancy between the predicted s̃∆ and its          length, and temporal progress. Concatenating the features
+ground-truth counterpart recorded in the demonstrations as:         across all steps yields a trajectory feature matrix U =
+                                                                    [u1 , u2 , . . . , ud ]⊤ , which is fed into a temporal self-attention
+             Lstate = ||(st+K ⊖ s̃t+K ) − s̃∆ ||22 .         (4)    block to capture temporal dependencies and produce the
+                                                                    action-conditioned motion prior cmotion .
+Observation Prediction Module                                          We then fuse the motion prior cmotion , the stale latent
+While the state correction module mitigates a fraction of the       zt+K−d together with the per-camera embedding ecam which
+prediction-execution misalignment, observational staleness          distinguishes the camera streams and position embedding
+remains a critical unaddressed factor causing performance           epos , and the corrected state ŝt+K to supply the actual end-
+degradation, the severity of which increases sharply as the de-     effector configuration at execution time t + K to form a
+lay d increases. To estimate the unobservable execution-time        conditioning feature F . However, directly regressing the fu-
+                      𝑡 = 20     𝑡 = 40      𝑡 = 60      𝑡 = 80   𝑡 = 100
+                                                                                  Finally, the VLA policy leverages our anticipated pair to
+Transport gate 𝛼
+
+
+                                                                                  generate the next chunk Am+1 = πθ (· | ẑt+K , ŝt+K ), where
+                                                                                  the predicted visual latent ẑt+K is directly injected into the
+                                                                                  policy, bypassing the original vision encoder. The chunk is
+                                                                                  already aligned to the execution time t + K and is therefore
+Synthesis gate 𝛽
+
+
+
+
+                                                                                  executed directly from its first action, i.e., Am+1 [0:K − 1].
+
+                                                                                  Policy Consistency Loss
+                                                                                  To ensure that the predicted observation ẑt+K and corrected
+ Figure 4: Illustration of the transport gate α (top) and syn-                    state ŝt+K are faithfully consumed by the policy, we further
+ thesis gate β (bottom) during execution. The transport gate                      introduce a policy consistency loss Lpolicy to encourage the
+ activates on the moving arm and gripper, propagating ex-                         action chunk generated by the untouched policy from the an-
+ isting visual features according to the committed motion,                        ticipated pair (ẑt+K , ŝt+K ) to align with the one generated
+ whereas the synthesis gate highlights motion boundaries and                      from the ground-truth pair (zt+K , st+K ). To circumvent the
+ newly revealed regions that require feature synthesis.                           computational overhead of multi-step flow matching during
+                                                                                  training, we employ a single-step flow approximation to gen-
+                                                                                  erate the action chunk. The Lpolicy is defined as:
+ ture latent from F is highly ill-posed and physically uncon-
+ strained. We therefore explicitly project F by cascaded linear                      Lpolicy = ||πθ (zt+K , st+K ) − πθ (ẑt+K , ŝt+K )||22 ,   (9)
+ and convolutional layers into a 2D flow displacement ∆p                          where πθ (·) is the frozen VLA policy. The overall objective
+ and a transport gate α ∈ [0, 1]. The stale feature is spatially                  function is formulated as Ltotal = Lstate + Lobs + λLpolicy .
+ warped using differentiable bilinear grid sampling to pull in
+ the motion-transported content and blend it back through a
+ gated combination to obtain ztrans , whose content has been
+                                                                                                         Experiments
+ repositioned to the location carried by the motion flow, as:                     In this section, we conduct comprehensive experiments on
+                                                                                  both simulated and real-world tasks to evaluate the effective-
+                   ztrans = (1 − α) · zt+K−d + α · W(zt+K−d , p − ∆p), (6)        ness of our method under various inference delay settings.
+ where W(·) and p denote the bilinear grid sampling and                           Implementation Details. We implement the proposed
+ the 2D coordinate grid, respectively. The transport gate α                       method with PyTorch on NVIDIA RTX 4090 GPUs with
+ serves as a per-token weight that determines the contribu-                       the batch size set to 128, reaching convergence within 200k
+ tion of warped features, where static regions preserve their                     iterations. We employ the Adam optimizer (Kingma and Ba
+ original representations (α → 0), while regions undergo-                         2015) for optimization with the learning rate decayed from
+ ing robot-induced motion increasingly rely on the warped                         3×10−4 to 1×10−6 , and empirically set the hyperparameter
+ features (α → 1), as shown in the top row of Fig. 4.                             λ = 10. To make our approach robust across a wide range of
+    While warp transport handles coordinate-space displace-                       inference delays without per-delay retraining, we uniformly
+ ment, it is fundamentally restricted to feature rearrangement                    sample the delay d ∼ U[1, dmax ] at each training step, where
+ and cannot synthesize unknown content, such as visual defor-                     dmax denotes the largest delay considered on each bench-
+ mations upon gripper contact or newly revealed disoccluded                       mark. Importantly, the base VLA policy remains untouched
+ regions, which cannot be explained by geometric warping.                         throughout the entire training process.
+ To this end, we introduce a gated residual branch consisting
+                                                                                  Simulated Benchmark
+ of several linear and convolutional layers to compensate for
+ content unexplained by transport, which ingests the condi-                       In this section, we conduct experiments on two simulated
+ tioning feature F, the transport residual ztrans − zt+K−d that                   robotic manipulation benchmarks, including Kinetix (Black,
+ represents changes already resolved by advection, and the                        Galliker, and Levine 2025) and LIBERO (Liu et al. 2023),
+ initial observation z0 as a static visual reference from which                   to evaluate the effectiveness of the proposed method under
+ disoccluded content can be borrowed, to predict a synthesis                      various inference delay settings. We compare our method
+ feature r and a synthesis gate β ∈ [0, 1] as:                                    with two categories of existing methods: (1) Inference-time
+                                                                                  methods: including Naive Asynchronous (Naive Async.),
+                     {r, β} = Linear(Conv(F, ztrans − zt+K−d , z0 )),       (7)   which directly executes actions from the most recently gen-
+ The final execution-time latent ẑt+K is reconstructed as                        erated action chunk, Temporal Ensembling (TE) (Zhao
+ ẑt+K = ztrans + β · r. The synthesis gate β regulates the                       et al. 2023), BID (Liu et al. 2025b), and RTC (Black,
+ injection of synthesized features, assigning higher weights                      Galliker, and Levine 2025). (2) Training-time methods: in-
+ to areas where visual dynamics cannot be resolved by spatial                     cluding training-time RTC (T-RTC) (Black et al. 2025c),
+ transport, as shown in the bottom row of Fig. 4. In the train-                   VLASH (Tang et al. 2025), REMAC (Wang et al. 2026a),
+ ing phase, we employ an observation prediction loss Lobs to                      and DiscreteRTC (Wang et al. 2026b).
+ minimize the discrepancy between the predicted latent ẑt+K                      Kinetix. We first evaluate our method on the Kinetix sim-
+ and the recorded latent zt+K at execution time as:                               ulator (Black, Galliker, and Levine 2025), which contains
+                                                                                  12 highly dynamic and stochastic environments designed to
+                                  Lobs = ||zt+K − ẑt+K ||22 .              (8)   assess asynchronous execution. For each task, we adopt the
+ Table 1: Performance comparison of π0.5 (Black et al. 2025a) and SmolVLA-450M (Shukor et al. 2025) in the LIBERO (Liu et al.
+ 2023) benchmark with different methods across various inference delays d ∈ {5, 10, 15, 20}. The best results are highlighted in
+ bold. “Infer.” and “Train.” denote the methods that are categorized as inference-time and training-time, respectively.
+
+                                                                                                                  π0.5                                                          SmolVLA-450M
+                            Methods                                       Success Rate (%) ↑ / Execution Steps ↓                                                     Success Rate (%) ↑ / Execution Steps ↓
+                                                                   d=5                                d = 10                 d = 15             d = 20          d=5           d = 10         d = 15         d = 20
+                            Naive Async.                    89.5 / 169.0                           82.7 / 183.0          76.3 / 196.6         68.3 / 210.9   70.3 / 206.4   64.5 / 218.2   61.3 / 224.2   56.2 / 232.8
+                            TE                              87.8 / 173.0                           84.3 / 180.1          80.6 / 185.8         74.8 / 197.0   68.4 / 208.8   66.7 / 212.9   62.6 / 220.0   59.7 / 224.2
+               Infer.
+
+
+
+
+                            BID                             90.3 / 168.2                           84.0 / 180.5          76.1 / 197.3         71.3 / 205.8   70.0 / 207.6   65.0 / 216.4   61.7 / 223.0   57.1 / 229.4
+                            RTC                             89.9 / 168.4                           83.2 / 181.6          77.5 / 194.2         73.7 / 200.5   69.7 / 208.1   64.9 / 217.0   62.6 / 220.9   58.7 / 226.3
+                            T-RTC                           89.4 / 168.5                           84.0 / 177.7          77.9 / 193.1         74.0 / 200.1   69.9 / 208.7   65.6 / 215.8   61.7 / 222.0   59.4 / 226.6
+               Train.
+
+
+
+
+                            VLASH                           88.0 / 171.9                           83.4 / 178.9          79.5 / 187.4         74.5 / 197.4   69.3 / 208.5   65.8 / 217.6   64.7 / 215.6   61.9 / 220.9
+                            REMAC                           90.8 / 166.6                           85.4 / 177.6          78.5 / 192.6         73.9 / 199.6   70.9 / 206.2   66.5 / 213.5   62.2 / 220.9   59.7 / 224.9
+                            Ours                            94.2 / 162.4                           92.4 / 166.9          91.0 / 170.1         88.5 / 175.1   75.8 / 198.7   73.3 / 202.7   71.6 / 206.4   69.4 / 209.4
+
+
+                                        Average Success Rate                                              Average Execution Steps
+               0.9                                                                          125                                                     serves as a plug-and-play module.
+                                                                                            120
+               0.8
+                                                                                            115                                                     LIBERO. We further evaluate on the LIBERO (Liu et al.
+                                                                          Execution Steps
+
+
+
+
+                                                                                                                                                    2023) benchmark, which spans four task suites, including
+Success Rate
+
+
+
+
+                                                                                            110
+               0.7
+                                                                                            105                                                     Spatial, Object, Goal, and Long. To assess whether our
+               0.6                                                                          100                                                     adapter transfers across backbones, we attach it to two pre-
+               0.5
+                                                                                             95                                                     trained VLAs, π0.5 (Black et al. 2025a) and SmolVLA-
+                                                                                             90
+                                                                                                                                                    450M (Shukor et al. 2025), with the execution horizon set
+                        0           1            2             3      4                           0       1          2           3        4
+                                          Inference Delay                                                     Inference Delay                       to K = 25. We probe a wider delay as d ∈ {5, 10, 15, 20},
+                     Naive Async.         TE         BID       RTC   T­RTC                        VLASH   REMAC          DiscreteRTC   Ours
+                                                                                                                                                    reflecting practical deployment where remote or resource-
+                                                                                                                                                    constrained inference on large VLAs incurs substantial de-
+ Figure 5: Performance comparison in the Kinetix simula-                                                                                            lays. For inference-time methods and our method, we build
+ tor (Black, Galliker, and Levine 2025) with different execu-                                                                                       directly on the finetuned weights of the above two VLAs
+ tion methods across various inference delays d ∈ [0, 4].                                                                                           released by LeRobot (Cadene et al. 2026) and keep them
+                                                                                                                                                    frozen for evaluation. For training-time methods, instead of
+                                                                                                                                                    adapting these weights, we reproduce them ourselves fol-
+ action chunking flow policies with a prediction horizon of                                                                                         lowing their corresponding publications, except for VLASH,
+ H = 8, pretrained for 32 epochs following (Black, Galliker,                                                                                        which provides an official LIBERO implementation. We omit
+ and Levine 2025). The inference delay d is varied from 0 to                                                                                        DiscreteRTC for comparison since it presumes a discrete dif-
+ 4, and the execution horizon is selected from max{1, d} to                                                                                         fusion policy trained from scratch and cannot be instantiated
+ 8 − d, ensuring that actions remain continuously available                                                                                         on the flow-based backbones adopted here.
+ without gaps between consecutive chunks.                                                                                                              We report the average success rate and execution steps
+    We report the average performance across 12 tasks, mea-                                                                                         across four tasks in Table 1, where our method consistently
+ sured by both task success rate and execution steps, as shown                                                                                      achieves the highest success rate while requiring the fewest
+ in Fig. 5. Naive Async. suffers performance collapse as                                                                                            execution steps on all evaluated delays and both VLA back-
+ the inference delay increases, while inference-time meth-                                                                                          bones. The performance of existing methods deteriorates
+ ods provide partial mitigation. Training-time methods show                                                                                         substantially with increasing delay, whereas our approach
+ stronger robustness, but their reliance on outdated observa-                                                                                       exhibits only a modest 5.7% and 6.4% decrease in success
+ tions and states still causes notable degradation under large                                                                                      rate from d = 5 to d = 20 on π0.5 and SmolVLA, respec-
+ delays. VLASH reduces this misalignment by conditioning                                                                                            tively. Moreover, our method consistently completes tasks in
+ on execution-time states, yet its performance remains inferior                                                                                     fewer execution steps, indicating smoother and more deci-
+ to ours. In contrast, our method shows superior robustness,                                                                                        sive control under severe asynchronous execution. VLASH,
+ with only a 3.0% success rate drop from d = 0 to d = 4, and                                                                                        which partially mitigates prediction-execution misalignment
+ fewer steps are required when d ≥ 2. Meanwhile, previous                                                                                           by rolling forward the proprioceptive state, presents robust-
+ methods require more execution steps under large delays due                                                                                        ness at large delays compared to other methods. However,
+ to reactive hesitation and inter-chunk discontinuities, proving                                                                                    it still trails our method, suggesting that compensating for
+ that our method can realize reliable and smoother decision-                                                                                        the robot state alone is insufficient when visual observa-
+ making. It is worth noting that our method is slightly behind                                                                                      tions remain temporally stale. By jointly anticipating the
+ several training-time methods that fine-tune or retrain the pol-                                                                                   execution-time context, our method consistently achieves the
+ icy for the benchmark tasks at small delays, i.e., d = {0, 1},                                                                                     best performance. We provide more comprehensive simu-
+ whereas our method keeps the VLA policy frozen and only                                                                                            lated experimental analysis in the appendix.
+Table 2: The average success rate of ablation studies using                                                                                            Naive Async                                     RTC                        VLASH                            FutureRTC
+                                                                                           100                                                                                450                                                                                                       50
+                                                                                                               90                                                                                              401
+SmolVLA-450M (Shukor et al. 2025) on the LIBERO (Liu                                        90                                                                                400                                    380                                                                                                    41.6
+
+
+
+
+                                                                                                                                                                                                                                  1.27x
+                                                                                                                                   85                                                                                                     362                                                                                                              40.1
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                                   1.33x
+                                                                                                                                                                                                                                                                                        40   38.9                                  39.2
+
+
+
+
+                                                                                                                                                                                                                                                                   Execution Time (s)
+                                                                                                       80 80                                           80
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                                                                  1.51x
+                                                                                                                                                                                                                                                           1.35x
+                                                                        Success Rate (%)
+                                                                                            80                                                                                                                             330 315
+
+
+
+
+                                                                                                                                                                                                                                                                                                                    1.53x
+                                                                                                                                                                                    329
+
+
+
+
+                                                                                                                                                            Execution Steps
+                                                                                                                              75                                                                                                                312 305
+
+
+
+
+                                                                                                                                                                                                       1.39x
+                                                                                                                                                                                                                                                                                                    32.3                                  32.9 31.3               32.2 31.3
+et al. 2023) benchmark. The last two columns report the                                     70
+                                                                                            60
+                                                                                                  65
+                                                                                                                                             60
+                                                                                                                                                  70                          300         276
+                                                                                                                                                                                                254
+                                                                                                                                                                                                      237
+                                                                                                                                                                                                                                                          269                           30                 27.3
+                                                                                                                                                                                                                                                                                                                  25.5                                                          26.5
+                                                                                                                                                                              200
+added parameters (M) and inference time (ms) of our newly                                   50
+                                                                                            40
+                                                                                                                    45
+                                                                                                                         50
+                                                                                                                                        40
+                                                                                                                                                                                                                                                                                        20
+
+                                                                                                                                                                              100                                                                                                       10
+proposed modules relative to the VLA policy.                                                30
+                                                                                            20                                                                                  0                                                                                                        0
+                                                                                                 Stack Plates Fold Towel Hang Cups                                                  Stack Plates Fold Towel Hang Cups                                                                        Stack Plates Fold Towel Hang Cups
+                                                                                                                                                                                     (a) Latency 170 ms (d = 5)
+                                                                                           100                                                                                450                                                                                                       50
+                           Success Rate (%)                                                                                                                                                                    415
+
+
+
+
+                                                                                                                                                                                                                                  1.27x
+                                                                                            90                 85                                                             400                                    387                  387                                                                               42.4 41.0                      41.2
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                                   1.33x
+                                                                                                                                                                                                                                                           1.32x
+                                                                                                                                                                                                                                                                                        40   39.7
+ Methods                                               Param.   Time
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                                                                  1.49x
+                                                                                                                                                                                                                                                                   Execution Time (s)
+                                                                                                                                   80                                               344                                    347
+
+
+
+
+                                                                        Success Rate (%)
+
+
+
+
+                                                                                                                                                                                                                                                                                                                    1.52x
+                                                                                            80
+
+
+
+
+                                                                                                                                                            Execution Steps
+                                                                                                                                                                                                                                 326
+                    d=5    d = 10   d = 15    d = 20
+
+
+
+
+                                                                                                                                                                                                       1.40x
+                                                                                                       75 75                                                                                                                                    316 317                                             34.9                                  33.6                    33.4
+                                                                                                                                                                              300         279 272                                                         294                                                                                    31.9                    31.7
+                                                                                            70                                65                       65                                                                                                                               30                 28.3                                                                 27.6
+                                                                                                                                                                                                      245                                                                                                         26.1
+                                                                                            60    55                                         55 55
+ Baseline           26.1     8.4      2.5       0.7    450.0     35.4                       50
+                                                                                                                                                                              200                                                                                                       20
+                                                                                                                         40
+ +SCM               45.9    18.1     10.4       5.8    +0.04    +1.15                       40                      35
+                                                                                                                                        30
+                                                                                                                                                                              100                                                                                                       10
+                                                                                            30
+ +OPM               74.1    70.4     70.0      67.5    +5.19    +3.04                       20                                                                                  0                                                                                                        0
+                                                                                                 Stack Plates Fold Towel Hang Cups                                                  Stack Plates Fold Towel Hang Cups                                                                        Stack Plates Fold Towel Hang Cups
+ + Lpolicy (Ours)   75.8    73.3     71.6      69.4      -        -                                                                                                                  (b) Latency 320 ms (d = 10)
+
+
+                                                                          Figure 6: Real-world comparison on three bimanual manip-
+Ablation and Analysis                                                     ulation tasks, Stack Plates, Fold Towel, and Hang Cups, with
+We conduct a series of ablations to evaluate our newly pro-               π0.5 (Black et al. 2025a) as the VLA policy.
+posed components. The average success rate of the LIBERO
+benchmark using SmolVLA-450M is reported in Table 2.
+   We first construct a Baseline that feeds the stale pair                and competitive methods, including Naive Async., RTC, and
+(ot+K−d , st+K−d ) directly into the policy and executes the              VLASH, on three bimanual manipulation tasks: (1) Stack
+resulting chunk from index [0:K − 1]. Without any com-                    Plates, stacking the left and right plates onto the middle one;
+pensation, as reported in row 1 of Table 2, the success rate              (2) Fold Towel, folding a towel with both arms to form a com-
+deteriorates rapidly as the delay increases, demonstrating the            pact square; and (3) Hang Cups, hanging the left and right
+severe impact of prediction-execution misalignment. Intro-                cups onto the corresponding sides of a rack, respectively. For
+ducing only our State Correction Module (SCM), i.e., row 2                each task, we collect 100 demonstrations to fine-tune π0.5 .
+of Table 2, which replaces the stale state with the corrected             Evaluations are conducted across 20 trials per task, in which
+state ŝt+K while retaining the stale observation, improves the           the initial position and orientation of the object are random-
+low-delay results but remains ineffective under large delays,             ized. The maximum execution steps are strictly limited to
+proving that stale visual observation, not only the propriocep-           400, 450, and 400 for the three tasks, respectively.
+tive state, is also the bottleneck under asynchronous execu-                 As illustrated in Fig. 6, our FutureRTC consistently
+tion. In contrast, further introducing the Observation Predic-            achieves the highest success rates, as well as the fewest execu-
+tion Module (OPM), i.e., row 3 of Table 2, which supplies                 tion steps and times across three tasks, particularly as latency
+the execution-time visual latent representation ẑt+K , pro-              increased. While Naive Async. degrades sharply, RTC and
+vides substantial improvements. Moreover, we additionally                 VLASH offer only partial relief from prediction-execution
+employ the policy consistency loss Lpolicy to align the pre-              misalignment, ultimately falling short of FutureRTC in terms
+dicted observation-state pair with the distribution expected              of effectiveness and efficiency. With the ability to predict
+by the VLA policy, thus introducing overall performance                   execution-time context, FutureRTC maintains reliable and
+improvements as reported in row 4 of Table 2.                             smooth operation even in the presence of remarkable infer-
+   Finally, the last two columns report the computational                 ence latency, indicating that the robustness observed in sim-
+overhead of the proposed adapter, which introduces only 5.19              ulations has effectively transferred to real-world operations.
+M additional parameters and 3.04 ms of inference latency,                 We provide more comprehensive real-world experimen-
+indicating that our method achieves substantial performance               tal analysis in the appendix.
+improvements with limited computational overhead.
+                                                                                                                                                                                    Conclusion
+Real-World Evaluation                                                     We have presented FutureRTC, a plug-and-play adaptation
+Setup. We deploy FutureRTC on a dual-arm AgileX Cobot                     framework for mitigating the prediction-execution misalign-
+Magic robot using π0.5 as the VLA backbone with an exe-                   ment inherent in asynchronous VLA execution. Specifically,
+cution horizon of K = 25. The robot operates at a control                 FutureRTC anticipates the execution-time context by correct-
+frequency of 30Hz, corresponding to the control period of                 ing rolled-forward proprioceptive states and predicting future
+∆t ≈ 33ms. Without any test-time strategy, a single forward               visual representations through the proposed state correction
+pass of the VLA requires approximately 99ms. Since the pol-               module and observation prediction module, respectively, en-
+icy is served on a remote machine, an additional ∼ 40ms is                abling the VLA policy to generate actions conditioned on the
+incurred by LAN communication, while data processing and                  observation and state at execution time. Moreover, the pol-
+disk logging contribute another ∼ 30ms. The resulting end-                icy consistency loss is introduced to encourage the predicted
+to-end latency is ∼ 170ms, corresponding to an inference                  context to be faithfully consumed by the policy. Extensive
+delay of about d = 5. To emulate more challenging remote                  experiments on simulated benchmarks and real-world ma-
+or resource-constrained deployment scenes, we further inject              nipulation tasks demonstrate that FutureRTC consistently
+an additional 150ms latency, extending the delay to d = 10.               improves delay robustness, execution smoothness, task ef-
+Task Design and Measurement. We evaluate our method                       ficiency, and success rates across VLA backbones.
+Acknowledgements. This work was supported by the Na-                Liu, B.; Zhu, Y.; Gao, C.; Feng, Y.; Liu, Q.; Zhu, Y.; and
+tional Natural Science Foundation of China (NSFC) under             Stone, P. 2023. Libero: Benchmarking knowledge transfer
+grants No.625B2123, No.62372091, and No.52502425, and               for lifelong robot learning. Advances in Neural Information
+the Hainan Province Science and Technology Plan Project             Processing Systems, 36: 44776–44791. 5, 6, 7, 10, 11, 13,
+under grant ZDYF2024(LALH)001.                                      15, 16, 17
+                                                                    Liu, S.; Wu, L.; Li, B.; Tan, H.; Chen, H.; Wang, Z.; Xu,
+                        References                                  K.; Su, H.; and Zhu, J. 2025a. Rdt-1b: a diffusion foun-
+Bjorck, J.; Castañeda, F.; Cherniadev, N.; Da, X.; Ding, R.;        dation model for bimanual manipulation. In International
+Fan, L.; Fang, Y.; Fox, D.; Hu, F.; Huang, S.; et al. 2025.         Conference on Learning Representations, 29982–30009. 2
+Gr00t n1: An open foundation model for generalist humanoid          Liu, Y.; Hamid, J.; Xie, A.; Lee, Y.; Du, M.; and Finn, C.
+robots. arXiv preprint arXiv:2503.14734. 2                          2025b. Bidirectional Decoding: Improving Action Chunking
+Black, K.; Brown, N.; Darpinian, J.; Dhabalia, K.; Driess,          via Guided Test-Time Sampling. In International Conference
+D.; Esmail, A.; Equi, M. R.; Finn, C.; Fusai, N.; Galliker,         on Learning Representations, 4594–4627. 2, 3, 5
+M. Y.; et al. 2025a. π0.5 : a Vision-Language-Action Model          Liu, Y.; Yu, H.; Zhao, J.; Li, B.; Zhang, D.; Li, M.; Wu, W.;
+with Open-World Generalization. In Annual Conference on             Hu, Y.; Xie, J.; Guo, J.; et al. 2026. Learning Native Contin-
+Robot Learning. 1, 2, 3, 6, 7, 10, 11, 12, 13, 15, 17               uation for Action Chunking Flow Policies. In Proceedings
+Black, K.; Brown, N.; Driess, D.; Esmail, A.; Equi, M.; Finn,       of Robotics: Science and Systems. 3
+C.; Fusai, N.; Groom, L.; Hausman, K.; Ichter, B.; et al.           Ma, Y.; Zhou, Y.; Yang, Y.; Wang, T.; and Fan, H.
+2025b. π0 : A Vision-Language-Action Flow Model for Gen-            2025. Running VLAs at Real-Time Speed. arXiv preprint
+eral Robot Control. In Proceedings of Robotics: Science and         arXiv:2510.26742. 2
+Systems. 1, 2, 3
+                                                                    Sendai, K.; Alvarez, M.; Matsushima, T.; Matsuo, Y.; and
+Black, K.; Galliker, M.; and Levine, S. 2025. Real-Time             Iwasawa, Y. 2025. Leave No Observation Behind: Real-
+Execution of Action Chunking Flow Policies. In Advances in          time Correction for VLA Action Chunks. arXiv preprint
+Neural Information Processing Systems, volume 38, 33383–            arXiv:2509.23224. 3
+33407. 1, 2, 3, 5, 6, 11, 12, 14
+                                                                    Shukor, M.; Aubakirova, D.; Capuano, F.; Kooijmans, P.;
+Black, K.; Ren, A. Z.; Equi, M.; and Levine, S. 2025c.
+                                                                    Palma, S.; Zouitine, A.; Aractingi, M.; Pascal, C.; Russi, M.;
+Training-Time Action Conditioning for Efficient Real-Time
+                                                                    Marafioti, A.; et al. 2025. Smolvla: A vision-language-action
+Chunking. arXiv preprint arXiv:2512.05964. 2, 3, 5
+                                                                    model for affordable and efficient robotics. arXiv preprint
+Cadene, R.; Alibert, S.; Capuano, F.; Aractingi, M.; Zoui-          arXiv:2506.01844. 2, 3, 6, 7, 10, 11, 13, 16, 17
+tine, A.; Kooijmans, P.; Choghari, J.; Russi, M.; Pascal, C.;
+Palma, S.; et al. 2026. LeRobot: An Open-Source Library for         Tang, J.; Sun, Y.; Zhao, Y.; Yang, S.; Lin, Y.; Zhang, Z.;
+End-to-End Robot Learning. In International Conference on           Hou, J.; Lu, Y.; Liu, Z.; and Han, S. 2025. VLASH: Real-
+Learning Representations. 6                                         Time VLAs via Future-State-Aware Asynchronous Infer-
+                                                                    ence. arXiv preprint arXiv:2512.01031. 1, 2, 3, 4, 5, 11,
+Chi, C.; Xu, Z.; Feng, S.; Cousineau, E.; Du, Y.; Burchfiel, B.;    12
+Tedrake, R.; and Song, S. 2025. Diffusion Policy: Visuomo-
+tor Policy Learning via Action Diffusion. The International         Wang, H.; Zhang, G.; Yan, Y.; Shang, Y.; Kompella, R. R.;
+Journal of Robotics Research, 44(10-11): 1684–1704. 2               and Liu, G. 2026a. Real-Time Robot Execution with Masked
+                                                                    Action Chunking. In International Conference on Learning
+Ho, T.-B.; Nguyen, Q.-T.; Ha, T.-L.; Nguyen, G.-B.; Nguyen,
+                                                                    Representations. 2, 3, 5, 11, 12
+V.-T.; Dinh, L.; Vu, M. N.; Nguyen, D. M.; Le, A. T.;
+and Vien, N. A. 2026. Start Right, Arrive Right: Asyn-              Wang, P.; Hong, K.; Peng, C.; Driggs-Campbell, K.;
+chronous Execution via Initial Noise Selection. arXiv               Tomizuka, M.; Xu, C.; and Tang, C. 2026b. DiscreteRTC:
+preprint arXiv:2606.19774. 2, 3                                     Discrete Diffusion Policies are Natural Asynchronous Ex-
+                                                                    ecutors. arXiv preprint arXiv:2604.25050. 2, 3, 5
+Kawaharazuka, K.; Matsushima, T.; Gambardella, A.; Guo,
+J.; Paxton, C.; and Zeng, A. 2024. Real-world robot appli-          Wen, J.; Zhu, Y.; Li, J.; Tang, Z.; Shen, C.; and Feng, F. 2025.
+cations of foundation models: A review. Advanced Robotics,          DexVLA: Vision-Language Model with Plug-In Diffusion
+38(18): 1232–1254. 2                                                Expert for General Robot Control. In Annual Conference on
+Kim, M. J.; Pertsch, K.; Karamcheti, S.; Xiao, T.; Balakr-          Robot Learning, 3094–3114. 2
+ishna, A.; Nair, S.; Rafailov, R.; Foster, E. P.; Sanketi, P. R.;   Wu, W.; Lu, F.; Wang, Y.; Yang, S.; Liu, S.; Wang, F.; Zhu,
+Vuong, Q.; et al. 2024. OpenVLA: An Open-Source Vision-             Q.; Sun, H.; Wang, Y.; Ma, S.; et al. 2026. A Pragmatic VLA
+Language-Action Model. In Annual Conference on Robot                Foundation Model. arXiv preprint arXiv:2601.18692. 2
+Learning. 1, 2                                                      Yang, C.; Hu, Y.; Ma, Y.; Yang, Y.; Tan, J.; and Fan, H. 2026.
+Kingma, D. P.; and Ba, J. 2015. Adam: A Method for Stochas-         Realtime-VLA V2: Learning to Run VLAs Fast, Smooth, and
+tic Optimization. In International Conference on Learning           Accurate. In Proceedings of the IEEE/CVF Conference on
+Representations. 5                                                  Computer Vision and Pattern Recognition Workshops, 4501–
+Lipman, Y.; Chen, R. T. Q.; Ben-Hamu, H.; Nickel, M.; and           4509. 10
+Le, M. 2023. Flow Matching for Generative Modeling. In              Ze, Y.; Zhang, G.; Zhang, K.; Hu, C.; Wang, M.; and Xu, H.
+International Conference on Learning Representations. 2, 3          2024. 3D Diffusion Policy: Generalizable Visuomotor Policy
+Learning via Simple 3D Representations. In Proceedings of
+Robotics: Science and Systems. 2
+Zhao, T.; Kumar, V.; Levine, S.; and Finn, C. 2023. Learning
+Fine-Grained Bimanual Manipulation with Low-Cost Hard-
+ware. In Proceedings of Robotics: Science and Systems. 2,
+3, 5
+Zhong, L.; Liu, Y.; Wei, Y.; Xiong, Z.; Liu, S.; and Ren,
+G. 2026. Acot-vla: Action chain-of-thought for vision-
+language-action models. In Proceedings of the IEEE/CVF
+Conference on Computer Vision and Pattern Recognition,
+8152–8162. 2
+Appendices                                                          Impact of the Prediction-Execution Misalignment
+                                                                    To quantify the individual impact of observation and pro-
+This appendix is organized as follows:                              prioceptive state staleness under asynchronous execution,
+                                                                    we conduct experiments on the LIBERO (Liu et al. 2023)
+ • Sec. More Detailed Analysis formally defines real-time           benchmark with π0.5 (Black et al. 2025a) and SmolVLA-
+   robot execution, analyzes the impact of the prediction-          450M (Shukor et al. 2025). At the generation time t + K − d,
+   execution misalignment, and reports the computational            the policy is conditioned on the stale pair (ot+K−d , st+K−d ),
+   efficiency and trajectory smoothness of our method.              while the generated chunk is executed at t + K. We isolate
+ • Sec. Real-world Evaluation details the video compar-             the contribution of each modality by selectively replacing
+   isons, hardware setup, task design, and policy implemen-         stale inputs with their execution-time counterparts, i.e., the
+   tation of our real-world experiments.                            ground-truth observation ot+K or state st+K , resulting in
+                                                                    four configurations as follows:
+ • Sec. Simulated Evaluation presents the per-task results
+   on Kinetix and the detailed per-suite results on LIBERO.          • Stale observation + stale state, i.e., {ot+K−d , st+K−d },
+                                                                       corresponding to naive asynchronous execution.
+ • Sec. Ablation Study reports the complete ablation of our
+   proposed components on both SmolVLA-450M and π0.5 .               • Stale observation + execution-time state, i.e.,
+                                                                       {ot+K−d , st+K }, correcting only the state.
+ • Sec. Limitations discusses the limitations and future di-         • Execution-time observation + stale state, i.e.,
+   rections of our method.                                             {ot+K , st+K−d }, correcting only the visual observation.
+                                                                     • Execution-time observation + execution-time state,
+                More Detailed Analysis                                 i.e., {ot+K , st+K }, serving as the delay-free upper bound.
+Definition of Real-Time Robot Execution                                Moreover, since the appropriate execution of an action
+                                                                    chunk A depends on whether its conditioning inputs are
+VLA policies are typically trained on demonstrations under          aligned with the execution time, we further clarify the chunk-
+the idealized assumption of instantaneous observation acqui-        splicing conventions used in the main paper. A[0:K−1] exe-
+sition and immediate action execution. During deployment,           cutes the generated chunk from its first action, which is valid
+however, generating an action chunk incurs a non-negligible         when the conditioning context corresponds to the execution
+inference latency δ, compounded by hardware-level com-              time. In contrast, A[d:d+K−1] removes the first d actions
+munication, readout, and actuation delays. Following (Yang          that overlap with the already committed chunk and executes
+et al. 2026), we define real-time robot execution as the con-       the remaining actions, following the naive asynchronous con-
+tinuous, stall-free operation of the VLA policy at a target         vention. We evaluate the above four configurations under
+control frequency, satisfying three core criteria:                  both execution conventions to disentangle the impact of stale
+ • Accurate. The policy reliably completes the intended task        conditioning inputs from that of chunk-splicing offsets.
+   with a high success rate.                                           The average success rate across four suites of the LIBERO
+                                                                    benchmark is reported in Table 3. We first examine how
+ • Smooth. The commanded trajectory is smooth, free of              the chunk-splicing convention interacts with the staleness
+   abrupt accelerations and jerky motions.                          of the conditioning inputs. Under naive asynchronous ex-
+ • Fast. The policy completes the task in fewer control steps       ecution, the policy is conditioned on the fully stale pair
+   and less wall-clock time.                                        {ot+K−d , st+K−d }. Executing the generated chunk directly
+                                                                    from its first action, i.e., A[0:K−1], causes the success rate
+   Satisfying the above three criteria exposes a fundamental        to collapse rapidly as the delay increases. The reason is that
+tension between synchronous and asynchronous execution.             the chunk is generated for the time index t + K − d but
+Synchronous execution conditions the policy on the latest           executed d steps later. Discarding the first d actions, i.e., ex-
+observation and proprioceptive state, thereby preserving ac-        ecuting A[d:d+K−1], compensates for this temporal offset
+tion accuracy, but forces the robot to idle during every chunk      and substantially improves performance. However, discard-
+inference, producing stalls that directly violate the fast crite-   ing the first d actions is beneficial only when the conditioning
+rion. Asynchronous execution eliminates stalls by generating        inputs are stale. Once the execution-time context becomes
+the next action chunk in parallel with the execution of the cur-    available, i.e., the {ot+K , st+K−d } and {ot+K , st+K }, the
+rent one. However, each chunk is conditioned on observations        chunk is generated as if the current step is at t + K, so its first
+and states that have already become stale by the time it is ex-     action already corresponds to the execution time. Removing
+ecuted, giving rise to the prediction-execution misalignment.       the first d actions then skips into the future, commanding ac-
+Thus, the generated actions become progressively misaligned         tions intended for t + K + d before the robot has reached the
+with the evolving scene, leading to inter-chunk discontinu-         corresponding state. Consequently, A[d:d+K−1] collapses,
+ities and simultaneously degrading accuracy, smoothness,            whereas A[0:K−1] stays near the upper bound. Hence,
+and execution efficiency as the inference delay increases.          whenever the execution-time context can be recovered, the
+   Overall, real-time control requires the stall-free property of   chunk should be executed directly from index [0:K−1].
+asynchronous execution without sacrificing execution-time              Under the correct execution convention A[0:K−1], we
+alignment that our method aims to address.                          further compare the four conditioning configurations. Cor-
+Table 3: Analysis of prediction-execution misalignment on the LIBERO (Liu et al. 2023) benchmark, measured by average
+success rates across four suites, with π0.5 (Black et al. 2025a) and SmolVLA-450M (Shukor et al. 2025) as the VLA policies.
+
+                                                           Execute A[0 : K − 1]                 Execute A[d : d + K − 1]
+  Backbone       Input
+                                                  d=5        d = 10   d = 15    d = 20     d=5        d = 10         d = 15   d = 20
+                 {ot+K−d , st+K−d }                46.9       11.7      5.2        2.5      89.5        82.7          76.3     68.3
+                 {ot+K−d , st+K }                  47.2       12.4      5.3        1.9      89.7        82.6          73.4     67.6
+  π0.5           {ot+K , st+K−d }                  96.3       95.9     95.4       95.8      37.6         4.7           1.3      0.8
+                 {ot+K , st+K }                    96.6       96.6     96.6       96.6      37.2         6.5           1.6      0.9
+                 {ẑt+K , ŝt+K } (Ours)           94.2       92.4     91.0       88.5      39.0         7.2           2.6      0.7
+                 {ot+K−d , st+K−d }                26.1        8.4     2.5        0.7       70.3        64.5          61.3     56.2
+                 {ot+K−d , st+K }                  44.6       17.9     10.9       6.6       59.7        31.5          22.1     15.6
+  SmolVLA        {ot+K , st+K−d }                  61.7       26.8     18.1       16.4      39.3         7.5           2.3      1.0
+                 {ot+K , st+K }                    77.6       77.6     77.6       77.6      24.0         4.0           1.9      0.3
+                 {ẑt+K , ŝt+K } (Ours)           75.8       73.3     71.6       69.4      24.2         3.9           0.7      0.2
+
+
+Table 4: The parameters and inference time introduced by
+our method to π0.5 (Black et al. 2025a) and SmolVLA-
+450M (Shukor et al. 2025).
+
+                          π0.5                     SmolVLA
+ Methods       Param. (M)        Time (ms)   Param. (M)   Time (ms)                           (a) VLA policy: 𝜋!.#
+ Base            3616.8            98.8        450.0        35.4
+ +FutureRTC       +6.45            +3.64       +5.19        +3.04
+
+
+
+recting only the state, i.e., ot+K−d , st+K , yields little im-
+provement over the fully stale baseline on π0.5 , which is                               (b) VLA policy: SmolVLA-450M
+consistent with its proprioceptive state being encoded as
+textual tokens within the language input. In contrast, state            Figure 7: Average action velocity and acceleration on the
+correction brings a more noticeable gain on SmolVLA,                    LIBERO (Liu et al. 2023) benchmark under d = 5 for
+whose continuous state is projected through a dedicated lin-            π0.5 (Black et al. 2025a) (a) and SmolVLA-450M (Shukor
+ear layer into a separate state token directly attended by the          et al. 2025) (b), comparing RTC (Black, Galliker, and Levine
+action expert. Moreover, correcting only the observation, i.e.,         2025), VLASH (Tang et al. 2025), REMAC (Wang et al.
+{ot+K , st+K−d }, recovers the majority of the performance              2026a), and our FutureRTC. The left panel plots the ac-
+gap. These results demonstrate that the stale visual observa-           tion velocity (rad/s) and the right panel the action accel-
+tion, not only the stale state, is also a dominant source of            eration (rad/s2 ) during execution, where previous methods
+prediction-execution misalignment.                                      exhibit pronounced acceleration spikes at the chunk bound-
+   Finally, when both the execution-time observation and                aries, whereas FutureRTC produces smoother trajectories.
+state are supplied, i.e., {ot+K , st+K } with A[0:K−1], the
+success rate remains constant across all delays, matching
+the delay-free performance. This result indicates that asyn-            SmolVLA-450M (Shukor et al. 2025). As reported in Ta-
+chronous execution itself incurs no performance penalty, pro-           ble 4, our method introduces only marginal overhead on both
+vided that the policy is conditioned on the correct execution-          VLA policies, adding 6.45M parameters and 3.64ms infer-
+time context. Since such context is unavailable at generation           ence latency to π0.5 , and 5.19M parameters and 3.04ms to
+time, FutureRTC instead predicts the execution-time obser-              SmolVLA, showing that FutureRTC achieves robust real-
+vation ẑt+K and state ŝt+K from their stale counterparts,             time execution at limited computational cost.
+enabling the policy to operate as if the delay did not exist and
+thereby approach this delay-invariant upper bound.                      Trajectory Smoothness Analysis
+                                                                        To evaluate the smoothness criterion, we analyze the kine-
+Computational Efficiency                                                matic properties of the executed actions on the LIBERO (Liu
+We evaluated the computational efficiency of our method                 et al. 2023) benchmark across all four suites, compar-
+in terms of the parameters and inference time introduced                ing FutureRTC with representative baselines including
+to the base VLA policies π0.5 (Black et al. 2025a) and                  RTC (Black, Galliker, and Levine 2025), VLASH (Tang et al.
+                                                                                    Global Camera   Left-hand Camera   Right-hand Camera
+
+
+
+
+                                                                     Stack Plates
+                                                                     Fold Towel
+    (a) COBOT Magic               (b) Real-world Experiments Setup
+
+
+Figure 8: Real-world experimental platform. (a) The AgileX
+
+
+
+
+                                                                     Hang Cups
+Cobot Magic robot. (b) The workspace of the three bimanual
+tasks, containing the plates, towel, and cups with a cup rack.
+
+
+2025), and REMAC (Wang et al. 2026a). Fig. 7 reports the
+average action velocity and acceleration profiles during ex-         Figure 9: Example demonstration sequences of the three real-
+ecution for each backbone, where previous methods suffer             world tasks: Stack Plates, Fold Towel, and Hang Cups.
+from pronounced spikes caused by inter-chunk discontinu-
+ities. In contrast, VLASH partially mitigates the spikes by
+conditioning on the forward-predicted future state, yet it re-            • Fold Towel: the two arms fold a flattened towel with two
+mains less smooth than our approach owing to the lack of                    successive folds into a compact square.
+execution-time observation as input for action prediction.                • Hang Cups: the two arms pick up the left and right cups
+By anticipating the execution-time context, our FutureRTC                   and hang them onto the corresponding branches of a rack.
+consistently produces the smoothest trajectories.
+                                                                        For each task, we collect 100 teleoperated demonstrations
+                                                                     for policy fine-tuning, with the initial object positions and
+                   Real-world Evaluation                             orientations randomized across demonstrations. We illustrate
+To qualitatively demonstrate the real-world execution be-            the demonstration data of the three tasks in Fig. 9.
+havior of FutureRTC, we provide side-by-side comparison
+videos in the Project Website. For each of the three real-world      Policy Implementation
+bimanual tasks, i.e., Stack Plates, Fold Towel, and Hang             To obtain a task-competent policy, we fine-tune π0.5 (Black
+Cups, we visualize executions of Naive Async., RTC (Black,           et al. 2025a) on the collected demonstrations of each task
+Galliker, and Levine 2025), VLASH (Tang et al. 2025), and            for 30k iterations. This fine-tuned policy is kept frozen and
+FutureRTC under asynchronous inference. The videos show              shared across the inference-time methods, including Naive
+that FutureRTC generates smoother and more decisive mo-              Async. and RTC, and our method, consistent with the plug-
+tions with fewer hesitations, while achieving more reliable          and-play setting used throughout the main paper. The fine-
+task completion, whereas the baselines exhibit jerky transi-         tuning hyperparameters are summarized in Table 5. For the
+tions and delayed completion.                                        training-based method VLASH, we adopt the officially re-
+                                                                     leased implementation to fine-tune it on π0.5 .
+Hardware Setup
+We conduct real-world experiments on a dual-arm AgileX                                        Simulated Evaluation
+Cobot Magic robot1 equipped with three RGB cameras, i.e.,            Kinetix. We report the per-task success rates across all 12
+two wrist-mounted cameras and one global camera mounted              Kinetix environments under inference delays d ∈ [0, 4] in
+on the central mast, as shown in Fig. 8 (a). We also illustrate      Fig. 10. FutureRTC demonstrates consistently robust perfor-
+the objects used in three tasks in Fig. 8 (b), i.e., the plates,     mance across diverse environments, exhibiting the smallest
+towel, and cups with a cup rack used in Stack Plates, Fold           and most consistent degradation as the delay increases, with-
+Towel, and Hang Cups, respectively.                                  out the abrupt failures observed in other comparison methods
+                                                                     on individual tasks. Although FutureRTC does not domi-
+Task Design                                                          nate every individual environment, its consistent robustness
+                                                                     across diverse dynamics yields the strongest overall perfor-
+We design three bimanual manipulation tasks to evaluate              mance under varying inference delays.
+coordinated two-arm control under asynchronous execution:            LIBERO. We report the per-suite success rate (SR) and exe-
+ • Stack Plates: the two arms grasp the left and right plates        cution steps on the four LIBERO suites in Tables 6 and 7 for
+   and stack them onto the middle plate to form a single pile.       π0.5 and SmolVLA-450M, respectively, complementing the
+                                                                     averaged results in the main paper. We additionally include
+   1
+       https://global.agilex.ai/products/cobot-magic                 the synchronous (Sync.) execution results as reference, i.e.,
+Table 5: The hyperparameters adopted for fine-tuning π0.5          or discrete-diffusion policies, and more extreme inference
+on the real-world demonstrations.                                  delays remains an interesting direction for future work.
+
+ Hyperparameter                             Value
+ Base policy                                  π0.5
+ Fine-tuning scheme                    Full fine-tuning
+ Optimizer                    AdamW (β1 =0.9, β2 =0.95, ϵ=10−8 )
+ Weight decay                              1 × 10−10
+ LR schedule                      Cosine, 1,000 warmup steps
+ Peak / final learning rate        2.5 × 10−5 / 2.5 × 10−6
+ Training steps                              30,000
+ Batch size                                     8
+ Action horizon (H)                            50
+ Random seed                                   42
+ # Demonstrations per task                    100
+ Training hardware               4× NVIDIA RTX 4090 24GB
+
+
+
+d = 0. FutureRTC consistently achieves the highest success
+rate and the fewest execution steps across all suites and delay
+settings, with the largest performance gains observed on the
+long-horizon suite, i.e., Long, where prediction-execution
+misalignment accumulates most severely.
+
+                      Ablation Study
+We report the detailed ablation results of π0.5 (Black et al.
+2025a) and SmolVLA-450M (Shukor et al. 2025) on the
+LIBERO (Liu et al. 2023) benchmark across four suites and
+all delays d ∈ {5, 10, 15, 20} in Table 8. We first construct a
+Baseline that feeds the stale pair (ot+K−d , st+K−d ) directly
+into the policy and executes the resulting chunk from in-
+dex [0:K−1], in which the success rate deteriorates rapidly
+as the delay increases on each suite and both backbones,
+demonstrating the severe impact of the prediction-execution
+misalignment. Introducing only the State Correction Module
+(SCM), which replaces the stale state with the corrected state
+ŝt+K while retaining the stale observation, yields limited
+improvement that stays far from recovering the performance
+under large delays, proving that the stale visual observa-
+tion is also a critical bottleneck under asynchronous execu-
+tion. Further introducing the Observation Prediction Module
+(OPM), which supplies the execution-time visual latent rep-
+resentation ẑt+K , provides substantial improvements across
+all suites and delays. Finally, we employ the policy con-
+sistency loss Lpolicy to align the predicted observation-state
+pair with the distribution expected by the policy, bringing a
+further consistent performance gain.
+
+                         Limitations
+While FutureRTC substantially improves the robustness of
+asynchronous VLA execution, it still has several limita-
+tions. First, the observation prediction module models vi-
+sual changes through motion-driven feature transport and
+residual synthesis. While highly effective in manipulation
+scenes where the robot is the primary source of environmen-
+tal change, it may struggle in highly dynamic scenes dom-
+inated by independent external agents. Second, our current
+framework is instantiated on flow-matching VLA policies
+with latent-space observation prediction. Extending Futur-
+eRTC to other policy architectures, such as autoregressive
+                    1.0
+                                    car launch                                cartpole thrust
+                                                                                                        0.7
+                                                                                                                        catapult                                  catcher v3                        Average Success Rate
+                                                                1.0                                                                               1.0                                    0.9
+                    0.9                                                                                 0.6                                       0.8
+                                                                0.8
+     Success Rate
+
+
+
+
+                    0.8                                                                                                                                                                  0.8
+                                                                                                        0.5                                       0.6
+                                                                0.6
+                    0.7                                                                                 0.4                                       0.4                                    0.7
+                    0.6                                         0.4                                     0.3                                       0.2
+                          0   1          2           3      4         0   1         2           3   4         0   1         2        3      4           0    1         2        3    4   0.6
+                                   chain lander                 1.0
+                                                                                grasp easy                            h17 unicycle                1.0
+                                                                                                                                                              hard lunar lander
+                                                                                                        1.0
+                                                                                                                                                                                         0.5
+                0.96                                            0.9
+                                                                                                        0.8
+ Success Rate
+
+
+
+
+                                                                                                                                                  0.8
+                                                                0.8
+                0.94                                                                                    0.6                                                                                        Average Execution Steps
+                                                                0.7                                                                                                                      125
+                                                                                                                                                  0.6
+                0.92                                                                                    0.4                                                                              120
+                                                                0.6
+                          0   1          2           3      4         0   1         2           3   4         0   1         2        3      4           0    1         2        3    4   115
+                    1.0
+                                  mjc half cheetah              1.0
+                                                                              mjc swimmer                              mjc walker               1.00
+                                                                                                                                                                  trampoline
+                                                                                                                                                                                         110
+                                                                                                        0.8
+                    0.8                                         0.8                                                                             0.75                                     105
+     Success Rate
+
+
+
+
+                                                                                                        0.6
+                                                                0.6                                                                                                                      100
+                    0.6                                                                                 0.4                                     0.50
+                                                                0.4                                                                                                                       95
+                    0.4                                                                                 0.2                                     0.25
+                                                                0.2                                                                                                                       90
+                                                                                                        0.0                                     0.00
+                          0   1           2        3        4         0   1          2        3     4         0   1          2        3     4           0    1          2        3   4         0      1         2           3   4
+                                   Inference Delay                            Inference Delay                         Inference Delay                            Inference Delay                          Inference Delay
+                                                         Naive Async.         TE             BID        RTC           T­RTC               VLASH             REMAC              DiscreteRTC         Ours
+
+Figure 10: Performance comparison in the Kinetix simulator (Black, Galliker, and Levine 2025) with different methods across
+various inference delays d ∈ [0, 4]. Left: Success rate for individual tasks. Right: Average success rate and execution steps.
+Table 6: Detailed performance comparison of π0.5 (Black et al. 2025a) in the LIBERO (Liu et al. 2023) benchmark with different
+methods across various inference delays d ∈ {5, 10, 15, 20}. “Infer.” and “Train.” denote the methods that are categorized as
+inference-time and training-time, respectively. “SR” and “Steps” indicate success rate and execution steps, respectively.
+
+                                        Spatial           Object               Goal               Long          Average
+             Methods       delay    SR ↑    Steps ↓   SR ↑    Steps ↓   SR ↑     Steps ↓   SR ↑     Steps ↓   SR ↑   Steps ↓
+               Sync.         0      96.6    107.6     98.0     137.8    95.0     117.5     96.8     260.6     96.6    155.8
+                              5     90.8    113.0     90.4     147.9    91.0     125.6     85.8     289.4     89.5    169.0
+                             10     83.2    123.4     85.0     155.8    89.8     127.3     72.6     325.5     82.7    183.0
+           Naive Async.      15     79.6    128.6     77.4     166.7    87.8     131.5     60.2     359.5     76.3    196.6
+                             20     67.6    142.0     77.0     167.5    83.6     137.0     45.0     397.2     68.3    210.9
+                              5     91.0    114.4     88.6     150.1    93.0     122.0     78.6     305.5     87.8    173.0
+                             10     87.4    118.7     84.8     155.7    92.0     124.1     73.0     321.9     84.3    180.1
+                TE           15     81.0    126.3     81.2     161.4    90.8     125.2     69.2     330.3     80.6    185.8
+                             20     74.0    134.1     77.6     167.0    88.6     128.3     59.0     358.5     74.8    197.0
+  Infer
+                              5     91.6    113.0     90.6     148.3    91.4     124.6     87.4     286.9     90.3    168.2
+                             10     85.8    121.4     83.4     157.9    89.8     127.2     77.0     315.7     84.0    180.5
+               BID           15     82.0    125.0     78.4     166.4    85.4     135.8     58.6     361.9     76.1    197.3
+                             20     71.4    137.7     78.4     166.5    85.2     135.3     50.2     383.8     71.3    205.8
+                              5     91.4    113.1     89.4     149.2    91.6     124.8     87.0     286.5     89.9    168.4
+                             10     84.2    122.0     84.2     156.9    90.4     127.2     73.8     320.5     83.2    181.6
+               RTC           15     80.0    128.2     78.6     166.0    88.8     130.0     62.4     352.8     77.5    194.2
+                             20     71.6    137.3     79.0     165.0    86.0     134.9     58.0     364.9     73.7    200.5
+                              5     87.4    118.4     88.6     150.2    93.6     121.2     87.8     284.3     89.4    168.5
+                             10     82.2    123.4     83.4     157.6    91.0     125.0     79.4     304.8     84.0    177.7
+              T-RTC          15     81.8    123.7     78.8     164.9    89.8     127.8     61.2     356.2     77.9    193.1
+                             20     74.0    134.9     76.4     170.2    86.2     133.9     59.2     361.5     74.0    200.1
+                              5     87.9    119.1     87.4     151.8    93.2     121.8     83.4     295.0     88.0    171.9
+                             10     82.4    123.7     84.2     156.5    88.4     128.8     78.6     306.8     83.4    178.9
+             VLASH           15     77.3    129.7     78.4     165.4    88.2     130.1     74.2     324.5     79.5    187.4
+                             20     76.2    132.0     75.4     171.5    79.0     144.4     67.3     341.7     74.5    197.4
+  Train.                      5     90.6    114.2     91.0     147.9    94.0     119.5     87.6     284.6     90.8    166.6
+                             10     87.8    117.7     85.2     155.4    91.6     123.8     77.0     313.3     85.4    177.6
+             REMAC           15     82.0    125.3     80.6     162.2    90.0     127.3     61.4     355.7     78.5    192.6
+                             20     74.2    134.1     79.4     163.4    87.2     130.7     54.8     370.1     73.9    199.6
+                              5     95.0    109.6     96.2     140.4    93.6     120.5     91.8     279.1     94.2    162.4
+                             10     95.0    110.8     93.8     143.3    93.4     121.5     87.4     291.9     92.4    166.9
+            FutureRTC        15     93.2    112.5     94.0     142.7    92.2     123.0     84.4     302.0     91.0    170.1
+                             20     90.4    115.8     92.6     145.8    90.8     125.3     80.2     313.7     88.5    175.1
+Table 7: Detailed performance comparison of SmolVLA-450M (Shukor et al. 2025) in the LIBERO (Liu et al. 2023) benchmark
+with different methods across various inference delays d ∈ {5, 10, 15, 20}.
+
+                                     Spatial           Object              Goal               Long          Average
+             Methods      delay   SR ↑   Steps ↓   SR ↑   Steps ↓   SR ↑     Steps ↓   SR ↑     Steps ↓   SR ↑   Steps ↓
+              Sync.         0     77.8    128.2    85.4    156.2    83.4     139.9     63.8     355.2     77.6   194.9
+                            5     71.6    135.6    75.0    168.6    81.0     142.9     53.6     378.4     70.3   206.4
+                           10     68.0    139.0    71.6    173.8    77.0     150.1     41.4     409.8     64.5   218.2
+           Naive Async.
+                           15     65.2    142.5    71.6    173.7    72.2     157.1     36.2     423.4     61.3   224.2
+                           20     55.8    154.1    72.4    172.3    67.4     164.9     29.2     440.0     56.2   232.8
+                            5     69.0    138.1    76.6    165.9    79.0     145.0     49.0     386.2     68.4   208.8
+                           10     66.6    140.5    76.4    166.4    78.2     146.6     45.6     398.1     66.7   212.9
+               TE
+  Infer                    15     59.8    148.7    75.4    167.6    75.6     151.8     39.6     411.6     62.6   220.0
+                           20     54.8    154.8    72.0    173.1    74.2     153.1     37.8     415.8     59.7   224.2
+                            5     73.0    134.0    75.4    167.8    80.2     144.5     51.4     384.2     70.0   207.6
+                           10     67.8    139.5    71.2    174.5    78.0     147.2     42.8     404.6     65.0   216.4
+               BID
+                           15     65.8    141.9    71.2    174.4    73.2     156.0     36.4     419.8     61.7   223.0
+                           20     53.8    156.6    72.4    172.6    68.4     162.1     33.6     426.4     57.1   229.4
+                            5     73.4    133.8    75.0    168.6    79.6     145.0     50.6     385.0     69.7   208.1
+                           10     67.8    139.5    71.2    174.5    77.2     148.7     43.2     405.3     64.9   217.0
+              RTC          15     65.6    142.1    71.0    174.6    73.8     155.3     40.0     411.7     62.6   220.9
+                           20     57.6    151.1    71.2    174.3    69.2     161.5     36.6     418.2     58.7   226.3
+                            5     74.4    133.1    71.2    175.4    77.2     151.3     56.6     375.1     69.9   208.7
+                           10     72.4    134.2    67.8    180.2    76.0     153.0     46.2     395.8     65.6   215.8
+             T-RTC         15     67.4    140.0    66.0    182.8    74.0     155.3     39.2     410.0     61.7   222.0
+                           20     63.8    144.5    66.6    181.7    69.8     161.9     37.2     418.2     59.4   226.6
+                            5     70.8    136.1    77.4    167.3    77.8     149.2     51.2     381.5     69.3   208.5
+                           10     66.2    141.8    71.4    174.7    78.0     149.3     47.4     404.7     65.8   217.6
+             VLASH
+                           15     67.0    140.4    64.8    183.0    80.6     144.0     46.2     394.8     64.7   215.6
+  Train.                   20     64.8    143.9    60.4    190.1    76.8     150.6     45.6     399.1     61.9   220.9
+                            5     73.0    133.8    77.4    165.5    81.2     142.2     52.0     383.4     70.9   206.2
+                           10     69.4    138.0    72.2    173.1    78.0     147.5     46.4     395.5     66.5   213.5
+             REMAC
+                           15     66.0    141.6    70.8    175.2    73.2     154.6     38.8     412.1     62.2   220.9
+                           20     59.6    148.6    71.6    173.7    72.4     155.9     35.2     421.4     59.7   224.9
+                            5     77.2    129.4    83.6    158.4    82.4     140.7     59.8     366.2     75.8   198.7
+                           10     75.4    131.6    82.0    160.8    80.4     142.9     55.4     375.5     73.3   202.7
+           FutureRTC       15     72.2    135.3    79.6    164.6    81.6     142.9     52.8     382.6     71.6   206.4
+                           20     72.8    134.8    75.0    170.8    79.4     143.5     50.2     388.7     69.4   209.4
+Table 8: Detailed ablation results on the LIBERO (Liu et al. 2023) benchmark across the four suites with various inference
+delays d ∈ {5, 10, 15, 20}, using frozen π0.5 (Black et al. 2025a) and SmolVLA-450M (Shukor et al. 2025).
+
+                                                           π0.5
+                            Spatial             Object                   Goal               Long           Average
+  Methods      delay    SR ↑    Steps ↓     SR ↑    Steps ↓       SR ↑     Steps ↓   SR ↑     Steps ↓   SR ↑    Steps ↓
+                 5      21.8     204.1      53.0     240.4        67.2     187.2     45.6     433.5     46.9     266.3
+                10       2.4     218.7       1.6     279.8        36.6     240.2      6.0     512.2     11.7     312.7
+  Baseline      15       1.0     219.7       0.0     280.0        18.8     273.4      1.0     519.0     5.2      323.0
+                20       0.2     219.9       0.2     280.0         8.2     291.5      1.2     518.7     2.5      327.5
+                 5      26.0     200.8      53.8     239.4        65.4     189.6     42.8     435.5     47.0     266.3
+                10       2.6     219.2       2.2     279.6        38.2     237.8      5.0     513.7     12.0     312.6
+   +SCM         15       0.6     219.9       0.2     280.0        18.6     274.1      2.0     517.6     5.4      322.9
+                20       0.4     220.0       0.4     279.8         9.2     289.7      1.6     518.4     2.9      327.0
+                 5      95.0     109.6      96.0     140.5        93.8     120.0     92.4     277.0     94.3     161.8
+                10      93.2     111.2      92.8     143.5        92.8     121.6     84.6     300.7     90.9     169.3
+   +OPM         15      91.6     113.5      92.8     143.1        92.0     123.2     82.2     312.0     89.7     173.0
+                20      90.2     115.5      93.8     141.9        89.4     128.5     74.6     329.3     87.0     178.8
+                 5      95.0     109.6      96.2     140.4        93.6     120.5     91.8     279.1     94.2     162.4
+                10      95.0     110.8      93.8     143.3        93.4     121.5     87.4     291.9     92.4     166.9
+  +Lpolicy      15      93.2     112.5      94.0     142.7        92.2     123.0     84.4     302.0     91.0     170.1
+                20      90.4     115.8      92.6     145.8        90.8     125.3     80.2     313.7     88.5     175.1
+
+
+                                                   SmolVLA-450M
+                            Spatial             Object                   Goal               Long           Average
+  Methods      delay    SR ↑    Steps ↓     SR ↑    Steps ↓       SR ↑     Steps ↓   SR ↑     Steps ↓   SR ↑    Steps ↓
+                 5      10.6     212.0      23.6     262.0        50.6     208.0     19.6     482.7     26.1     291.2
+                10       3.6     219.0       0.4     280.0        24.8     257.7      4.8     514.5     8.4      317.8
+  Baseline      15       0.2     219.9       0.0     280.0         8.6     286.5      1.0     519.6     2.5      326.5
+                20       0.0     220.0       0.0     280.0         1.6     298.5      1.0     519.4     0.7      329.5
+                 5      34.2     188.5      56.2     215.2        67.8     179.9     25.4     464.8     45.9     262.1
+                10      11.4     213.6      16.0     273.0        34.6     240.2     10.4     501.4     18.1     307.1
+   +SCM         15       7.8     216.8       7.4     278.1        19.6     269.9      6.6     510.8     10.4     318.9
+                20       3.2     218.7       0.8     279.8        14.2     279.2      5.0     515.8     5.8      323.4
+                 5      75.4     131.3      83.2     158.8        84.2     136.8     53.4     380.5     74.1     201.8
+                10      73.4     133.6      78.8     165.2        81.8     141.7     47.6     395.6     70.4     209.0
+   +OPM         15      72.0     135.6      79.6     164.9        83.0     140.0     45.4     402.3     70.0     210.7
+                20      71.8     136.2      75.0     171.5        79.6     145.6     43.4     434.4     67.5     221.9
+                 5      77.2     129.4      83.6     158.4        82.4     140.7     59.8     366.2     75.8     198.7
+                10      75.4     131.6      82.0     160.8        80.4     142.9     55.4     375.5     73.3     202.7
+  +Lpolicy      15      72.2     135.3      79.6     164.6        81.6     142.9     52.8     382.6     71.6     206.4
+                20      72.8     134.8      75.0     170.8        79.4     143.5     50.2     388.7     69.4     209.4
+

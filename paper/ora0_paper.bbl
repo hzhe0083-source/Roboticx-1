@@ -1,0 +1,124 @@
+\begin{thebibliography}{10}
+
+\bibitem{bagaria2026recursivebeliefvisionlanguage}
+V.~Bagaria, B.~Sebastian, and N.~K. Patel.
+\newblock Recursive belief vision language action models, 2026.
+
+\bibitem{black2026pi0visionlanguageactionflowmodel}
+K.~Black, N.~Brown, D.~Driess, A.~Esmail, M.~Equi, C.~Finn, N.~Fusai, L.~Groom,
+  K.~Hausman, B.~Ichter, S.~Jakubczak, T.~Jones, L.~Ke, S.~Levine, A.~Li-Bell,
+  M.~Mothukuri, S.~Nair, K.~Pertsch, L.~X. Shi, J.~Tanner, Q.~Vuong,
+  A.~Walling, H.~Wang, and U.~Zhilinsky.
+\newblock $\pi_0$: A vision-language-action flow model for general robot
+  control, 2026.
+
+\bibitem{pi_rl}
+K.~Chen, Z.~Liu, T.~Zhang, Z.~Guo, S.~Xu, H.~Lin, H.~Zang, X.~Li, Q.~Zhang,
+  Z.~Yu, G.~Fan, T.~Huang, Y.~Wang, and C.~Yu.
+\newblock $\pi_\texttt{RL}$: Online rl fine-tuning for flow-based
+  vision-language-action models, 2026.
+
+\bibitem{driess2025knowledgeinsulatingvisionlanguageactionmodels}
+D.~Driess, J.~T. Springenberg, B.~Ichter, L.~Yu, A.~Li-Bell, K.~Pertsch, A.~Z.
+  Ren, H.~Walke, Q.~Vuong, L.~X. Shi, and S.~Levine.
+\newblock Knowledge insulating vision-language-action models: Train fast, run
+  fast, generalize better, 2025.
+
+\bibitem{libero_cf}
+Y.~Fang, Y.~Feng, D.~Jing, J.~Liu, Y.~Yang, Z.~Wei, D.~Szafir, and M.~Ding.
+\newblock When vision overrides language: Evaluating and mitigating
+  counterfactual failures in vlas, 2026.
+
+\bibitem{fei2025liberoplusindepthrobustnessanalysis}
+S.~Fei, S.~Wang, J.~Shi, Z.~Dai, J.~Cai, P.~Qian, L.~Ji, X.~He, S.~Zhang,
+  Z.~Fei, J.~Fu, J.~Gong, and X.~Qiu.
+\newblock Libero-plus: In-depth robustness analysis of vision-language-action
+  models, 2025.
+
+\bibitem{intelligence2025pi05visionlanguageactionmodelopenworld}
+P.~Intelligence, K.~Black, N.~Brown, J.~Darpinian, K.~Dhabalia, D.~Driess,
+  A.~Esmail, M.~Equi, C.~Finn, N.~Fusai, M.~Y. Galliker, D.~Ghosh, L.~Groom,
+  K.~Hausman, B.~Ichter, S.~Jakubczak, T.~Jones, L.~Ke, D.~LeBlanc, S.~Levine,
+  A.~Li-Bell, M.~Mothukuri, S.~Nair, K.~Pertsch, A.~Z. Ren, L.~X. Shi,
+  L.~Smith, J.~T. Springenberg, K.~Stachowicz, J.~Tanner, Q.~Vuong, H.~Walke,
+  A.~Walling, H.~Wang, L.~Yu, and U.~Zhilinsky.
+\newblock $\pi_{0.5}$: a vision-language-action model with open-world
+  generalization, 2025.
+
+\bibitem{li2026rememvlaempoweringvisionlanguageactionmodel}
+H.~Li, F.~Shen, D.~Chen, L.~Yang, X.~Wang, J.~Shi, Z.~Bing, Z.~Liu, and
+  A.~Knoll.
+\newblock Remem-vla: Empowering vision-language-action model with memory via
+  dual-level recurrent queries, 2026.
+
+\bibitem{li2026cogvlacognitionalignedvisionlanguageactionmodel}
+W.~Li, R.~Zhang, R.~Shao, J.~He, and L.~Nie.
+\newblock Cogvla: Cognition-aligned vision-language-action model via
+  instruction-driven routing \& sparsification, 2026.
+
+\bibitem{lin2025evo1lightweightvisionlanguageactionmodel}
+T.~Lin, Y.~Zhong, Y.~Du, J.~Zhang, J.~Liu, Y.~Chen, E.~Gu, Z.~Liu, H.~Cai,
+  Y.~Zou, L.~Zou, Z.~Zhou, G.~Li, and B.~Zhao.
+\newblock Evo-1: Lightweight vision-language-action model with preserved
+  semantic alignment, 2025.
+
+\bibitem{liu2023liberobenchmarkingknowledgetransfer}
+B.~Liu, Y.~Zhu, C.~Gao, Y.~Feng, Q.~Liu, Y.~Zhu, and P.~Stone.
+\newblock Libero: Benchmarking knowledge transfer for lifelong robot learning,
+  2023.
+
+\bibitem{nvidia2025gr00tn1openfoundation}
+NVIDIA, :, J.~Bjorck, F.~Castañeda, N.~Cherniadev, X.~Da, R.~Ding, L.~J. Fan,
+  Y.~Fang, D.~Fox, F.~Hu, S.~Huang, J.~Jang, Z.~Jiang, J.~Kautz, K.~Kundalia,
+  L.~Lao, Z.~Li, Z.~Lin, K.~Lin, G.~Liu, E.~Llontop, L.~Magne, A.~Mandlekar,
+  A.~Narayan, S.~Nasiriany, S.~Reed, Y.~L. Tan, G.~Wang, Z.~Wang, J.~Wang,
+  Q.~Wang, J.~Xiang, Y.~Xie, Y.~Xu, Z.~Xu, S.~Ye, Z.~Yu, A.~Zhang, H.~Zhang,
+  Y.~Zhao, R.~Zheng, and Y.~Zhu.
+\newblock Gr00t n1: An open foundation model for generalist humanoid robots,
+  2025.
+
+\bibitem{ren2024diffusionpolicypolicyoptimization}
+A.~Z. Ren, J.~Lidard, L.~L. Ankile, A.~Simeonov, P.~Agrawal, A.~Majumdar,
+  B.~Burchfiel, H.~Dai, and M.~Simchowitz.
+\newblock Diffusion policy policy optimization, 2024.
+
+\bibitem{shi2026memoryvlaperceptualcognitivememoryvisionlanguageaction}
+H.~Shi, B.~Xie, Y.~Liu, L.~Sun, F.~Liu, T.~Wang, E.~Zhou, H.~Fan, X.~Zhang, and
+  G.~Huang.
+\newblock Memoryvla: Perceptual-cognitive memory in vision-language-action
+  models for robotic manipulation, 2026.
+
+\bibitem{shukor2025smolvlavisionlanguageactionmodelaffordable}
+M.~Shukor, D.~Aubakirova, F.~Capuano, P.~Kooijmans, S.~Palma, A.~Zouitine,
+  M.~Aractingi, C.~Pascal, M.~Russi, A.~Marafioti, S.~Alibert, M.~Cord,
+  T.~Wolf, and R.~Cadene.
+\newblock Smolvla: A vision-language-action model for affordable and efficient
+  robotics, 2025.
+
+\bibitem{copycat_ptp}
+M.~Torne, A.~Tang, Y.~Liu, and C.~Finn.
+\newblock Learning long-context diffusion policies via past-token prediction,
+  2025.
+
+\bibitem{xiao2026avavlaimprovingvisionlanguageactionmodels}
+L.~Xiao, J.~Li, J.~Gao, F.~Ye, Y.~Jin, J.~Qian, J.~Zhang, Y.~Wu, and X.~Yu.
+\newblock Ava-vla: Improving vision-language-action models with active visual
+  attention, 2026.
+
+\bibitem{xie2026turbovlarealtimevisionlanguageactionmodel}
+H.~Xie, C.~Yao, X.~Wu, X.~Xi, Y.~Tang, D.~Xu, Y.~Zhu, D.~Liang, X.~Bai, and
+  H.~Ding.
+\newblock Turbovla: Real-time vision-language-action model at 32 hz on an rtx
+  4090 with <1 gb vram, 2026.
+
+\bibitem{zhang2026flatnesspreservesinstructionfollowing}
+H.~Zhang and Y.~Bisk.
+\newblock Flatness preserves instruction following in vision-language-action
+  models, 2026.
+
+\bibitem{zhang2026reinflowfinetuningflowmatching}
+T.~Zhang, C.~Yu, S.~Su, and Y.~Wang.
+\newblock Reinflow: Fine-tuning flow matching policy with online reinforcement
+  learning, 2026.
+
+\end{thebibliography}

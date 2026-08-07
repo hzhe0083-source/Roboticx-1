@@ -1,0 +1,208 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="app.diagrams.net" agent="Codex" version="26.0.9" pages="1">
+  <diagram id="va-compound-actual" name="VA Compound Actual Architecture">
+    <mxGraphModel dx="1900" dy="1080" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1900" pageHeight="1080" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="title" value="&lt;b&gt;VA Compound 实际架构&lt;/b&gt;" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontFamily=Helvetica;fontSize=24;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="40" y="18" width="900" height="38" as="geometry" />
+        </mxCell>
+        <mxCell id="subtitle" value="基于 ORA0 当前代码 · 在线推理 / 单层注意力 / 成对训练" style="text;html=1;strokeColor=none;fillColor=none;align=right;verticalAlign=middle;whiteSpace=wrap;fontFamily=Helvetica;fontSize=13;fontColor=#475569;" vertex="1" parent="1">
+          <mxGeometry x="1040" y="24" width="820" height="28" as="geometry" />
+        </mxCell>
+
+        <mxCell id="runtime_header" value="&lt;b&gt;A · 在线推理路径（每条新指令缓存一次语言；每个观测步更新一次视觉记忆）&lt;/b&gt;" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#E2E8F0;strokeColor=#64748B;strokeWidth=1.5;align=left;spacingLeft=14;fontFamily=Helvetica;fontSize=16;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="40" y="75" width="1820" height="36" as="geometry" />
+        </mxCell>
+
+        <mxCell id="instruction" value="&lt;b&gt;自然语言指令&lt;/b&gt;&lt;br&gt;命令变化时触发" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#F8FAFC;strokeColor=#64748B;strokeWidth=1.5;fontFamily=Helvetica;fontSize=13;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="60" y="130" width="180" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="qwen" value="&lt;b&gt;QwenTextBackbone&lt;/b&gt;&lt;br&gt;Qwen/Qwen3.5-2B · 冻结&lt;br&gt;max length = 64" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#E0F2FE;strokeColor=#0284C7;strokeWidth=2;fontFamily=Helvetica;fontSize=13;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="280" y="125" width="260" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="language_cache" value="&lt;b&gt;LanguageCache（按层）&lt;/b&gt;&lt;br&gt;hidden [B,N&lt;sub&gt;l&lt;/sub&gt;,2048] + mask&lt;br&gt;K&lt;sub&gt;L&lt;/sub&gt;&lt;sup&gt;i&lt;/sup&gt;, U&lt;sub&gt;L&lt;/sub&gt;&lt;sup&gt;i&lt;/sup&gt;: [B,8,N&lt;sub&gt;l&lt;/sub&gt;,64]" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#FEF3C7;strokeColor=#D97706;strokeWidth=2;fontFamily=Helvetica;fontSize=13;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="590" y="125" width="270" height="80" as="geometry" />
+        </mxCell>
+
+        <mxCell id="video_window" value="&lt;b&gt;相机窗口&lt;/b&gt;&lt;br&gt;[B,4,3,384,384]&lt;br&gt;ImageNet 归一化" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#F8FAFC;strokeColor=#64748B;strokeWidth=1.5;fontFamily=Helvetica;fontSize=13;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="60" y="230" width="180" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="vjepa" value="&lt;b&gt;VJEPA21Backbone&lt;/b&gt;&lt;br&gt;V-JEPA 2.1 ViT-B/16 · 冻结&lt;br&gt;384px 视频编码" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#E0F2FE;strokeColor=#0284C7;strokeWidth=2;fontFamily=Helvetica;fontSize=13;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="280" y="225" width="260" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="vision_projection" value="&lt;b&gt;Token 限幅 + Vision Projection&lt;/b&gt;&lt;br&gt;adaptive pool → 64 tokens&lt;br&gt;[B,64,768] → [B,64,512]" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#E0F2FE;strokeColor=#0284C7;strokeWidth=2;fontFamily=Helvetica;fontSize=13;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="590" y="230" width="270" height="80" as="geometry" />
+        </mxCell>
+
+        <mxCell id="robot_state" value="&lt;b&gt;机器人状态&lt;/b&gt;&lt;br&gt;proprio [B,14]&lt;br&gt;previous action [B,7]" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#F8FAFC;strokeColor=#64748B;strokeWidth=1.5;fontFamily=Helvetica;fontSize=13;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="60" y="335" width="180" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="state_init" value="&lt;b&gt;Action Token 初始化&lt;/b&gt;&lt;br&gt;state_projection([14+7]→512)&lt;br&gt;+ learned queries [H=8,512]" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#EDE9FE;strokeColor=#7C3AED;strokeWidth=2;fontFamily=Helvetica;fontSize=13;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="280" y="330" width="260" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="action_tokens" value="&lt;b&gt;A&lt;sub&gt;t&lt;/sub&gt; 初始动作查询&lt;/b&gt;&lt;br&gt;state-conditioned&lt;br&gt;[B,8,512]" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#EDE9FE;strokeColor=#7C3AED;strokeWidth=2;fontFamily=Helvetica;fontSize=13;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="590" y="335" width="270" height="80" as="geometry" />
+        </mxCell>
+
+        <mxCell id="va_policy" value="&lt;b&gt;VACompoundPolicy · 可训练&lt;/b&gt;&lt;br&gt;&lt;b&gt;VACouplingLayer × 4&lt;/b&gt;　hidden=512 · heads=8&lt;br&gt;每层：共享 V/A Attention → Residual → 独立 V/A FFN&lt;br&gt;读取本层语言 K/V 与上一时刻视觉 M&lt;sup&gt;i&lt;/sup&gt;&lt;br&gt;&lt;font color=&quot;#6D28D9&quot;&gt;bidir_va / uni_a：相同参数量，仅 role mask 不同&lt;/font&gt;" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#EDE9FE;strokeColor=#7C3AED;strokeWidth=2.5;fontFamily=Helvetica;fontSize=15;fontColor=#0F172A;spacing=14;" vertex="1" parent="1">
+          <mxGeometry x="930" y="170" width="450" height="190" as="geometry" />
+        </mxCell>
+        <mxCell id="action_head" value="&lt;b&gt;Action Head&lt;/b&gt;&lt;br&gt;LayerNorm + Linear&lt;br&gt;512 → 7" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#EDE9FE;strokeColor=#7C3AED;strokeWidth=2;fontFamily=Helvetica;fontSize=13;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="1440" y="165" width="180" height="75" as="geometry" />
+        </mxCell>
+        <mxCell id="action_chunk" value="&lt;b&gt;连续预测动作块&lt;/b&gt;&lt;br&gt;a&lt;sub&gt;t:t+H−1&lt;/sub&gt;&lt;br&gt;[B,8,7]" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#DCFCE7;strokeColor=#16A34A;strokeWidth=2;fontFamily=Helvetica;fontSize=13;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="1680" y="165" width="180" height="75" as="geometry" />
+        </mxCell>
+        <mxCell id="visual_memory" value="&lt;b&gt;VisualMemory&lt;/b&gt;&lt;br&gt;M&lt;sub&gt;t&lt;/sub&gt; = {V&lt;sup&gt;1&lt;/sup&gt;…V&lt;sup&gt;4&lt;/sup&gt;}&lt;br&gt;命令变化时清空" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#FEF3C7;strokeColor=#D97706;strokeWidth=2;fontFamily=Helvetica;fontSize=13;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="1440" y="330" width="180" height="75" as="geometry" />
+        </mxCell>
+        <mxCell id="controller" value="&lt;b&gt;机器人 / 低层控制器&lt;/b&gt;&lt;br&gt;执行动作并产生下一状态&lt;br&gt;&lt;font color=&quot;#475569&quot;&gt;（repo 外部）&lt;/font&gt;" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#DCFCE7;strokeColor=#16A34A;strokeWidth=2;fontFamily=Helvetica;fontSize=13;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="1680" y="330" width="180" height="75" as="geometry" />
+        </mxCell>
+        <mxCell id="runtime_note" value="实线 = 当前步数据流　　橙色虚线 = 同层上一时刻目标视觉记忆　　灰色虚线 = 控制闭环反馈" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontFamily=Helvetica;fontSize=12;fontColor=#475569;" vertex="1" parent="1">
+          <mxGeometry x="280" y="438" width="590" height="24" as="geometry" />
+        </mxCell>
+
+        <mxCell id="edge_cmd_qwen" value="tokens" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeWidth=2;strokeColor=#334155;fontFamily=Helvetica;fontSize=11;fontColor=#475569;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="instruction" target="qwen">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_qwen_cache" value="hidden" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeWidth=2;strokeColor=#0284C7;fontFamily=Helvetica;fontSize=11;fontColor=#0369A1;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="qwen" target="language_cache">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_video_vjepa" value="frames" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeWidth=2;strokeColor=#334155;fontFamily=Helvetica;fontSize=11;fontColor=#475569;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="video_window" target="vjepa">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_vjepa_projection" value="tokens" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeWidth=2;strokeColor=#0284C7;fontFamily=Helvetica;fontSize=11;fontColor=#0369A1;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="vjepa" target="vision_projection">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_state_init" value="state" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeWidth=2;strokeColor=#334155;fontFamily=Helvetica;fontSize=11;fontColor=#475569;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="robot_state" target="state_init">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_init_tokens" value="queries" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeWidth=2;strokeColor=#7C3AED;fontFamily=Helvetica;fontSize=11;fontColor=#6D28D9;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="state_init" target="action_tokens">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_cache_policy" value="L&lt;sup&gt;i&lt;/sup&gt; K/U" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeWidth=2;strokeColor=#D97706;fontFamily=Helvetica;fontSize=11;fontColor=#92400E;labelBackgroundColor=#FFFFFF;entryX=0;entryY=0.08;entryDx=0;entryDy=0;" edge="1" parent="1" source="language_cache" target="va_policy">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_vision_policy" value="V&lt;sub&gt;t&lt;/sub&gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeWidth=2;strokeColor=#0284C7;fontFamily=Helvetica;fontSize=10;fontColor=#0369A1;labelBackgroundColor=#FFFFFF;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="vision_projection" target="va_policy">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_action_policy" value="A&lt;sub&gt;t&lt;/sub&gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeWidth=2;strokeColor=#7C3AED;fontFamily=Helvetica;fontSize=10;fontColor=#6D28D9;labelBackgroundColor=#FFFFFF;entryX=0;entryY=0.8;entryDx=0;entryDy=0;" edge="1" parent="1" source="action_tokens" target="va_policy">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_policy_head" value="A&lt;sup&gt;4&lt;/sup&gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeWidth=2;strokeColor=#7C3AED;fontFamily=Helvetica;fontSize=10;fontColor=#6D28D9;labelBackgroundColor=#FFFFFF;exitX=1;exitY=0.17;exitDx=0;exitDy=0;" edge="1" parent="1" source="va_policy" target="action_head">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_policy_memory" value="M&lt;sub&gt;t&lt;/sub&gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeWidth=2;strokeColor=#D97706;fontFamily=Helvetica;fontSize=11;fontColor=#92400E;labelBackgroundColor=#FFFFFF;exitX=1;exitY=0.9;exitDx=0;exitDy=0;" edge="1" parent="1" source="va_policy" target="visual_memory">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_head_chunk" value="8 × 7" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeWidth=2;strokeColor=#16A34A;fontFamily=Helvetica;fontSize=10;fontColor=#15803D;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="action_head" target="action_chunk">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_chunk_controller" value="执行" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeWidth=2;strokeColor=#16A34A;fontFamily=Helvetica;fontSize=10;fontColor=#15803D;labelBackgroundColor=#FFFFFF;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="action_chunk" target="controller">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="edge_memory_feedback" value="下一观测步：M&lt;sub&gt;t−1&lt;/sub&gt;&lt;sup&gt;i&lt;/sup&gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;dashed=1;dashPattern=8 6;endArrow=classic;endFill=1;strokeWidth=2.5;strokeColor=#D97706;fontFamily=Helvetica;fontSize=10;fontColor=#92400E;labelBackgroundColor=#FFFFFF;exitX=0.5;exitY=1;entryX=0;entryY=0.98;" edge="1" parent="1" source="visual_memory" target="va_policy">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1530" y="468" />
+              <mxPoint x="900" y="468" />
+              <mxPoint x="900" y="356" />
+            </Array>
+            <mxPoint x="0" y="-12" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="edge_controller_state" value="下一步 proprio / previous action" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;dashed=1;dashPattern=6 6;endArrow=classic;endFill=1;strokeWidth=2;strokeColor=#64748B;fontFamily=Helvetica;fontSize=10;fontColor=#475569;labelBackgroundColor=#FFFFFF;exitX=0.5;exitY=1;entryX=0.5;entryY=1;" edge="1" parent="1" source="controller" target="robot_state">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1770" y="486" />
+              <mxPoint x="150" y="486" />
+            </Array>
+            <mxPoint x="-500" y="-12" as="offset" />
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="layer_header" value="&lt;b&gt;B · 单个 VACouplingLayer 的真实计算（第 i 层）&lt;/b&gt;" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#E2E8F0;strokeColor=#64748B;strokeWidth=1.5;align=left;spacingLeft=14;fontFamily=Helvetica;fontSize=16;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="40" y="500" width="1820" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="query_streams" value="&lt;b&gt;查询流 Query streams&lt;/b&gt;&lt;br&gt;Visual V&lt;sub&gt;t&lt;/sub&gt;&lt;sup&gt;i−1&lt;/sup&gt; [B,N&lt;sub&gt;v&lt;/sub&gt;,512]&lt;br&gt;Action A&lt;sub&gt;t&lt;/sub&gt;&lt;sup&gt;i−1&lt;/sup&gt; [B,H,512]" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#F8FAFC;strokeColor=#64748B;strokeWidth=1.5;fontFamily=Helvetica;fontSize=13;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="60" y="560" width="240" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="context_streams" value="&lt;b&gt;上下文流 Key / value&lt;/b&gt;&lt;br&gt;current V · previous M&lt;sup&gt;i&lt;/sup&gt; · Action A&lt;br&gt;cached Language K&lt;sub&gt;L&lt;/sub&gt;&lt;sup&gt;i&lt;/sup&gt;,U&lt;sub&gt;L&lt;/sub&gt;&lt;sup&gt;i&lt;/sup&gt;" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#FEF3C7;strokeColor=#D97706;strokeWidth=2;fontFamily=Helvetica;fontSize=13;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="60" y="690" width="240" height="95" as="geometry" />
+        </mxCell>
+        <mxCell id="query_projection" value="&lt;b&gt;LayerNorm → q&lt;sub&gt;v&lt;/sub&gt; / q&lt;sub&gt;a&lt;/sub&gt;&lt;/b&gt;&lt;br&gt;Q = [V W&lt;sub&gt;Q&lt;/sub&gt;&lt;sup&gt;V&lt;/sup&gt; ; A W&lt;sub&gt;Q&lt;/sub&gt;&lt;sup&gt;A&lt;/sup&gt;]&lt;br&gt;reshape → 8 heads" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#EDE9FE;strokeColor=#7C3AED;strokeWidth=2;fontFamily=Helvetica;fontSize=13;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="360" y="560" width="240" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="kv_projection" value="&lt;b&gt;LayerNorm → role-specific K / U&lt;/b&gt;&lt;br&gt;k,u for V · M · A&lt;br&gt;+ cached K&lt;sub&gt;L&lt;/sub&gt;,U&lt;sub&gt;L&lt;/sub&gt; → concat" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#EDE9FE;strokeColor=#7C3AED;strokeWidth=2;fontFamily=Helvetica;fontSize=13;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="360" y="690" width="240" height="95" as="geometry" />
+        </mxCell>
+        <mxCell id="attention" value="&lt;b&gt;共享 Scaled Dot-Product Attention&lt;/b&gt;&lt;br&gt;scores(fp32) = QK&lt;sup&gt;T&lt;/sup&gt; / √64&lt;br&gt;softmax(scores) U 同时更新 V 与 A" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#EDE9FE;strokeColor=#7C3AED;strokeWidth=2.5;fontFamily=Helvetica;fontSize=14;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="760" y="615" width="240" height="105" as="geometry" />
+        </mxCell>
+        <mxCell id="role_mask" value="&lt;b&gt;role_mask + language_mask&lt;/b&gt;　bidir_va：V/A 读全部 K/U　｜　uni_a：Visual Q 仅读 Visual K" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#FEF3C7;strokeColor=#D97706;strokeWidth=1.5;fontFamily=Helvetica;fontSize=11;fontColor=#92400E;" vertex="1" parent="1">
+          <mxGeometry x="630" y="755" width="520" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="split_updates" value="&lt;b&gt;Split + output projections&lt;/b&gt;&lt;br&gt;update → ΔV, ΔA&lt;br&gt;out_v / out_a" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#EDE9FE;strokeColor=#7C3AED;strokeWidth=2;fontFamily=Helvetica;fontSize=13;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="1080" y="615" width="210" height="105" as="geometry" />
+        </mxCell>
+        <mxCell id="residual_ffn" value="&lt;b&gt;Residual + 独立 pre-norm FFN&lt;/b&gt;&lt;br&gt;V ← V + out_v + ffn_v&lt;br&gt;A ← A + out_a + ffn_a" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#EDE9FE;strokeColor=#7C3AED;strokeWidth=2;fontFamily=Helvetica;fontSize=13;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="1370" y="615" width="210" height="105" as="geometry" />
+        </mxCell>
+        <mxCell id="layer_memory" value="&lt;b&gt;同层记忆写回&lt;/b&gt;&lt;br&gt;M&lt;sub&gt;t&lt;/sub&gt;&lt;sup&gt;i&lt;/sup&gt; = V&lt;sub&gt;t&lt;/sub&gt;&lt;sup&gt;i&lt;/sup&gt;&lt;br&gt;历史长度不增长" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#FEF3C7;strokeColor=#D97706;strokeWidth=2;fontFamily=Helvetica;fontSize=13;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="1660" y="560" width="200" height="85" as="geometry" />
+        </mxCell>
+        <mxCell id="layer_next" value="&lt;b&gt;层间 / 输出传递&lt;/b&gt;&lt;br&gt;V&lt;sup&gt;i&lt;/sup&gt;, A&lt;sup&gt;i&lt;/sup&gt; → Layer i+1&lt;br&gt;最后一层 A → Action Head" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#DCFCE7;strokeColor=#16A34A;strokeWidth=2;fontFamily=Helvetica;fontSize=13;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="1660" y="710" width="200" height="75" as="geometry" />
+        </mxCell>
+
+        <mxCell id="edge_query_projection" value="V / A" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeWidth=2;strokeColor=#334155;fontFamily=Helvetica;fontSize=10;fontColor=#475569;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="query_streams" target="query_projection"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="edge_context_projection" value="V / M / A / L" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeWidth=2;strokeColor=#D97706;fontFamily=Helvetica;fontSize=10;fontColor=#92400E;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="context_streams" target="kv_projection"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="edge_q_attention" value="Q" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeWidth=2;strokeColor=#7C3AED;fontFamily=Helvetica;fontSize=11;fontColor=#6D28D9;labelBackgroundColor=#FFFFFF;entryX=0;entryY=0.3;" edge="1" parent="1" source="query_projection" target="attention"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="edge_kv_attention" value="K, U" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeWidth=2;strokeColor=#7C3AED;fontFamily=Helvetica;fontSize=11;fontColor=#6D28D9;labelBackgroundColor=#FFFFFF;entryX=0;entryY=0.76;" edge="1" parent="1" source="kv_projection" target="attention"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="edge_mask_attention" value="mask" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeWidth=1.5;strokeColor=#D97706;fontFamily=Helvetica;fontSize=10;fontColor=#92400E;labelBackgroundColor=#FFFFFF;exitX=0.5;exitY=0;entryX=0.5;entryY=1;" edge="1" parent="1" source="role_mask" target="attention"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="edge_attention_split" value="update" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeWidth=2;strokeColor=#7C3AED;fontFamily=Helvetica;fontSize=10;fontColor=#6D28D9;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="attention" target="split_updates"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="edge_split_residual" value="ΔV / ΔA" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeWidth=2;strokeColor=#7C3AED;fontFamily=Helvetica;fontSize=10;fontColor=#6D28D9;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="split_updates" target="residual_ffn"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="edge_res_memory" value="V&lt;sup&gt;i&lt;/sup&gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeWidth=2;strokeColor=#D97706;fontFamily=Helvetica;fontSize=10;fontColor=#92400E;labelBackgroundColor=#FFFFFF;exitX=1;exitY=0.3;entryX=0;entryY=0.5;" edge="1" parent="1" source="residual_ffn" target="layer_memory"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="edge_res_next" value="V&lt;sup&gt;i&lt;/sup&gt;, A&lt;sup&gt;i&lt;/sup&gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeWidth=2;strokeColor=#16A34A;fontFamily=Helvetica;fontSize=10;fontColor=#15803D;labelBackgroundColor=#FFFFFF;exitX=1;exitY=0.72;entryX=0;entryY=0.5;" edge="1" parent="1" source="residual_ffn" target="layer_next"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <mxCell id="training_header" value="&lt;b&gt;C · 当前训练入口（train.py：预计算特征上的 VA 复合体训练）&lt;/b&gt;" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#E2E8F0;strokeColor=#64748B;strokeWidth=1.5;align=left;spacingLeft=14;fontFamily=Helvetica;fontSize=16;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="40" y="825" width="1820" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="training_features" value="&lt;b&gt;features.pt / synthetic_sequence&lt;/b&gt;&lt;br&gt;vision [N,T,N&lt;sub&gt;v&lt;/sub&gt;,768] · language [N,N&lt;sub&gt;l&lt;/sub&gt;,2048]&lt;br&gt;proprio · previous action · expert action chunks" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#F8FAFC;strokeColor=#64748B;strokeWidth=1.5;fontFamily=Helvetica;fontSize=12;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="60" y="885" width="300" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="paired_sampler" value="&lt;b&gt;FeatureDataset + PairedBatchSampler&lt;/b&gt;&lt;br&gt;每个 pair 恰好 2 行 · 共享 t=0 状态&lt;br&gt;不同 instruction_id / 专家动作" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#F8FAFC;strokeColor=#64748B;strokeWidth=1.5;fontFamily=Helvetica;fontSize=12;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="410" y="885" width="230" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="temporal_rollout" value="&lt;b&gt;rollout_policy&lt;/b&gt;&lt;br&gt;语言 K/V 只构建一次&lt;br&gt;T≥4 顺序展开 · M&lt;sub&gt;t−1&lt;/sub&gt; → M&lt;sub&gt;t&lt;/sub&gt;&lt;br&gt;跨时刻反向传播" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#EDE9FE;strokeColor=#7C3AED;strokeWidth=2;fontFamily=Helvetica;fontSize=12;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="690" y="885" width="280" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="training_losses" value="&lt;b&gt;总损失&lt;/b&gt;&lt;br&gt;Huber behavior cloning&lt;br&gt;+ λ&lt;sub&gt;pair&lt;/sub&gt; · Huber(t=0 预测动作差, 专家动作差)&lt;br&gt;共享决策状态迫使语言解释动作差异" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#FEE2E2;strokeColor=#DC2626;strokeWidth=2;fontFamily=Helvetica;fontSize=12;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="1020" y="885" width="350" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="optimizer" value="&lt;b&gt;AdamW&lt;/b&gt;&lt;br&gt;gradient clip = 1.0&lt;br&gt;更新 VA Compound" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#EDE9FE;strokeColor=#7C3AED;strokeWidth=2;fontFamily=Helvetica;fontSize=12;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="1420" y="885" width="190" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="checkpoint" value="&lt;b&gt;可选 checkpoint&lt;/b&gt;&lt;br&gt;config + model state&lt;br&gt;+ training contract" style="rounded=1;arcSize=12;whiteSpace=wrap;html=1;fillColor=#DCFCE7;strokeColor=#16A34A;strokeWidth=2;fontFamily=Helvetica;fontSize=12;fontColor=#0F172A;" vertex="1" parent="1">
+          <mxGeometry x="1660" y="885" width="200" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="training_note" value="&lt;b&gt;重要边界：train.py --data&lt;/b&gt; 直接读取预计算的 vision_tokens / language_hidden；Qwen 与 V-JEPA 保持冻结，不参与端到端骨干微调。" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontFamily=Helvetica;fontSize=12;fontColor=#475569;" vertex="1" parent="1">
+          <mxGeometry x="60" y="995" width="1080" height="42" as="geometry" />
+        </mxCell>
+        <mxCell id="source_note" value="来源：README.md · VA_COMPOUND_REPORT.md · backbones.py · model.py · train.py" style="text;html=1;strokeColor=none;fillColor=none;align=right;verticalAlign=middle;whiteSpace=wrap;fontFamily=Helvetica;fontSize=11;fontColor=#64748B;" vertex="1" parent="1">
+          <mxGeometry x="1160" y="995" width="700" height="42" as="geometry" />
+        </mxCell>
+
+        <mxCell id="edge_features_sampler" value="check" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeWidth=1.8;strokeColor=#334155;fontFamily=Helvetica;fontSize=11;fontColor=#475569;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="training_features" target="paired_sampler"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="edge_sampler_rollout" value="pair" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeWidth=1.8;strokeColor=#334155;fontFamily=Helvetica;fontSize=11;fontColor=#475569;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="paired_sampler" target="temporal_rollout"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="edge_rollout_losses" value="pred" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeWidth=2;strokeColor=#7C3AED;fontFamily=Helvetica;fontSize=11;fontColor=#6D28D9;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="temporal_rollout" target="training_losses"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="edge_losses_optimizer" value="grad" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeWidth=2;strokeColor=#DC2626;fontFamily=Helvetica;fontSize=11;fontColor=#B91C1C;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="training_losses" target="optimizer"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="edge_optimizer_checkpoint" value="save" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeWidth=2;strokeColor=#16A34A;fontFamily=Helvetica;fontSize=11;fontColor=#15803D;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="optimizer" target="checkpoint"><mxGeometry relative="1" as="geometry" /></mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

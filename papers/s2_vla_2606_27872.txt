@@ -1,0 +1,582 @@
+                                             S2 -VLA: State-Space Guided Vision-Language-Action Models for Long-Horizon
+                                                                             Manipulation
+                                                   Zhipeng Xie1 , Zongyi Han1 , Xiangyi Wei1 , Shiliang Sun2 , Yang Li1 and Jing Zhao1∗
+                                          1
+                                            School of Computer Science and Technology, East China Normal University, Shanghai 200062, China
+                                              2
+                                                State Key Laboratory of Submarine Geoscience, School of Automation and Intelligent Sensing,
+                                                                   Shanghai Jiao Tong University, Shanghai 200240, China
+                                               {51285901044, 51285901051, 52285901014}@stu.ecnu.edu.cn, shiliangsun@gmail.com, {yli,
+                                                                                  jzhao}@cs.ecnu.edu.cn
+arXiv:2606.27872v1 [cs.RO] 26 Jun 2026
+
+
+
+
+                                                                    Abstract
+
+                                               Vision-Language-Action (VLA) models have
+                                               demonstrated strong capabilities in robotic ma-
+                                               nipulation, but their performance degrades signifi-
+                                               cantly in long-horizon tasks due to cumulative er-
+                                               ror propagation. This limitation largely arises from
+                                               static feature fusion mechanisms that rely on fixed
+                                               weights to combine visual, language, and action
+                                               representations, preventing the model from adapt-
+                                               ing to different phases of task execution. To address
+                                               this limitation, we propose S2 -VLA, a framework
+                                               that introduces a State-Space Guided Adaptive At-
+                                               tention (SSGAA) mechanism. SSGAA maintains
+                                               a belief state that tracks task progression and gen-
+                                               erates dynamic gating weights to adaptively fuse           Figure 1: Illustrative examples comparing our S2 -VLA, which in-
+                                               information from three complementary sources vi-           corporates State-Space Guided Adaptive Attention, with static fu-
+                                               sual features for spatial perception, task intents for     sion approaches, highlighting its ability to mitigate early-stage bias.
+                                               high-level task planning, and temporal action se-
+                                               quences for execution consistency. This adaptive
+                                               fusion allows the model to shift its focus throughout      visual observations and language instructions with the action
+                                               task execution, aligning with the evolving require-        space to generate precise and executable policies.
+                                               ments of different task stages. Despite its compact           The mainstream method aligns multimodal representa-
+                                               2B parameter size, S2 -VLA consistently outper-            tions vision and language with the action space to gen-
+                                               forms larger 7B-scale models and achieves state-of-        erate executable policies by performing end-to-end fine-
+                                               the-art performance on long-horizon manipulation           tuning of Vision-Language Models on large-scale robotic
+                                               benchmarks, including LIBERO and SimplerEnv.               datasets [Collaboration et al., 2025; Khazatsky et al., 2025].
+                                               highlighting the importance of adaptive feature fu-        However, when applied to long-horizon manipulation tasks
+                                               sion for long-horizon robotic manipulation.                that require multi-step reasoning, these models are funda-
+                                                                                                          mentally limited by their static representation fusion mecha-
+                                                                                                          nism. Considering a task such as put both the cream cheese
+                                         1    Introduction                                                box and the butter in the basket. The model employs fixed
+                                                                                                          weights to fuse information from different modalities like vi-
+                                         In recent years, significant advances in vision-language mod-    sion and language throughout its execution. Consequently,
+                                         els (VLMs) [Bai et al., 2025a; Chen et al., 2024; Karam-         during the grasping phase which demands precise localiza-
+                                         cheti et al., 2024] have propelled the development of gen-       tion, the model cannot sufficiently focus on spatial details of
+                                         eralist robotic systems capable of perception, reasoning, and    the object. Meanwhile, in the planning phase which requires
+                                         action under open-ended instructions. Within this paradigm,      comprehension of the overall goal, it fails to allocate adequate
+                                         Vision-Language-Action (VLA) [Zhang et al., 2025a] mod-          attention to semantic intent. This lack of phase-adaptive ca-
+                                         els have emerged as a promising framework that bridges high-     pability in its rigid design leads to decision biases at criti-
+                                         level understanding to low-level control, enabling instruction   cal steps. More critically, in long-horizon tasks, the lack of
+                                         driven robotic manipulation. The core of VLA research lies       a context-aware correction mechanism allows these early bi-
+                                         in effectively aligning multimodal representations comprising    ases to propagate and amplify along the action chain, ulti-
+mately leading to task failure.                                     ken Generation Models discretize actions into tokens and
+   To overcome this limitation, we propose the S2 -VLA              generate them sequentially, such as OpenVLA [Kim et al.,
+framework. Its core is a novel State-Space Guided Adaptive          2024], RT-2 [Zitkovich et al., 2023], π0 -FAST [Pertsch et al.,
+Attention (SSGAA) mechanism. As illustrated in Figure 1,            2025], CoT-VLA [Zhao et al., 2025], FlowVLA [Zhong et
+unlike static fusion, S2 -VLA maintains a compact belief            al., 2025], UniVLA [Bu et al., 2025], TraceVLA [Zheng et
+state that tracks task progression and dynamically gates three      al., 2025], WorldVLA [Cen et al., 2025], SpatialVLA [Qu
+complementary information streams spatial visual features,          et al., 2025], Magma [Yang et al., 2025], MolmoAct [Lee
+semantic task intent, and temporal action history enabling          et al., 2025], etc. While semantically more unified, this se-
+phase-aware adaptation. Extensive experiments on bench-             rial generation typically incurs higher inference latency. In
+marks such as LIBERO [Liu et al., 2023], SimplerEnv [Li et          contrast, Parallel Decoding with Decoupled Policy Heads de-
+al., 2024b] and ALOHA [Zhao et al., 2023] platform demon-           couples representation from execution to simultaneously im-
+strate that S2 -VLA, despite with compact 2B parameters, con-       prove speed and precision, such as OpenVLA-OFT [Kim et
+sistently outperforms larger 7B-scale models and sets a new         al., 2025], π0 [Black et al., 2024], GR00T N1 [NVIDIA et al.,
+state-of-the-art, effectively mitigating error propagation and      2025], SmolVLA [Shukor et al., 2025], CogACT [Li et al.,
+significantly improving long-horizon task success.                  2024a], 4D-VLA [Zhang et al., 2025b], ThinkAct [Huang et
+   The main contributions of our work are as follows:               al., 2025], CronusVLA [Li et al., 2025a], MemoryVLA [Shi
+    • We propose S2 -VLA, which leverages pretrained VLMs           et al., 2025], RoboVLMs [Liu et al., 2025a], and others. Un-
+      to directly generate robot action policies through a          der this paradigm, the VLM mainly provides semantic repre-
+      belief-state-space interface, eliminating the need for        sentations or high-level planning signals, while concrete ac-
+      large-scale action-sequence pretraining.                      tion generation is handled by a decoupled policy head (e.g.,
+                                                                    diffusion or flow-matching models or ACT-style chunking).
+    • We propose a novel State-Space Guided Adaptive At-            We adopt the latter paradigm to achieve efficient continuous
+      tention mechanism, which models task progress as a dy-        control, with a focus on optimizing the feature fusion mech-
+      namic belief state. This belief state is used to guide a      anism, aiming to fully leverage the perceptual capabilities of
+      gating network that dynamically modulates the fusion          VLMs and appropriately bridge them with action generation
+      of visual, linguistic, and action representations for long-   for effective long-horizon task execution.
+      horizon manipulation tasks.
+    • We show that S2 -VLA achieves robust long-horizon             2.2   Policy Generation and Feature Integration
+      robotic manipulation with a lightweight model archi-          The performance of decoupled VLAs depends on what infor-
+      tecture, outperforming prior VLA methods on multiple          mation is utilized from the backbone and how it is integrated.
+      standard benchmarks.                                          Existing methods typically exhibit statically configured fea-
+                                                                    ture integration, which limits their adaptability.
+2     Related Work                                                  Static Focus on Compressed Representations. Most
+2.1    Vision-Language-Action Models                                mainstream methods [Liu et al., 2025b; Kim et al., 2025]
+                                                                    restrict their attention to the final output representations.
+In the ongoing development of generalist robotic poli-
+                                                                    Specifically, OpenVLA-OFT [Kim et al., 2025] utilizes
+cies, the field is observing a distinct trajectory that moves
+                                                                    Learnable Action Queries to perform parallel decoding of fu-
+from imitation-learning-based expert policies toward general-
+                                                                    ture action chunks. However, the policy head attends exclu-
+purpose foundation models. Early pioneers in this domain,
+                                                                    sively to embeddings at these specific query token positions.
+such as ACT [Zhao et al., 2023], proved that it is possi-
+                                                                    While these embeddings encapsulate rich semantic intent,
+ble to achieve strong dexterity by directly fitting the action
+                                                                    they constitute an information bottleneck, abstracting away
+distribution from demonstration data. Following this break-
+                                                                    the fine-grained spatial details present in the VLM’s image
+through, researchers have further explored generalist policies
+                                                                    token embeddings. This rigid focus makes it difficult for the
+pre-trained on large-scale robot trajectories, resulting in rep-
+                                                                    model to recover the precise geometric information required
+resentative systems like Octo [Team et al., 2024], RDT [Liu
+                                                                    for high-dexterity tasks.
+et al., 2025b], Seer [Tian et al., 2024], RT-1 [Brohan et
+al., 2023], RT-1-X [Collaboration et al., 2025], and Unified-       Static Multi-level Fusion. To retrieve lost details,
+VLA [Li et al., 2025b]. However, it is worth noting that these      SmolVLA [Shukor et al., 2025] and VLA-Adapter [Wang
+approaches often struggle to handle open-world semantic in-         et al., 2025] introduce mechanisms to aggregate multi-
+structions effectively. They tend to face challenges with long-     level backbone features (e.g., intermediate hidden states).
+tail concepts and compositional generalization, especially in       Although this expands the information scope, the fusion
+scenarios where semantic understanding is not grounded in           strategy remains static. The models learn a fixed set of
+strong pre-trained VLMs. Consequently, to address this bot-         weights to balance these information sources. Consequently,
+tleneck, contemporary research has started to leverage pre-         they fail to adaptively shift their focus as applying the same
+trained VLMs as semantic backbones, a strategy that has suc-        fusion ratio regardless of whether the robot is in a visually
+cessfully given rise to VLA models [Zhang et al., 2025a;            critical phase (e.g., aligning for a grasp) or an intent-critical
+Gao et al., 2025].                                                  phase (e.g., executing motion primitives).
+   Current VLA architectures can be broadly summarized                 We argue that effective manipulation necessitates phase
+into two paradigms for action decoding. Autoregressive To-          aware trade-offs visual precision for localization versus se-
+Figure 2: Architecture and Workflow of the S2 -VLA Framework. The Workflow processes multimodal inputs through a vision-language
+backbone, with the core State-Space Guided Adaptive Attention(SSGAA) module adaptively fusing spatial, semantic, and temporal informa-
+tion under the dynamic guidance of the belief state.
+
+
+mantic intent for planning a critical temporal dynamic ig-           where fϕ is a learned update function, K is the lookback hori-
+nored by current methods.                                            zon, and t and l denote the time step and the layer index of the
+                                                                                                   (l)
+                                                                     action head, respectively. ht represents the hidden state up-
+3     Methodology                                                    dated via the l layer at time step t, initialized by the low-level
+                                                                                (0)
+3.1    Problem Formulation                                           features ht . This formulation explicitly models the causal
+                                                                     relationship between the agent’s actions At−K:t−1 and envi-
+We formalize the language-conditioned long-horizon manip-
+                                                                     ronmental feedback (proprioception), enabling the model to
+ulation tasks in VLA model. At each time step t, an agent re-
+                                                                     track task progress and detect execution deviations. For initial
+ceives a multi-view visual observation Vt , a natural language
+                                                                     steps where the number of past actions is less than K, zero-
+instruction Lt , and proprioceptive feedback Pt . A standard
+                                                                     padding is applied to the sequence. We implement fϕ using a
+VLA policy is typically formulated as a direct mapping from
+                                                                     lightweight Gated Recurrent Unit (GRU) [Cho et al., 2014].
+these inputs to a future action sequence
+                                                                     Its recurrent nature maintains temporally coherent representa-
+               At:t+K−1 = πVLA (Vt , Lt , Pt ),              (1)     tions, compressing the history of action-perception pairs into
+                                                                     a dynamic representation of task phase and execution quality.
+where At:t+K−1 = [at , at+1 , . . . , at+K−1 ] denotes K the         The complete policy is then conditioned on this belief state to
+predicted actions.                                                   generate actions as
+   Although effective for short-horizon tasks, this formula-
+                                                                                              ′
+tion fundamentally lacks an explicit mechanism to maintain                        At:t+K−1 = πVLA (Vt , Lt , Pt | bt ).            (3)
+temporal coherence. Each action is generated from a static
+                                                                     The belief state bt is learned end-to-end from the action pre-
+sensory snapshot, disregarding the execution history and how
+                                                                     diction loss, without any explicit supervision on task phases
+past actions have led to the current state. This makes the
+                                                                     or execution errors. By minimizing prediction error, the
+model susceptible to error accumulation in long-horizon sce-
+                                                                     model is forced to encode predictive information about fu-
+narios.
+                                                                     ture successful actions from the history of action-perception
+3.2 S2 -VLA                                                          sequences. Consequently, distinct patterns arising from dif-
+                                                                     ferent task phases (e.g., approaching, grasping, placing) as
+Belief-Driven VLA Paradigm                                           well as discrepancies between expected and actual outcomes
+To overcome the lack of temporal coherence in static VLA             due to errors or perturbations are naturally encoded into bt .
+models for long-horizon tasks, we formulate an internal be-          This makes bt an latent representation that emergently en-
+lief state bt ∈ Rdb . This state serves as a compact temporal        codes both task-phase information and execution fidelity, dis-
+context, summarizing where we are in task execution, and             tilled directly from action-perception dynamics through end-
+is recursively updated to encode task progression and histori-       to-end optimization.
+cal information. The belief state update integrates the recent
+action sequence and its sensory feedback, formulated as              Framework Overview
+         (
+              (l) (l)         (l−1)                                  The belief state bt provides crucial guidance for adaptive fu-
+           (ot , ht ) = fϕ (ht      , At−K:t−1 , Pt )                sion of multimodal information. Building upon this, we pro-
+             (l)         (l)                               (2)
+           bt = Wb · ot + β b                                        pose the S2 -VLA framework. Its core is a novel State-Space
+Guided Adaptive Attention mechanism. SSGAA consist of                    Belief-Guided Gating. The belief state bt dynamically
+three functionally complementary and parallel attention path-            modulates these three branches through a gating mechanism.
+ways. Instead of static fusion, these pathways are adaptively            At layer l, soft gating weights are computed as
+integrated via a dynamic gating network regulated by the be-                     (l) (l) (l) ⊤               
+                                                                                                                          (l)
+                                                                                                                              
+lief state bt , enabling stage-aware and adaptive feature aggre-                 gvis , gite , gact = Softmax MLP(l)  g (bt     . (7)
+gation. This design enables the policy to dynamically balance            Branch outputs are fused as
+spatial details an d semantic intent based on action history                               (l)    (l)    (l)    (l)    (l)   (l)
+and proprioception, thereby enhancing execution consistency                      H(l) = gvis · Ovis + gite · Oite + gact · Oact ,     (8)
+                                                                                (l)    (l)        (l)
+in long-horizon tasks. The overall architecture of S2 -VLA are           where Ovis , Oite , and Oact denote the outputs of the visual,
+illustrated in Figure 2.                                                 semantic, and action self-attention branches at layer l, re-
+Unified Input Construction                                               spectively. The fused representation H(l) is processed by a
+Visual features Ft = ViT(Vt ) ∈ RNv ×d are extracted from                feed-forward network. The processed output then serves a
+multi-view images Vt . Language instructions L are tokenized             dual function. First, it provides the query input Q(l+1) for
+into {l1 , l2 , . . . , lNl } ∈ RNl ×d , and learnable intent tokens     the next layer’s visual and context cross-attention branches.
+Atokens are embedded as {ã1 , ã2 , . . . , ãNa } ∈ RNa ×d for         Second, it is fed into the same layer’s action sequence self-
+task-specific context. The combined input sequence is:                   attention branch. This design enables iterative refinement
+                                                                         through multi-layer processing.
+  X = Ft ; l1 , . . . , lNl ; ã1 , . . . , ãNa ∈ R(Nv +Nl +Na )×d .
+                                               
+                                                                   (4)   Parallel Action Decoding
+The sequence is processed through H Transformer layers to                The final action prediction is generated by applying layer nor-
+produce hierarchical representations.                                    malization followed by a linear projection to the output of the
+                                                                         last SSGAA layer are computed as
+State-Space Guided Adaptive Attention                                                                           ⊤
+                                                                                    Ât:t+K−1 = LN H(Lout ) Wout      + β out ,      (9)
+The SSGAA mechanism consists of belief-guided dynamic
+gating and three complementary attention pathways, all oper-             where LN(·) denotes layer normalization. The learnable pa-
+ating on contextualized representations derived from the uni-            rameters are the weight matrix Wout ∈ RT ×d and the bias
+fied input sequence X.                                                   vector β out ∈ RT . The bias β out is broadcasted across the
+                                                                         temporal dimension K during the addition.
+Action Sequence Self-Attention. Ensures temporal coher-
+ence in the predicted motion trajectories. This branch op-               3.3   Training and Inference Strategies
+erates on a dedicated action-sequence embedding A(0) ∈                   Unified Loss Formulation
+RT ×K×d where T denotes the action dimension and K the                   The training objective is defined by the action prediction loss,
+number of predicted steps, which is initialized as zero vectors          which ensures precise trajectory generation by minimizing
+and refined layer-wise through self-attention [Vaswani et al.,           the discrepancy between predicted and ground-truth actions
+2017] within the SSGAA module. This enables modeling of                                                  K−1
+the temporal dependencies across the predicted K steps.                                               1 X
+                                                                                  Ltotal = Laction =         ∥at+k − ât+k ∥22 ,     (10)
+Low-Level Visual Cross-Attention. Provides precise spa-                                               K
+                                                                                                         k=0
+tial grounding by attending to fine-grained visual features.             where at+k denotes the ground-truth action at future step t+k
+We construct a visual vector Cvis ∈ RNv ×d by stacking the               and ât+k is the corresponding prediction. This formulation
+hidden states of visual tokens from one transformer layer. The           directly optimizes the model for action prediction accuracy
+operation is defined as                                                  without additional regularization terms.
+                           Q(Cvis Wkvis )⊤
+                                          
+       Ovis = Softmax            √           (Cvis Wvvis ), (5)          End-to-End Training and Inference
+                                   d                                     The S2 -VLA model is trained end-to-end, jointly optimizing
+where Q ∈ RK×d is the query projection derived from the                  all components including the pre-trained Qwen3-VL [Bai et
+learnable action sequence representation and Wkvis , Wvvis ∈             al., 2025a] backbone, belief update module, and SSGAA at-
+                                                                         tention mechanism to allow gradient flow and coordinated
+Rd×d are learnable key and value projections that preserve
+                                                                         adaptation for robotic manipulation. During inference, the
+fine-grained spatial details crucial for object manipulation.
+                                                                         model operates in a temporally recurrent loop. At each step,
+High-Level Intent Cross-Attention. Facilitates semantic                  it first updates its state through a GRU [Cho et al., 2014].
+intent understanding by processing aggregated multimodal                 The model then computes adaptive gating weights to fuse vi-
+context. We form a semantic context vector Cite ∈ RNa ×d                 sual, textual, and action features into a unified representation.
+from the hidden states of the Na learnable intent tokens                 Based on this representation, it predicts and executes the next
+across layers. The attention is computed as                              action before proceeding to the following time step. This de-
+                         
+                           Q(Cite Wkite )⊤
+                                                                        sign ensures temporal consistency and robustness via contin-
+       Oite = Softmax            √           (Cite Wvite ), (6)          uous state estimation. Simultaneously, the dynamic gating
+                                   d                                     mechanism enables automatic attention shifting across differ-
+where Wkite , Wvite ∈ Rd×d project the action-token represen-            ent modalities according to the current task phase, thereby
+tations, which encode the distilled task semantics, into keys            facilitating adaptive and reliable task execution. Details are
+and values respectively.                                                 provided in the supplementary material.
+                               Scale   Spatial   Object   Goal   Long   Avg.                                  Spoon      Carrot    Stack   Eggplant     Avg.
+    Method                                                                      Method
+                                (B)     (%)       (%)     (%)     (%)   (%)                                  on Towel   on Plate   Cube    in Basket   Success
+    FlowVLA (2025, ArXiv)      8.5      93.2      95.0    91.6   72.6   88.1    RT-1-X (2024, ICRA)             0.0       4.2       0.0       0.0        1.1
+    UnifiedVLA (2025, ArXiv)    8.5     95.4      98.8    93.6   94.0   95.5    OpenVLA (2024, RSS)             4.2       0.0       0.0      12.5        4.2
+    OpenVLA (2024, CoRL)         7      84.7      88.4    79.2   53.7   76.5    Octo-Base (2024, ArXiv)        15.8      12.5       0.0      41.7       17.5
+    OpenVLA-OFT (2025, RSS)      7      97.6      98.4    97.9   94.5   97.1    RoboVLMs (2024, ArXiv)         45.8      20.8       4.2      79.2       37.5
+    UniVLA (2025, RSS)           7      96.5      96.8    95.6   92.0   95.2    CogACT-Base (2024, ArXiv)      71.7      50.8      15.0      67.5       51.3
+    MemoryVLA (2025, ArXiv)      7      98.4      98.4    96.4   93.4   96.7    CogACT-Large (2024, ArXiv)     58.3      45.8      29.2      95.8       57.3
+                                                                                π0 -Uniform* (2024, ArXiv)     63.3      58.8      21.3     79.2        55.7
+    CoT-VLA (2025, CVPR)         7      87.5      91.6    87.6   69.0   81.1
+                                                                                π0 -Beta* (2024, ArXiv)        84.6      55.8      47.9     85.4        68.4
+    WorldVLA (2025, ArXiv)       7      87.6      99.2    83.4   60.0   81.8    Magma (2025, PP)               37.5      29.2      20.8      91.7       44.8
+    CronusVLA (2025, AAAI)       7      97.3      99.6    96.9   94.0   97.0    TraceVLA (2025, ArXiv)         12.5      16.6      16.6      65.0       27.7
+    TraceVLA (2025, ArXiv)       7      84.6      85.2    75.1   54.1   74.8    SpatialVLA (2025, ArXiv)       16.7      25.0      29.2     100.0       42.7
+    MolmoAct (2025, ArXiv)       7      87.0      95.4    87.6   77.2   86.6    MemoryVLA (2025, ArXiv)        75.0      75.0      37.5     100.0       71.9
+    ThinkAct (2025, NeurIPS)     7      88.3      91.4    87.1   70.9   84.4
+    4D-VLA (2025, ArXiv)         4      88.9      95.2    90.9   79.1   88.6    S2 -VLA (ours)                 83.3      87.5      41.7     100.0       78.1
+    SpatialVLA (2025, RSS)       4      88.2      89.9    78.6   55.5   78.1
+    π0 (2025, RSS)               3      96.8      98.8    95.8   85.2   94.2   Table 2: Performance comparison on SimplerEnv-Bridge with Wid-
+    π0 -FAST (2025, RSS)         3      96.4      96.8    88.6   60.2   85.5
+    SmolVLA (2025, ArXiv)      2.2      93.0      94.0    91.0   77.0   88.8   owX robot.
+    GR00T N1 (2025, ArXiv)       2      94.4      97.6    93.0   90.6   93.9
+    Seer (2025, ArXiv)         0.57      -         -       -     78.7   78.7
+    VLA-OS (2025, ArXiv)        0.5     87.0      96.5    92.7   66.0   85.6
+    S2 -VLA (ours)              2       98.4      99.6    98.4   96.4   98.2
+
+Table 1: Performance comparison on LIBERO benchmark (Spa-
+tial/Object/Goal/Long subsets).
+
+
+4      Experiments
+4.1      Experimental Setup
+To evaluate the robustness of policies in long-horizon ma-
+nipulation tasks, we evaluate S2 -VLA on three main bench-
+marks. During training, the model is optimized using four
+H100 GPUs. For inference, the system requires only 7GB
+of VRAM to perform deployment. In simulation, we use
+the LIBERO [Liu et al., 2023] benchmark (Spatial, Object,
+Goal, and Long subsets) with fixed trajectories per task, lan-
+guage instructions, and third-person views, following official                 Figure 3: Real World Performance of our S2 -VLA compared with
+                                                                               ACT and π0 -FAST.
+protocols with scripted initial scene sampling. Additionally,
+we evaluate within the SIMPLER [Li et al., 2024b] beach-
+mark which is a high-fidelity simulation platform designed                        Table 2 presents the performance on four manipulation
+to bridge the real-to-sim control and visual gap by faithfully                 tasks using the WidowX robot platform. Our method still
+replicating real-world conditions for representative robotic                   achieves state-of-the-art results even in the highly realistic
+arms such as WidowX. Extensive testing has demonstrated a                      simulation environment, SimplerEnv-Bridge.
+strong correlation between SIMPLER performance and real-
+world results. In the real world, we use the ALOHA bimanual                    Real-World Experimental Evaluation
+system [Zhao et al., 2023] (30 Hz control) with multi-view                     We evaluated S2 -VLA on a real-world ALOHA dual-arm
+overhead and wrist cameras and proprioceptive inputs. Tasks                    mobile manipulation platform through a series of complex
+include pick-and-place, stacking, desktop organization, and                    manipulation tasks. The evaluation comprised four distinct
+utensil distribution. Experimental setup details are provided                  tasks. In the pick-and-place task, the positions of a blue and a
+in the supplementary materials.                                                yellow block were randomly initialized, requiring the system
+                                                                               to pick up the blue block and place it into a bowl. In the stack-
+4.2      Main Results Analysis                                                 ing task, after random initialization of the block positions, the
+Performance on Simulation Benchmark                                            system was required to stack the yellow block on top of the
+As shown in Table 1, we conduct comparative experiments                        blue block. The desktop organization task involved randomly
+with multiple methods on the LIBERO benchmark. Bold                            initializing block positions and then first placing the yellow
+is the best performance and Bold is the suboptimal perfor-                     block into a bowl, followed by placing the blue block into the
+mance. The results indicate that S2 -VLA demonstrates SOTA                     same bowl. Finally, the utensil distribution task required the
+while maintaining efficiency advantages. It achieves success                   system, after random initialization of utensil positions, to use
+rates of 98.4%, 99.6%, 98.4%, and 96.4% on the Spatial, Ob-                    the left arm to pick up a pair of chopsticks, pass them to the
+ject, Goal, and Long-Horizon subsets, respectively, with an                    right arm, and then place the chopsticks into a bowl with the
+average success rate of 98.2%, significantly outperforming                     right arm. Details are provided in supplementary materials.
+the compared methods. Particularly in long-horizon tasks, the                     As illustrated in Figure 3, the key steps in the execution
+model effectively mitigates error accumulation issues through                  process of our S2 -VLA are presented. It achieved superior
+the State-Space Guided Adaptive Attention mechanism.                           success rates compared to all baseline methods, demonstrat-
+  Setting            Gated layers    Perf.(%)    ∆ vs. w/o Gate         Method / Model                        Size   SR(%)   ∆ vs. S 2 -VLA
+                                                                        Qwen2.5-VL + FAST (2025, RSS)         3B     90.2         -6.2
+  w/o Gate                 –           95.0            +0.0             Qwen2.5-VL + OFT (2025, RSS)          3B     92.0         -4.4
+  Gate@All            all layers       94.4            -0.6             Qwen2.5-VL + PI (2025, RSS)           3B     88.4         -8.0
+                                                                        Qwen2.5-VL + GR00T (2025, ArXiv)      3B     90.8         -5.6
+  Single-layer ablations
+  Gate@1                 1             94.2            -0.8             Qwen3-VL + FAST (2025, RSS)           4B     90.6         -5.8
+                                                                        Qwen3-VL + OFT (2025, RSS)            4B     93.8         -2.6
+  Gate@6                 6             96.0            +1.0             Qwen3-VL + PI (2025, RSS)             4B     88.4         -8.0
+  Gate@12               12             96.4            +1.4             Qwen3-VL + GR00T (2025, ArXiv)        4B     92.0         -4.4
+  Gate@18               18             95.8            +0.8             Qwen3-VL + Adapter-Pro (2025, AAAI)   2B     94.4         -2.0
+  Gate@24               24             94.8            -0.2             S2 -VLA (ours)                        2B     96.4          –
+  Combination strategy
+  Combination       6,12,18            94.4            -0.6             Table 4: Performance comparison on LIBERO Long benchmark.
+
+  State guidance ablation
+  w/o State            12              95.8            +0.8            lation of gating weights by the evolving belief state, enabling
+  S2 -VLA(ours)           12           96.4            +1.4            phase-aware adaptation.
+                                                                       Ablation on State Guided Gating
+Table 3: Ablation on gating configuration and belief-state guidance.   To further validate the core role of belief-state guidance, we
+∆ shows performance change relative to ”w/o Gate”.
+                                                                       conduct a controlled experiment. On the best-performing gat-
+                                                                       ing layer (Gate@12), we remove the input from the belief
+ing that its SSGAA mechanism enables effective real-world              state bt and replace it with a learnable constant vector to gen-
+transfer capability.                                                   erate static gating weights (denoted as w/o Belief State). The
+                                                                       results in table 3 show that the static gating setup performs
+4.3   Ablation Studies                                                 worse than the full belief-state-guided gating. This demon-
+This section ablates the core design of S2 -VLA, the action            strates that the performance improvement is not simply due
+head constructed from a 24-layer SSGAA mechanism. We                   to the introduction of a gating mechanism, but rather depends
+systematically address four key questions (i) Is dynamic gat-          critically on having the gating weights be dynamically modu-
+ing necessary? (ii) Is gating performance depth-sensitive?             lated by the current belief state bt . This dynamic mechanism
+(iii) Does belief-state guidance provide additional benefit?           enables the model to adaptively adjust the fusion of multi-
+(iv) What is the optimal SSGAA configuration? All exper-               source information (visual, semantic, and action-sequence)
+iments follow the same training and evaluation protocols as            according to the task phase. Our ablation study demonstrates
+the main experiments, with only the gating strategy modified.          that Gating is more effective at semantically rich middle lay-
+   The study begins by evaluating whether state-driven gat-            ers and belief-state guidance is essential for optimal perfor-
+ing improves performance. As shown in Table 3, disabling               mance. Consequently, S2 -VLA adopts single-layer gating at
+gating (w/o Gate) results in 95.0% performance, while en-              a critical middle layer (layer 12, The experimentally deter-
+abling gating in all layers (Gate@All) slightly degrades per-          mined optimal SSGAA configuration layer) with belief-state
+formance to 94.4%. This suggests that indiscriminate gating            guidance as its core configuration.
+across all layers is not beneficial. To investigate depth sensi-
+tivity, we conduct single-layer gating experiments, enabling           4.4   Evaluation of QwenVL-Based Models
+gating only at specific layers while keeping others static. Re-        To isolate the performance gains attributable to architec-
+sults reveal a clear pattern that gating provides significant          tural design, we systematically transplant several mainstream
+gains at middle layers (6, 12, 18), with layer 12 achieving            SOTA VLA Policy Head methods onto the QwenVL fam-
+the best performance (96.4%), while shallow and deep layers            ily of backbones including Qwen2.5-VL [Bai et al., 2025b]
+show minimal or negative impact. This reflects the hierarchi-          and Qwen3-VL [Bai et al., 2025a] for a fair comparison.
+cal structure of feature extraction. Intermediate levels capture       As shown in Table 4, although all methods are built upon
+semantically rich features ideal for adaptive resource alloca-         the same pre-trained QwenVL weights, S2 -VLA achieves the
+tion, while early and final stages are better by static fusion.        highest success rate of 96.4% with its compact 2B parameter
+   Given the success of single-layer gating at layer 12, we            architecture. This performance not only surpasses the simi-
+investigate whether combining multiple high-performing lay-            larly sized Qwen3-VL+Adapter-Pro [Wang et al., 2025] with
+ers (6, 12, 18) yields further improvements. Surprisingly, this        the success rate of 94.4% but also exceeds all methods using
+multi-layer configuration performs worse (94.4%) than both             larger 3B and 4B backbones, which Qwen3-VL+OFT [Kim
+the best single-layer setting and the no-gating baseline. This         et al., 2025] only gets success rate of 93.8%. The results
+indicates that multi-point gating introduces instability. To iso-      demonstrate that the SSGAA mechanism is more effective
+late the contribution of belief-state guidance, we replace the         than merely scaling up parameters for long-horizon tasks. S2 -
+dynamic state input bt with a learnable static vector in the           VLA successfully breaks through the performance plateau
+Gate@12 configuration. This w/o State variant achieves only            observed in static fusion methods, which typically saturates
+95.8%, significantly lower than the full SSGAA (96.4%).                in the 88%-94% range as task complexity increases. By in-
+This confirms that performance gains arise not merely from             tegrating the semantic representations from the foundation
+introducing gating, but specifically from the dynamic modu-            model with real-time state predictions, it achieves dynamic
+(a)
+
+
+
+
+(b)
+                   4                   7                    9              16                 19                 21                       23                 26               30
+                                                            9                                                                                                26
+
+
+
+
+      Aim target           Grip item        Locate and          Put item        Task change         Aim target              Grip item           Locate and         Put item
+                                           move to basket                                                                                      move to basket
+
+                       Figure 4: Gating weight trajectories and stage-aligned keyframes for a representative LIBERO-Long rollout.
+
+
+shifting of perceptual focus across task phases, thereby en-                             Efficiency              TraceVLA       CronusVLA        OpenVLA-OFT      S2 -VLA(ours)
+hancing robustness against long-horizon error accumulation.                              Throughput (Hz) ↑            4.3           8.7               71.4            80.8
+
+
+4.5     Gating Interpretability Analysis                                                                Table 5: Inference efficiency comparison.
+The primary cause of failure in long-horizon manipulation
+tasks lies in the propagation and amplification of perception                          tion sequence self-attention (blue curve, gaction ) remains dom-
+or decision-making errors from early key steps during sub-                             inant. This allows the model to maintain smooth and tem-
+sequent execution, ultimately leading to overall task failure.                         porally consistent trajectories through coherent step-by-step
+To elucidate how S2 -VLA addresses this challenge at a mech-                           motion modeling, thereby reducing unnecessary perceptual
+anistic level, we performed step-by-step visualization of the                          and planning overhead.
+gating weights in its SSGAA module. A representative long-                                This SSGAA mechanism enables the model to adaptively
+horizon task put both the cream cheese box and the butter                              enhance the most pertinent information-processing pathway
+in the basket is selected for analysis. During a successful                            according to different task phases, thereby improving deci-
+execution trajectory, the model’s dynamic allocation of gat-                           sion robustness in error-prone stages such as fine manipula-
+ing weights across its three attention branches is recorded at                         tion and phase switching. Experimental results confirm that
+each reasoning step, which include low-level visual cross-                             this mechanism effectively reduces the likelihood of errors in
+attention (preserving fine-grained spatial details), high-level                        critical steps, suppresses error propagation and accumulation
+semantic cross-attention (goal-oriented planning), and action                          from the source, and consequently enhances both the overall
+sequence self-attention (temporal coherence in motion gen-                             success rate and execution stability of long-horizon manipu-
+eration). The resulting dynamic trajectories of the weights,                           lation tasks.
+aligned with stage-wise keyframes, are shown in Figure 4.
+The main observations are summarized as follows.                                       4.6         Performance Efficiency Metrics
+   During phases that require precise object grounding and                             To verify inference efficiency, we compare the 7B model with
+fine spatial alignment (e.g., when the end-effector approaches                         our method, with results shown in Table 5.
+the target object, corresponding to the “Aim target” and “Lo-
+cate and move to basket” keyframes marked by a green tri-
+angle in Figure 4), the weight of the low-level visual cross-                          5       Conclusion
+attention (green curve, gvisual ) rises significantly. This indi-                        2
+                                                                                       S -VLA effectively mitigates error accumulation in long-
+cates that the model relies more heavily on early-layer visual                         horizon tasks by employing a state-space-guided adaptive at-
+tokens to support high-precision positioning.                                          tention mechanism, which dynamically fuses visual, linguis-
+   At key decision points involving subtask switching or                               tic, and action representations. Despite its compact size of
+phase transitions (e.g., triggering the grasp action, transport-                       2B parameters, the model outperforms conventional 7B-scale
+ing the object to the basket, and executing the release action,                        models and achieves state-of-the-art success rates on long-
+corresponding to stages such as “Grip item” and “Place item”                           horizon manipulation benchmarks, including LIBERO [Liu et
+in keyframes marked by a red triangle Figure 4), the weight                            al., 2023] and SimplerEnv [Li et al., 2024b]. Future work will
+of the high-level Intent cross-attention (red curve, gintent ) ex-                     explore the architectural compatibility of the SSGAA mech-
+hibits clear peaks. This demonstrates that the model lever-                            anism and extend its core idea of belief state modeling to dif-
+ages aggregated multimodal task representations to perform                             ferent generative frameworks, such as Diffusion models or
+explicit stage transitions and behavioral planning.                                    Flow Matching, to enhance the modeling capability for com-
+   During long-range, steady-state motion segments, the ac-                            plex multimodal action distributions.
+Acknowledgments                                                   Padalkar, Abraham Lee, Acorn Pooley, Agrim Gupta,
+This work is supported by the National Natural Science Foun-      et al. Open X-Embodiment: Robotic Learning Datasets
+dation of China under Projects 62476089, 62576206 and             and RT-X Models, May 2025. arXiv:2310.08864 [cs].
+62572194, and by the Shanghai Science and Technology           [Gao et al., 2025] Chongkai Gao, Zixuan Liu, Zhenghao
+Committee under Grant No. 24511103202.                            Chi, Junshan Huang, Xin Fei, Yiwen Hou, Yuxuan Zhang,
+                                                                  Yudi Lin, Zhirui Fang, Zeyu Jiang, and Lin Shao. VLA-
+Contribution Statement                                            OS: Structuring and Dissecting Planning Representations
+Zhipeng Xie and Zongyi Han contributed equally to this            and Paradigms in Vision-Language-Action Models, June
+work. Jing Zhao is the corresponding author.                      2025. arXiv:2506.17561 [cs].
+                                                               [Huang et al., 2025] Chi-Pin Huang, Yueh-Hua Wu, Min-
+References                                                        Hung Chen, Yu-Chiang Frank Wang, and Fu-En Yang.
+                                                                  ThinkAct: Vision-Language-Action Reasoning via Re-
+[Bai et al., 2025a] Shuai Bai, Yuxuan Cai, Ruizhe Chen, Ke-
+                                                                  inforced Visual Latent Planning, September 2025.
+   qin Chen, Xionghui Chen, Zesen Cheng, Lianghao Deng,
+                                                                  arXiv:2507.16815 [cs].
+   Wei Ding, Chang Gao, Chunjiang Ge, et al. Qwen3-
+   VL Technical Report, November 2025. arXiv:2511.21631        [Karamcheti et al., 2024] Siddharth Karamcheti, Suraj Nair,
+   [cs].                                                          Ashwin Balakrishna, Percy Liang, Thomas Kollar, and
+[Bai et al., 2025b] Shuai Bai, Keqin Chen, Xuejing Liu,           Dorsa Sadigh. Prismatic VLMs: investigating the design
+                                                                  space of visually-conditioned language models. In Pro-
+   Jialin Wang, Wenbin Ge, Sibo Song, Kai Dang, Peng
+                                                                  ceedings of the 41st International Conference on Machine
+   Wang, Shijie Wang, Jun Tang, et al. Qwen2.5-VL Techni-
+                                                                  Learning, volume 235 of ICML’24, pages 23123–23144,
+   cal Report, February 2025. arXiv:2502.13923 [cs].
+                                                                  Vienna, Austria, July 2024. JMLR.org.
+[Black et al., 2024] Kevin Black, Noah Brown, Danny
+                                                               [Khazatsky et al., 2025] Alexander Khazatsky, Karl Pertsch,
+   Driess, Adnan Esmail, Michael Equi, Chelsea Finn,
+   Niccolo Fusai, Lachy Groom, Karol Hausman, Brian               Suraj Nair, Ashwin Balakrishna, Sudeep Dasari, Siddharth
+   Ichter, et al. $pi 0$: A Vision-Language-Action Flow           Karamcheti, Soroush Nasiriany, Mohan Kumar Srirama,
+   Model for General Robot Control, November 2024.                Lawrence Yunliang Chen, Kirsty Ellis, et al. DROID:
+   arXiv:2410.24164 [cs].                                         A Large-Scale In-The-Wild Robot Manipulation Dataset,
+                                                                  April 2025. arXiv:2403.12945 [cs].
+[Brohan et al., 2023] Anthony Brohan, Noah Brown, Justice
+   Carbajal, Yevgen Chebotar, Joseph Dabis, Chelsea Finn,      [Kim et al., 2024] Moo Jin Kim, Karl Pertsch, Siddharth
+   Keerthana Gopalakrishnan, Karol Hausman, Alex Herzog,          Karamcheti, Ted Xiao, Ashwin Balakrishna, Suraj Nair,
+   Jasmine Hsu, et al. RT-1: Robotics Transformer for Real-       Rafael Rafailov, Ethan Foster, Grace Lam, Pannag San-
+   World Control at Scale, August 2023. arXiv:2212.06817          keti, et al. OpenVLA: An Open-Source Vision-Language-
+   [cs].                                                          Action Model, September 2024. arXiv:2406.09246 [cs].
+[Bu et al., 2025] Qingwen Bu, Yanting Yang, Jisong Cai,        [Kim et al., 2025] Moo Jin Kim, Chelsea Finn, and Percy
+   Shenyuan Gao, Guanghui Ren, Maoqing Yao, Ping Luo,             Liang.       Fine-Tuning Vision-Language-Action Mod-
+   and Hongyang Li. UniVLA: Learning to Act Any-                  els: Optimizing Speed and Success, April 2025.
+   where with Task-centric Latent Actions, November 2025.         arXiv:2502.19645 [cs].
+   arXiv:2505.06111 [cs].                                      [Lee et al., 2025] Jason Lee, Jiafei Duan, Haoquan Fang,
+[Cen et al., 2025] Jun Cen, Chaohui Yu, Hangjie Yuan,             Yuquan Deng, Shuo Liu, Boyang Li, Bohan Fang, Jieyu
+   Yuming Jiang, et al. WorldVLA: Towards Autoregressive          Zhang, Yi Ru Wang, Sangho Lee, et al. MolmoAct: Ac-
+   Action World Model, June 2025. arXiv:2506.21539 [cs].          tion Reasoning Models that can Reason in Space, Septem-
+                                                                  ber 2025. arXiv:2508.07917 [cs].
+[Chen et al., 2024] Xi Chen, Josip Djolonga, Piotr
+   Padlewski, Basil Mustafa, Soravit Changpinyo, Jialin        [Li et al., 2024a] Qixiu Li, Yaobo Liang, Zeyu Wang, Lin
+   Wu, Carlos Riquelme Ruiz, Sebastian Goodman, Xiao              Luo, Xi Chen, Mozheng Liao, Fangyun Wei, Yu Deng,
+   Wang, Yi Tay, et al. On scaling up a multilingual vision       Sicheng Xu, Yizhong Zhang, et al. CogACT: A Foun-
+   and language model. In Proceedings of the IEEE/CVF             dational Vision-Language-Action Model for Synergizing
+   Conference on Computer Vision and Pattern Recognition          Cognition and Action in Robotic Manipulation, Novem-
+   (CVPR), pages 14432–14444, June 2024.                          ber 2024. arXiv:2411.19650 [cs].
+[Cho et al., 2014] Kyunghyun Cho, Bart van Merrienboer,        [Li et al., 2024b] Xuanlin Li, Kyle Hsu, Jiayuan Gu, Karl
+   Caglar Gulcehre, Dzmitry Bahdanau, et al. Learn-               Pertsch, Oier Mees, Homer Rich Walke, Chuyuan Fu,
+   ing Phrase Representations using RNN Encoder-Decoder           Ishikaa Lunawat, Isabel Sieh, Sean Kirmani, et al. Evalu-
+   for Statistical Machine Translation, September 2014.           ating Real-World Robot Manipulation Policies in Simula-
+   arXiv:1406.1078 [cs].                                          tion, May 2024. arXiv:2405.05941 [cs].
+[Collaboration et al., 2025] Open X.-Embodiment Col-           [Li et al., 2025a] Hao Li, Shuai Yang, Yilun Chen, Xinyi
+   laboration, Abby O’Neill, Abdul Rehman, Abhinav                Chen, Xiaoda Yang, Yang Tian, Hanqing Wang, Tai
+   Gupta, Abhiram Maddukuri, Abhishek Gupta, Abhishek             Wang, Dahua Lin, Feng Zhao, et al. CronusVLA:
+   Towards Efficient and Robust Manipulation via Multi-        [Vaswani et al., 2017] Ashish Vaswani, Noam Shazeer, Niki
+   Frame Vision-Language-Action Modeling, October 2025.           Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez,
+   arXiv:2506.19816 [cs].                                         Ł ukasz Kaiser, and Illia Polosukhin. Attention is All you
+[Li et al., 2025b] Shuang Li, Yihuai Gao, Dorsa Sadigh, and       Need. In Advances in Neural Information Processing Sys-
+   Shuran Song. Unified Video Action Model, April 2025.           tems, volume 30. Curran Associates, Inc., 2017.
+   arXiv:2503.00200 [cs].                                      [Wang et al., 2025] Yihao Wang, Pengxiang Ding, Lingxiao
+[Liu et al., 2023] Bo Liu, Yifeng Zhu, Chongkai Gao, Yihao        Li, Can Cui, Zirui Ge, Xinyang Tong, Wenxuan Song, Han
+   Feng, Qiang Liu, Yuke Zhu, and Peter Stone. LIBERO:            Zhao, Wei Zhao, Pengxu Hou, et al. VLA-Adapter: An Ef-
+   Benchmarking Knowledge Transfer for Lifelong Robot             fective Paradigm for Tiny-Scale Vision-Language-Action
+   Learning. In Advances in Neural Information Processing         Model, September 2025. arXiv:2509.09372 [cs].
+   Systems, volume 36, pages 44776–44791. Curran Asso-         [Yang et al., 2025] Jianwei Yang, Reuben Tan, Qianhui Wu,
+   ciates, Inc., 2023.                                            Ruijie Zheng, Baolin Peng, Yongyuan Liang, Yu Gu,
+[Liu et al., 2025a] Huaping Liu, Xinghang Li, Peiyan Li,          Mu Cai, Seonghyeon Ye, Joel Jang, Yuquan Deng, and
+   et al. Towards generalist robot policies: What matters in      Jianfeng Gao. Magma: A foundation model for mul-
+   building vision-language-action models. Research Square,       timodal ai agents. In Proceedings of the IEEE/CVF
+   feb 2025. Preprint available at Research Square.               Conference on Computer Vision and Pattern Recognition
+                                                                  (CVPR), pages 14203–14214, June 2025.
+[Liu et al., 2025b] Songming Liu, Lingxuan Wu, Bangguo
+   Li, Hengkai Tan, Huayu Chen, Zhengyi Wang, Ke Xu,           [Zhang et al., 2025a] Dapeng Zhang, Jing Sun, Chenghui
+   Hang Su, and Jun Zhu. RDT-1B: a Diffusion Foun-                Hu, Xiaoyan Wu, Zhenlong Yuan, Rui Zhou, Fei Shen,
+   dation Model for Bimanual Manipulation, March 2025.            and Qingguo Zhou. Pure Vision Language Action (VLA)
+   arXiv:2410.07864 [cs].                                         Models: A Comprehensive Survey, November 2025.
+                                                                  arXiv:2509.19012 [cs].
+[NVIDIA et al., 2025] NVIDIA, Johan Bjorck, Fernando
+   Castañeda, Nikita Cherniadev, Xingye Da, Runyu Ding,       [Zhang et al., 2025b] Jiahui Zhang, Yurui Chen, Yueming
+   Linxi ”Jim” Fan, Yu Fang, Dieter Fox, Fengyuan Hu, et al.      Xu, Ze Huang, Yanpeng Zhou, Yu-Jie Yuan, Xinyue Cai,
+   GR00T N1: An Open Foundation Model for Generalist              Guowei Huang, Xingyue Quan, Hang Xu, and Li Zhang.
+   Humanoid Robots, March 2025. arXiv:2503.14734 [cs].            4D-VLA: Spatiotemporal Vision-Language-Action Pre-
+[Pertsch et al., 2025] Karl Pertsch, Kyle Stachowicz, Brian       training with Cross-Scene Calibration, November 2025.
+                                                                  arXiv:2506.22242 [cs].
+   Ichter, Danny Driess, Suraj Nair, Quan Vuong, Oier Mees,
+   Chelsea Finn, and Sergey Levine. FAST: Efficient Action     [Zhao et al., 2023] Tony Z. Zhao, Vikash Kumar, Sergey
+   Tokenization for Vision-Language-Action Models, Jan-           Levine, and Chelsea Finn. Learning Fine-Grained Biman-
+   uary 2025. arXiv:2501.09747 [cs].                              ual Manipulation with Low-Cost Hardware, April 2023.
+[Qu et al., 2025] Delin Qu, Haoming Song, Qizhi Chen,             arXiv:2304.13705 [cs].
+   Yuanqi Yao, Xinyi Ye, Yan Ding, Zhigang Wang, JiaYuan       [Zhao et al., 2025] Qingqing Zhao, Yao Lu, Moo Jin Kim,
+   Gu, Bin Zhao, Dong Wang, et al. SpatialVLA: Explor-            Zipeng Fu, Zhuoyang Zhang, Yecheng Wu, Zhaoshuo
+   ing Spatial Representations for Visual-Language-Action         Li, Qianli Ma, Song Han, Chelsea Finn, et al. Cot-vla:
+   Model, May 2025. arXiv:2501.15830 [cs].                        Visual chain-of-thought reasoning for vision-language-
+[Shi et al., 2025] Hao Shi, Bin Xie, Yingfei Liu, Lin Sun,        action models. In Proceedings of the IEEE/CVF Con-
+                                                                  ference on Computer Vision and Pattern Recognition
+   Fengrong Liu, et al. MemoryVLA: Perceptual-Cognitive
+                                                                  (CVPR), pages 1702–1713, June 2025.
+   Memory in Vision-Language-Action Models for Robotic
+   Manipulation, August 2025. arXiv:2508.19236 [cs].           [Zheng et al., 2025] Ruijie Zheng, Yongyuan Liang, Shuaiyi
+[Shukor et al., 2025] Mustafa Shukor, Dana Aubakirova,            Huang, Jianfeng Gao, Hal Daumé, Andrey Kolobov,
+                                                                  Furong Huang, and Jianwei Yang.           TraceVLA: Vi-
+   Francesco Capuano, Pepijn Kooijmans, Steven Palma,
+                                                                  sual Trace Prompting Enhances Spatial-Temporal Aware-
+   Adil Zouitine, Michel Aractingi, Caroline Pascal, Mar-
+                                                                  ness for Generalist Robotic Policies, June 2025.
+   tino Russi, Andres Marafioti, et al.       SmolVLA: A
+                                                                  arXiv:2412.10345 [cs].
+   Vision-Language-Action Model for Affordable and Effi-
+   cient Robotics, June 2025. arXiv:2506.01844 [cs].           [Zhong et al., 2025] Zhide Zhong, Haodong Yan, Junfeng
+[Team et al., 2024] Octo Model Team, Dibya Ghosh, Homer           Li, Xiangchen Liu, Xin Gong, Tianran Zhang, Wenx-
+                                                                  uan Song, Jiayi Chen, Xinhu Zheng, Hesheng Wang, and
+   Walke, Karl Pertsch, Kevin Black, Oier Mees, Sudeep
+                                                                  Haoang Li. FlowVLA: Visual Chain of Thought-based
+   Dasari, Joey Hejna, Tobias Kreiman, Charles Xu, et al.
+                                                                  Motion Reasoning for Vision-Language-Action Models,
+   Octo: An Open-Source Generalist Robot Policy, May
+                                                                  October 2025. arXiv:2508.18269 [cs].
+   2024. arXiv:2405.12213 [cs].
+[Tian et al., 2024] Yang Tian, Sizhe Yang, Jia Zeng,           [Zitkovich et al., 2023] Brianna Zitkovich, Tianhe Yu,
+   Ping Wang, Dahua Lin, Hao Dong, and Jiangmiao                  Sichun Xu, et al. RT-2: Vision-Language-Action Models
+   Pang. Predictive Inverse Dynamics Models are Scal-             Transfer Web Knowledge to Robotic Control. In Pro-
+   able Learners for Robotic Manipulation, December 2024.         ceedings of The 7th Conference on Robot Learning, pages
+   arXiv:2412.15109 [cs].                                         2165–2183. PMLR, December 2023.
+

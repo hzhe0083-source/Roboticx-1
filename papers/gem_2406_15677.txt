@@ -1,0 +1,566 @@
+                                         IEEE ROBOTICS AND AUTOMATION LETTERS. PREPRINT VERSION. JUNE, 2025                                                                              1
+
+
+
+
+                                            Learning Efficient and Robust Language-conditioned Manipulation
+                                           using Textual-Visual Relevancy and Equivariant Language Mapping
+                                                            Mingxi Jia†1 , Haojie Huang†2 , Zhewen Zhang‡2 , Chenghao Wang‡2 , Linfeng Zhao2 ,
+                                                          Dian Wang2 , Jason Xinyu Liu1 , Robin Walters2 , Robert Platt∗2 , and Stefanie Tellex∗1
+
+
+
+                                            Abstract—Controlling robots through natural language is piv-
+                                         otal for enhancing human-robot collaboration and synthesizing
+                                         complex robot behaviors. Recent works that are trained on large
+                                         robot datasets show impressive generalization abilities. However,
+                                         such pretrained methods are (1) often fragile to unseen scenarios,
+arXiv:2406.15677v2 [cs.RO] 26 Jun 2025
+
+
+
+
+                                         and (2) expensive to adapt to new tasks. This paper introduces
+                                         Grounded Equivariant Manipulation (GEM), a robust yet effi-
+                                         cient approach that leverages pre-trained vision-language models
+                                         with equivariant language mapping for language-conditioned
+                                         manipulation tasks. Our experiments demonstrate GEM’s high
+                                         sample efficiency and generalization ability across diverse tasks
+                                         in both simulation and the real world. GEM achieves similar
+                                         or higher performance with orders of magnitude fewer robot
+                                         data compared with major data-efficient baselines such as CLI-
+                                         Port and VIMA. Finally, our approach demonstrates greater
+                                         robustness compared to large VLA model, e.g, OpenVLA, at
+                                         correctly interpreting natural language commands on unseen
+                                         objects and poses. Code, data, and training details are available
+                                         https://saulbatman.github.io/gem page/
+                                           Index Terms—Deep Learning in Grasping and Manipulation,
+                                         Learning from Demonstration
+                                                                                                                        Fig. 1: Overview. By leveraging textual-visual relevancy maps with
+                                                                 I. INTRODUCTION                                        equivariant language mapping, it allows the robot to learn robust
+                                                                                                                        manipulation policies from a few demonstrations with high data
+                                               OMMANDING a robotic manipulator with natural lan-
+                                         C     guage is important for enabling human-robot collab-
+                                         oration, while adding language specifications increases the
+                                                                                                                        efficiency. Our method achieves, in average, 10x data efficiency
+                                                                                                                        against CLIPort [1] and 53% more robustness than OpenVLA [4].
+
+                                         complexity of the policy learning problem because the model                    Language Models (VLM) to generate robot commands. How-
+                                         needs to deal with a higher dimensional state space, especially                ever, since the VLMs lack an understanding of the geometries
+                                         in the multi-task setting. Data-driven approaches open new                     of the physical world, these approaches are still fragile to
+                                         possibilities for learning fine-grained language-conditioned                   unseen object poses and cannot perform accurate, fine-grained
+                                         policies by learning from human demonstrations. Yet, these                     manipulation on novel shapes.
+                                         methods require extensive data collection [1, 2, 3] or expensive                  Therefore, two key weaknesses of prior work are (1) data-
+                                         finetuning [4, 5]. For example, CLIPort [1] needs 50-100                       driven methods require extensive data collection and expensive
+                                         demonstrations per task to ensure robust performance. RT-2 [5]                 fine-tuning if a new task is to be learned due to the complex
+                                         finetunes a 55B LLM model with 130k robot trajectories and                     state space of potential objects and poses as well as the
+                                         10 billion images-text pairs.                                                  large action space of possible robot movements, and (2) the
+                                            Another strand of prior works [6, 7, 8, 9] loosens the need                 zero-shot approches are fragile to unseen object poses and
+                                         for large robotic datasets by directly utilizing existing Vision               distractor objects. We address these challenges by introducing
+                                                                                                                        a new imitation learning algorithm that leverages textual-visual
+                                            Manuscript received: January, 29, 2025; Revised April, 30, 2025; Accepted
+                                         June, 5, 2025.
+                                                                                                                        relevancies from pretrained VLMs and equivariant language
+                                            This paper was recommended for publication by Editor Markus Vincze          mapping that enables our method to learn efficient yet robust
+                                         upon evaluation of the Associate Editor and Reviewers’ comments. This work     language-conditioned policies.
+                                         is supported by ONR under grant numbers N000142412784.
+                                            †, ‡ Equal Contribution, ⋆ Equally Advising                                    Our approach, Grounded Equivariant Manipulation (GEM)
+                                            1 Mingxi Jia, Jason Xinyu Liu, and Stefanie Tellex are with Brown
+                                                                                                                        exploits domain symmetries that exist in the language-
+                                         University, Providence, RI, USA {mingxi_jia, xinyu_liu,                        conditioned manipulation problem, specifically, equivariance
+                                         stefanie_tellex}@brown.edu
+                                            2 Haojie Huang, Zhewen Zhang, Chenghao Wang, Linfeng Zhao, Dian             in SE(2). For example, consider “grasp the coffee mug by
+                                         Wang, Robin Walters, and Robert Platt are with Northeastern University,        its handle.” If there is a rotation or translation of the mug,
+                                         Boston,       USA       {huang.haoj, zhang.zhew, wang.chengh,                  the desired pick action should also transform accordingly, i.e.,
+                                         zhao.linf, wang.dian, r.walters}@northeastern.edu,
+                                         rplatt@ccs.neu.edu                                                             equivariantly. Our learned policy incorporates such language-
+                                            Digital Object Identifier (DOI): see top of this page.                      conditioned symmetries and generalizes to unseen scenarios
+2                                                                   IEEE ROBOTICS AND AUTOMATION LETTERS. PREPRINT VERSION. JUNE, 2025
+
+
+
+related by symmetric transformations, thus making the model          architecture that treats language as a dynamic feature and
+generalize to unseen object poses in a few-shot manner. To           enables object-level equivariance using equivariant language
+enable novel object generalization across objects, colors, and       mapping via Language Steerable Kernels. Our approach can
+shapes, we propose textual-visual relevancy maps to distill          learn a multi-task policy yet maintain high sample efficiency
+information from large vision and language models. We extract        and spatial robustness.
+textual relevancy for open-vocabulary recognition and con-              Zero-shot Manipulation requires the robot to generalize
+struct visual relevancy via data retrieval to improve robustness.    to out-of-distribution objects with novel shapes, colors, or
+We leverage spatial action map [10], i.e., representing actions      textures. Learning-from-scratch methods [10, 25, 26] perform
+as pixel locations, with open-loop action primitives that allow      well on seen objects but cannot generalize well on unseen
+us to flexibly leverage equivariance and semantic relevancies.       ones. Prior work [27, 28, 29] uses LLM/VLMs as a zero-shot
+The resulting method is robust to unseen object poses and            object detector or a text-level task planner, assuming access to
+achieves better novel object generalization ability, as shown        skills like a grasping model and pose estimators. However, the
+in Figure 1.                                                         lack of learning ability limits these methods from adapting to
+   We make the following specific contributions. (1) We pro-         complex task-oriented behaviors, e.g., “insert the letter E block
+pose a novel method to construct patch-level textual and visual      into the letter E hole” since there is no general actor available
+relevancy maps for robust open-vocabulary generalization.            for such placing skills. F3RM [30] learns few-shot pick-and-
+(2) We analyze the symmetries underlying the language-               place with distilled fields, but it is slow because it requires
+conditioned manipulation problem and design a novel neu-             extensive camera views and test-time optimization for every
+ral network called language steerable kernels for building           action step. RT-2 [5] and OpenVLA [4] learn generalist vision-
+language-conditioned equivariant networks. (3) We demon-             language-action models by training on large robotic datasets,
+strate the state-of-the-art generalization robustness and sample     which give a certain degree of emerging behaviors on unseen
+efficiency in both simulation and the real world on a series         objects with novel instructions. Still, it is expensive to collect
+of challenging language-conditioned manipulation tasks, using        new datasets and finetune these large parameterized models to
+only 10%-20% training data compared with CLIPort [1] and             adapt to new tasks. In this paper, we propose a novel approach
+0.1% training data compared with VIMA [2].                           that is capable of learning policies in a predefined space of
+                                                                     skills with a small number of demonstrations while leveraging
+                                                                     the zero-shot generalization ability from pre-trained VLM
+                     II. R ELATED WORK
+                                                                     models via patch-level textual and visual relevancy maps.
+   Language-conditioned Policy Learning: Using language
+as task specifications is a common way for multi-task policy
+                                                                                              III. M ETHOD
+learning. Prior works [11, 12, 13, 2, 14] use feature concatena-
+tion, FiLM [15], or the self/cross-attention mechanism to fuse          Problem Statement and Assumptions: We consider
+image and language features. For example, Shridhar et al. [1]        the problem of learning from demonstrations for language-
+utilizes CLIP visual and text encoders and fuses language and        conditioned manipulation tasks in SE(2) space. We frame
+image features with a two-stream architecture. Goyal et al. [14]     it as a two-step pick-and-place learning problem, although
+processes the language token and visual token jointly with a         our approach can support a larger space of skills, including
+transformer. These models treat language as static features,         pushing, pulling, etc. Given a set of demonstrations that
+meaning that the language features remain the same no matter         contains observation-language-action tuples (Ot , ℓt , at ), the
+how visual features change in a specific task. These designs         objective is to learn a policy p(at |ot , ℓt ) where the action
+require lots of data to cover all possible variances of visual       at = (apick
+                                                                               t   , aplace
+                                                                                      t     ) has pick and place components. Please
+features to guarantee performance. For instance, VIMA [2]            note the policy can be formulated to generate the multi-step
+requires 60k robot demos to learn its visual pick & place            pick-place actions, and we discard time step subscripts t for
+tasks. In contrast, our method maps language instructions into       simplicity in the following sections. The visual observation Ot
+equivariant features that dynamically apply over the entire          is a set of RGBD images at several camera views. The two-step
+image space to generate robot actions, allowing our method           actions, apick and aplace , are parameterized in terms of SE(2)
+to achieve similar or higher success rates with only 10-20           coordinates (u, v, θpick ) and (u, v, θplace ), respectively, where
+demonstrations.                                                      u, v denotes the pixel coordinates of the gripper position,
+   Data-efficient Few-shot Learning requires the robot to            θpick is the pick orientation defined with respect to the world
+learn a robust policy to manipulate in-distribution objects          frame, and θplace is the delta angle between the pick and
+given only a few demonstrations. Prior works using geometric-        place. The language instruction ℓt specifies the current-step
+constrained models [10, 16, 17, 18, 19, 20, 21, 22, 23, 24]          instruction, e.g., “open the drawer” or “grasp scissors by its
+leverage symmetries in robotic tasks and have demonstrated           handle and place into box.” We assume ℓt for each step can
+their superior effectiveness for unseen pose generalization that     be parsed into the pick instruction and the place instruction,
+allows few-shot learning. However, these methods often learn a       ℓ = (ℓpick , ℓplace ).
+single-task policy and only take visual inputs. It is challenging       Method Overview: There are three main modules. (1)
+to incorporate language into equivariant models because, un-         The relevancy extraction module takes multi-view images O
+like images, language does not have explicit spatial properties      and the language instruction ℓ. It outputs a dense relevancy
+like rotation or translation. In this paper, we propose a novel      map that summarizes the visual and language input. (2) The
+JIA et al.: GEM                                                                                                                            3
+
+
+
+
+Fig. 2: Relevancy Map Extraction. After (a) patchifying images into patches, we compute two types of relevancy maps. (b) Textual
+Relevancy Maps allow open-vocabulary recognition, which is a topdown projection from the relevancy point cloud constructed with multi-
+view relevancy maps. We reconstruct the point cloud by reprojecting RGBD with camera intrinsics and merging different views with extrinsics.
+(c) Visual Relevancy Maps enhance the recognition robustness by querying from the existing database.
+language-conditioned pick module takes as input the top-
+down orthographic RGB-D projection o of the scene with the
+language instruction ℓ and outputs an action map over pick
+actions. (3) Similarly, the language-conditioned place module
+produces an action map over place actions. The difference is
+that the place module does convolution with an image-crop-
+conditioned kernel instead of a language-conditioned kernel.
+
+A. Zero-shot Recognition via Textual & Visual Relevancies
+   The relevancy extraction module uses a pre-trained CLIP
+model to identify parts of the visual observation most relevant
+to the current task. Specifically, it takes the language goals
+ℓpick and ℓplace and the current N -view observations O =
+{o1 , o2 , ..., oN } as input and produces relevancy maps Rpick
+and Rplace that highlight the language goals in the pixel space.
+Note that while these relevancy maps do not tell the system
+exactly where to pick, they provide a strong visual-language
+prior. The pipeline is illustrated in Figure 2.                        Fig. 3: Qualitative Results of Relevancy Maps. Our recognition
+                                                                       accuracy with visual relevancy focuses more on the task-specific part
+   Textual Relevancy Maps for Zero-shot Recognition: We                (first-row), is less distracted by color (second-row), and recognizes
+use CLIP [31], which was trained by minimizing the cosine              uncommon instructions (third-row) than the baseline [32]. The text-
+similarity between the image feature and its text label with           visual ratio is set to 0.8 for visualization.
+internet data, to generate a pixel-wise relevancy score for            a final top-down textual relevancy map Rtext via projection,
+each of the N views in O. We split each image along a                  as shown in panel (b) of Figure 2.
+grid into image patches with patch size p and stride s. Each
+                                                                          Visual Relevancy Map for Semantic Correction: Al-
+RGB image patch is then scored with its cosine similarity to
+                                                                       though the textual relevancy map highlights image regions re-
+the language instructions with pre-trained CLIP features. The
+                                                                       lated to language instructions, we found it insufficient because
+textual relevancy function Rtext can be described by
+                                                                       the high-value region does not necessarily highlight the correct
+                  Rtext (P(on ), ℓ) = P −1 (Epatch · EℓT ),      (1)   object if certain text is underrepresented during CLIP training.
+                                                                       This misalignment creates noisy training samples as shown in
+where P denotes the image patchification function and P −1             Figure 3 where Grounding DINO only highlights a rough area
+denotes an inverse process that transforms all similarity scores       and Ours w/o Visual Relevancy is biased by colors. To solve
+back to the original image dimension. Epatch ∈ R(m×n)×dm               it, we further introduce the visual relevancy map, which is
+is the embedding outputs from the CLIP image encoder,                  illustrated in Figure 2(c). Starting with the demonstrations,
+where (m × n) and dm denote the number of image patches                we identify the image crops in the demonstration data corre-
+and the output embedding dimension of CLIP respectively.               sponding to pick and place events. For all pick/place events
+Eℓ ∈ R1×dm is the embedding output for language instruction            identified, we store into a database a pair comprised of the
+ℓ from the CLIP text encoder. After getting pixel-wise rele-           image patch at the pick/place location and the language query
+vancies for each of the N views, we integrate this information         that describes the pick/place object (left side of Figure 2(c)).
+into a single point cloud and label each point with the                Then, at inference time, we index into the dataset using the
+corresponding relevancy maps from all views so that we get             language query text and recall the corresponding image crop,
+4                                                                    IEEE ROBOTICS AND AUTOMATION LETTERS. PREPRINT VERSION. JUNE, 2025
+
+
+
+                                                                      in the workspace. In the following, we propose a novel
+                                                                      neural network architecture that enables equivariant language
+                                                                      Mapping with its mathematical proofs.
+                                                                         Equivariant Language Mapping: We propose Equivari-
+                                                                      ant Language Mapping via language steerable kernels that
+                                                                      leverage object-level SE(2) equivariance, which allows our
+                                                                      model to learn a new task in a few-shot learning manner.
+                                                                      Previous work [10, 1] infers the pick location by taking the
+                                                                      argmax on the output attention map from UNet, which has no
+                                                                      guarantee that the model will generalize if any object moves in
+                                                                      SE(2). Instead, we leverage the object-level symmetry by first
+                                                                      mapping text embeddings by a UNet ψ pick (ℓpick ) into a kernel
+                                                                      with a spatial dimension of (C, H, W) and then converting it
+                                                                      into steerable kernels by rotating the output with a group of n
+                                                                      rotations { 2πi
+                                                                                    n |0 ≤ i < n}. This results in a stack of n rotated
+                                                                      feature maps, Ψ(·) = {g0 · ψ(·), g2 · ψ(·), · · · , gn−1 · ψ(·)},
+                                                                      where gi = 2πi   n . We define the entire process as a language
+                                                                      steerable kernel generator κpick (ℓpick ). The language kernel
+Fig. 4: Object-level SE(2)-equivariant Picking Model. Our pick-       Φ maps language embeddings to convolutional kernels that
+ing model f pick consists of two branches. The top branch is our
+                                                                      satisfy the steerability constraints [33]. It allows picking action
+vision-language encoder ϕ(O, ℓ), which includes a learnable action
+model A and the textual-visual relevancy extractor R. The bottom      inference to be SO(2) equivariant with respect to the object
+branch is the Equivariant Language Mapping κ, which generates the     poses.
+language steerable kernel by rotating the dynamic kernel ψ(ℓ). The       Symmetry of Language-Conditioned Pick: The picking
+fire and the snowflake symbol denote frozen and trainable models.     model f pick calculates a probability distribution over gripper
+We discretize the SO(2) rotation space into 72 bins.
+                                                                      pose that corresponds to the probability of a successful grasp
+e.g., recall the image crop from the dataset corresponding to         on the desired object part. This distribution p(apick |o, ℓpick )
+“banana root”. The crop query process can be expressed by             is estimated by f pick (o, ℓpick , M pick ). The pick command
+                                            T
+          QueriedCrop(D, ℓ) = arg max(Eℓ · Kcrop ),           (2)     executed by the robot is selected by a⋆pick = arg max apick .
+                                  crop∈D                              The desired pick action is equivariant with respect to the
+where Kcrop ∈ RN ×dm denotes all language embeddings that             pose of the object to be picked, i.e., g · p(apick |bpick , ℓpick ) =
+correspond with N image patches for all N pick and place              p(apick |g · bpick , ℓpick ), where bpick denotes the object to be
+objects in dataset D. Eℓ ∈ R1×dm denotes the embedding of             picked and g· denotes the action of a transformation g. Note
+the language query. Then, we generate visual relevancy maps           that this equivariance is local to the object, in contrast to
+by evaluating the cosine similarity between the CLIP embed-           standard models that are equivariant w.r.t. the scene.
+dings of the recalled image crop and the patch embeddings                Specifically, assume the observation ot contains a set of m
+from the top-down image ot . The visual relevancy generation          objects {bi }m i=1 on the workspace and denote the object b
+                                                                                                                                       pick
+                                                                                                                                      pick
+function Rvisual can be described by                                  as the goal object instructed by the language instruction ℓ .
+                                                                      If there is a transformation g ∈ SE(2) on the target object bpick
+          Rvisual (P(o), ℓ, D) = P −1 (Epatch · Ecrop
+                                                 T
+                                                      ),      (3)     regardless of transformations on other objects, we denote it as
+                                                                            pick
+where Ecrop ∈ R1×dm denotes the embedding output for the              g · ob . The symmetry underlying f can be stated as
+image crop from the CLIP image encoder. If the pick/place                                                       pick
+                                                         T                             arg max f pick (g · ob          , ℓpick )
+target cannot be located in the dataset, i.e., max(Eℓ · Kcrop )                                                                        (4)
+is below a threshold, then the visual relevancy map function                             = g · arg max f pick (o, ℓpick )
+returns None. See Figure 3 for visualization examples.
+                                                                         Equation 4 claims that if there is transformation g ∈ SE(2)
+   To fuse textual and visual relevancy maps, we do a pixel-
+                                                                      on the object bℓ , the best action a⋆pick to grasp the instructed
+wise weighted averaging if a Best Crop exists in the dataset.
+                                                                      object should be transformed to g · a⋆pick . If the symmetry is
+Otherwise, only the textual map will be used.
+                                                                      encoded in our pick model, it can generalize the knowledge
+                                                                      learned from the demonstration to many unseen configurations.
+B. Language Equivariance for Few-shot Learning:                       We use this symmetry to improve sample efficiency and the
+   While the relevancy maps provide semantic guidance for             generalization of our pick model.
+recognizing objects, the robot has no knowledge of where                 Pick Model Architecture: There are two main parts of
+to manipulate the object shapes. Here, we use Learn from              the pick model. The first (shown in the top part of Figure 4)
+Demonstrations (LfD) to encode human knowledge into a                 calculates a language-conditioned pick map as follows. We
+learning-based model. A desired property we want a language-          feed the raw RGB-D observation into a UNet, denoted as
+conditioned policy model to have is object-level equivariance,        Apick , and encode ℓpick
+                                                                                           t   with the CLIP. The encoded language
+meaning that the output action should transform accordingly           vector is concatenated onto the descriptor of every pixel
+as the object specified by the language instruction transforms        in the bottleneck layer of Apick . The output of Apick is
+JIA et al.: GEM                                                                                                                                      5
+
+
+
+denoted as Apick (o, ℓpick ) or Apick for simplicity. It is then
+integrated with the pick relevancy map Rpick with element-
+wise multiplication, shown as ⊗ in Figure 4.
+   Symmetry of Language-Conditioned Place: Place ac-
+tion that transforms pick target to the placement are bi-
+equivariant [34, 35], i.e., independent transformations of the
+placement with g1 and the pick target with g2 result in a change
+(a′place = g1 aplace g2−1 ) to complete the rearrangement at the
+new configuration. Leveraging the bi-equivariant symmetries                        Fig. 5: Performance Comparisons on VIMABench [2]. X-axis and
+can generalize the place knowledge to different configurations                     y-axis represent the number of demonstrations for training and task
+and thus improve the sample efficiency. The coupled symme-                         success rate during evaluation in the visual manipulation task.
+tries exist in the language-conditioned place:                                       It states that if there is a rotation on o, the grasp position is
+                                   place               pick                        changed by Tg0 , and the rotation is changed by ρout (g). Since
+        arg max f place (g1 · ob           + g2 · ob          , ℓplace ) =
+                                                                             (5)   the cross-correlation is calculated for each pixel without stride,
+                          g1 θ(g2−1 ) · arg max f place (o, ℓplace )               the rotated bℓ is captured by ρ(g). In our implementation, we
+                  place           pick                                             generate the language-conditioned steerable kernel κ(ℓ) but
+where g1 · ob       + g2 · ob      denotes g1 ∈ SE(2) and g2 ∈
+                                                                                   remove the constraint of the equivariant property of ϕ. The U-
+SE(2) acting on the instructed placement bplace and the picked
+                                                                                   Net encoder maintains soft global equivariance with the long
+object bpick , respecitively. θ(g2−1 ) denote the angle of the place
+                                                                                   skip connections and data augmentation.
+action is rotated by −g2 . Specifically, the RHS of Equation 5
+indicates that the best place location is rotated by g1 , and the
+place orientation is rotated by θ(g1 )θ(g2−1 ). Our place model                                          IV. E XPERIMENTS
+is designed to satisfy the language-conditioned equivariance                          We design the following experiments to answer four ques-
+of Equation 5.                                                                     tions:
+                                                                                      • How is our data efficiency and performance on seen
+C. Equivariance Proof for Language Steerable Kernel                                     and unseen scenarios compared with few-shot learning
+   Here, we prove the object-level SE(2) equivariance via                               methods [1, 10], large transformer-based models [2], and
+language steerable kernels as stated in Equation 4.                                     zero-shot methods [6]? — Section IV-A
+   Steeribility background: The G-steerable kernels are con-                          • How is the real-world performance of our method on
+volution kernels K : Rn → Rdout ×din satisfying the steerabil-                          different physical robot platforms? — Section IV-B
+ity constraint, where n is the dimensionality of the space, dout                      • How is our robustness against unseen poses and language
+and din are the output and input field type                                             & objects versus large VLA models [4] with few-shot
+                                                                                        fine-tuning? — Section IV-C
+                   K(g · x) = ρout (g)K(x)ρin (g)−1                          (6)
+                                                                                      • How does each component in our method contribute to
+   Proposition 1: If κ(ℓ) is a steerable kernel, it approximately                       the final performance? — Section IV-D
+satisfies the symmetry stated in Equation 4.
+   Translational Equivariance. Since FCNs are translation-
+                                                                                   A. Simulation Experiments
+ally equivariant by their nature, if a target object ob is
+translated to a new location, the cross-correlation between                           Tasks & Baselines For simulation tasks, we use
+κ(ℓ) ∗ f pick (o, ℓ) will capture this translation, and there is no                18 tasks provided by CLIPort Benchmark [1], includ-
+change in the change space.                                                        ing multi-step tasks (block-in-bowl, packing-box/google-
+   Rotation Equivariance. Assuming ϕ satisfies the equivari-                       pairs/objects), long-horizon (stack-block-pyramid-seq, towers-
+ant property that ϕ(Tg0 o, ℓ) = Tg0 ϕ(o, ℓ) and the rotation of ob                 of-hanoi), deformable object (align-rope, separating-piles),
+is represented by Tg0 ot , we start the proof with lemma 1 and                     novel color/object tasks (unseen tasks). The metric is in
+lemma 2.                                                                           the range of 0 (failure) to 100 (success). Partial rewards
+   Lemma 1: if k(x) is a steerable kernel that takes trivial-type                  are calculated in multi-step tasks. For instance, in pushing-
+input signal, it satisfies Tg0 K(x) = ρout (g −1 )K(x).                            colored-piles, pushing 10 piles out of 50 into the correct zone
+   Lemma 2:                                                                        will be credited 10
+                                                                                                     50 ×100% rewards. For baselines, we compare
+   Cross-correlation satisfies that                                                our method with four strong baselines: Transporter [10],
+                                                                                   CLIPort [1], VIMA [2], MOKA [6].
+              (Tg0 (K ⋆ f ))(⃗v ) = ((Tg0 K) ⋆ (Tg0 f ))(⃗v )                (7)      Comparing with Data-efficient CNN-based Methods:
+   Given Lemma 1 and lemma 2, we can prove that                                    Transporter [10] and CLIPort [1] are data-efficient methods
+     κ(ℓ) ∗ ϕ(Tg0 o, ℓ) =κ(ℓ) ∗ Tg0 ϕ(o, ℓ)                                        based on convolutional neural networks for pick-and-place
+                                                                                   tasks. Transporter-Lan is a modified Transporter [10] to take
+                           =κ(ℓ) ∗ Tg0 ϕ(o, ℓ)                                     language instructions, where we concat the text embedding
+                           =Tg0 Tg0−1 κ(ℓ) ∗ Tg0 ϕ(o, ℓ)                           onto the bottleneck of UNet. In Table I, we report the
+                           =Tg0 [Tg0−1 κ(ℓ) ∗ ϕ(o, ℓ)] lemma 2                     performance on CLIPort Benchmark [1]. The best performance
+                                                                                   is highlighted in bold in each column. Several conclusions can
+                           =Tg0 [ρout (g)κ(ℓ) ∗ ϕ(o, ℓ)] lemma 1                   be drawn from Table I. (1) GEM outperforms the baselines in
+6                                                                                           IEEE ROBOTICS AND AUTOMATION LETTERS. PREPRINT VERSION. JUNE, 2025
+
+
+
+
+                            packing-box-pairs           packing-box-pairs     packing-seen-google packing-unseen-google packing-seen-google packing-unseen-google
+                               seen-colors                unseen-colors           objects-seq           objects-seq        objects-group        objects-group
+    Model                  10         20       100     10      20     100     10      20      100    10      20      100     10      20     100    10      20     100
+    Transporter-Lan [10] 50.4 72.4 86.8               41.2 40.4 60.7          36.3 57.0 83.2         31.7 46.8 54.9         49.6 57.0 81.2         56.6 59.4 77.4
+    CLIPort [1]          63.2 78.3 88.2               28.8 64.2 71.4          37.9 52.6 80.1         45.9 41.7 49.6         62.0 62.1 77.1         49.5 50.3 60.0
+    CLIPort-multi [1]    60.3 82.9 81.4               42.4 53.7 54.3          76.6 84.3 77.0         50.4 58.7 47.6         79.0 88.0 88.6         79.9 85.6 73.8
+    MOKA [6]             ———–16.3———–                 ———–20.6———–            ———–32.7———–           ———–41.2———–           ———–36.1———–           ———–40.7———–
+    GEM (ours)             79.6      86.7      91.8    67.3   71.4   78.2     76.2   85.8     89.7   69.2   79.8    86.0    86.6    85.1    94.2   78.1   71.9   82.3
+    GEM-multi (ours)       90.6      90.7      93.8    73.8   78.2   78.2     93.7   91.0     90.3   86.3   79.7    75.7    94.5    93.1    94.2   89.7   90.9   88.5
+                           stack-block-pyramid         stack-block-pyramid      separating-piles       separating-piles       towers-of-hanoi        towers-of-hanoi
+                              seq-seen-colors           seq-unseen-colors         seen-colors           unseen-colors         seq-seen-colors       seq-unseen-colors
+    Model                  10         20       100     10      20     100     10      20      100    10      20      100     10      20     100    10      20     100
+    Transporter-Lan [10]   52.0 72.7 94.3              18.0 26.0 17.0         40.0 60.0 92.0         56.0 73.8 52.3         81.1 88.6 95.7         43.4 48.3 60.0
+    CLIPort [1]            22.8 39.5 50.5              21.8 19.2 27.7         53.1 56.0 74.8         56.4 66.0 72.5         75.1 75.0 91.1         57.6 47.3 99.4
+    CLIPort-multi [1]      74.7 87.7 93.3              45.7 28.3 33.0         59.7 72.2 75.0         67.8 65.2 58.8         78.3 95.4 97.4         60.3 69.4 69.7
+    MOKA [6]               ———–0———–                    ———–0———–             ———–11.4———–           ———–14.8———–            ———–0———–              ———–0———–
+    GEM (ours)             70.7      82.7      96.3    59.3   73.7   84.3     82.3   75.4     78.8   60.0   91.8    96.6    88.3    93.4    100    83.1   87.7   98.0
+    GEM-multi (ours)       94.3      95.3      95.0    76.0   89.3   78.7     94.2   96.2     92.0   89.0   97.6    96.6    96.3    99.4    98.9   93.4   98.0   97.1
+                                                                              assembling-kits-seq    assembling-kits-seq     put-blocks-in-bowls   put-blocks-in-bowls
+                                  align-rope          packing-unseen-shapes
+                                                                                  seen-colors           unseen-colors            seen-colors          unseen-colors
+    Model                   10        20       100     10      20     100     10      20      100    10      20      100     10      20     100    10      20     100
+    Transporter-Lan [10]   11.5 33.7 72.4              24.0 26.0 30.0         26.4 39.2 58.4         20.0 24.8 23.6         42.7 68.7 86.3         12.0 17.0 36.0
+    CLIPort [1]            30.0 16.9 51.5              29.0 24.0 34.0         17.8 24.8 39.4         16.6 20.6 36.6         37.2 55.6 92.7         50.8 41.7 51.8
+    CLIPort-multi [1]      39.7 42.4 40.8              52.0 46.0 52.0         28.8 42.8 32.0         28.4 27.2 18.8         84.0 96.0 98.0         38.7 48.0 44.0
+    MOKA [6]               ———–2.4———–                 ———–4.0———–             ———–0———–              ———–0———–             ———–22.5———–           ———–17.5———–
+    GEM (ours)             31.6      38.6      69.0    54.0   44.0   52.0     42.8   47.2     62.4   34.4   40.0    62.8    94.0    98.3    100    87.7   92.0   94.3
+    GEM-multi (ours)       62.6      59.6      58.6    60.0   50.0   52.0     55.6   62.0     56.8   53.2   58.0    46.4    100     100     100    95.3   97.0   97.0
+
+TABLE I: Performance Comparisons on CLIPort Benchmark Tasks (%) on 50 testing episodes. {10, 20, 100} denotes the number of
+demonstrations used in training. “-multi” denotes multi-task models where they are trained on all tasks and evaluated separately.
+all the tasks by a significantly large margin. For example, in
+task separating-piles-unseen-colors, our method gets 97.6%
+success rate with 20 demos while the best baseline only
+achieves 66.0%. (2) GEM is more sample efficient compared
+with the baseline. Trained with 10 demos, it can outperform
+the baselines with 20 and 100 demos on 10 out of 18 tasks.
+In stack-block-pyramid-seq-seen-colors, our method trained
+with 10 demos gets 70.7% while CLIPort only gets 50.5%
+trained with 100 demos. (3) GEM demonstrates strong zero-                                              (a) UR5             (b) Franka               (c) Spot
+shot learning ability. The performance gap between GEM and                                   Fig. 6: Real-world Tabletop and Mobile Manipulation Setup.
+the baselines becomes larger with unseen objects. In put-                                    Cameras are highlighted in red, and workspaces are labeled in blue.
+blocks-in-bowls with 100 demos, the difference between GEM                                   B. Real-world Experiments
+and CLIPort increases from ∆7.3% to ∆42.5% on unseen
+                                                                                                For real-world experiments, we evaluate the few-shot and
+colors. (4) GEM is capable of learning a multi-task policy
+                                                                                             zero-shot learning ability of our model on a series of chal-
+from diverse datasets. As shown in multi-task results, GEM-
+                                                                                             lenging open-vocabulary manipulation tasks.
+multi performs best on 41 out of 54 evaluation cases.
+                                                                                                Tabletop Tasks: As shown in Figure 7, we design four
+   Comparing with Zero-shot VLM Methods: In Table I,                                         distinguishable tasks to demonstrate the effectiveness of our
+we also compare with MOKA [6], a state-of-the-art zero-shot                                  method on different levels. Pick-object-pat-in-box demon-
+method that is based on GPT4 [36] and SAM [37] without                                       strates a key necessity of the few-shot learning ability of our
+training on any robot data. Table I shows that our method                                    method that we can learn to take fine-grained task-specific
+trained with 10 demonstrations achieves, on average, 43.67 %                                 instructions like “pick red mug by its handle”. Stack-block-
+better than the baseline across all tasks. The large performance                             pyramid shows the method’s capability of doing long-horizon
+gap indicates that (1) there is a large gap between LLM/VLM                                  sequential tasks with an SE(2) model in 3D space with z-
+data and task-specific robot data, and (2) it is vital to do few-                            axis heuristics. Pill-storaging shows our method can do multi-
+shot learning to align pre-trained relevancies and post-trained                              task behaviors within one model beyond pick-and-place with
+robotic features.                                                                            simple primitive actions. Common-knowledge demonstrates
+   Comparing with Transformer-based Methods: VIMA [2]                                        zero-shot recognition ability on common knowledge objects.
+is a learning-based approach that is based on pretrained                                        Tabletop Results: We evaluate our method in four tasks as
+transformer architecture [38]. In Figure 5, we compare GEM                                   shown in Figure 7 and report the results in Table II. Object sets
+with VIMA [2] on VIMABench [2], where ours achieves the                                      can be found in Figure 7. Our single-task method outperforms
+same performance with 6 demos comparing VIMA with 6k                                         the baseline on all tasks up to a margin of 75.0%. On pick-
+demos.                                                                                       object-part-in-box, our method reaches 76.7% success rate on
+JIA et al.: GEM                                                                                                                                                         7
+
+
+
+
+      (a) pick-object-part-in-box             (b) stack-block-pyramid
+
+                                                                                     Fig. 8: Robustness Analysis on Positional and Object Generaliza-
+                                                                                     tion. We highlight our robustness gain over the baseline in orange.
+                                                                                     robot needs to perform precise picking on the mug handle
+                                                                                     and put it into a box. We evenly collect demonstrations of 12
+                                                                                     translations and rotations across the workspace separately. To
+          (c) pill-organizing                 (d) common-knowledge                   test the robustness of translation generalization, we gradually
+Fig. 7: Real-world Tabletop Tasks. The transparent and solid arms                    decreased the amount of training data so that the number
+show the intermediate actions. On each task’s right side, it shows the               of unseen poses increases during evaluation. As shown in
+seen/unseen objects on the upper/bottom sides.                                       Figure 8, our method preserves robust performance when
+seen objects while the baseline can only obtain 26.7% success                        testing on more unseen poses. Meanwhile, the baseline suffers
+rate. Besides, it shows strong generalization ability on unseen                      a severe performance drop when the data is limited.
+colors and shapes, whereas the baseline fails to generalize                             Novel Object Generalization Robustness: We construct
+well. The real-world experiments further prove the few-shot                          an object set that consists of 12 objects. The task is to “pick
+and zero-shot learning ability of GEM.                                               {OBJECT} and place into brown box”. To test the robust-
+                                                                                     ness of novel objects and language instruction, we gradually
+                    pick-object-         stack-            pill-        common-      decrease the number of training objects ntrain and test the
+                   part-in-box(5)   block-pyramid(5)   storaging(5)   knowledge(2)
+CLIPort (seen)       8/30           46/60              8/48           5/16
+                                                                                     models on the rest of the objects. During evaluation, the object
+GEM (seen)           23/30          56/60              35/48          16/16          orders are randomly shuffled so that all scenarios are unseen,
+CLIPort (unseen)     2/30            6/60              8/48           4/16           even if they contain seen objects. OpenVLA [4] suffers more
+GEM (unseen)         16/30          38/60              27/48          16/16          performance loss compared with our method when testing on
+                                                                                     more novel objects.
+TABLE II: Real-world Tabletop Performance. The numbers next
+                                                                                                                        pyramid-seen-100     pyramid-unseen-100
+to task names indicate the n demonstrations we collect per training
+object per task. “(seen)” denotes that all objects are in-distribution,                               Ours                      94.0                 84.3
+but their poses are randomly initialized during testing. “(unseen)”                           w.o Relevancy Map            91.7 (↓ 2.3)         21.0 (↓ 63.3)
+                                                                                           w.o Multi-view Relevancy        63.0 (↓ 31.0)        34.3 (↓ 50.0)
+means all testing objects are novel. Denominators are the number                           w.o Visual Relevancy Map        91.3 (↓ 2.7)          82.7 (↓ 1.6)
+of evaluation steps. Evaluation length differs due to different task                          w.o Steerable Kernel          7.7 (↓ 84.0)        1.7 (↓ 82.6)
+lengths and numbers of objects.                                                               w.o Lan-cond Kernel          90.7 (↓ 2.7)         61.3 (↓ 23.0)
+                                                                                            CLIP → Ground DINO             83.7 (↓ 10.3)        21.7 (↓ 41.6)
+   Mobile Manipulation Results: To demonstrate the ef-
+fectiveness of our method in an open-world setting with a                            TABLE III: Ablation Study in Simulation. Arrows indicate per-
+                                                                                     formance differences between ours and each variation.
+large workspace, we evaluate GEM with Spot on a language-
+conditioned pick-place task. Pixel-based action space allows                                                    arrange-letter-to-word-seen arrange-letter-to-word-unseen
+us to collect all the demos on one table, and the policy can                                    Ours                      72.2                          75.0
+generalize to a multi-table environment by using an action                           w.o Visual Relevancy Map          42.2 (↓ 30)                  68.8 (↓ 6.2)
+
+parameterization trick, where we concat observations in spatial                      TABLE IV: Ablation on Visual Relevancy Map in Real-world
+dimension and unionize the output action map during inference                        Tasks. 5 demos are used for training.
+time. Our model reaches 80% success rate for seen objects and
+                                                                                     D. Ablation Study:
+50% for unseen objects.
+                                                                                        To investigate each component, we present a detailed abla-
+                                                                                     tion as shown in Table III and Table IV. The main findings are:
+C. Generalization Robustness Analysis:                                               (1) Relevancy maps are crucial for novel object generalization,
+   We evaluate the generalization robustness in terms of three                       where the performance for pyramid-unseen drops by 63.3
+aspects: unseen translations, unseen rotations, and novel ob-                        without it. (2) Language steerable kernels are important for
+jects with unseen language instructions. We compare with                             few-shot learning from limited demonstrations. (3) Visual
+OpenVLA [4], which is a large vision-language-action model                           relevancy maps are necessary for real-world tasks where the
+pretrained on large-scale robotic datasets. We fine-tune Open-                       performance drops 6.2%-30% without it. Since real-world
+VLA on a few demonstrations and apply the same SE(2) data                            observations are often noisier, visual relevancy maps help
+augmentation to guarantee fair comparison.                                           suppress the noise. (4) Interestingly, multi-view observations
+   Spatial Generalization Robustness: We design a spatial                            can significantly affect performance. We hypothesize that side-
+generalization testbed to evaluate the translational and ro-                         view observations are closer to natural image views on which
+tational generalization robustness. The task is to “pick the                         CLIP is trained. (5) The performance drops if we replace
+red mug by handle and place into brown box”, where the                               CLIP with an open-vocabulary object detector Grounding
+8                                                                                 IEEE ROBOTICS AND AUTOMATION LETTERS. PREPRINT VERSION. JUNE, 2025
+
+
+
+DINO [32]. It shows that relevancy maps are more scalable                           [8] S. Mirchandani et al., “Large language models as general pattern
+without the “objectness” inductive bias that object detectors                           machines,” arXiv:2307.04721, 2023.
+                                                                                    [9] J. Liang et al., “Code as policies: Language model programs for
+often rely on.                                                                          embodied control,” in ICRA, 2023, pp. 9493–9500.
+                                                                                   [10] A. Zeng et al., “Transporter networks: Rearranging the visual world for
+                               block-in-bowl-seen     block-in-bowl-unseen              robotic manipulation,” in 5th CoRL, 2021.
+                                                                                   [11] L. Shao et al., “Concept2robot: Learning manipulation concepts from
+          Number of Cameras     1      2       3       1       2      3
+                                                                                        instructions and human demonstrations,” IJRR, vol. 40, 2021.
+          Ours                 98.0   100.0   100.0   79.0    88.3   96.0          [12] G. Tziafas et al., “Language-guided robot grasping: Clip-based referring
+          CLIPort              98.0   92.7    95.3    36.0    45.3   38.7               grasp synthesis in clutter,” arXiv:2311.05779, 2023.
+                                                                                   [13] C. Tang et al., “Task-oriented grasp prediction with visual-language
+TABLE V: Ablation on Number of Camera Views. 100 demos                                  inputs,” arXiv:2302.14355, 2023.
+are used for training. Evaluated at 20,000 Steps.                                  [14] A. Goyal et al., “Rvt: Robotic view transformer for 3d object manipu-
+                                                                                        lation,” arXiv:2306.14896, 2023.
+   The performance of our model gets affected, but still                           [15] E. Perez et al., “Film: Visual reasoning with a general conditioning
+remains good performance given fewer camera views. As                                   layer,” in AAAI, vol. 32, no. 1, 2018.
+shown in Table V, reducing camera views from three to                              [16] H. Huang et al., “Equivariant Transporter Network,” in RSS, New York
+                                                                                        City, NY, USA, June 2022.
+one, the performance drops by 2.0 and 17.0 in put-block-                           [17] D. Wang, R. Walters, and R. Platt, “SO (2)-equivariant reinforcement
+in-bowl-seen and put-block-in-bowl-unseen, respectively. Our                            learning,” in ICLR, 2022.
+hypothesis is that: (1) increased occlusion issues arise from                      [18] H. Huang et al., “Edge grasp network: A graph-based se (3)-invariant
+                                                                                        approach to grasp detection,” in ICRA. IEEE, 2023, pp. 3882–3888.
+fewer viewpoints, and (2) noisier saliency maps result from the                    [19] B. Hu et al., “Orbitgrasp: Se (3)-equivariant grasp learning,” in 8th
+absence of smoothing effects by multiple views. In contrast,                            CoRL, 2024.
+CLIPort maintains stable performance given any number of                           [20] L. Zhao et al., “E(2)-equivariant graph planning for navigation,” IEEE
+                                                                                        Robotics and Automation Letters (RA-L), 2024.
+cameras. However, our model still outperforms the baseline in                      [21] A. Simeonov et al., “Neural descriptor fields: Se (3)-equivariant object
+all testing cases. In addition, the choice of viewpoint in the                          representations for manipulation,” in ICRA, 2022, pp. 6394–6400.
+single-view setting is important. We find that the front-view                      [22] J. Yang et al., “Equivact: Sim (3)-equivariant visuomotor policies beyond
+                                                                                        rigid object manipulation,” arXiv:2310.16050, 2023.
+camera that looks at the workspace from the opposite side of                       [23] L. Zhao et al., “Integrating symmetry into differentiable planning with
+the robot works better than other views.                                                steerable convolutions,” in ICLR, 2023.
+                                                                                   [24] D. Wang et al., “Equivariant diffusion policy,” in 8th Annual Conference
+                                                                                        on Robot Learning, 2025.
+                              V. C ONCLUSION                                       [25] P. Florence, L. Manuelli, and R. Tedrake, “Self-supervised correspon-
+   In this work, we propose Grounded Equivariant                                        dence in visuomotor policy learning,” IEEE Robotics and Automation
+                                                                                        Letters, vol. 5, no. 2, pp. 492–499, 2019.
+Manipulation (GEM) that leverages pretrained textual-visual                        [26] C. Wang et al., “Mimicplay: Long-horizon imitation learning by watch-
+relevancy and the inherent symmetry in language-conditioned                             ing human play,” in 7th CoRL, 2023.
+manipulation. Our method learns robust language-conditioned                        [27] A. Rashid et al., “Language embedded radiance fields for zero-shot task-
+                                                                                        oriented grasping,” in 7th CoRL, 2023.
+manipulation policies in a few-shot manner and shows a                             [28] M. Ahn et al., “Do as i can, not as i say: Grounding language in robotic
+certain degree of novel object generalization ability. We                               affordances,” arXiv:2204.01691, 2022.
+validate the proposed method on simulated and real-world                           [29] Y. Hu et al., “Look before you leap: Unveiling the power of gpt-4v in
+                                                                                        robotic vision-language planning,” arXiv:2311.17842, 2023.
+tasks against different baselines. One limitation is that our                      [30] W. Shen et al., “Distilled feature fields enable few-shot language-guided
+model needs predefined action primitives with heuristics                                manipulation,” arXiv:2308.07931, 2023.
+like “pick”, “place”, “open”, etc, limiting its ability to                         [31] A. Radford et al., “Learning transferable visual models from natural
+                                                                                        language supervision,” in ICML, 2021, pp. 8748–8763.
+perform more complex tasks. Fortunately, LLMs [36]                                 [32] S. Liu et al., “Grounding dino: Marrying dino with grounded pre-training
+and LLM-based methods [39] provide convenient tools to                                  for open-set object detection,” arXiv:2303.05499, 2023.
+parse and translate natural languages into high-level robot                        [33] G. Cesa, L. Lang, and M. Weiler, “A program to build e (n)-equivariant
+                                                                                        steerable cnns,” in ICLR, 2021.
+primitives. In the future, we will extend our method to (1)                        [34] H. Huang et al., “Fourier transporter: Bi-equivariant robotic manipula-
+SE(3) action space without predefined primitives, and (2)                               tion in 3d,” arXiv:2401.12046, 2024.
+improve local understanding [40, 41]. Worth mentioning, the                        [35] H. Ryu et al., “Equivariant descriptor fields: Se (3)-equivariant energy-
+                                                                                        based models for end-to-end visual robotic manipulation learning,”
+language-conditioned symmetries we studied in Section III are                           arXiv:2206.08321, 2022.
+applicable for SE(3) space, which provides a solid foundation                      [36] OpenAI, “Gpt-4 technical report,” 2023.
+for extension using 3D convolution methods [42, 34].                               [37] A. Kirillov et al., “Segment anything,” in ICCV, 2023, pp. 4015–4026.
+                                                                                   [38] A. Vaswani et al., “Attention is all you need,” in NeurIPS 2017, I. Guyon
+                                                                                        et al., Eds., 2017, pp. 5998–6008.
+                                R EFERENCES                                        [39] Y. Li et al., “Hamster: Hierarchical action models for open-world robot
+    [1] M. Shridhar, L. Manuelli, and D. Fox, “Cliport: What and where                  manipulation,” arXiv preprint arXiv:2502.05485, 2025.
+        pathways for robotic manipulation,” in CoRL, 2022, pp. 894–906.            [40] S. Rawlekar et al., “Disentangling clip features for enhanced localized
+    [2] Y. Jiang et al., “Vima: General robot manipulation with multimodal              understanding,” arXiv preprint arXiv:2502.02977, 2025.
+        prompts,” arXiv:2210.03094, 2022.                                          [41] D. Jing et al., “Fineclip: Self-distilled region-based clip for better fine-
+    [3] A. Brohan et al., “Rt-1: Robotics transformer for real-world control at         grained understanding,” Advances in Neural Information Processing
+        scale,” arXiv:2212.06817, 2022.                                                 Systems, vol. 37, pp. 27 896–27 918, 2024.
+    [4] M. J. Kim et al., “Openvla: An open-source vision-language-action          [42] S. James et al., “Coarse-to-fine q-attention: Efficient learning for visual
+        model,” arXiv:2406.09246, 2024.                                                 robotic manipulation via discretisation,” in CVPR, 2022.
+    [5] A. Brohan et al., “Rt-2: Vision-language-action models transfer web
+        knowledge to robotic control,” arXiv:2307.15818, 2023.
+    [6] F. Liu et al., “Moka: Open-vocabulary robotic manipulation through
+        mark-based visual prompting,” arXiv:2403.03174, 2024.
+    [7] W. Huang et al., “Voxposer: Composable 3d value maps for robotic
+        manipulation with language models,” in CoRL, 2023, pp. 540–562.
+

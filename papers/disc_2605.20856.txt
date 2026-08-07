@@ -1,0 +1,1270 @@
+                                                     DISC: Decoupling Instruction from
+                                              State-Conditioned Control via Policy Generation
+                                                                    Hanxiang Ren‡,§,¶,*        Pei Zhou§,¶,*      Xunzhe Zhou§,¶       Yanchao Yang§,¶,†
+                                                                         ‡                         §                                   ¶
+                                                                             Zhejiang University       The University of Hong Kong         TranscEngram
+
+
+
+                                            Abstract—Language-conditioned manipulation policies typi-             bypassing language entirely. For example, in a shared kitchen
+                                         cally process instructions and observations through shared               scene, a policy may learn the frequent pan-placement behavior
+                                         network parameters. This task-state entanglement provides a              and omit the instructed stove-activation subgoal. The result
+arXiv:2605.20856v1 [cs.RO] 20 May 2026
+
+
+
+
+                                         pathway for observation leakage – networks learn scene-to-action
+                                         shortcuts that bypass language grounding entirely. DISC elimi-           is policies that exploit visual shortcuts rather than ground
+                                         nates this failure structurally. Rather than conditioning a univer-      instructions – succeeding on familiar scenes but failing when
+                                         sal policy on language, DISC uses a hypernetwork to generate the         instructions change or visual context becomes ambiguous. Ev-
+                                         entire parameter set of a task-specific visuomotor policy from the       idence from the broader vision-language community confirms
+                                         instruction alone. The generated policy never directly accesses          this pattern, manifesting as modality competition [22, 40],
+                                         language; therefore, its task-awareness must come from the
+                                         language. Consequently, observation leakage has no pathway to            visual neglect [24], and entity grounding failures [1, 25].
+                                         emerge. On the other hand, generating coherent high-dimensional             We propose DISC, which takes architectural decoupling
+                                         policy weights is itself a challenging problem. We address it            to its logical conclusion: a task specification, instantiated
+                                         with a two-stage hypernetwork whose refinement stage embeds              here as language, generates the entire parameter set of a
+                                         the structure of gradient-based optimization as a feed-forward           task-specific visuomotor policy. A hypernetwork processes
+                                         inductive bias, producing globally consistent parameters without
+                                         actual gradient computation. Trained entirely from scratch on            instructions alone to produce policy weights; the generated
+                                         standard data budgets, DISC outperforms all entangled baselines          policy processes visual observations alone using those weights.
+                                         on LIBERO-90 and Meta-World, with advantages that widen                  This separation provides a structural guarantee against ob-
+                                         on complex, long-horizon tasks – and surpasses the large-scale           servation leakage – no task-agnostic parameters exist where
+                                         pretrained π0 despite using no external pretraining data. On             shortcuts could emerge, and task semantics influence behav-
+                                         a real-world benchmark where all tasks share identical visual
+                                         context, DISC substantially outperforms entangled alternatives,          ior only through generated weights. A central challenge is
+                                         directly confirming that language-generated policy parameters,           that naive weight generation produces incoherent parameters.
+                                         not visual shortcuts, drive behavior. The hypernetwork further           DISC addresses this with a two-stage architecture. A Weight
+                                         learns a semantically structured parameter manifold that enables         Initialization Network first maps the language embedding
+                                         few-shot adaptation from minimal demonstrations and robust               to a semantically informed point in parameter space. An
+                                         generalization across paraphrased instructions. Our code is
+                                         available at: https://github.com/ReNginx/DISC.                           Iterative Refinement Module then improves this initialization
+                                                                                                                  by mimicking the structure of gradient-based optimization –
+                                                                   I. I NTRODUCTION                               forward evaluation, error estimation, and parameter correction
+                                            Reliable task-conditioned manipulation requires robots to             – while remaining fully feed-forward at inference time. This
+                                         treat the task specification as the source of task identity, rather      optimization-inspired inductive bias enables the hypernetwork
+                                         than as a weak hint that can be overridden by familiar visual            to produce globally coherent policy parameters without incur-
+                                         scenes. Language-conditioned manipulation policies must pro-             ring the cost of actual gradient computation, bridging the gap
+                                         cess two fundamentally different inputs: an instruction that             between the expressiveness of full policy generation and the
+                                         specifies what task to perform (fixed throughout an episode)             quality demands of precise visuomotor control.
+                                         and an observation that captures what the current state is                  Despite training entirely from scratch, DISC achieves 94.3%
+                                         (evolving continuously). Current architectures conflate these            on LIBERO-90 and 92.2% on Meta-World, outperforming the
+                                         roles by processing both through shared representations – a              strongest trained-from-scratch entangled baseline by 7.7% on
+                                         design we term task-state entanglement. We argue this cre-               LIBERO-90. For context, DISC surpasses even the pretrained
+                                         ates two compounding failures. First, shared parameters face             π0 (91.6%) and remains competitive with π0.5 (95.7%) –
+                                         optimization tension between language grounding (requiring               demonstrating that architectural inductive biases can recover
+                                         semantic understanding) and visuomotor control (requiring                much of the benefit attributed to large-scale pretraining. The
+                                         spatial precision). Second, and more critically, entangled ar-           advantage widens on complex, long-horizon tasks, precisely
+                                         chitectures enable observation leakage: visual context often             where task-state entanglement is most damaging. On a real-
+                                         correlates with task identity in limited robotics datasets, al-          world combinatorial benchmark where visual context is shared
+                                         lowing the network to map scenes directly to actions while               across all 9 tasks, DISC achieves 86.4% versus 78.5% for the
+                                                                                                                  best entangled baseline, confirming that task-specific generated
+                                           * Equal contribution. † Corresponding author.                          parameters, not visual shortcuts, drive behavior. The decou-
+pled architecture further enables superior few-shot adaptation,     an optimization-inspired hypernetwork whose iterative refine-
+robust grounding across paraphrased instructions, and a se-         ment enables feed-forward generation of high-quality policy
+mantically structured parameter manifold where related tasks        parameters. Although adaptable to meta-learning [8, 36, 38],
+cluster closely by functional meaning.                              we focus on multi-task manipulation policy learning.
+                     II. R ELATED W ORK
+                                                                                          III. P RELIMINARY
+   Multi-Task Manipulation Policies. Current language-
+conditioned manipulation methods process instructions and              We target multi-task robotic manipulation, where an agent
+observations through shared network components and dif-             must execute diverse tasks specified by natural language in-
+fer mainly in their fusion mechanism. Transformer-based             structions. Each task is defined by an instruction l ∈ J , and at
+approaches [5, 17, 45, 49, 46] tokenize and concatenate             each timestep, the agent receives an observation ot = (It , st )
+multimodal inputs into unified sequences [42], as exempli-          comprising an RGB image and proprioceptive state, from
+fied by RT-1 [4], Gato [30], Octo [41], VQ-BeT [37], and            which it produces a continuous action at ∈ A.
+BAKU [10] – where the same WQ , WK , WV projections                    Notably, the instruction and observation serve qualitatively
+and feed-forward weights operate on both language and visual        different roles. The instruction specifies what task to perform
+tokens. Text-aware variants such as OTTER [13] condition            – it defines the goal and remains fixed throughout an episode.
+visual features on language, but retain shared action-prediction    The observation captures what the current state is – it evolves
+parameters. Concept-guided policies such as AutoCGP [47]            continuously and directly constrains which action is appropri-
+learn semantic control structure from unlabeled demonstra-          ate. A well-designed policy shall treat these inputs according
+tions. Diffusion-based methods [11, 39] instead cast control        to their distinct roles, without conflating the two.
+as conditional denoising, pioneered by Diffusion Policy [6].           For learning, given a dataset D of expert demonstrations
+Architectures have evolved from U-Nets [35] with FiLM               spanning N tasks, we train a policy via behavior cloning:
+conditioning [27] to Transformer-based backbones such as
+DiT [26] and BESO [32], with RDT-1B [21] and MoDE [33]                       LBC (θ) = E(ot ,at ,l)∼D ∥π(ot , l; θ) − at ∥22 .
+                                                                                                                           
+                                                                                                                                   (1)
+scaling through pre-training and mixture-of-experts tuning,
+while DP3 [44], 3D Diffuser Actor [16], and PointVLA [18]              Current approaches learn an entangled policy π(o, l; θ) that
+enhance geometric grounding via 3D representations. Flow-           processes both inputs through shared parameters – a design
+matching models π0 [3] and π0.5 [15] further improve general-       we term task-state entanglement. As we argue next, this ar-
+ization through large-scale pre-training. Despite this diversity,   chitectural choice introduces fundamental learning difficulties
+all these methods entangle instruction and state within shared      that compromise language grounding.
+processing stages. Concatenation-based transformers apply
+identical weights to both modalities throughout the network.
+                                                                    A. Limitations of Task-State Entanglement
+Cross-attention and FiLM-based architectures [27] introduce
+partial separation – FiLM affects vision only through affine           Task-state entanglement creates two distinct problems that
+modulation – but language still controls only a small fraction      undermine robust instruction following.
+of computation, while the vast majority of parameters remain              a) Problem 1: Competing Functions within Shared Pa-
+task-agnostic and can learn shortcut mappings that bypass           rameters: A language-conditioned policy must serve two dis-
+language entirely. As analyzed in Section III-A, this task-         tinct roles: interpreting the instruction to understand what task
+state entanglement creates two problems: optimization tension       to perform, and processing observations to predict appropriate
+between competing functions within shared parameters, and           actions. In entangled architectures, both roles are handled by
+observation leakage that enables the network to map visual          the same parameters. For instance, transformer-based policies
+context directly to actions without grounding language.             concatenate language and visual tokens:
+   Hypernetworks for Policy Generation. An alternative
+paradigm uses hypernetworks [2, 9, 14, 48] – networks                         Output = Transformer(Concat(Tl , Tv ); θ) ;          (2)
+trained to output the weights of another – to generate
+task-specific policies. HyPoGen [31], HyperZero [34], and           Diffusion policies similarly condition on jointly embeddings:
+Hyper-GoalNet [48] demonstrate this for multi-task or goal-
+conditioned manipulation. These methods motivate separating                           at = Denoise(ϵt | el , ev ; θ) .             (3)
+task specification from policy execution, but differ in condi-
+tioning and generator design: HyPoGen and HyperZero use             In both designs, shared parameters θ must simultaneously learn
+compact MLP-style generators, while Hyper-GoalNet condi-            language understanding and visuomotor control. However, de-
+tions on goal images and current observations rather than           mands conflict: language understanding benefits from semantic
+language-only specifications. DISC addresses both the frame-        abstraction and visual invariance, while visuomotor control
+work question – decoupling instruction from state-conditioned       requires sensitivity to precise spatial details. Thus, forcing both
+control by generating task-specific target policy parameters        roles through shared parameters creates optimization tension
+from language – and the architecture question, introducing          that degrades either core function.
+Fig. 1: Behavioral Evidence of Task-State Entanglement. Current policies trained with entangled architectures fail to ground
+language instructions faithfully. Left: given the instruction regarding “white bowl,” Octo instead approaches the microwave –
+executing a behavior associated with a different task that shares similar visual context. Right: given the multi-step instruction
+“turn on the stove and put the frying pan on it,” the large-scale pretrained π0.5 skips the stove-activation subgoal and directly
+places the pan on the stove, matching a related pan-placement task under the same scene-level context. These failures illustrate
+observation leakage: the policies have learned scene-to-action mappings rather than instruction-to-action mappings. DISC, with
+its decoupled architecture, correctly executes both instructions by separating task specification from state-conditioned control.
+
+
+      b) Problem 2: Observation Leakage Enables Shortcut               Rather than learning a single policy that fuses both modalities,
+Learning: A more severe failure arises from what we call               our method, DISC, decomposes the problem into two stages:
+observation leakage: visual observations often contain cues            (1) a hypernetwork Hϕ processes the task specification to
+correlating with task identity. Specific objects, scene layouts,       generate a complete set of policy weights, and (2) the gener-
+or robot configurations may appear predominantly in certain            ated policy πθπ maps observations to actions using only those
+tasks. Given this, entangled architectures can learn to map            weights – without any direct task-specification input.
+visual patterns directly to actions – bypassing language. This            Formally, given an instruction l as the task specification, we
+shortcut minimizes training loss without requiring the network         first obtain a task embedding via a frozen language encoder:
+to ground linguistic meaning, yielding policies that succeed on
+                                                                                                 el = ΦL (l) .                       (4)
+familiar scenes but fail when instructions change.
+   Figure 1 demonstrates this failure. In the left example, Octo       The hypernetwork then generates policy parameters:
+approaches the microwave when asked to put the white bowl to
+                                                                                                θπ = Hϕ (el ) .                      (5)
+the right of the plate, executing a behavior linked to a similar
+visual context. In the right example, the pretrained π0.5 is           Further, the generated policy performs visuomotor control:
+asked to turn on the stove and put the frying pan on it, but
+it performs only the pan-placement subgoal, consistent with a                                  at = π(ot ; θπ ) .                    (6)
+scene-level shortcut from the related task of putting the pan              This decomposition directly addresses both problems iden-
+on the stove under the same scene context. These examples              tified in Section III-A. First, the competing functions are as-
+show that observation leakage can persist across model scales          signed to separate networks: the hypernetwork learns to inter-
+when language and state are fused during action fine-tuning.           pret the task specification, while the target policy learns to map
+In contrast, our decoupled architecture executes the specified         observation embeddings to actions, eliminating optimization
+subgoals, confirming that architectural separation prevents            tension between task understanding and visuomotor control.
+such shortcuts. These problems compound to produce policies            Second, the direct action-mapping pathway for observation
+that are brittle to instruction variation, fail to generalize across   leakage is structurally removed. In entangled architectures,
+visual contexts, and degrade on long-horizon tasks where               shortcuts arise because the model can learn to ignore the
+grounding errors accumulate. To overcome these limitations,            task specification and map observations directly to actions –
+we propose treating language not as an input to be fused, but          both modalities feed into the same network, so bypassing one
+as a generative signal that produces the parameters of a task-         is easy. In DISC, the target policy has no direct access to
+specific visuomotor policy – an approach we detail next.               the instruction at all. The only way for task information to
+                                                                       influence behavior is through the generated parameters; the
+                          IV. M ETHOD
+                                                                       hypernetwork must encode task semantics into the weights
+A. Decoupling Instruction from State-Conditioned Control               because there is no alternative route.
+   Our solution is to separate task-specification processing               Figure 2 illustrates this architecture. Observations ot enter
+from state-conditioned control entirely. In this paper, the task       only at the target policy stage, maintaining complete separation
+specification is instantiated as a natural-language instruction.       from task-specification processing.
+Fig. 2: The DISC architecture. The task specification, instantiated as a language instruction l, is encoded into embedding el
+                                                                                                                                (0)
+and processed by the hypernetwork through two stages: (1) the Weight Initialization Network generates initial parameters θπ
+              (0)                                                                                                          (T )
+(labeled as θ ), and (2) the learned iterative refinement module updates parameters over T steps to produce final θ . The
+refinement module mimics optimization structure – forward, backward, and meta-update operations – but all transformations are
+learned, and the entire generation process is feed-forward. The generated parameters configure the target policy πθπ , a compact,
+task-specific visuomotor controller. Observations ot enter only at the target policy stage: the task specification determines which
+policy executes, while the generated policy processes visual input independently, ensuring complete separation between task-
+specification processing and state-conditioned control.
+
+
+      a) Contrast with Conditioning Approaches: Existing            millions of interdependent parameters with complex functional
+conditioning methods – concatenation [37, 41], cross-               relationships. Prior hypernetwork architectures (e.g., simple
+attention [19], and FiLM [6, 27] – integrate language and           MLP generators) struggle to capture these dependencies, pro-
+vision within shared processing stages, to different extents.       ducing weights that lack the coherent structure required for
+   Concatenation exhibits the most direct form of entangle-         effective control.
+ment: language tokens Tl and visual tokens Tv are concate-             Our key architectural contribution is a hypernetwork that
+nated into a unified sequence and processed by the same             incorporates the structural inductive bias of iterative opti-
+transformer layers. Cross-attention uses modality-specific pro-     mization while remaining fully feed-forward at inference time.
+jections to compute queries from vision and keys/values from        The design is inspired by a simple observation: gradient-based
+language. While these projections are separate, the attention       optimization naturally produces coherent parameters via incre-
+operation produces fused features that are processed by sub-        mental updates respecting inter-layer dependencies. We embed
+sequent shared layers, entangling the two modalities from           this structure into the architecture itself – the hypernetwork
+that point onward. FiLM is closest in spirit to our approach:       mimics the computational pattern of optimization (forward
+language affects vision through learned affine modulation           pass, backward pass, parameter update), but how each of
+(γ(el )·hv +β(el )), and no layer processes both modalities with    these operations refines the parameters is entirely learned from
+shared parameters. However, language generates only a small         data. This achieves the coherence benefits of optimization-like
+fraction of the computation – the scale and shift values – while    refinement without incurring the computational cost of actual
+the vast majority of the visual backbone parameters remain          gradient computation at inference time.
+shared across all tasks. These shared, task-agnostic parameters           a) Stage 1: Weight Initialization Network: The first stage
+can still learn shortcut mappings from visual features to actions   generates a coarse initialization from the task embedding:
+that bypass language conditioning entirely.
+   DISC takes this principle to its logical conclusion: all task-                          θπ(0) = WINϕ1 (el ) .                     (7)
+specific parameters of the target policy are generated from the
+                                                                    This positions the parameters in a well-conditioned region
+task specification, instantiated here as a language instruction,
+                                                                    of the weight space – distinguishing, for instance, grasping
+leaving no space in the target policy where shortcuts could
+                                                                    tasks from pushing tasks – but lacks the fine-grained precision
+emerge. The policy’s entire computational structure is deter-
+                                                                    required for successful execution.
+mined by the task specification, ensuring that task semantics
+are embedded throughout the visuomotor controller rather than            b) Stage 2: Learned Iterative Refinement: The second
+applied as a light modulation.                                      stage refines this initialization through T learned update steps:
+
+                                                                     θπ(t+1) = θπ(t) + ∆θ(t) ,   where    ∆θ(t) = fϕ2 (θπ(t) , el ) . (8)
+B. Hypernetwork Architecture
+  A core challenge is generating coherent, high-performing             Importantly, this is not optimization in the traditional sense.
+policy parameters from a task embedding induced by a lan-           The refinement module fϕ2 is a neural network with fixed,
+guage instruction. Naive direct regression from el to the full      learned parameters ϕ2 . At inference time, generating policy
+parameter vector θπ fails because policy networks contain           parameters requires only T forward passes through fϕ2 – no
+gradients are computed with respect to any loss, no demon-           proceeds in two stages. First, the hypernetwork generates by
+stration data is accessed, and no iterative solving occurs. The      mapping the new instruction to policy parameters:
+entire generation process is feed-forward.
+   Specifically, the refinement module is architecturally de-                              θπinit = Hϕ (ΦL (lnew )) .            (10)
+composed to mirror the structure of optimization: it computes a      Since the hypernetwork has learned the structure of the task
+latent forward representation z from the current parameters, es-     manifold during multi-task training, this initialization already
+timates pseudo-gradient signals ∇z, and aggregates these into        encodes relevant task semantics – positioning the parameters
+parameter updates ∆θ(t) (see Figure 2). However, unlike true         near the task-optimal region rather than at a random starting
+optimization where gradients are computed analytically from          point. Second, the generated target policy parameters are fine-
+a loss function, here the “forward,” “backward,” and “update”        tuned with the provided demonstrations:
+operations are all learned neural network components. The                                X       X                         2
+architecture provides the structural scaffold – the pattern of           θπ∗ = arg min                  ∥π(ot ; θπ ) − at ∥2 .    (11)
+                                                                                    θπ
+how information flows – while training determines the actual                             ξj ∈Dnew (ot ,at )∼ξj
+transformation at each stage. This learned refinement process
+                                                                     The hypernetwork remains frozen throughout, preserving its
+produces globally coherent parameter updates, similar to how
+                                                                     learned meta-knowledge. This transforms adaptation from a
+true gradients enforce consistency across layers, but adapted
+                                                                     global search over a large, entangled parameter space into
+specifically to the encountered task distribution.
+                                                                     a local refinement of a compact, well-initialized policy –
+      c) Target Policy: The generated parameters θπ configure
+                                                                     requiring fewer demonstrations and fewer gradient steps to
+a compact visuomotor controller mapping observations to ac-
+                                                                     reach competent performance.
+tions. Because the target policy is specialized to a single task,
+it can be significantly smaller than monolithic architectures                                 V. E XPERIMENT
+that must accommodate the entire task distribution within one
+                                                                        We conduct experiments to validate that explicit decou-
+set of weights. In our implementation, the target policy is
+                                                                     pling of instruction processing from state-conditioned control
+a lightweight MLP, enabling efficient inference suitable for
+                                                                     through DISC improves language-conditioned robotic manip-
+high-frequency robotic control. More architectural details are
+                                                                     ulation. Our evaluation addresses four key research questions:
+provided in the appendix.
+      d) Training and Inference: The full framework is trained       1) Multi-Task Efficiency (RQ1): Does DISC’s decoupled
+end-to-end by optimizing hypernetwork parameters ϕ =                     architecture outperform state-of-the-art entangled methods
+{ϕ1 , ϕ2 } using the behavior cloning loss:                              on diverse manipulation tasks?
+                                                                     2) Few-Shot Adaptation (RQ2): Can the structured parame-
+   LBC (ϕ) = E(ot ,at ,l)∼D ∥π(ot ; Hϕ (ΦL (l))) − at ∥22 . (9)
+                                                        
+                                                                         ter manifold learned by DISC enable more effective adapta-
+For each training sample, the hypernetwork generates policy              tion to novel tasks compared to entangled representations?
+                     (T )                                            3) Language Grounding Quality (RQ3): Does DISC’s de-
+parameters θπ = θπ from the task specification, the tar-
+                                                                         coupled architecture ground the semantic content of in-
+get policy uses these parameters to predict actions, and the
+                                                                         structions – responding to task meaning rather than surface-
+prediction error backpropagates through the entire generation
+                                                                         level phrasing – and does the generated parameter space
+process to update ϕ accordingly. At inference time, deploy-
+                                                                         reflect meaningful task structure?
+ment is straightforward: given a new instruction l as the task
+                                                                     4) Real-World Deployment (RQ4): Does DISC’s decoupling
+specification, we encode it, run the hypernetwork forward to
+                                                                         principle transfer to physical robot settings, where real-
+generate θπ , and execute the target policy in the environment.
+                                                                         world perception noise and scene ambiguity might affect
+The generation is a single feed-forward pass through the
+                                                                         precise language-driven control?
+hypernetwork for each task, after which the compact target
+policy runs independently at control frequency without further       The experimental setup is detailed in Section V-A. We report
+overhead during execution.                                           multi-task performance in Section V-B, few-shot adaptation
+                                                                     in Section V-C, language grounding and structure analysis in
+C. Few-Shot Adaptation (Optional)                                    Section V-D, and real-world evaluation in Section V-E. Further
+   We call this adaptation optional because it is not required by    implementation details are provided in the appendix.
+the standard inference pipeline; it is used only when a novel
+task is accompanied by a few demonstrations. A practical             A. Experimental Setup
+benefit of DISC’s decoupled architecture is efficient adaptation           a) Benchmarks: In simulation, we employ two standard
+to novel tasks from minimal demonstrations. The separation           benchmarks to test multi-task proficiency: LIBERO-90 [20]
+between the hypernetwork (which captures general knowledge           and Meta-World [43]. For LIBERO-90, we train on 90
+about how language maps to policy structure) and the target          diverse language-conditioned tasks and evaluate under novel
+policy (which executes a specific task) provides a natural           initial configurations. To analyze performance relative to task
+decomposition for efficient adaptation.                              complexity, we categorize these tasks into Easy, Medium,
+   When presented with a novel task with instruction lnew and        and Long-Horizon groups based on the number of object
+a small number of demonstrations Dnew = {ξj }K    j=1 , adaptation   interactions involved. For Meta-World, we adopt the ML45
+protocol (45 goal-conditioned tasks) and group them by ma-         TABLE I: Multi-task performance on LIBERO-90. Success
+nipulation primitives (e.g., pick&place, press&pull) to            rates (%) averaged over 20 episodes. DISC shows increasing
+assess semantic generalization across diverse mechanics. We        advantages on complex tasks where task-state entanglement is
+utilize the standard dataset budget: 50 human demonstrations       most problematic. Best in bold, second-best underlined among
+per task for LIBERO-90 and 100 expert demonstrations per           methods trained from scratch. Italicized values denote fine-
+task for Meta-World. Detailed task lists and categorization        tuned results with large-scale pretraining.
+criteria are provided in the appendix.                               Method                   Easy    Medium     Long     Overall
+   Real-World Benchmark. To rigorously evaluate whether
+                                                                     Octo                     92.3     89.0      79.3      84.7
+language instructions – rather than visual cues – drive policy       VQ-BeT                   89.5     86.7      84.3      85.9
+behavior, we construct a real-world testbed comprising 9             DP                       93.2     72.7      72.7      75.2
+distinct combinatorial tasks. Figure 3 illustrates this experi-      DiT                      57.3     42.0      34.2      40.1
+                                                                     H-Zero                   50.0     75.1      69.1      69.1
+mental protocol. The setup involves picking one of 3 potential       H-Gen                    30.5     50.7      46.3      46.1
+target objects and placing it into one of 3 specific containers,     OTTER                    96.4     87.9      83.2      86.6
+resulting in 3 × 3 = 9 unique language-conditioned tasks.            DISC (Ours)              97.3     95.3      92.7      94.3
+As depicted in Figure 3 (a), the workspace is cluttered with         π0 (Pretrained + FT)     95.9     92.0      90.2      91.6
+distractors. The yellow arrows exemplify the task ambiguity          π0.5 (Pretrained + FT)   96.4     97.0      94.4      95.7
+that is resolved solely by language: for instance, the Red Apple
+corresponds to three distinct potential trajectories depending
+on the target container specified in the instruction. Figure 3
+(b) shows the terminal state of a successful execution. Cru-       are tested on the same tasks in the training set, but with novel
+cially, because the same objects and containers are present        initial configurations (unseen object positions, robot poses)
+in every task, visual context alone cannot determine the           to assess whether the policy generalizes based on language
+correct behavior – making this benchmark a direct test of          instructions rather than memorized scene-action associations.
+whether observation leakage drives the policy. We collect 100            a) Results on LIBERO-90: Table I reveals a critical pat-
+demonstrations for each task. Additional environment details       tern supporting our hypothesis. Among trained-from-scratch
+are deferred to the appendix.                                      entangled baselines, OTTER [13] is the strongest overall,
+      b) Baselines: We benchmark DISC against a suite of           reaching 86.6%, and performs particularly well on Easy tasks
+state-of-the-art methods, categorized into two groups: (1) En-     with 96.4%. DISC achieves 94.3% overall – a 7.7% absolute
+tangled Architectures, including Transformer-based models          improvement over OTTER. When checking the gap against
+such as Octo [41] and VQ-BeT [37], the text-aware VLA              the best from each category, we see it correlate with task
+model OTTER [13], and Diffusion-based models like U-               complexity: +0.9% on Easy tasks (97.3 vs. 96.4), +6.3% on
+Net-based Diffusion Policy (DP) [6] and Transformer-based          Medium tasks (95.3 vs. 89.0), and +8.4% on Long-Horizon
+Diffusion (DiT) [6]; and (2) Hypernetwork-based Archi-             tasks (92.7 vs. 84.3). This pattern is consistent with our
+tectures, specifically HyPoGen [31] (abbreviated as H-Gen)         analysis of task-state entanglement: as task horizon grows,
+and HyperZero [34] (H-Zero). To isolate the impact of archi-       the opportunity for observation leakage increases – entangled
+tectural inductive biases, we train all baselines from scratch     policies accumulate grounding errors across sequential steps
+using identical visual (ResNet-18) and language (T5-small)         because visual shortcuts that work for early subgoals may
+backbones. Architectural details are provided in the appendix.     not generalize to later ones. DISC’s decoupled architecture
+Furthermore, to contextualize our performance against the          avoids this failure mode entirely, as the target policy has no
+current state-of-the-art, we include two large-scale pretrained    mechanism to bypass its generated parameters. Remarkably,
+models, π0 [3] and π0.5 [15], fine-tuned on LIBERO-90 as           despite being trained entirely from scratch, DISC surpasses
+reference points.                                                  the large-scale pretrained model π0 (91.6%) and remains
+      c) Training Protocol: All experiments follow a standard      competitive with π0.5 (95.7%).
+Behavior Cloning (BC) paradigm. The aggregate training                   b) Complementary Failure Modes vs. π0.5 : A task-level
+datasets consist of 4,500 episodes for LIBERO (50×90), 4,500       comparison across all 90 LIBERO tasks reveals that DISC
+for Meta-World (100 × 45), and 900 for the real-world bench-       and π0.5 exhibit complementary failure modes despite their
+mark (100 × 9). Crucially, to isolate the impact of proposed       close aggregate gap: 68 tasks are within 5%, DISC wins
+architecture from capacity-related benefits, we standardize the    by >5% on 9 tasks, and π0.5 wins by >5% on 13 tasks.
+model size across all trained-from-scratch methods to ∼30M         DISC’s largest advantages appear on multi-step tasks re-
+parameters. For the reference models π0 and π0.5 , we fine-tune    quiring precise language-grounded sequencing: on “turn
+from their official pretrained checkpoints. Complete training      on the stove and put the frying pan on it” across two
+details are available in the appendix.                             kitchen scenes, DISC achieves 92%/96% while π0.5 drops
+                                                                   to 30%/60% (+62%/+36% gaps), suggesting π0.5 exploits
+B. Multi-Task Performance (RQ1)                                    scene-level visual priors rather than faithfully following the
+  We evaluate whether decoupling instruction from state-           instruction. This indicates that even internet-scale pretraining
+conditioned control improves multi-task performance. Models        does not eliminate observation leakage: action fine-tuning on
+Fig. 3: Real-World Combinatorial Benchmark Visualization. (a) Initial State: The setup presents inherent visual ambiguity:
+the target object (e.g., Red Apple) has multiple potential destinations (indicated by arrows). (b) Language-Conditioned
+Outcomes: Starting from the identical initial state shown in (a), DISC successfully executes three distinct tasks specified
+by different language instructions: (b1) placing the apple into the Small Gray Bowl, (b2) the Large Red Bowl, and (b3)
+the Light Gray Box. Because the visual scene is identical in all three cases, the divergent behaviors can only arise from the
+language instruction – confirming that the generated policy parameters, not visual context, determine task execution.
+
+TABLE II: Joint evaluation on LIBERO-Spatial, LIBERO-               TABLE III: Meta-World ML45 multi-task performance by
+Object, and LIBERO-Goal. Success rates (%) are averaged             manipulation primitives. DISC maintains advantages across
+over 50 episodes per task. π0 and π0.5 are fine-tuned from          action types, achieving 92.2% overall success rate.
+pretrained checkpoints, whereas DISC is trained from scratch.
+                                                                                 Task Category Octo VQ-BeT               DP         DiT H-Zero H-Gen DISC
+             Method   Spatial   Object   Goal   Overall                          open&close         99.3       100.0     56.8       52.7     99.3        91.5     99.5
+             π0        96.8      98.8    95.8    97.1                            pick&place         83.0        69.0     19.5       19.0     81.5        66.5     88.0
+             π0.5      98.8      98.2    98.0    98.3                            press&pull         93.4        88.1     33.9       38.5     38.4        72.5     93.4
+             DISC      99.2      99.4    97.4    98.7                            others             85.8        77.6     54.6       48.1     48.2        68.5     88.7
+                                                                                 Overall            90.6        84.6     44.5 42.9           56.8        73.8     92.2
+
+
+limited robot data re-introduces shortcut-learning pathways                        DISC (Ours)         Octo      DP       DiT           H-Zero       H-Gen        VQ-BeT
+through the entangled fusion of language and visual tokens.                                 Demo Count: 1                                        Demo Count: 3
+                                                                             0.6
+Conversely, π0.5 ’s largest advantages appear on fine-grained                                                                 0.6
+                                                                  Success Rate
+
+
+
+
+placement tasks (e.g., “place book in front compartment”),                   0.4
+                                                                                                                              0.4
+where DISC scores 46–56% vs. π0.5 ’s 75–95%. Since DISC                      0.2                                              0.2
+achieves 96–100% on other book-placement tasks (left/back
+                                                                             0.0                                              0.0
+compartments), the gap reflects motor precision of the compact                      0    200     400     600    800    1000         0      200     400    600     800    1000
+MLP target policy for specific spatial targets, rather than a                              Demo Count: 10                                    Demo Count: 20
+language-grounding failure.                                                  0.8                                              0.8
+                                                                  Success Rate
+
+
+
+
+      c) Broader LIBERO Suite Evaluation: We further test                    0.6                                              0.6
+whether DISC remains competitive on the standard LIBERO-                     0.4                                              0.4
+Spatial, LIBERO-Object, and LIBERO-Goal suites under a                       0.2                                              0.2
+broader joint-training setting. As shown in Table II, DISC                   0.0                                              0.0
+                                                                                    0    200     400     600    800    1000         0      200     400    600     800    1000
+achieves the highest overall success rate of 98.7%, slightly                                   Finetune Steps                                    Finetune Steps
+exceeding both pretrained reference models despite using
+                                                                    Fig. 4: Few-Shot Adaptation Efficiency on LIBERO-Spatial.
+no large-scale pretraining. DISC performs best on LIBERO-
+                                                                    The plots show success rate over 1000 fine-tuning steps, with
+Spatial (99.2%) and LIBERO-Object (99.4%), while π0.5
+                                                                    K ∈ {1, 3, 10, 20} demonstrations. DISC shows better sample
+obtains the highest score on LIBERO-Goal (98.0%). These
+                                                                    efficiency than state-of-the-art baselines like Octo and DP.
+results provide an additional cross-suite check that the de-
+coupled architecture remains competitive beyond LIBERO-90,
+rather than being tailored to a single benchmark split.             trol benefits diverse manipulation primitives across task cate-
+      d) Results on Meta-World: Meta-World results (Ta-             gories, not just specific tasks in isolation.
+ble III) confirm that DISC’s advantages generalize across
+benchmarks. While simple open&close tasks saturate near             C. Few-Shot Adaptation to Unseen Tasks (RQ2)
+100% for most methods, DISC shows clear improvements on                We evaluate the adaptation efficiency of DISC on held-out
+tasks requiring precise object manipulation (pick&place:            LIBERO-Spatial tasks. This experiment assesses whether the
++5.0% over Octo) and complex action sequences (others:              structured parameter manifold learned by our hypernetwork
++2.9%). The consistent performance across categories demon-         enables efficient transfer to novel tasks under varying data
+strates that decoupling instruction from state-conditioned con-     budgets (K ∈ {1, 3, 10, 20} demonstrations).
+      a) Adaptation Protocol: Our adaptation protocol ensures       TABLE IV: Semantic grounding under linguistic variation. All
+a rigorous comparison across architectures. For Hypernetwork-       methods are retrained with paraphrased data and evaluated on
+based methods, we query the frozen hypernetwork with the            held-out descriptions. DISC maintains higher success rates, in-
+new instruction to generate a policy initialization θπinit , then   dicating that the decoupled architecture grounds task meaning
+fine-tune only the generated parameters. For entangled base-        rather than memorizes specific phrasings.
+lines, we adopt the standard LoRA [12] strategy. To maintain         Dataset      Octo   VQ-BeT   DP     DiT    H-Zero   H-Gen   DISC
+fairness, the trainable parameter count for LoRA adapters is
+                                                                     LIBERO-90    80.6    76.4    34.5   29.7    66.4    45.9    85.4
+matched (≈ 0.74M) to that of our generated policies. All             Meta-World   90.3    85.9    49.5   23.3    79.2    83.1    91.8
+methods are optimized using the same loss and optimizer for
+1,000 gradient steps. We report the success rate evaluated at
+key checkpoints across different fine-tuning steps, averaged
+over 20 evaluation episodes per task.
+      b) Results and Analysis: Figure 4 highlights DISC’s
+superior sample efficiency across diverse data regimes. No-
+tably, in the extreme few-shot setting (K = 1, 3), DISC
+achieves non-trivial success rates where diffusion-based meth-
+ods (DP, DiT) struggle near 0% performance. With very few
+demonstrations, entangled architectures lack sufficient data to
+disentangle task specification from state observation, causing
+the optimization to collapse onto spurious visual correlations.
+DISC’s decoupled architecture sidesteps this failure: because       Fig. 5: t-SNE visualization of generated policy parameters.
+the hypernetwork has already encoded task semantics into            Semantically similar tasks cluster based on functional mean-
+the generated initialization, fine-tuning only needs to adjust      ing, indicating that the hypernetwork maps linguistic task
+visuomotor precision rather than learn task identity from           specifications to a structured parameter manifold.
+scratch. Furthermore, DISC demonstrates rapid convergence:
+as seen in the K = 10 and K = 20 plots, our performance
+curve rises sharply within the first 200 steps, significantly       and visual tokens share processing stages, allowing the net-
+outpacing baselines like Octo which exhibit a slower “warm-         work to form spurious associations between particular word
+up” phase. This confirms that the hypernetwork provides a se-       tokens and visual features. When phrasing changes, these
+mantically informed initialization near the task-optimal region,    associations break.
+transforming adaptation from a global search over an entangled            b) Parameter Space Visualization: Figure 5 visualizes
+parameter space into a local refinement of a compact, well-         the generated parameter manifold via t-SNE [23], revealing
+initialized policy. See the appendix for additional results.        that the hypernetwork organizes policy parameters by func-
+                                                                    tional semantics rather than visual similarity. We observe three
+D. Language Grounding and Structure Analysis (RQ3)                  key properties: (1) Action-Type Separation: A macroscopic
+     a) Semantic Grounding under Linguistic Variation: A            distinction exists between articulated object manipulation
+central claim of DISC is that the hypernetwork learns to            (Tasks 1–8, central cluster) and pick-and-place tasks (Tasks
+extract task semantics from language, not memorize surface-         10–24, periphery), indicating the capture of high-level control
+level token patterns. To test this, all methods are retrained       primitives in the generated weights. (2) Functional Grouping:
+under identical conditions using augmented language data:           The central cluster further separates tasks by object affordance,
+50 paraphrased instructions per task (e.g., “pick up the red        distinguishing Cabinet/Drawer interactions (Tasks 5–8) from
+block” → “grab the crimson cube”), and then evaluated on 10         Stove and Microwave operations. (3) Semantic Continuity:
+additional held-out descriptions not seen during training. This     Inverse operations, such as Turn On/Off Stove (Tasks 1–2) and
+measures each architecture’s ability to map diverse phrasings       Open/Close Microwave (Tasks 3–4), are mapped as nearest
+of the same task to functionally equivalent control behavior        neighbors. This topology confirms that the hypernetwork has
+– a test of whether the model grounds task meaning rather           learned a mapping where semantic proximity in language
+than memorizes specific wording. As shown in Table IV,              corresponds to geometric proximity in the weight manifold.
+DISC achieves the highest performance on both benchmarks:           This structure directly explains the few-shot adaptation advan-
+85.4% on LIBERO-90 (vs. Octo’s 80.6%) and 91.8% on Meta-            tages observed in Section V-C: novel tasks with semantically
+World (vs. Octo’s 90.3%). This result follows naturally from        similar instructions receive nearby initializations, reducing the
+DISC’s architecture. Because the hypernetwork must decode           distance that fine-tuning must traverse.
+an instruction into a complete set of target policy parameters
+– the only channel through which language influences the            E. Real-World Deployment (RQ4)
+task-specific action mapping – it is incentivized to extract the      The simulation experiments establish DISC ’s advantages
+underlying task specification rather than relying on specific       under controlled conditions. We now evaluate whether the
+lexical patterns. In entangled architectures, language tokens       decoupling principle transfers to physical robot settings, where
+TABLE V: Real-world performance on 9 combinatorial tasks.           Apple → Large Red Bowl vs. Small Gray Bowl) – precisely
+The setup involves picking one of 3 target objects into             the failure mode predicted when visual context rather than
+one of 3 containers in a cluttered scene where visual con-          language determines behavior. DISC mitigates both failure
+text is shared across all tasks. Success rates (%) averaged         modes: the decoupled architecture ensures that task identity
+over 30 episodes. (Abbr: R.A.=Red Apple, G.A.=Green Ap-             is encoded entirely in the generated parameters, eliminating
+ple, W.M.=Watermelon; S.G.=Small Gray, L.R.=Large Red,              observation leakage, while the refinement module provides the
+L.G.=Light Gray).                                                   parameter precision needed for reliable physical execution.
+ ID Instruction (Obj → Container) H-Zero      DP     Octo DISC           a) Real-World Failure Analysis: DISC’s only sub-
+                                                                    baseline result is on Task 05 (G.A. → L.R. Bowl, 53.3%),
+ 01        R.A. → S.G. Bowl           73.3    60.0   73.3 96.7      where the gripper tends to grasp the apple at suboptimal
+ 02        R.A. → L.R. Bowl           10.0    23.3   53.3 83.3
+ 03        R.A. → L.G. Box            13.3    33.3   70.0 90.0      positions, leading to drops during transport. Notably, DISC
+ 04        G.A. → S.G. Bowl            3.3    43.3   80.0 93.3      achieves 93.3% and 100% on the other two Green Apple tasks
+ 05        G.A. → L.R. Bowl            6.7    56.7   73.3 53.3      (04, 06) and 83.3% on the same target container with a dif-
+ 06        G.A. → L.G. Box             0.0    76.7   83.3 100.0     ferent object (Task 02), confirming that the failure stems from
+ 07        W.M. → S.G. Bowl           36.7    53.3   90.0 90.0      execution-level imprecision rather than a language-grounding
+ 08        W.M. → L.R. Bowl           16.7    96.7   93.3 86.7
+ 09        W.M. → L.G. Box            26.7    66.7   96.7 83.3
+                                                                    error. This indicates that the current bottleneck is the compact
+                                                                    MLP target policy, which can be insufficient for physically
+      Average Success Rate (%)        18.5    57.0 78.5    86.4     demanding placements. Generating more expressive target
+                                                                    policies (e.g., diffusion- or flow-based) is a promising direction
+                                                                    for further improving precision and robustness.
+richer visual correlations, increased perceptual noise, and         Summary. Across simulation and real-world settings, our
+narrower grounding margins exacerbate observation leakage.          experiments confirm that decoupling instruction from state-
+   We evaluate DISC on the combinatorial benchmark de-              conditioned control yields consistent improvements in multi-
+scribed in Section V-A, which provides a direct test of ob-         task performance, few-shot adaptation, semantic grounding,
+servation leakage on a physical robot. The 9 tasks are formed       and physical deployment. These advantages scale with task
+by the Cartesian product of 3 distinct objects (Red Apple,          complexity and visual ambiguity – precisely the conditions
+Green Apple, Watermelon) and 3 target containers (Small             under which task-state entanglement is most damaging, and
+Gray Bowl, Large Red Bowl, Light Gray Box), all presented           where DISC’s architectural guarantees are most valuable.
+simultaneously in a cluttered workspace with distractors. This
+setting is particularly revealing: because the same objects                               VI. C ONCLUSION
+and containers are present in every task, visual context is
+nearly identical across all 9 tasks. A policy that has learned         The central finding of this work is that where language
+scene-to-action mappings through observation leakage will           enters a policy architecture matters more than how it is
+systematically confuse tasks that share visual context, while       encoded. Task-state entanglement is not merely a training
+a policy whose behavior is determined by language-generated         problem solvable with more data or larger models – it
+policy parameters will distinguish them correctly.                  is a structural property of shared-parameter designs. DISC
+   As shown in Table V, DISC achieves the highest average           demonstrates that generating task-specific policy parameters
+success rate, outperforming all baselines by clear margins.         from language blocks the shared action-mapping pathway
+Qualitative analysis reveals distinct failure modes that align      behind this entanglement, recovering instruction grounding,
+with our theoretical framework. HyperZero frequently fails          generalization, and few-shot adaptation beyond what scaling
+due to spatial precision errors (e.g., “air grasps”), indicating    entangled architectures has achieved. The learned parameter
+that without the iterative refinement stage, the generated pa-      manifold organizes tasks as geometric neighbors in weight
+rameters lack sufficient fidelity for precise physical control –    space without explicit supervision, suggesting that decoupling
+validating the architectural contribution of our optimization-      unlocks structure entangled architectures cannot express. In
+inspired refinement module. Entangled baselines exhibit a           practice, DISC is most attractive when reliable grounding,
+qualitatively different failure: Octo and DP often achieve cor-     efficient control, and adaptation from limited robot data are
+rect localization but suffer from orientation misalignment, sug-    primary requirements. Large pretrained VLAs remain com-
+gesting that their shared representations have learned coarse       plementary: they are well suited to data-rich and compute-rich
+scene-to-action associations rather than precise language-          settings where broad pretraining can be fully exploited.
+driven control. This is the signature of observation leakage:       Limitations. The main practical trade-off of DISC lies on
+the policy partially succeeds by mapping visual context to          the training side, where it can require more memory and
+approximate actions, but fails when the task requires fine-         longer optimization than comparable static policies. Under-
+grained distinctions that only language can resolve. Notably,       specified instructions may also surface uncertainty rather than
+Octo performs well on visually distinctive tasks (e.g., Task 09,    being silently resolved through observation leakage, motivat-
+Watermelon → Light Gray Box) but degrades sharply on                ing future work on more efficient refinement, uncertainty-
+tasks requiring subtle container distinctions (e.g., Task 02, Red   aware clarification, and broader multi-modal extensions.
+                   ACKNOWLEDGMENTS                              [11] Jonathan Ho, Ajay Jain, and Pieter Abbeel. Denoising
+  This work is supported by the Early Career Scheme of the           diffusion probabilistic models. Advances in neural infor-
+Research Grants Council (RGC) grant # 27207224, the HKU-             mation processing systems, 33:6840–6851, 2020.
+100 Award, a donation from the Musketeers Foundation, and in    [12] Edward J Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-
+part by the JC STEM Lab of Autonomous Intelligent Systems            Zhu, Yuanzhi Li, Shean Wang, Lu Wang, Weizhu Chen,
+funded by The Hong Kong Jockey Club Charities Trust.                 et al. Lora: Low-rank adaptation of large language
+                                                                     models. ICLR, 1(2):3, 2022.
+                       R EFERENCES                              [13] Huang Huang, Fangchen Liu, Letian Fu, Tingfan Wu,
+ [1] Iñigo Alonso, Gorka Azkune, Ander Salaberria, Jeremy           Mustafa Mukadam, Jitendra Malik, Ken Goldberg, and
+     Barnes, and Oier Lopez de Lacalle. Vision-language              Pieter Abbeel. Otter: A vision-language-action model
+     models struggle to align entities across modalities. In         with text-aware feature extraction.       arXiv preprint
+     Findings of the Association for Computational Linguis-          arXiv:2503.03734, 2025.
+     tics: ACL 2025, pages 18846–18862, Vienna, Austria,        [14] Yizhou Huang, Kevin Xie, Homanga Bharadhwaj, and
+     July 2025. Association for Computational Linguistics.           Florian Shkurti. Continual model-based reinforcement
+     URL https://aclanthology.org/2025.findings-acl.965.             learning with hypernetworks. In 2021 IEEE International
+ [2] Jacob Beck, Matthew Thomas Jackson, Risto Vuorio, and           Conference on Robotics and Automation (ICRA), pages
+     Shimon Whiteson. Hypernetworks in meta-reinforcement            799–805. IEEE, 2021.
+     learning. In Conference on Robot Learning, pages 1478–     [15] Physical Intelligence, Kevin Black, Noah Brown, James
+     1487. PMLR, 2023.                                               Darpinian, Karan Dhabalia, Danny Driess, Adnan Es-
+ [3] Kevin Black, Noah Brown, Danny Driess, Adnan Es-                mail, Michael Equi, Chelsea Finn, Niccolo Fusai, et al.
+     mail, Michael Equi, Chelsea Finn, Niccolo Fusai, Lachy          pi 0.5: a vision-language-action model with open-world
+     Groom, Karol Hausman, Brian Ichter, et al. pi 0 :               generalization. arXiv preprint arXiv:2504.16054, 2025.
+     A vision-language-action flow model for general robot      [16] Tsung-Wei Ke, Nikolaos Gkanatsios, and Katerina
+     control. arXiv preprint arXiv:2410.24164, 2024.                 Fragkiadaki. 3d diffuser actor: Policy diffusion with 3d
+ [4] Anthony Brohan, Noah Brown, Justice Carbajal, Yev-              scene representations. arXiv preprint arXiv:2402.10885,
+     gen Chebotar, Joseph Dabis, Chelsea Finn, Keerthana             2024.
+     Gopalakrishnan, Karol Hausman, Alex Herzog, Jasmine        [17] Moo Jin Kim, Karl Pertsch, Siddharth Karamcheti, Ted
+     Hsu, et al. Rt-1: Robotics transformer for real-world           Xiao, Ashwin Balakrishna, Suraj Nair, Rafael Rafailov,
+     control at scale. arXiv preprint arXiv:2212.06817, 2022.        Ethan Foster, Grace Lam, Pannag Sanketi, et al. Openvla:
+ [5] Qingwen Bu, Yanting Yang, Jisong Cai, Shenyuan Gao,             An open-source vision-language-action model. arXiv
+     Guanghui Ren, Maoqing Yao, Ping Luo, and Hongyang               preprint arXiv:2406.09246, 2024.
+     Li. Univla: Learning to act anywhere with task-centric     [18] Chengmeng Li, Junjie Wen, Yaxin Peng, Yan Peng, and
+     latent actions. arXiv preprint arXiv:2505.06111, 2025.          Yichen Zhu. Pointvla: Injecting the 3d world into vision-
+ [6] Cheng Chi, Zhenjia Xu, Siyuan Feng, Eric Cousineau,             language-action models. IEEE Robotics and Automation
+     Yilun Du, Benjamin Burchfiel, Russ Tedrake, and Shuran          Letters, 11(3):2506–2513, 2026.
+     Song. Diffusion policy: Visuomotor policy learning via     [19] Xinghang Li, Minghuan Liu, Hanbo Zhang, Cunjun Yu,
+     action diffusion. The International Journal of Robotics         Jie Xu, Hongtao Wu, Chilam Cheang, Ya Jing, Weinan
+     Research, page 02783649241273668, 2023.                         Zhang, Huaping Liu, et al. Vision-language foundation
+ [7] Jacob Devlin, Ming-Wei Chang, Kenton Lee, and                   models as effective robot imitators. arXiv preprint
+     Kristina Toutanova. Bert: Pre-training of deep bidi-            arXiv:2311.01378, 2023.
+     rectional transformers for language understanding. In      [20] Bo Liu, Yifeng Zhu, Chongkai Gao, Yihao Feng, Qiang
+     Proceedings of the 2019 Conference of the North Amer-           Liu, Yuke Zhu, and Peter Stone. Libero: Benchmarking
+     ican Chapter of the Association for Computational Lin-          knowledge transfer for lifelong robot learning. Advances
+     guistics, pages 4171–4186. Association for Computa-             in Neural Information Processing Systems, 36:44776–
+     tional Linguistics, 2019. URL https://aclanthology.org/         44791, 2023.
+     N19-1423.                                                  [21] Songming Liu, Lingxuan Wu, Bangguo Li, Hengkai Tan,
+ [8] Chelsea Finn, Pieter Abbeel, and Sergey Levine. Model-          Huayu Chen, Zhengyi Wang, Ke Xu, Hang Su, and Jun
+     agnostic meta-learning for fast adaptation of deep net-         Zhu. Rdt-1b: a diffusion foundation model for bimanual
+     works. In International conference on machine learning,         manipulation. arXiv preprint arXiv:2410.07864, 2024.
+     pages 1126–1135. PMLR, 2017.                               [22] Zhining Liu, Ziyi Chen, Hui Liu, Chen Luo, Xianfeng
+ [9] David Ha, Andrew Dai, and Quoc V Le. Hypernetworks.             Tang, Suhang Wang, Joy Zeng, Zhenwei Dai, Zhan Shi,
+     arXiv preprint arXiv:1609.09106, 2016.                          Tianxin Wei, Benoit Dumoulin, and Hanghang Tong.
+[10] Siddhant Haldar, Zhuoran Peng, and Lerrel Pinto. Baku:          Seeing but not believing: Probing the disconnect between
+     An efficient transformer for multi-task policy learning.        visual attention and answer correctness in VLMs. arXiv
+     Advances in Neural Information Processing Systems, 37:          preprint arXiv:2510.17771, 2025.
+     141208–141239, 2024.                                       [23] Laurens van der Maaten and Geoffrey Hinton. Visu-
+     alizing data using t-sne. Journal of machine learning             networks for zero-shot transfer in reinforcement learning.
+     research, 9(Nov):2579–2605, 2008.                                 In Proceedings of the AAAI Conference on Artificial
+[24] Ankan Mullick, Saransh Sharma, Abhik Jana, and Pawan              Intelligence, volume 37, pages 9579–9587, 2023.
+     Goyal. Text takes over: A study of modality bias in          [35] Olaf Ronneberger, Philipp Fischer, and Thomas Brox.
+     multimodal intent detection. In Proceedings of the 2025           U-net: Convolutional networks for biomedical image
+     Conference on Empirical Methods in Natural Language               segmentation. In International Conference on Medical
+     Processing, pages 24040–24070, Miami, Florida, USA,               image computing and computer-assisted intervention,
+     November 2025. Association for Computational Lin-                 pages 234–241. Springer, 2015.
+     guistics. URL https://aclanthology.org/2025.emnlp-main.      [36] Adam Santoro, Sergey Bartunov, Matthew Botvinick,
+     1226.                                                             Daan Wierstra, and Timothy Lillicrap. Meta-learning
+[25] Anupam Pani and Yanchao Yang. Gaze-vlm: Bridging                  with memory-augmented neural networks. In Interna-
+     gaze and vlms through attention regularization for ego-           tional conference on machine learning, pages 1842–
+     centric understanding. arXiv preprint arXiv:2510.21356,           1850. PMLR, 2016.
+     2025.                                                        [37] Nur Muhammad Shafiullah, Zichen Cui, Ariuntuya Arty
+[26] William Peebles and Saining Xie.           Scalable diffu-        Altanzaya, and Lerrel Pinto. Behavior transformers:
+     sion models with transformers. In Proceedings of the              Cloning k modes with one stone. Advances in neural
+     IEEE/CVF international conference on computer vision,             information processing systems, 35:22955–22968, 2022.
+     pages 4195–4205, 2023.                                       [38] Jake Snell, Kevin Swersky, and Richard Zemel. Prototyp-
+[27] Ethan Perez, Florian Strub, Harm De Vries, Vincent                ical networks for few-shot learning. Advances in neural
+     Dumoulin, and Aaron Courville. Film: Visual reasoning             information processing systems, 30, 2017.
+     with a general conditioning layer. In Proceedings of the     [39] Jiaming Song, Chenlin Meng, and Stefano Ermon.
+     AAAI conference on artificial intelligence, volume 32,            Denoising diffusion implicit models. arXiv preprint
+     2018.                                                             arXiv:2010.02502, 2020.
+[28] Alec Radford, Jong Wook Kim, Chris Hallacy, Aditya           [40] Jiaqi Tang, Yinsong Xu, Yang Liu, and Qingchao Chen.
+     Ramesh, Gabriel Goh, Sandhini Agarwal, Girish Sastry,             Shaping initial state prevents modality competition in
+     Amanda Askell, Pamela Mishkin, Jack Clark, Gretchen               multi-modal fusion: A two-stage scheduling framework
+     Krueger, and Ilya Sutskever. Learning transferable visual         via fast partial information decomposition. arXiv preprint
+     models from natural language supervision. In Proceed-             arXiv:2509.20840, 2025.
+     ings of the 38th International Conference on Machine         [41] Octo Model Team, Dibya Ghosh, Homer Walke, Karl
+     Learning, volume 139, pages 8748–8763. PMLR, 2021.                Pertsch, Kevin Black, Oier Mees, Sudeep Dasari, Joey
+     URL https://proceedings.mlr.press/v139/radford21a.html.           Hejna, Tobias Kreiman, Charles Xu, et al. Octo: An
+[29] Colin Raffel, Noam Shazeer, Adam Roberts, Katherine               open-source generalist robot policy. arXiv preprint
+     Lee, Sharan Narang, Michael Matena, Yanqi Zhou, Wei               arXiv:2405.12213, 2024.
+     Li, and Peter J Liu. Exploring the limits of transfer        [42] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob
+     learning with a unified text-to-text transformer. Journal         Uszkoreit, Llion Jones, Aidan N Gomez, Łukasz Kaiser,
+     of machine learning research, 21(140):1–67, 2020.                 and Illia Polosukhin. Attention is all you need. Advances
+[30] Scott Reed, Konrad Zolna, Emilio Parisotto, Ser-                  in neural information processing systems, 30, 2017.
+     gio Gomez Colmenarejo, Alexander Novikov, Gabriel            [43] Tianhe Yu, Deirdre Quillen, Zhanpeng He, Ryan Julian,
+     Barth-Maron, Mai Gimenez, Yury Sulsky, Jackie Kay,                Karol Hausman, Chelsea Finn, and Sergey Levine. Meta-
+     Jost Tobias Springenberg, et al. A generalist agent. arXiv        world: A benchmark and evaluation for multi-task and
+     preprint arXiv:2205.06175, 2022.                                  meta reinforcement learning. In Conference on robot
+[31] Hanxiang Ren, Li Sun, Xulong Wang, Pei Zhou, Zewen                learning, pages 1094–1100. PMLR, 2020.
+     Wu, Siyan Dong, Difan Zou, Youyi Zheng, and Yanchao          [44] Yanjie Ze, Gu Zhang, Kangning Zhang, Chenyuan Hu,
+     Yang. Hypogen: Optimization-biased hypernetworks for              Muhan Wang, and Huazhe Xu. 3d diffusion policy:
+     generalizable policy generation. In The Thirteenth Inter-         Generalizable visuomotor policy learning via simple 3d
+     national Conference on Learning Representations, 2025.            representations. arXiv preprint arXiv:2403.03954, 2024.
+[32] Moritz Reuss, Maximilian Li, Xiaogang Jia, and Rudolf        [45] Wenyao Zhang, Hongsi Liu, Zekun Qi, Yunnan Wang,
+     Lioutikov.    Goal-conditioned imitation learning us-             Xinqiang Yu, Jiazhao Zhang, Runpei Dong, Jiawei He,
+     ing score-based diffusion policies.        arXiv preprint         Fan Lu, He Wang, et al. Dreamvla: a vision-language-
+     arXiv:2304.02532, 2023.                                           action model dreamed with comprehensive world knowl-
+[33] Moritz Reuss, Jyothish Pari, Pulkit Agrawal, and Rudolf           edge. arXiv preprint arXiv:2507.04447, 2025.
+     Lioutikov. Efficient diffusion transformer policies with     [46] Pei Zhou and Yanchao Yang. Maxmi: A maximal mutual
+     mixture of expert denoisers for multitask learning. arXiv         information criterion for manipulation concept discovery.
+     preprint arXiv:2412.12953, 2024.                                  In European Conference on Computer Vision, pages 88–
+[34] Sahand Rezaei-Shoshtari, Charlotte Morissette, Fran-              105. Springer, 2024.
+     cois R Hogan, Gregory Dudek, and David Meger. Hyper-         [47] Pei Zhou, Ruizhe Liu, Qian Luo, Fan Wang, Yibing
+     Song, and Yanchao Yang. Autocgp: Closed-loop concept-
+     guided policies from unlabeled demonstrations. In The
+     Thirteenth International Conference on Learning Repre-
+     sentations, 2025.
+[48] Pei Zhou, Wanting Yao, Qian Luo, Xunzhe Zhou, and
+     Yanchao Yang. Hyper-goalnet: Goal-conditioned manip-
+     ulation policy learning with hypernetworks. Advances
+     in Neural Information Processing Systems, 38:83438–
+     83469, 2026.
+[49] Brianna Zitkovich, Tianhe Yu, Sichun Xu, Peng Xu,
+     Ted Xiao, Fei Xia, Jialin Wu, Paul Wohlhart, Stefan
+     Welker, Ayzaan Wahid, et al. Rt-2: Vision-language-
+     action models transfer web knowledge to robotic control.
+     In Conference on Robot Learning, pages 2165–2183.
+     PMLR, 2023.
+                      A PPENDIX A                                  LIBERO-90: Contains 90 tasks in total.
+             P ROBLEM F ORMULATION D ETAILS                        • Easy (11 tasks): Single-object manipulation.
+A. State and Action Spaces                                         • Medium (35 tasks): Multi-object coordination.
+   The state space S ⊆ RH×W ×C × Rds consists of:                  • Long (44 tasks): Sequential multi-step goals.
+
+• RGB images It ∈ R
+                        H×W ×C
+                                  with resolution H × W and        Please refer to Appendix L-A for the complete list of all 90
+  C = 3 color channels. Specifically, in LIBERO-90 experi-         tasks.
+  ments, an additional gripper-view image is also included.        Meta-World ML45: Contains 45 training tasks covering pick-
+                               d                                   place, push, press, and open-close interactions. The full list is
+• Proprioceptive state st ∈ R s including end-effector pose
+  and gripper state.                                               provided in Appendix L-B.
+   The continuous action space A ⊆ Rda represents target
+joint velocities or end-effector displacements, depending on       B. Sampling Strategy
+the control mode. The transition dynamics T : S ×A → ∆(S),            For all the experiments, we first construct a global list
+where ∆(S) denotes the probability simplex over S, capture         of all transitions across the dataset, where each entry is a
+the stochastic nature of manipulation tasks.                       tuple (task, episode, timestep). At training time, each batch is
+                                                                   formed by uniformly sampling transitions from this list.
+B. Dataset Structure
+                                                                      For language augmentation experiments in the main paper,
+  Each demonstration trajectory ξji has a horizon Tji and          we use the same transition-level sampling strategy. In addition,
+consists of:                                                       for each sampled transition we randomly draw a paraphrased
+                  i,j
+• Observations ot     = (Iti,j , si,j
+                                  t ) combining visual and pro-    instruction from that task’s pool of 50 paraphrases, so the
+  prioceptive information.                                         model sees diverse linguistic realizations of the same under-
+                    i,j
+• Expert actions at ∈ A recorded from human demonstra-             lying task during training.
+  tions or privileged controllers.
+• Language instruction li describing the task goal in natural      C. Baseline Implementation Details
+  language.                                                          We compare against six state-of-the-art methods across two
+                     A PPENDIX B                                   categories:
+E XAMPLES OF TASK -S TATE E NTANGLED A RCHITECTURES                Task-state Entangled Methods:
+   Modern language-conditioned robotic policies employ var-        • Octo [41]: Transformer processing concatenated language-
+
+ious forms of task-state entanglement:                               vision tokens with self-attention mechanism.
+   Transformer-based Fusion. Policies like Octo [41] tok-          • VQ-BeT [37]: Vector-quantized behavior transformer using
+enize both language and visual inputs, concatenating them            self-attention mechanism.
+into a single sequence for processing. The self-attention          • Diffusion Policy [6]: UNet-based diffusion with FiLM
+mechanism allows arbitrary interactions between language and         conditioning for language and observation information.
+visual tokens, creating entangled representations throughout       • DiT [6]: Diffusion transformer using cross-attention for
+the network depth.                                                   language and observation information.
+   Diffusion-based Fusion. Diffusion Policies [6] typically        Hypernetwork Methods:
+incorporate language by concatenating embeddings with visual
+                                                                   • HyPoGen [31]: Iterative hypernetwork with optimization
+features or inputs, followed by architecture-specific condition-
+                                                                     bias to decode the policy parameters from the language
+ing mechanisms:
+                                                                     embedding.
+• FiLM conditioning: Language embeddings modulate visual
+                                                                   • HyperZero [34]: Direct MLP mapping from language to pa-
+   features through affine transformations when using U-Net-         rameters to decode the policy parameters from the language
+   based diffusion policies.                                         embedding.
+• Cross-attention: Action denoising queries attend to both
+   language and visual keys when using transformer-based             All baselines are implemented in PyTorch with the follow-
+   diffusion policies (DiT).                                       ing specifications:
+                                                                   Shared Components:
+   In all cases, the action prediction emerges from representa-
+                                                                   • Visual encoder: ResNet-18 pretrained on ImageNet, fine-
+tions where language and vision have been deeply intertwined
+through non-linear transformations, making it difficult to iso-      tuned during training.
+late their individual contributions.                               • Language encoder: T5-small encoder [29], and is kept
+                                                                     frozen during training in LIBERO-90 and Meta-World ex-
+                     A PPENDIX C                                     periments.
+         E NVIRONMENTAL S ETUP AND BASELINES                       • Action space: 6-DoF end-effector delta and 1-dim state of
+A. Task Statistics Overview                                          gripper for LIBERO, 3-DOF end-effector delta and 1-dim
+ We evaluate on two benchmarks: LIBERO-90 and Meta-                  gripper for Meta-World.
+World ML45.                                                        Model-Specific Details:
+•  Octo: 8-layer transformer, 8 attention heads, hidden dim                  These pseudo-gradients are not true gradients of an explicit
+   512.                                                                      loss function but learned signals that guide parameter updates
+• VQ-BeT: Codebook size 16 with 2 groups, 8-layer trans-                     toward task-specific optima.
+   former, 8 attention heads, hidden dim 488.                                   Meta-Update Network: Finally, a meta-update network
+• Diffusion Policy: 100 denoising steps, DDIM sampler,                       computes the parameter update:
+   FiLM conditioning, down-scale dims [128, 256, 512], and                                          
+                                                                                                             ∂L        ∂L
+                                                                                                                                  
+                                                                                          t            t
+   timestep embedding dim 256.                                                        ∆θ = FMeta θπ , el ,       ,...,     ; ϕ2,m      (14)
+                                                                                                            ∂zn        ∂z1
+• DiT: 8-layer diffusion transformer, cross-attention for lan-
+   guage and observation.                                                    The complete refinement module parameters are denoted as
+                                                                             ϕ2 = {ϕ2,f , ϕ2,b , ϕ2,m }. This design allows the hypernetwork
+• HyPoGen: 3 refinement blocks, hidden dim 32.
+                                                                             to learn task-specific optimization trajectories in parameter
+• HyperZero: 5-layer MLP hypernetwork, hidden dim 48,
+                                                                             space, effectively performing learned optimization tailored to
+   ReLU activations.
+                                                                             each language instruction.
+   For all hypernet-based methods, we use the same policy                       Attention-Based Implementation Details: Our forward
+network of a 5-layer MLP with hidden dim 320, resulting in                   and backward pass simulators leverage cross-attention mech-
+a total parameter of around 0.74M in LIBERO and real-world                   anisms to model neural gradient computation through tok-
+experiments, and 0.57M in Meta-World experiments.                            enized representations. We tokenize parameter matrices θi
+   To ensure a fair comparison, we maintain a consistent model               of layer i row-wise as ω i = {ω1 , ω2 , . . . , ωni } using
+capacity across all methods above, with approximately 30M                    MLP encoders, while activations zi are tokenized as τ i =
+trainable parameters.                                                        {τ1 , τ2 , . . . , τni } representing individual neurons. We use a
+Large-scale Pretrained Reference Models:                                     uniform d = 128 for all token representations in our
+• π0 : The official Pi-0 checkpoint [3], fine-tuned on LIBERO-               model. The forward simulator FForward implements layer-
+   90 to serve as a high-performance baseline.                               wise computation as τ i = CrossAttn(ω i , τ i−1 , τ i−1 ), where
+• π0.5 : The official Pi-0.5 checkpoint [15], fine-tuned on                  parameter tokens serve as queries attending over previ-
+   LIBERO-90 to serve as an additional reference point.                      ous layer activations with attention head dimension dk =
+                                                                             128. For backward pass simulation, FBackward estimates Ja-
+                      A PPENDIX D                                            cobians using Jθi = CrossAttn(τ i−1 , ω i , ω i ) and Jhi =
+         T RAINING AND I MPLEMENTATION D ETAILS                              CrossAttn(ω i , τ i−1 , τ i−1 ) for inter-layer dependencies. Chain
+A. Language Encoder                                                          rule computations are implemented via attention-based matrix
+  We employ T5-small [29] as our language encoder ΦL ,                       multiplications: ∂L/∂zi−1 = CrossAttn(∂L/∂zi , Jhi , Jhi ),
+mapping natural language instructions into 512-dimensional                   ensuring modality consistency by using upstream gradients as
+embeddings. Instructions are capped at a maximum length of                   queries while Jacobian estimates serve as both keys and values.
+32 tokens. To bridge the dimension gap, an additional learned                Each cross-attention module employs 4 attention heads with 1
+projection network aligns these language embeddings with the                 layer, enabling the model to capture fine-grained dependency
+hypernetwork’s task-conditioning space.                                      structures essential for effective parameter generation.
+                                                                             C. Architectural Design Choices
+B. Neural Gradient Estimation and Update Module
+                                                                                The WIN can be implemented as either a multi-layer per-
+   The iterative refinement module (Stage 2) employs a so-
+                                                                             ceptron (MLP) or a Transformer, depending on the complexity
+phisticated neural gradient estimation mechanism inspired by
+                                                                             of the target network. In our experiments, we employ a 4-layer
+meta-learning. It is important to note that this is not a true
+                                                                             transformer with cross-attention blocks for the WIN.
+optimization process, but a learned process that mimics the op-
+timization process. At each refinement step t ∈ {0, . . . , T −1},           D. Training Details
+the module simulates an optimization process through three
+                                                                             Visual Data Augmentation: During training, we apply stan-
+sub-networks:
+                                                                             dard visual augmentations including random resized crops and
+   Forward Pass Simulation: The module first simulates a                     color jittering to the input RGB images to improve policy
+forward pass through the target network to estimate task-                    robustness.
+specific activation patterns:                                                Optimization:
+               (z0 , . . . , zn ) = FForward (θπt , el ; ϕ2,f )      (12)    • Optimizer: We use the AdamW optimizer with a learning
+                                                                               rate of 1 × 10−4 , β1 = 0.9, β2 = 0.999, and a weight decay
+where zi represents estimated activations at layer i and ϕ2,f                  of 1 × 10−4 .
+are the forward simulator parameters.                                        • Learning Rate Schedule: A cosine annealing schedule is
+   Backward Pass Simulation: Next, it simulates a backward                     employed throughout the training.
+pass to compute pseudo-gradients:
+                                                                             • Training Stability: For DiT, we apply gradient clipping
+                  
+     ∂L        ∂L                                                              with a max norm of 1.0 to ensure stability. Other models
+         ,...,       = FBackward (θπt , el , z0 , . . . , zn ; ϕ2,b ) (13)
+     ∂zn       ∂z1                                                             do not require gradient clipping.
+Algorithm 1 Single Step Update for DISC                             TABLE VI: Computational cost breakdown for DISC and
+                                                                    baselines on an NVIDIA RTX 4090 GPU.
+    1: Input: Parameters θ (t−1) , task embedding el
+    2: Output: Updated parameters ∆θ (t−1)                            Component / Model                      Time (ms)      FPS
+    3: Tokenize parameters for each layer i’s parameter θi :
+                                                                      DISC Weight Gen.
+    4:   ωi ← Tokenize(θi )                                             (Full hypernet run)                     15.75      ∼ 64
+    5: Compute initial activation τ0 :                                DISC Target Net
+    6:   τ0 ← CrossAttn(learnable query, el , el )                      (Policy execution)                      0.13      ∼ 7422
+    7: Forward Pass Computation Using Cross-Attention:                HyPoGen Weight Gen.
+ 8:   τi ← CrossAttn(ωi , τi−1 , τi−1 )                                 (Full hypernet run)                     3.38       ∼ 295
+ 9: Backward Pass and Jacobian Estimation:                            End-to-End Control Loop
+       ∂zi
+10:   ∂z   ← CrossAttn(ωi , τi−1 , τi−1 )
+           i−1                                                        DISC (Ours)
+         ∂zi                                                                                                              ∼ 1485
+      ∂θi ← CrossAttn(τi−1 , ωi , ωi )
+11:                                                                     (Fastest control loop)                  0.67
+12: Gradient Computation:
+                                                                    HyPoGen
+          ∂L                ∂L     ∂zi     ∂zi                          (Same target net)                       0.67      ∼ 1485
+13:      ∂zi−1 ← CrossAttn ∂zi , ∂zi−1 , 
+                                          ∂zi−1
+                                                                      Octo
+                           ∂L ∂zi ∂zi
+14:      ∇ωi ← CrossAttn ∂z   ,     ,
+                             i ∂θi ∂θi
+                                                                        (One-pass transformer)                  1.86       ∼ 539
+15: Decode into θ space                                               Diffusion Policy
+16:      ∆θi ← MLP(∇ωi ) and proper reshape                             (Multi-step denoising)                 160.17       ∼6
+
+
+
+•   Precision: We utilize mixed-precision training (BF16) for       we optimize LoRA parameters attached to the backbone; for
+    all models to accelerate computation, with the exception of     hypernetwork-based architectures (including DISC), we fine-
+    DiT, which is trained in FP32 to avoid numerical instability.   tune the lightweight target policy generated by the frozen
+                                                                    hypernetwork.
+                         A PPENDIX E                                   While traditional methods like Low-Rank Adaptation
+           T RAINING & I NFERENCE C OST A NALYSIS                   (LoRA) [12] are effective for general adaptation, they face
+   DISC follows a “Generate Once, Act Many” paradigm:               specific challenges when applied to policies with task-state
+the hypernetwork generates the policy weights once per              entanglement. We compare the two approaches from the
+task/language instruction, after which only the lightweight         following perspectives:
+Target Network is used in the control loop. In Table VI,            • Decoupled vs. Entangled Updates: LoRA updates must
+we show the computation cost comparison between DISC                  navigate through the backbone’s entangled representations,
+with other baselines. DISC and HyPoGen share the same                 where modifications for new language instructions can inad-
+lightweight target network, so their control-loop inference           vertently affect established visuomotor features. In contrast,
+speed is effectively identical, both running comfortably in the       DISC operates in a decoupled parameter space, exclusively
+sub-millisecond regime. Both hypernetwork-based methods               updating the target policy θπ . This ensures that visual
+are substantially faster than monolithic architectures like Octo,     representation learning remains stable while allowing for
+and orders of magnitude faster than diffusion-based policies          rapid policy adaptation.
+such as Diffusion Policy. Although DISC employs a more              • Initialization Quality: Standard parameter-efficient meth-
+expressive hypernetwork and its weight generation is corre-           ods typically initialize updates from scratch. Conversely,
+spondingly slower, this cost remains real-time and is incurred        DISC leverages the frozen hypernetwork Hϕ to provide a
+only once per task. As a result, the weight-generation overhead       task-conditioned initialization. This places the optimization
+is negligible in the overall control budget, while DISC still         in a semantically informed region of the parameter space,
+enjoys the efficiency benefits of an extremely fast controller.       significantly reducing the adaptation effort compared to
+   DISC and HyPoGen share the same lightweight target                 learning offsets from a generic base model.
+network, so their control-loop inference speed is effectively
+identical. Both are substantially faster than monolithic ar-        B. Adaptation Algorithm Implementation
+chitectures like Octo, and orders of magnitude faster than             For few-shot adaptation with K demonstrations, we employ
+diffusion-based policies.                                           the procedure outlined in Algorithm 2.
+                           A PPENDIX F                                 The key insight is that the hypernetwork-generated initial-
+                                                                             (0)
+                 F EW-S HOT A DAPTATION D ETAILS                    ization θπ provides a strong task-specific prior. This positions
+                                                                    the optimization in a favorable region of the parameter space,
+A. Comparison with Parameter-Efficient Fine-Tuning                  enabling rapid convergence. The hypernetwork parameters ϕ
+   To ensure a fair comparison, we control the number of            remain frozen throughout this process, preserving the learned
+trainable parameters to be approximately the same (≈ 0.74M)         meta-knowledge. Typically, the adaptation converges within
+across all methods. Specifically, for entangled architectures,      50-200 gradient steps for K ∈ [1, 5].
+TABLE VII: Success rates (%) on the LIBERO-10 suite. Bold indicates the best result; underline indicates the second best,
+and the same convention applies hereafter.
+                        Demos            Steps            Octo   VQ-BeT        DP    DiT    H-Zero   H-Gen    DISC
+                        1                   0              3.5     3.0         3.0    1.0    0.0      0.0      3.0
+                                           50             12.5     9.0         1.0    2.0    13.5     3.5     16.0
+                                           200             9.5     15.5        0.0    0.0    10.0     14.0    16.0
+                                           500            10.5     11.0        0.0    1.0    13.0     19.0    24.0
+                                          1000            14.0     10.0        2.0    2.0    29.0     22.0    20.5
+                        3                  50             17.0     8.5         2.0    2.0    16.5     16.0    13.5
+                                           200            24.5     13.5        0.0    1.5    22.0     27.0    22.5
+                                           500            16.0     19.5        0.0    5.5    28.5     27.0    30.0
+                                          1000            17.5     25.5        0.0    3.0    34.5     26.0    30.0
+                        5                  50             11.5     11.0        2.0    1.0    23.0     17.0    19.0
+                                           200            27.5     19.5        0.5    3.0    22.0     18.0    21.5
+                                           500            28.0     29.0        0.0    1.5    30.0     21.0    24.0
+                                          1000            22.5     29.0        0.5    9.5    27.0     28.5    31.0
+                        10                 50             17.5     14.5        0.0    1.5    21.0     8.5     23.0
+                                           200            26.0     25.0        0.0    5.0    33.5     23.5    34.0
+                                           500            23.5     36.0        0.0    3.5    32.0     25.5    32.0
+                                          1000            32.5     39.0        0.0    5.0    38.0     33.5    38.5
+                        20                 50             21.5     16.5        0.0    1.5    30.0     16.0    29.0
+                                           200            24.5     20.0        0.0    5.5    35.5     34.5    33.0
+                                           500            29.5     34.0        0.0    6.0    41.0     43.5    27.5
+                                          1000            33.5     41.0        0.0    4.0    46.5     50.0    51.0
+                        Average Rank (Lower is Better)    3.62     3.52       6.57   6.00    2.33     3.43    2.14
+
+
+Algorithm 2 Few-Shot Adaptation for DISC                                  convergence. In the extremely low-data regime (e.g., K =
+Require: Novel task instruction lnew , demonstrations Dnew =              1 or K = 3), DISC often achieves non-trivial success rates
+    {ξj }K
+         j=1 , learning rate η
+                                                                          within just 50 to 200 gradient steps, whereas baselines like
+Ensure: Adapted policy parameters θπ∗                                     Octo typically require significantly more iterations or data to
+                                    (0)                                   achieve a better performance. For instance, in LIBERO-Goal
+ 1: Generate initial parameters: θπ ← Hϕ (ΦL (lnew ))
+ 2: Initialize optimizer (e.g., Adam)                                     (Table VIII) with only 1 demonstration, DISC reaches 38.5%
+ 3: for step t = 1 to Tmax do                                             success rate at 50 steps, significantly surpassing the baselines.
+ 4:     Sample batch B from DP    new
+                                                                             Comparison with Baselines. Previous strong baselines
+        Compute loss: L = |B|  1                                   2      like VQ-BeT perform well in specific domains (e.g., object-
+ 5:                                 (ok ,ak )∈B ∥π(ok ; θπ ) − ak ∥2
+ 6:     Update parameters: θπ ← θπ − η∇θπ L                               centric tasks). However, DISC surpasses VQ-BeT even on
+ 7: end for                                                               the LIBERO-Object suite (Avg Rank 2.30 vs. 2.58) while
+ 8: return θπ ∗
+                ← θπ                                                      maintaining a significant lead in spatial and goal-conditioned
+                                                                          tasks. Furthermore, DISC consistently outperforms the abla-
+                                                                          tion baseline H-Gen and H-Zero, validating the necessity and
+                                                                          effectiveness of the two-stage parameter generation.
+C. More Few-shot Adaptation Results
+    We present a comprehensive evaluation of few-shot adap-                                     A PPENDIX G
+tation performance across four LIBERO benchmark suites:                                 L ANGUAGE E NCODER A BLATION
+LIBERO-10, LIBERO-Goal, LIBERO-Object, and LIBERO-                           We further investigate how the choice of language encoder
+Spatial. The detailed success rates across varying numbers of             affects the quality of the generated policy parameters. Table XI
+demonstrations (K ∈ {1, 3, 5, 10, 20}) and adaptation steps               reports the success rates on LIBERO-90 when using different
+are reported in Tables VII, VIII, IX, and X.                              off-the-shelf encoders to obtain the task embedding el . DISC
+    Overall Performance and Ranking. As indicated by the                  achieves the highest performance when equipped with a T5-
+average rank metrics, DISC consistently outperforms baselines             small encoder (94.3%), while replacing T5-small with CLIP-
+across all task suites. Specifically, DISC achieves the best              base [28] or BERT-base [7] leads to notable degradation
+(lowest) average rank on LIBERO-10 (2.14), LIBERO-Goal                    (88.9% and 81.2%, respectively). We hypothesize that T5’s
+(1.57), LIBERO-Spatial (1.14), and LIBERO-Object (2.30).                  text-to-text pre-training objective provides richer semantic and
+This demonstrates the method’s superior robustness and versa-             syntactic structure, enabling the hypernetwork to construct
+tility across diverse manipulation tasks, regardless of whether           a more coherent parameter manifold from language input.
+the task requires long-horizon sequencing, precise spatial                In contrast, CLIP-base is primarily optimized for image-text
+positioning, or object manipulation.                                      alignment, and BERT-base focuses on masked-token predic-
+    Adaptation Efficiency. A key advantage of DISC is its rapid           tion, both of which offer weaker task-level semantics for
+                                     TABLE VIII: Success rates (%) on LIBERO-goal suite
+                       Demos            Steps           Octo   VQ-BeT       DP    DiT    H-Zero   H-Gen   DISC
+                       1                  0              0.0    0.0         0.0    0.0    0.0     2.5      1.5
+                                         50             10.5    16.0        0.0   3.0     38.5    21.0    38.5
+                                         200            22.0    35.0        0.0    5.5    43.5    34.5    38.0
+                                         500            33.0    43.0        1.0   15.0    44.5    35.5    41.5
+                                        1000            34.0    44.5        0.5   21.0    42.0    43.5    37.5
+                       3                 50             12.5    20.0        0.5    3.0    47.5    29.0    52.5
+                                         200            14.5    39.0        1.0    5.5    45.5    35.5    66.5
+                                         500            20.5    58.0        0.5   12.0    52.0    46.5    67.5
+                                        1000            40.0    67.0        1.0   25.0    55.5    58.5    65.5
+                       5                 50             16.0    15.5        0.5    4.0    49.0    50.0    60.0
+                                         200            38.0    48.0        1.5    2.5    54.5    44.5    70.0
+                                         500            45.5    56.0        0.5    9.5    59.0    66.0    73.0
+                                        1000            55.0    68.5        0.0   21.5    59.5    59.0    68.0
+                       10                50             16.5    20.5        0.0    2.0    63.0    45.0    75.5
+                                         200            40.5    52.0        0.5    4.5    61.0    60.5    74.0
+                                         500            46.0    72.5        1.0    6.5    68.0    77.5    65.0
+                                        1000            58.0    75.5        1.0   16.5    75.5    69.5    81.0
+                       20                50             13.5    23.5        0.5    1.0    52.0    43.0    68.0
+                                         200            41.0    57.0        2.0    4.5    73.0    61.0    76.5
+                                         500            62.0    71.5        1.5    6.5    79.5    69.5    82.5
+                                        1000            63.5    74.0        1.5   15.0    67.0    71.5    82.0
+                       Average Rank (Lower is Better)   4.86    2.90       6.81   5.86    2.38    3.05    1.57
+
+                                     TABLE IX: Success rates (%) on LIBERO-object suite
+                       Demos            Steps           Octo   VQ-BeT       DP    DiT    H-Zero   H-Gen   DISC
+                       1                 0              0.0     0.0         0.0   0.0     0.0     0.0     0.0
+                                         50             0.0     0.0         0.0   0.0     5.0     9.5     3.5
+                                        200             1.0     2.5         0.0   0.0     2.5     9.0     1.5
+                                        500             0.0     8.5         0.0   0.0     5.0     8.5     0.0
+                                        1000            1.5     10.0        0.0   0.5     10.0    17.0    1.5
+                       3                 50             0.0     0.0         0.0   0.0     4.0      0.0     1.5
+                                        200             1.5     28.0        0.0   0.0      3.5     5.0    15.0
+                                        500             5.5     18.0        0.0   0.0     13.0     8.5    22.5
+                                        1000            8.5     19.5        0.0   0.5     19.5     9.5    24.5
+                       5                 50             0.0     4.5         0.0   0.0     5.0     9.0     15.0
+                                        200             5.0     27.5        0.0   0.0      3.5     5.5    12.0
+                                        500             4.0     25.5        0.0   0.0     24.5    13.5    22.0
+                                        1000            1.0     24.5        0.0   0.0     20.0    18.5    28.5
+                       10                50              0.0    4.5         0.0   0.0     21.5    22.5     5.0
+                                        200              6.0    35.5        0.0   0.0     24.5     2.5    8.0
+                                        500             16.0    16.5        0.0   0.0     31.5    14.5    33.5
+                                        1000            12.5    22.5        0.0   0.0     31.0    33.5    40.0
+                       20                50              0.0    2.5         0.0   0.0     9.0     16.5    17.5
+                                        200              4.0    45.0        0.0   0.0     18.0    35.0    20.0
+                                        500             13.5    31.0        0.0   0.0     26.0    52.0    30.0
+                                        1000            33.0    37.5        0.0   0.0     33.0    29.0    49.5
+                       Average Rank (Lower is Better)   4.95    2.58       6.30   6.20    2.85    2.83    2.30
+
+
+
+generating policy parameters. Based on these results, we               optimal performance. While removing the WIN module (DISC
+adopt T5-small as our default language encoder throughout              w/o WIN) maintains high success on Easy tasks (93.6%),
+all experiments.                                                       performance drops significantly on Long-horizon tasks (68.5%
+                                                                       vs. 92.7%), highlighting the difficulty of optimizing complex
+                   A PPENDIX H                                         behaviors without a strong initialization. Conversely, using
+       H YPERNETWORK A RCHITECTURE A BLATION                           only the coarse initialization (DISC w/ WIN Only) achieves
+   To validate our two-stage, coarse-to-fine generation process,       a decent overall success rate of 78.2% but lacks the precision
+which combines a Weight Initialization Network (WIN) with              required for harder tasks. Our full model, which integrates
+iterative refinement, we ablate each component. The results            both stages, achieves the highest performance (94.3%), sub-
+in Table XII demonstrate that both stages are critical for             stantially outperforming the WIN-only variant by +18.0% on
+                                       TABLE X: Success rates (%) on LIBERO-spatial suite
+                       Demos                Steps              Octo   VQ-BeT       DP     DiT    H-Zero   H-Gen    DISC
+                       1                      0                 0.0    3.0         0.0    0.0     0.0      0.0      0.0
+                                             50                27.5    11.5        0.0    0.0     30.5     23.0    31.0
+                                             200               29.5    26.5        0.0    2.0     34.5     38.5    45.5
+                                             500               36.0    36.5        0.5    8.0     37.0     42.5    46.5
+                                            1000               34.0    45.0        0.0    8.0     53.0     38.0    55.0
+                       3                     50                22.5    13.5        0.5     0.0    34.0     36.5    48.5
+                                             200               44.5    36.5        0.0     1.0    43.0     45.0    54.5
+                                             500               45.5    50.5        0.0     4.0    49.5     53.5    68.0
+                                            1000               46.0    54.5        0.0    10.5    46.5     52.5    66.0
+                       5                     50                41.0    25.0        1.0    0.0     43.5     41.5    62.5
+                                             200               54.0    44.5        0.0    0.5     57.5     53.0    58.5
+                                             500               59.0    47.5        0.0    4.5     50.0     70.0    60.5
+                                            1000               59.5    47.5        0.0    8.5     61.0     56.5    62.0
+                       10                    50                43.5    23.5        1.0    0.0     48.5     55.5    53.5
+                                             200               62.0    45.5        0.0    0.0     50.5     48.5    68.5
+                                             500               57.5    49.5        0.0    3.0     59.5     58.5    70.5
+                                            1000               69.5    58.5        0.5    6.0     58.0     44.0    74.0
+                       20                    50                43.0    26.5        1.0    0.0     49.5     46.0    60.0
+                                             200               63.5    47.5        0.0    0.0     61.5     60.0    67.5
+                                             500               69.5    67.5        0.0    1.5     57.0     56.5    76.0
+                                            1000               68.0    61.5        0.5    6.5     56.0     56.0    78.5
+                       Average Rank (Lower is Better)          3.38    4.14        6.43   6.00    2.95     3.05    1.14
+
+
+  TABLE XI: Ablation on the choice of language encoder.            across the methods. Diffusion Policy (DP) suffers from neg-
+                      T5-small   CLIP-base BERT-base
+                                                                   ative scaling as task diversity increases: while it starts with a
+                                                                   strong performance of 88.0% on 10 tasks, its success rate drops
+              Octo     84.7%       85.7%     79.3%
+              DISC     94.3%       88.9%     81.2%                 significantly to 75.2% as the number of tasks expands to 90,
+                                                                   suggesting potential capacity limitations or task interference
+TABLE XII: Ablation of hypernetwork components on when handling a large variety of behaviors. Octo, on the other
+LIBERO-90. Both coarse initialization (WIN) and iterative hand, displays relative stability with performance remaining
+refinement are essential for performance.                          largely flat (rising marginally from 82.0% to 84.7%), indicat-
+                                                                   ing that the architecture is robust but does not gain significant
+  Method Variant                      Easy Medium  Long    Overall advantages from the increased training distribution. In contrast,
+  DISC w/o WIN                        93.6  84.3    68.5    77.7   DISC demonstrates strong positive transfer; starting at 82.0%,
+  DISC w/ WIN only (no refinement)    87.3  79.7    74.7    78.2   its performance improves consistently as more tasks are added,
+  DISC (full)                         97.3  95.3    92.7    94.3   culminating in a 94.3% success rate on the full 90-task suite.
+                                                                   This scaling behavior also supports the hypothesis that DISC
+                                                                   ’s hypernetwork learns a semantically structured parameter
+long-horizon tasks. This confirms that coarse initialization and
+                                                                   manifold. Rather than being overwhelmed by task variety,
+iterative refinement are complementary, with their combination
+                                                                   our method leverages the richer task distribution to learn
+being essential for solving multi-stage manipulation tasks.
+                                                                   more generalizable policies, effectively outperforming task-
+                             A PPENDIX I                           state entangled architectures like Octo and Diffusion Policy
+                  D IFFERENT N UMBER OF TASKS                      in high-diversity settings.
+  We vary the number of training tasks using subsets of                                              A PPENDIX J
+LIBERO-90 and report success rates in Table XIII. The                                     R EAL ROBOT E XPERIMENTS D ETAILS
+performance trends for each method are shown below.
+                                                                                 In this section, we provide detailed specifications of the real-
+TABLE XIII: Impact of Task Diversity (Number of Tasks) on                     world experimental setup, the data collection protocol, and a
+LIBERO-90 Success Rate.                                                       comprehensive visualization of the combinatorial manipulation
+                                                                              tasks discussed in the main paper.
+         Num. Tasks        10   20     40          60   90
+                                                                              A. Hardware and Environment Setup
+         DP            88.0     87.3   76.8    73.6     75.2
+         Octo          82.0     80.7   82.3    82.5     84.7                     The experimental setup features a RealMan 7-DoF robotic
+         DISC          82.0     86.4   85.6    87.2     94.3                  arm equipped with a parallel-jaw gripper. Visual observations
+                                                                              are captured via two Intel RealSense D435i cameras: one
+  From the results, we observe distinct scaling behaviors                     mounted on a fixed pole to provide a static third-person
+Fig. 6: Full Visualization of Real-World Combinatorial Tasks. We evaluate DISC on all 9 combinations of the task matrix.
+Each row corresponds to a specific target object: Top Row: Red Apple; Middle Row: Green Apple; Bottom Row: Watermelon
+Slice. Column 1 (Initial State): Shows the cluttered starting configuration. Note that within each row, the visual observation
+is shared across all three downstream tasks. Columns 2-4 (Outcomes): Show the successful execution of DISC conditioned on
+three distinct instructions: placing the object into the Small Gray Bowl (Col 2), the Large Red Bowl (Col 3), and the Light
+Gray Box (Col 4). The yellow arrows in the initial states illustrate the three divergent trajectories the policy must generate
+based solely on language input.
+
+
+view of the workspace, and another mounted on the end-             This results in 3 × 3 = 9 unique language instructions of the
+effector to provide a gripper (egocentric) view. Both cameras      form “Pick up the [Object] and place it into the [Container].”
+stream RGB-D images at a resolution of 640 × 480, which               Visual Ambiguity Control. A critical feature of this bench-
+are subsequently resized to 224 × 224 for processing. The          mark is the preservation of visual context. As shown in
+workspace contains a set of interactable objects (Red Apple,       Figure 6, the workspace maintains a globally consistent, clut-
+Green Apple, Watermelon Slice) and containers (Small Gray          tered visual context with all candidate objects simultaneously
+Bowl, Large Red Bowl, Light Gray Box), along with various          present. Consequently, the robot must rely solely on the lin-
+distractor objects (e.g., bananas, mangoes, and other fruits) to   guistic instruction to determine whether to transport the object
+increase visual clutter and occlusion.                             to destination (b), (c), or (d). This design explicitly penalizes
+                                                                   methods that rely on observation leakage or memorize scene-
+B. Task Definitions and Combinatorial Protocol                     to-action shortcuts.
+
+   To rigorously test language grounding, we constructed a         C. Data Collection and Evaluation
+combinatorial benchmark consisting of 9 distinct tasks. These           a) Data Collection: We collected expert demonstrations
+tasks represent the Cartesian product of the object set O and      using a teleoperation interface. For each of the 9 tasks, we
+the container set C:                                               recorded 100 successful episodes, resulting in a total dataset
+•   Objects (O): {Red Apple, Green Apple, Watermelon Slice}        of 900 episodes.
+•   Containers (C): {Small Gray Bowl, Large Red Bowl, Light             b) Evaluation Metrics: During evaluation, a trial is con-
+    Gray Box}                                                      sidered a success if and only if the following criteria are met:
+                                                                     For instance, in the top row, the instruction explicitly spec-
+                                                                  ifies “Pick up the book...”. However, the policy concentrates
+                                                                  its attention almost exclusively on the robot’s gripper and the
+                                                                  unrelated caddy structure, ignoring the target object entirely.
+                                                                  Similarly, in the bottom row (“Pick up the alphabet soup...”),
+                                                                  the policy fails to focus on the target object. Instead, its
+                                                                  attention maps highlight the gripper or diffuse background
+                                                                  regions.
+                                                                     This pattern consistently demonstrates the mechanism of
+                                                                  observation leakage: in the absence of explicit structural
+                                                                  decoupling, the entangled network learns to rely on spuri-
+                                                                  ous correlations, such as the ever-present robot arm, rather
+                                                                  than grounding the variable linguistic concepts (e.g., “book,”
+                                                                  “soup”). The model “cheats” by mapping the constant visual
+                                                                  feature (the gripper) to actions, bypassing the language in-
+                                                                  struction entirely.
+                                                                     In contrast, DISC blocks this direct shortcut pathway by
+                                                                  construction. Since the target policy receives no language
+                                                                  input, task identity must be encoded into the generated policy
+Fig. 7: Attention Map Visualization for Task-State En-            weights by the hypernetwork, enforcing a structural depen-
+tangled Architectures. We visualize attention maps for an         dency on instruction semantics rather than visual shortcuts.
+Octo-style Transformer policy on two evaluation tasks. Despite
+specific language instructions (e.g., “Pick up the book”), the                            A PPENDIX L
+attention mechanisms frequently fail to localize the task-                           D ETAILED TASK S PLITS
+relevant objects. Instead, attention is heavily concentrated on      In this section, we provide the complete list of tasks used
+the robot’s manipulator arm (a constant visual feature) or        in our experiments for both LIBERO-90 and Meta-World.
+irrelevant background objects. This provides visual evidence
+                                                                  A. LIBERO Task Splits
+of observation leakage: the policy relies on scene-to-action
+shortcuts rather than true language grounding.                      90 tasks from LIBERO-90 are divided as follows:
+                                                                  Training Tasks (90):
+                                                                  • Easy (11 tasks): Single-object manipulation (e.g., “turn on
+
+1) The robot successfully grasps the correct target object          the stove”)
+   specified in the instruction.                                  • Medium (35 tasks): Multi-object coordination (e.g., “put
+2) The object is transported to and released inside the correct     the black bowl on the plate”)
+   target container.                                              • Long (44 tasks): Sequential multi-step (e.g., “turn on the
+
+We evaluate each method over 30 trials per task, totaling 30 ×      stove and put the frying pan on it”)
+9 = 270 evaluation episodes per method.                           The exact split of tasks is listed in Table XIV and XV.
+                                                                  B. Meta-World Task Splits
+                      A PPENDIX K
+            E XTENDED Q UALITATIVE A NALYSIS                         Similarly, we split Meta-World ML45 into 4 categories:
+                                                                  Training Tasks (45):
+   To provide concrete evidence for our claims regarding the
+                                                                  • open&close (8 tasks): Open or close an object (e.g.,
+limitations of task-state entanglement, we conduct qualitative
+                                                                     “window open”)
+analyses on a representative baseline. These visualizations
+                                                                  • pick&place (4 tasks): Pick the object up or place it
+empirically demonstrate the phenomena of attention misalign-
+                                                                     elsewhere (e.g., “pick out of hole”)
+ment and observation leakage, validating our hypothesis that
+                                                                  • press&pull (16 tasks): Press the button or lever (e.g.,
+entangled architectures often fail to ground language instruc-
+                                                                     “button press topdown”)
+tions in the visual scene.
+                                                                  • others (17 tasks): Other tasks not in previous categories
+                                                                     (e.g., “soccer”)
+A. Visual Evidence of Observation Leakage
+                                                                     These tasks correspond to the 45 training environments in
+   We visualize the attention maps from the Transformer           the standard Meta-World ML45 split. The exact split of tasks
+layers of a representative entangled baseline: an Octo-style      is listed in Table XVI.
+Transformer Policy. As illustrated in Figure 7, these visual-
+izations reveal a significant disconnect between the semantic
+requirements of the instruction and the model’s actual visual
+focus.
+             TABLE XIV: LIBERO-90 Training Tasks (Part 1: One-Object & Two-Object Short)
+Category       Tasks
+               KITCHEN SCENE3 turn on the stove
+               KITCHEN SCENE4 close the bottom drawer of the cabinet
+               KITCHEN SCENE8 turn off the stove
+               KITCHEN SCENE9 turn on the stove
+               KITCHEN SCENE10 close the top drawer of the cabinet
+One-Object     KITCHEN SCENE2 open the top drawer of the cabinet
+               KITCHEN SCENE5 close the top drawer of the cabinet
+               KITCHEN SCENE7 open the microwave
+               KITCHEN SCENE1 open the top drawer of the cabinet
+               KITCHEN SCENE1 open the bottom drawer of the cabinet
+               KITCHEN SCENE6 close the microwave
+               KITCHEN SCENE3 put the frying pan on the stove
+               KITCHEN SCENE3 put the moka pot on the stove
+               KITCHEN SCENE4 put the wine bottle on the wine rack
+               KITCHEN SCENE4 put the black bowl on top of the cabinet
+               KITCHEN SCENE4 put the black bowl in the bottom drawer of the cabinet
+               KITCHEN SCENE6 put the yellow and white mug to the front of the white mug
+               KITCHEN SCENE8 put the right moka pot on the stove
+               KITCHEN SCENE9 put the frying pan on top of the cabinet
+               KITCHEN SCENE9 put the white bowl on top of the cabinet
+               KITCHEN SCENE9 put the frying pan on the cabinet shelf
+               KITCHEN SCENE9 put the frying pan under the cabinet shelf
+               KITCHEN SCENE10 put the black bowl in the top drawer of the cabinet
+               LIVING ROOM SCENE5 put the white mug on the left plate
+               LIVING ROOM SCENE5 put the yellow and white mug on the right plate
+               LIVING ROOM SCENE5 put the red mug on the left plate
+               LIVING ROOM SCENE5 put the red mug on the right plate
+               LIVING ROOM SCENE6 put the white mug on the plate
+Two-Object     LIVING ROOM SCENE6 put the red mug on the plate
+               LIVING ROOM SCENE6 put the chocolate pudding to the left of the plate
+               LIVING ROOM SCENE6 put the chocolate pudding to the right of the plate
+               KITCHEN SCENE2 put the black bowl at the back on the plate
+               KITCHEN SCENE2 put the black bowl at the front on the plate
+               KITCHEN SCENE2 put the middle black bowl on the plate
+               KITCHEN SCENE2 put the middle black bowl on top of the cabinet
+               KITCHEN SCENE2 stack the middle black bowl on the back black bowl
+               KITCHEN SCENE2 stack the black bowl at the front on the black bowl in the middle
+               KITCHEN SCENE5 put the black bowl in the top drawer of the cabinet
+               KITCHEN SCENE5 put the black bowl on the plate
+               KITCHEN SCENE5 put the ketchup in the top drawer of the cabinet
+               KITCHEN SCENE5 put the black bowl on top of the cabinet
+               KITCHEN SCENE7 put the white bowl on the plate
+               KITCHEN SCENE7 put the white bowl to the right of the plate
+               KITCHEN SCENE1 put the black bowl on top of the cabinet
+               KITCHEN SCENE1 put the black bowl on the plate
+               KITCHEN SCENE4 put the wine bottle in the bottom drawer of the cabinet
+                       TABLE XV: LIBERO-90 Training Tasks (Part 2: Long Horizon)
+Category       Tasks
+               KITCHEN SCENE4 close the bottom drawer of the cabinet and open the top drawer
+               KITCHEN SCENE9 turn on the stove and put the frying pan on it
+               KITCHEN SCENE10 close the top drawer of the cabinet and put the black bowl on top of it
+               KITCHEN SCENE10 put the butter at the front in the top drawer of the cabinet and close it
+               KITCHEN SCENE10 put the butter at the back in the top drawer of the cabinet and close it
+               KITCHEN SCENE10 put the chocolate pudding in the top drawer of the cabinet and close it
+               LIVING ROOM SCENE1 pick up the cream cheese box and put it in the basket
+               LIVING ROOM SCENE1 pick up the alphabet soup and put it in the basket
+               LIVING ROOM SCENE1 pick up the tomato sauce and put it in the basket
+               LIVING ROOM SCENE2 pick up the orange juice and put it in the basket
+               LIVING ROOM SCENE2 pick up the milk and put it in the basket
+               LIVING ROOM SCENE2 pick up the butter and put it in the basket
+               LIVING ROOM SCENE2 pick up the alphabet soup and put it in the basket
+               LIVING ROOM SCENE2 pick up the tomato sauce and put it in the basket
+               LIVING ROOM SCENE4 stack the left bowl on the right bowl and place them in the tray
+               LIVING ROOM SCENE4 stack the right bowl on the left bowl and place them in the tray
+               LIVING ROOM SCENE4 pick up the black bowl on the left and put it in the tray
+               LIVING ROOM SCENE4 pick up the salad dressing and put it in the tray
+               LIVING ROOM SCENE4 pick up the chocolate pudding and put it in the tray
+               STUDY SCENE1 pick up the book and place it in the right compartment of the caddy
+               STUDY SCENE1 pick up the book and place it in the front compartment of the caddy
+               STUDY SCENE1 pick up the yellow and white mug and place it to the right of the caddy
+Long-Horizon
+               STUDY SCENE2 pick up the book and place it in the left compartment of the caddy
+               STUDY SCENE2 pick up the book and place it in the right compartment of the caddy
+               STUDY SCENE2 pick up the book and place it in the back compartment of the caddy
+               STUDY SCENE2 pick up the book and place it in the front compartment of the caddy
+               STUDY SCENE3 pick up the book and place it in the left compartment of the caddy
+               STUDY SCENE3 pick up the book and place it in the right compartment of the caddy
+               STUDY SCENE3 pick up the book and place it in the front compartment of the caddy
+               STUDY SCENE3 pick up the white mug and place it to the right of the caddy
+               STUDY SCENE3 pick up the red mug and place it to the right of the caddy
+               STUDY SCENE4 pick up the book on the right and place it under the cabinet shelf
+               STUDY SCENE4 pick up the book in the middle and place it on the cabinet shelf
+               STUDY SCENE4 pick up the book on the left and place it on top of the shelf
+               STUDY SCENE4 pick up the book on the right and place it on the cabinet shelf
+               LIVING ROOM SCENE3 pick up the alphabet soup and put it in the tray
+               LIVING ROOM SCENE3 pick up the tomato sauce and put it in the tray
+               LIVING ROOM SCENE3 pick up the butter and put it in the tray
+               LIVING ROOM SCENE3 pick up the cream cheese and put it in the tray
+               LIVING ROOM SCENE3 pick up the ketchup and put it in the tray
+               KITCHEN SCENE1 open the top drawer of the cabinet and put the bowl in it
+               LIVING ROOM SCENE1 pick up the ketchup and put it in the basket
+               STUDY SCENE1 pick up the book and place it in the left compartment of the caddy
+               KITCHEN SCENE3 turn on the stove and put the frying pan on it
+
+
+
+
+                                TABLE XVI: Meta-World ML45 Training Task List
+Category       Tasks
+Pick & Place   pick-place, pick-place-wall, pick-out-of-hole, shelf-place, bin-picking
+Push/Press     push, stick-push, coffee-push, push-wall, handle-press-side, handle-press, button-press-wall, button-press-topdown, button-press-
+               topdown-wall, button-press, lever-pull, stick-pull, handle-pull-side, handle-pull, coffee-pull, push-back
+Open & Close   faucet-open, faucet-close, window-close, window-open, door-open, door-close, drawer-close, drawer-open, box-close
+Others         sweep, assembly, dial-turn, coffee-button, basketball, sweep-into, disassemble, hammer, plate-slide, plate-slide-side, soccer,
+               plate-slide-back-side, plate-slide-back, reach, reach-wall, peg-insert-side, peg-unplug-side, hand-insert, door-lock, door-unlock
+
