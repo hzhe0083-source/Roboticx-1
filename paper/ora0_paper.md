@@ -711,9 +711,11 @@ logs/mw_c2_chunk_bucket.log) makes this precise: position h=0
 (nominal-only, Δc₀≡0) passes at 88.92% and positions h=1..5
 (contraction-corrected) at 89.8–90.0% with correction magnitudes
 ‖Ke‖ ≈ 0.027–0.034 — the corrective loop neither damages nor rescues
-clean execution, so the ~89% ceiling sits entirely in the nominal policy
-and its visual readout (64-token mean-pooled V-JEPA features), not in
-the C² contract.
+clean execution, and the direct-head checkpoint shows the identical
+flat profile (h=0 88.69%, h=1..5 88.8–89.5%,
+logs/mw_v5_direct_chunk_bucket.log), so the ~89% ceiling sits entirely
+in the nominal policy and its visual readout (64-token mean-pooled
+V-JEPA features), not in the C² contract.
 Directional language adherence (fork smoke) is 84.4% vs the 88.9%
 (16/18) bar — the model forks with language but not yet at bar level.
 

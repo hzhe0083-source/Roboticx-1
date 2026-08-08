@@ -74,6 +74,8 @@ class FeatureDataset(Dataset):
         vision_key: str = "vision_tokens",
         step_targets: Tensor | None = None,
         step_mask: Tensor | None = None,
+        local_tokens: Tensor | None = None,
+        coords: Tensor | None = None,
     ) -> None:
         if min_sequence_length < 2:
             raise ValueError("min_sequence_length must be at least 2")
@@ -112,6 +114,15 @@ class FeatureDataset(Dataset):
                     f"step_mask must have shape [{self.length}], got {tuple(step_mask.shape)}"
                 )
         self.step_mask = step_mask
+        if local_tokens is not None:
+            if tuple(local_tokens.shape[:2]) != (self.length, 4):
+                raise ValueError(
+                    f"local_tokens must be [N, 4, tokens, dim], got {tuple(local_tokens.shape)}"
+                )
+        if coords is not None and coords.ndim != 2:
+            raise ValueError(f"coords must be [N, 3], got {tuple(coords.shape)}")
+        self.local_tokens = local_tokens
+        self.coords = coords
 
         self._validate_shapes(min_sequence_length)
         self.pair_groups = self._build_pair_groups() if require_pairs else {}
@@ -227,6 +238,9 @@ class FeatureDataset(Dataset):
             item["step_targets"] = self.step_targets[index]
         if self.step_mask is not None:
             item["step_mask"] = self.step_mask[index]
+        if self.local_tokens is not None:
+            item["vision_tokens_st"] = self.local_tokens[index]
+            item["coords"] = self.coords
         return item
 
 
@@ -591,8 +605,16 @@ def rollout_policy(
     direct_predictions = [] if model.config.direct_head else None
     c2_references = [] if model.config.c2_controller else None
     for time_index in range(batch["vision_tokens"].shape[1]):
+        if model.config.local_slots:
+            vision_in = model.build_local_vision(
+                batch["vision_tokens_st"][:, time_index],
+                batch["coords"].to(device=batch["vision_tokens"].device),
+                language_cache.role_queries,
+            )
+        else:
+            vision_in = batch["vision_tokens"][:, time_index]
         condition, visual_memory = model.encode_condition(
-            batch["vision_tokens"][:, time_index],
+            vision_in,
             batch["proprio"][:, time_index],
             batch["previous_action"][:, time_index],
             language_cache=language_cache,
@@ -1102,6 +1124,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="v6a per-chunk-step 期望视觉目标（P 投影后 [N, T, 6, control_dim]）",
     )
     parser.add_argument(
+        "--local-slots-data",
+        type=Path,
+        default=None,
+        help="PULSE-VA Stage A：dense spatiotemporal tokens [N,4,288,768] + coords "
+        "[288,3]（prepare_mw_local_features.py 输出）。开启后视觉流变为 "
+        "16 coarse + 6 语言角色槽 + 3 关系 token = 25 tokens；仅 action loss。",
+    )
+    parser.add_argument(
+        "--role-seeds",
+        type=Path,
+        default=None,
+        help="PULSE-VA 角色种子：冻结 Qwen 编码 6 条角色描述的原始嵌入 [6, language_dim]"
+        "（make_role_seeds.py 输出）；经 lang_proj 投影后初始化 role_seeds（对称性破缺）。",
+    )
+    parser.add_argument(
+        "--local-slots-direct288",
+        action="store_true",
+        help="消融格：288 时空 token 直送 VA（无槽/关系），隔离分辨率增益",
+    )
+    parser.add_argument(
+        "--local-slots-fixed-query",
+        action="store_true",
+        help="消融格：槽只用固定角色种子（无语言交叉注意），对照语言实例化增益",
+    )
+    parser.add_argument(
         "--c2-v6b",
         type=Path,
         default=Path("data/mw_buttonpress_v6b.pt"),
@@ -1603,6 +1650,20 @@ def main() -> None:
             vision_key=vision_key,
             step_targets=c2_step_targets,
             step_mask=c2_step_mask,
+            local_tokens=(
+                torch.load(args.local_slots_data, map_location="cpu", weights_only=True)[
+                    "vision_tokens_st"
+                ]
+                if args.local_slots_data
+                else None
+            ),
+            coords=(
+                torch.load(args.local_slots_data, map_location="cpu", weights_only=True)[
+                    "coords"
+                ]
+                if args.local_slots_data
+                else None
+            ),
         )
         config = VACompoundConfig(
             language_dim=int(dataset.payload["language_hidden"].shape[-1]),
@@ -1632,6 +1693,9 @@ def main() -> None:
             role_query_tokens=args.role_query_tokens,
             dual_attention=args.dual_attention,
             flow_semantic=args.flow_semantic,
+            local_slots=args.local_slots_data is not None,
+            local_slots_direct288=args.local_slots_direct288,
+            local_slots_fixed_query=args.local_slots_fixed_query,
         )
         if args.single_task:
             loader = DataLoader(
@@ -1775,6 +1839,12 @@ def main() -> None:
         )
     else:
         model = VACompoundPolicy(config).to(device)
+        if args.role_seeds and config.local_slots:
+            seeds = torch.load(args.role_seeds, map_location="cpu", weights_only=True)[
+                "role_seeds"
+            ]
+            model.role_compiler.set_role_description_embeddings(seeds)
+            print(f"PULSE-VA: role seeds initialized from {args.role_seeds}")
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
     # Plan-Cache 方案 A：加载冻结 Qwen（local files only，fp16/bf16）+ 可训练

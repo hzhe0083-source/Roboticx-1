@@ -89,6 +89,18 @@ class VACompoundConfig:
     # flow head 逐层读语义上下文（compile readout tokens；flow_cond=adaln
     # 时经 cross-attn 注入）。
     flow_semantic: bool = False
+    # PULSE-VA（2026-08-08 Pro 审阅落地）：语言编程局部控制槽。Stage A 用
+    # dense spatiotemporal tokens [B,N,768]（2×12×12=288）+ 归一化坐标旁路 →
+    # 6 固定角色槽（语言实例化）→ 3 关系 token → 25-token VA 视觉流。
+    # 训练损失不变（仅 action loss）；C² 控制图在 Stage B 另行拟合。
+    local_slots: bool = False
+    local_slot_k: int = 6
+    local_slot_tokens: int = 288  # 每决策 dense token 数（2×12×12）
+    local_coarse: int = 16        # 粗上下文 token 数
+    # 消融格：direct288 = 288 token 直送 VA（无槽）；fixed_query = 槽只用固定
+    # 角色种子（无语言交叉注意）——与 language-slot 对照验证"语言定义"增益。
+    local_slots_direct288: bool = False
+    local_slots_fixed_query: bool = False
 
     def __post_init__(self) -> None:
         if self.hidden_dim % self.num_heads:
@@ -134,11 +146,15 @@ class LayerLanguageCache:
 class LanguageCache:
     layers: tuple[LayerLanguageCache, ...]
     attention_mask: Tensor
+    role_queries: Tensor | None = None  # [B, K, hidden] PULSE-VA 角色查询（一次性缓存）
 
     def detach(self) -> "LanguageCache":
         return LanguageCache(
             layers=tuple(layer.detach() for layer in self.layers),
             attention_mask=self.attention_mask.detach(),
+            role_queries=(
+                self.role_queries.detach() if self.role_queries is not None else None
+            ),
         )
 
     def to(
@@ -149,6 +165,11 @@ class LanguageCache:
         return LanguageCache(
             layers=tuple(layer.to(device=device, dtype=dtype) for layer in self.layers),
             attention_mask=self.attention_mask.to(device=device, dtype=torch.bool),
+            role_queries=(
+                self.role_queries.to(device=device, dtype=dtype)
+                if self.role_queries is not None
+                else None
+            ),
         )
 
 
@@ -1430,6 +1451,35 @@ class VACompoundPolicy(nn.Module):
             else None
         )
 
+        # PULSE-VA：语言编程局部控制槽（config.local_slots=True 时构造）。
+        # Stage A 只训练这些模块 + VA + direct head；C² 控制图 Stage B 再拟合。
+        if config.local_slots:
+            from va_compound.local_control_slots import (
+                LanguageRoleCompiler,
+                LocalControlSlotReader,
+                RelationTokens,
+            )
+
+            self.role_compiler = LanguageRoleCompiler(
+                hidden_dim=config.hidden_dim,
+                language_dim=config.language_dim,
+                n_role=config.local_slot_k,
+                num_heads=config.num_heads,
+            )
+            self.slot_reader = LocalControlSlotReader(
+                vision_dim=config.vision_dim,
+                hidden_dim=config.hidden_dim,
+                num_slots=config.local_slot_k,
+                num_heads=config.num_heads,
+            )
+            self.relation_tokens = RelationTokens(vision_dim=config.vision_dim)
+            self.coarse_pool = nn.AdaptiveAvgPool1d(config.local_coarse)
+        else:
+            self.role_compiler = None
+            self.slot_reader = None
+            self.relation_tokens = None
+            self.coarse_pool = None
+
         if config.action_query_cond:
             # 语言摘要（cache 第 0 层投影 key 的 mask 加权均值）→ 每 horizon 步 query 偏移。
             # 最后一层 zero-init：训练开始时等价于静态 action_queries（不破坏现有行为）。
@@ -1544,7 +1594,23 @@ class VACompoundPolicy(nn.Module):
         elif language_mask.shape != language_hidden.shape[:2]:
             raise ValueError("language_mask must match [batch, language_tokens]")
         caches = tuple(layer.project_language(language_hidden) for layer in self.layers)
-        cache = LanguageCache(layers=caches, attention_mask=language_mask.bool())
+        role_queries = None
+        if self.config.local_slots and not self.config.local_slots_direct288:
+            if self.config.local_slots_fixed_query:
+                # 消融：纯固定角色种子（无语言实例化），按 batch 展开。
+                role_queries = self.role_compiler.role_seeds.unsqueeze(0).expand(
+                    language_hidden.shape[0], -1, -1
+                )
+            else:
+                role_queries = self.role_compiler(
+                    language_hidden.to(dtype=self.role_compiler.lang_proj.weight.dtype),
+                    language_mask.bool(),
+                )
+            if detach:
+                role_queries = role_queries.detach()
+        cache = LanguageCache(
+            layers=caches, attention_mask=language_mask.bool(), role_queries=role_queries
+        )
         return cache.detach() if detach else cache
 
     def build_plan_cache(
@@ -1581,6 +1647,32 @@ class VACompoundPolicy(nn.Module):
                 dim=1,
             )
         return self.build_language_cache(extended, extended_mask, detach=detach)
+
+    def build_local_vision(
+        self,
+        dense_tokens: Tensor,   # [B, N, vision_dim] spatiotemporal 288 tokens
+        coords: Tensor,         # [N, 3] normalized t/y/x
+        role_queries: Tensor,   # [B, K, hidden]
+    ) -> Tensor:
+        """PULSE-VA Stage A readout: 16 coarse + K slots + 3 relations -> 25 tokens.
+
+        Ablation cell: ``local_slots_direct288`` returns the 288 dense tokens
+        unchanged (no slots) to isolate the pooling-resolution gain.
+        """
+        if self.config.local_slots_direct288:
+            return dense_tokens.to(dtype=self.vision_projection.weight.dtype)
+        if self.slot_reader is None or self.relation_tokens is None or self.coarse_pool is None:
+            raise ValueError("local_slots modules not built (config.local_slots=False)")
+        target_dtype = self.vision_projection.weight.dtype
+        dense = dense_tokens.to(dtype=target_dtype)
+        coarse = self.coarse_pool(dense.transpose(1, 2)).transpose(1, 2)  # [B, C, D]
+        slots, _, centers = self.slot_reader(
+            dense, role_queries.to(dtype=target_dtype), coords
+        )
+        relations = self.relation_tokens(slots, centers)
+        from va_compound.local_control_slots import build_va_vision_input
+
+        return build_va_vision_input(coarse, slots, relations)  # [B, 25, D]
 
     def encode_condition(
         self,
