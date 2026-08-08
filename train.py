@@ -740,16 +740,17 @@ def compute_c2_loss(
     n_future = min(6, references.shape[2])
     mask = clean_batch.get("step_mask")
     if mask is not None:
-        m = mask.reshape(-1, 1, 1, 1)  # [B,1,1,1]
-        denom = max(float(m.sum().item()) * n_future, 1.0)
-        future = (
-            F.smooth_l1_loss(
-                references[:, :, :n_future] * m,
-                clean_batch["step_targets"][:, :, :n_future] * m,
-                reduction="sum",
-            )
-            / denom
+        # 逐元素掩码平均（2026-08-08 修复：旧版分母只除 B_valid×n_future，
+        # 分子覆盖 B×T×H×C，缺失 T×C=64 倍归一化——潜伏 bug，本次数据无
+        # step_mask 未触发，但需保证掩码路径语义正确）。
+        m = mask.reshape(-1, 1, 1, 1)  # [B,1,1,1] 按样本有效
+        num = F.smooth_l1_loss(
+            references[:, :, :n_future] * m,
+            clean_batch["step_targets"][:, :, :n_future] * m,
+            reduction="sum",
         )
+        denom = m.expand(-1, references.shape[1], n_future, references.shape[3]).sum()
+        future = num / denom.clamp_min(1.0)
     else:
         future = F.smooth_l1_loss(references[:, :, :n_future], clean_batch["step_targets"][:, :, :n_future])
     logs["future"] = float(future.item())

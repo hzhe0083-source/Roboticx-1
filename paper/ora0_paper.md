@@ -26,7 +26,10 @@ adapter. Our action head is a lightweight flow-matching module (43.5M
 trainable parameters, 40.6 Hz deployment), trained with a two-term loss
 (flow-matching + paired instruction contrast) — no auxiliary losses such as
 image reconstruction or world-model objectives used by memory-based VLA
-baselines.
+baselines. The C² mainline controller (§3.5) additionally trains its
+reference/gain heads with a per-step expected-visual target (L_f) and
+recovery-residual supervision (L_r) — the two auxiliary terms whose
+normalization and scope we audit in Sec. 6.5.
 
 <!-- [TBD: L_m verdict, VLA-RL gains, LIBERO-100] -->
 
@@ -684,7 +687,10 @@ is 89/490 = 18.2% [11.4%, 25.7%] — below the direct head's 31.8% on the
 same protocol — but two properties change qualitatively. First,
 **held-out recovery jumps to 4/10 = 40.0%** (vs 10% for the direct
 pilot): the contraction controller's corrective behavior now operates
-at full task coverage (logs/mw_v5_c2_full_closedloop.log,
+at full task coverage — with the caveat that the v6b recovery branches
+are button-press-family only (single-task recovery data; see Sec. 6.5),
+so the 40.0% demonstrates recovery capability within that family, not
+MT50-wide recovery generality (logs/mw_v5_c2_full_closedloop.log,
 mw_v5_c2_full_recovery.log). Second, **language sensitivity is the
 strongest measured in this work**: wrong-instruction chunk-0 MAE rises
 +1427.1% over clean (vs +1182.6% for the direct mainline), and the
@@ -696,7 +702,18 @@ peg-sideways, sweeps, gripper-in-hole: all 0/10) and in short
 trajectories where the learned reference c̄ cannot yet track a
 near-trivial motion (e.g. reach-goal 0/10), consistent with the
 single-step action fit of 89.3343% (per-dim 83.0/86.9/88.2/99.2) staying
-below the 99% gate the C² design analysis set for base capability.
+below the 99% gate — and the plain direct head shows the same level
+(88.64%, per-dim 81.7/86.9/87.2/98.8, logs/mw_v5_direct_stepacc.log),
+isolating the bottleneck to the shared VA representation / feature
+pipeline rather than the C² head structure. A per-chunk-position audit
+of the C² checkpoint (39708 decisions per position,
+logs/mw_c2_chunk_bucket.log) makes this precise: position h=0
+(nominal-only, Δc₀≡0) passes at 88.92% and positions h=1..5
+(contraction-corrected) at 89.8–90.0% with correction magnitudes
+‖Ke‖ ≈ 0.027–0.034 — the corrective loop neither damages nor rescues
+clean execution, so the ~89% ceiling sits entirely in the nominal policy
+and its visual readout (64-token mean-pooled V-JEPA features), not in
+the C² contract.
 Directional language adherence (fork smoke) is 84.4% vs the 88.9%
 (16/18) bar — the model forks with language but not yet at bar level.
 
@@ -913,8 +930,10 @@ on physical rollouts.
   measured factors, in order of estimated contribution: (i) *single-step
   action fit*: the trained policy reproduces training actions within
   0.05 only 89.3343% of the time (per-dim 83.0/86.9/88.2/99.2) — below the
-  99% gate the C² design analysis set for base capability, so closed-loop
-  compounding dominates; (ii) *precision-insertion failure mode*: all
+  99% gate the C² design analysis set for base capability — and the plain
+  direct head fits at the same level (88.64%), so the fit bottleneck
+  resides in the shared VA representation and feature pipeline, not the
+  C² head; closed-loop compounding therefore dominates; (ii) *precision-insertion failure mode*: all
   peg/sweep/nut-into-hole tasks score 0/10 (the 6-step open-loop chunk
   executes with no corrective re-plan inside the chunk); (iii)
   *short-trajectory reference mismatch*: trivial motions such as
