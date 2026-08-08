@@ -367,9 +367,10 @@ class PairedBatchSampler(Sampler[list[int]]):
         if batch_size < 2 or batch_size % 2:
             raise ValueError("paired batch_size must be a positive even number")
         groups = getattr(dataset, "pair_groups", None)
-        if groups is None:
+        if not groups:
             # 泛化（2026-08-07）：任意带 payload pair_id/instruction_id 的
-            # 数据集（如无 pair_groups 属性的旧式数据集）也能配对采样。
+            # 数据集（如无 pair_groups 属性的旧式数据集，或 require_pairs=False
+            # 的空 groups——E 组打乱配对形态）也能配对采样。
             payload = dataset.payload
             if "pair_id" not in payload or "instruction_id" not in payload:
                 raise ValueError(
@@ -605,12 +606,17 @@ def rollout_policy(
     direct_predictions = [] if model.config.direct_head else None
     c2_references = [] if model.config.c2_controller else None
     for time_index in range(batch["vision_tokens"].shape[1]):
+        semantic_context = None
         if model.config.local_slots:
             vision_in = model.build_local_vision(
                 batch["vision_tokens_st"][:, time_index],
-                batch["coords"].to(device=batch["vision_tokens"].device),
+                batch["coords"][0].to(device=batch["vision_tokens"].device),
                 language_cache.role_queries,
             )
+            if model.config.flow_semantic and not model.config.direct_head:
+                # π0 式逐层 cross-attn：槽/关系 token（语言实例化语义上下文）
+                # 作为 flow head 的 cross-attn K/V，逐层注入。
+                semantic_context = vision_in  # [B, 25, vision_dim]
         else:
             vision_in = batch["vision_tokens"][:, time_index]
         condition, visual_memory = model.encode_condition(
@@ -637,6 +643,7 @@ def rollout_policy(
                     condition,
                     noisy_actions[:, time_index],
                     flow_time[:, time_index],
+                    semantic_context=semantic_context,
                 )
             )
         action_conditions.append(condition)
@@ -882,6 +889,80 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--data", type=Path, help="optional paired precomputed .pt dataset")
     parser.add_argument(
+        "--live-vjepa",
+        action="store_true",
+        help="Stage B：--data 路径在线 V-JEPA 编码（帧来自 raw parquet，可对 "
+        "V-JEPA 反向传播；输出 288 token，等价于 ST288；需 --single-task "
+        "--direct-head）",
+    )
+    parser.add_argument(
+        "--live-root",
+        type=Path,
+        default=Path(
+            "/media/ryan/robot-data/datasets/benchmark_data/raw/metaworld/lerobot_metaworld_mt50"
+        ),
+        help="MetaWorld LeRobot parquet 根目录（--live-vjepa 用）",
+    )
+    parser.add_argument(
+        "--control-stride",
+        type=int,
+        default=6,
+        help="决策点间隔（80 FPS 帧，--live-vjepa 用）：6=13.3Hz（v5 默认），"
+        "2=40Hz，1=80Hz。须与数据提取时一致（与 payload 行数对齐）。",
+    )
+    parser.add_argument(
+        "--sequences-per-episode",
+        type=int,
+        default=4,
+        help="每 episode 采样窗口数（--live-vjepa 用）：4=v5 行对齐，"
+        "8-16=全轨迹覆盖。须与数据提取时一致（由 payload metadata 校验）。",
+    )
+    parser.add_argument(
+        "--phase-bins",
+        type=int,
+        default=0,
+        help="相位完整采样窗口数（--live-vjepa 用）：0=关闭（用 "
+        "--sequences-per-episode），6-8=进度分箱 + 强制覆盖末段。"
+        "须与数据提取时一致。",
+    )
+    parser.add_argument(
+        "--phase-seed",
+        type=int,
+        default=0,
+        help="相位采样起点扰动种子（--live-vjepa 用）",
+    )
+    parser.add_argument(
+        "--success-only",
+        action="store_true",
+        help="只保留成功 episode（--live-vjepa 用；按 raw next.success 列过滤，"
+        "须与数据提取时一致，由 payload metadata 校验）",
+    )
+    parser.add_argument(
+        "--sliding-window",
+        action="store_true",
+        help="全帧监督（--live-vjepa 用）：窗口起点每 control-stride 帧滑动，"
+        "每个决策点都被训练覆盖。须与数据提取时一致，由 payload metadata 校验。",
+    )
+    parser.add_argument(
+        "--frame-aug",
+        action="store_true",
+        help="训练时帧增强（--live-vjepa 用，π0.5 配方）：RandomCrop 0.95 + "
+        "Rotate ±5° + ColorJitter，V-JEPA 编码前逐帧应用，每 epoch 重新随机。"
+        "注意：几何增强会扰动 local_slots 的坐标网格对应关系。",
+    )
+    parser.add_argument(
+        "--lr-vision",
+        type=float,
+        default=3e-6,
+        help="V-JEPA 解冻参数的学习率（--live-vjepa 用；默认 3e-6 低 LR 防坍塌）",
+    )
+    parser.add_argument(
+        "--vision-unfreeze-last",
+        type=int,
+        default=0,
+        help="解冻 V-JEPA 最后 N 个 block（0 = 保持冻结；与 --vision-unfreeze-all 互斥）",
+    )
+    parser.add_argument(
         "--e2e-data",
         type=Path,
         help="raw video/text dataset for end-to-end fine-tuning (V-JEPA+Qwen in graph)",
@@ -1069,11 +1150,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "(0 = all-joint, legacy behavior; 2026-08-07 审阅落地④)",
     )
     parser.add_argument(
-        "--flow-cond",
-        choices=("entry", "adaln"),
+        "--flow-cond",        choices=("entry", "adaln"),
         default="entry",
         help="flow head conditioning: entry (legacy, add at input) or adaln "
         "(per-layer AdaLN-Zero + cross-attention; 2026-08-07)",
+    )
+    parser.add_argument(
+        "--flow-layers",
+        type=int,
+        default=2,
+        help="flow head transformer layers (π0-style expert 加厚用；"
+        "resume 时新层随机初始化，已有层继承)",
     )
     parser.add_argument(
         "--evsm",
@@ -1144,6 +1231,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="消融格：288 时空 token 直送 VA（无槽/关系），隔离分辨率增益",
     )
     parser.add_argument(
+        "--lang-fixed-vector",
+        action="store_true",
+        help="grounding 对照（Codex 2026-08-08）：语言通道替换为数据集全局均值常量向量，"
+        "重训同容量模型——完整模型 vs 固定语言基线的差距即语言条件的因果贡献。"
+        "仅 feature 路径（非 live）可用。",
+    )
+    parser.add_argument(
         "--local-slots-fixed-query",
         action="store_true",
         help="消融格：槽只用固定角色种子（无语言交叉注意），对照语言实例化增益",
@@ -1194,12 +1288,45 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--vision-pooling",
-        choices=("flat", "spatial"),
+        choices=("flat", "spatial", "spatiotemporal"),
         default="flat",
-        help="vision feature variant: 'flat' (A) or 'spatial' (B) pooled tokens",
+        help="vision feature variant: 'flat' (A), 'spatial' (B), or "
+        "'spatiotemporal' (ST288/live 288-token；仅影响 training_contract 记录，"
+        "供闭环评估对齐在线池化)",
     )
     parser.add_argument("--steps", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=4, help="must be even")
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help="DataLoader worker 数（--live-vjepa 帧解码是 CPU 瓶颈：单线程冷解码 "
+        "64 帧 ≈ 1.7s/step 而 GPU 仅忙 ~0.5s；num_workers>=4 与 GPU 重叠解码，"
+        "step 时间降至 GPU 上限。0 = 现状主进程串行）",
+    )
+    parser.add_argument(
+        "--fork-data",
+        type=Path,
+        default=None,
+        help="pair 生死门（Codex Q5b）：严格 fork 数据集 .pt（含 pair_id/"
+        "instruction_id，2 行/对）。C/D/E 三组都走双 loader（v5 FM 批 + fork 批，"
+        "同 --fork-k 交替），仅 --pair-loss-weight 不同：C=0、D=1、"
+        "E=1 + 打乱配对数据。fork 批 pair loss 只对真配对生效（flow head 专属，"
+        "故 --fork-data 禁止 --direct-head）",
+    )
+    parser.add_argument(
+        "--fork-k",
+        type=int,
+        default=83,
+        help="v5:fork 批交替比（每 k 个 v5 批插 1 个 fork 批）。按自然暴露对齐："
+        "k = (9927/B_v)/(N_f/4)；留 12 对后 N_f=120 → k≈83。C/D/E 三组必须同 k",
+    )
+    parser.add_argument(
+        "--fork-skip-contract",
+        action="store_true",
+        help="E 组（打乱配对）跳过 fork 契约断言——E 的配对不满足同帧约束，"
+        "解释限于错误配对压力测试（Q5b③）",
+    )
     parser.add_argument("--sequence-length", type=int, default=4, help="synthetic BPTT length")
     parser.add_argument("--min-sequence-length", type=int, default=4)
     parser.add_argument("--pair-loss-weight", type=float, default=1.0)
@@ -1234,6 +1361,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="VACouplingLayer count in the decision stack (depth probe)",
     )
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument(
+        "--lr-slot",
+        type=float,
+        default=None,
+        help="PULSE-VA：新槽模块 LR（默认 = --lr）；Codex Stage A 建议 1e-4",
+    )
+    parser.add_argument(
+        "--lr-va",
+        type=float,
+        default=None,
+        help="PULSE-VA：共享 VA/头 LR（默认 = --lr）；Codex Stage A 建议 3e-5",
+    )
+    parser.add_argument(
+        "--head-only",
+        action="store_true",
+        help="Stage 1 对齐模式：只训练 flow head（VA/槽/V-JEPA 全部冻结）"
+        "——随机初始化的动作头噪声梯度不污染已训练的视觉/集成参数；"
+        "Stage 2 再去掉本开关全量微调。",
+    )
     parser.add_argument(
         "--prev-dropout",
         type=float,
@@ -1319,12 +1465,57 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--scene-teacher requires --data with precomputed features (needs metadata.tasks)")
     if args.direct_head and args.e2e_data:
         raise ValueError("--direct-head is not supported with --e2e-data (e2e rollout is flow-specific)")
+    if args.fork_data:
+        # pair 生死门约束（Codex Q5b）：flow head 专属（pair loss 在 direct 模式跳过）、
+        # 预计算特征路径（非 live）、单任务 v5 主 loader + fork 双 loader。
+        if args.direct_head:
+            raise ValueError("--fork-data requires the flow head (--direct-head 下 pair loss 被跳过)")
+        if args.live_vjepa:
+            raise ValueError("--fork-data is not supported with --live-vjepa (预计算特征路径)")
+        if not args.single_task:
+            raise ValueError("--fork-data requires --single-task (v5 主 loader FM-only)")
+        if not args.data:
+            raise ValueError("--fork-data requires --data (v5 特征数据集)")
+        if args.fork_k < 1:
+            raise ValueError("--fork-k must be >= 1")
+        if args.c2_controller:
+            raise ValueError("--fork-data is mutually exclusive with --c2-controller")
     if args.c2_controller and not args.direct_head:
         raise ValueError("--c2-controller requires --direct-head")
     if args.c2_controller and not args.single_task:
         raise ValueError("--c2-controller requires --single-task (v6a/v6b 为按钮任务单任务数据)")
     if args.c2_controller and not args.data:
         raise ValueError("--c2-controller requires --data (precomputed features)")
+    if args.live_vjepa:
+        if not args.data:
+            raise ValueError("--live-vjepa requires --data (v5 paired .pt 与 parquet 行对齐)")
+        if not args.single_task:
+            # Stage B 限定 single-task：配对帧级契约留待数据侧（flow 在
+            # single-task 下退化为 FM-only，可正常训练）。
+            raise ValueError("--live-vjepa requires --single-task (Stage B 限定)")
+        # flow 模式合法（π0 式 flow matching action expert；pair 在 single-task
+        # 下退化为 FM-only，direct_head 不再强制）。
+        if args.local_slots_data:
+            raise ValueError("--live-vjepa is mutually exclusive with --local-slots-data")
+        if args.c2_controller:
+            raise ValueError("--live-vjepa is mutually exclusive with --c2-controller")
+        if args.scene_teacher:
+            raise ValueError("--live-vjepa is mutually exclusive with --scene-teacher")
+        if args.sam_rho > 0:
+            raise ValueError(
+                "--live-vjepa forbids --sam-rho（SAM 二次前向复用已释放的视觉计算图，"
+                "且扰动后骨干未重新编码，Codex P1-2）"
+            )
+        if args.vision_unfreeze_all and args.vision_unfreeze_last:
+            raise ValueError(
+                "--vision-unfreeze-all and --vision-unfreeze-last are mutually exclusive"
+            )
+        if args.batch_size * 4 * 4 > 128:
+            print(
+                "warn: --live-vjepa batch*T*W > 128 帧（V-JEPA 解冻反向显存大，"
+                "16GB 卡建议 batch-size <= 8）",
+                flush=True,
+            )
     if args.c2_controller and (
         args.future_predict or args.evsm or args.plan_resampler or args.scene_teacher
     ):
@@ -1359,10 +1550,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("semantic anchor/geometry weights must be non-negative")
     # 第二轮架构重构（2026-08-08）参数校验。P0-高优 fail-fast：语义上下文/
     # role query/双注意力有结构性前置条件时直接报错，而不是静默失效。
-    if args.flow_semantic and not args.compile_task:
+    if args.flow_semantic and not args.compile_task and not args.live_vjepa:
         raise ValueError(
-            "--flow-semantic requires --compile-task (semantic_context comes "
-            "from the compiler readout tokens)"
+            "--flow-semantic requires --compile-task (e2e) or --live-vjepa "
+            "(semantic_context = langslot 槽输出 [B, 25, vision_dim])"
         )
     if args.flow_semantic and args.flow_cond != "adaln":
         raise ValueError(
@@ -1418,7 +1609,78 @@ def scale_semantic_lora_grads(text_backbone: nn.Module, scale: float) -> None:
             parameter.grad.mul_(scale)
 
 
-def save_checkpoint(args, config, model, e2e_model, scene_teacher=None) -> None:
+def _maybe_build_live_vision(args, device):
+    """Stage B：在线 V-JEPA 构建（Codex P0-2：single-task 分支也必须创建；
+    P0-3：参数保持 FP32，前向 autocast BF16——FP16 参数直接 AdamW 更新会
+    整步归零，FP16 ULP 6.1e-5 > lr 3e-6）。"""
+    if not args.live_vjepa:
+        return None
+    from va_compound.backbones import VJEPA21Backbone
+
+    vision_backbone = VJEPA21Backbone.from_pretrained(
+        device=device,
+        dtype="float32",  # FP32 master 参数（P0-3）
+        max_tokens=144,  # 12x12 grid（spatiotemporal 双片 → 288 token）
+        local_files_only=True,
+    )
+    if args.vision_unfreeze_all:
+        vision_backbone.unfreeze_all()
+        print("live-vjepa: V-JEPA 全量解冻（FP32 参数，BF16 autocast 前向）")
+    elif args.vision_unfreeze_last > 0:
+        vision_backbone.unfreeze_last(args.vision_unfreeze_last)
+        print(f"live-vjepa: V-JEPA 解冻最后 {args.vision_unfreeze_last} 个 block（FP32）")
+    return vision_backbone
+
+
+def _feature_optimizer_groups(args, model, vision_backbone):
+    """Stage A/B 参数分组：槽模块高 LR / VA 低 LR / V-JEPA 最低 LR。
+
+    --head-only（Stage 1 对齐）时只训 flow head：VA（含内部视觉流
+    q_v/k_v/u_v）、槽、V-JEPA 全部冻结——避免随机初始化的动作头噪声
+    梯度污染已训练好的视觉/集成参数（用户 2026-08-08 架构裁决）。
+    """
+    if args.head_only:
+        head_params, rest_names = [], []
+        for name, param in model.named_parameters():
+            if name.startswith("flow_head."):
+                head_params.append(param)
+            else:
+                rest_names.append(name)
+                param.requires_grad_(False)
+        if not head_params:
+            raise ValueError("--head-only requires flow head（--direct-head 不支持）")
+        print(
+            f"head-only: flow head 可训练参数 "
+            f"{sum(p.numel() for p in head_params):,}；VA/槽/V-JEPA 冻结 "
+            f"（{len(rest_names)} 组参数 requires_grad=False）"
+        )
+        return [{"params": head_params, "lr": args.lr}]
+    groups = None
+    if model.config.local_slots:
+        slot_names = ("role_compiler", "slot_reader", "relation_tokens")
+        slot_params, rest_params = [], []
+        for name, param in model.named_parameters():
+            (slot_params if any(name.startswith(s) for s in slot_names) else rest_params).append(
+                param
+            )
+        groups = [
+            {"params": rest_params, "lr": args.lr_va if args.lr_va is not None else args.lr},
+            {"params": slot_params, "lr": args.lr_slot if args.lr_slot is not None else args.lr},
+        ]
+    else:
+        groups = [{"params": list(model.parameters()), "lr": args.lr}]
+    if vision_backbone is not None:
+        vision_params = [p for p in vision_backbone.parameters() if p.requires_grad]
+        if vision_params:
+            groups.append({"params": vision_params, "lr": args.lr_vision})
+            print(
+                f"live-vjepa: V-JEPA 可训练参数 {sum(p.numel() for p in vision_params):,} "
+                f"@ lr={args.lr_vision}"
+            )
+    return groups
+
+
+def save_checkpoint(args, config, model, e2e_model, scene_teacher=None, vision_backbone=None) -> None:
     """原子保存 checkpoint（tmp 文件 + rename），供周期/最终保存复用。"""
     if not args.save:
         return
@@ -1499,12 +1761,18 @@ def save_checkpoint(args, config, model, e2e_model, scene_teacher=None) -> None:
                 "flow_steps": args.flow_steps,
                 "min_sequence_length": args.min_sequence_length,
                 "pair_loss_weight": args.pair_loss_weight,
+                "pair_mode": args.pair_mode,
+                "pair_probe_tau_max": args.pair_probe_tau_max,
                 "pair_start_atol": args.pair_start_atol,
                 "min_pair_action_delta": args.min_pair_action_delta,
             },
         }
         if scene_teacher is not None:
             payload["scene_teacher"] = scene_teacher.state_dict()
+        if args.live_vjepa and vision_backbone is not None:
+            # Stage B：解冻后的 V-JEPA 权重必须随 checkpoint 保存（评估侧
+            # eval_metaworld.py 已支持 vjepa_state_dict 恢复）。
+            payload["vjepa_state_dict"] = vision_backbone.model.state_dict()
     tmp_path = args.save.with_suffix(args.save.suffix + ".tmp")
     torch.save(payload, tmp_path)
     tmp_path.replace(args.save)
@@ -1582,6 +1850,7 @@ def main() -> None:
     iterator = None
     model = None
     e2e_model = None
+    vision_backbone = None
     if args.e2e_data:
         dataset = E2EDataset(args.e2e_data, min_sequence_length=args.min_sequence_length)
         payload = dataset.payload
@@ -1602,6 +1871,7 @@ def main() -> None:
             future_predict=args.future_predict,
             sequential_coupling=args.sequential_coupling,
             flow_cond=args.flow_cond,
+            flow_layers=args.flow_layers,
             evsm=args.evsm,
             evsm_kappa=args.evsm_kappa,
             evsm_temp=args.evsm_temp,
@@ -1614,7 +1884,13 @@ def main() -> None:
             flow_semantic=args.flow_semantic,
         )
         if args.single_task:
-            loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+            loader = DataLoader(
+                dataset,
+                batch_size=args.batch_size,
+                shuffle=True,
+                num_workers=args.num_workers,
+                persistent_workers=args.num_workers > 0,
+            )
         else:
             loader = DataLoader(
                 dataset,
@@ -1640,34 +1916,54 @@ def main() -> None:
                 max(int(round(args.batch_size * (1.0 - args.c2_recovery_ratio))), 1),
                 args.batch_size - 1,
             )
-        dataset = FeatureDataset(
-            args.data,
-            require_pairs=not args.single_task,
-            min_sequence_length=args.min_sequence_length,
-            pair_start_atol=args.pair_start_atol,
-            min_pair_action_delta=args.min_pair_action_delta,
-            pair_start_cosine=args.pair_start_cosine,
-            vision_key=vision_key,
-            step_targets=c2_step_targets,
-            step_mask=c2_step_mask,
-            local_tokens=(
-                torch.load(args.local_slots_data, map_location="cpu", weights_only=True)[
-                    "vision_tokens_st"
-                ]
-                if args.local_slots_data
-                else None
-            ),
-            coords=(
-                torch.load(args.local_slots_data, map_location="cpu", weights_only=True)[
-                    "coords"
-                ]
-                if args.local_slots_data
-                else None
-            ),
+        local_payload = (
+            torch.load(args.local_slots_data, map_location="cpu", weights_only=True)
+            if args.local_slots_data
+            else None
         )
+        local_tokens = None
+        if local_payload is not None:
+            # ST288 大数组在 .npy memmap（16.36 GiB FP16，mmap 零 RAM 峰值）。
+            from va_compound.live_vjepa import load_st288_memmap
+
+            npy_path = local_payload["vision_tokens_st_npy"]
+            local_tokens = load_st288_memmap(npy_path, local_payload["metadata"])
+        if args.live_vjepa:
+            # Stage B：在线 V-JEPA 编码（帧变体；vision_tokens 键被移除）。
+            from va_compound.live_vjepa import LiveVJEPADataset
+
+            dataset = LiveVJEPADataset(
+                args.data,
+                args.live_root,
+                min_sequence_length=args.min_sequence_length,
+                vision_pooling=args.vision_pooling,
+                control_stride=args.control_stride,
+                spe=args.sequences_per_episode,
+                phase_bins=args.phase_bins,
+                phase_seed=args.phase_seed,
+                success_only=args.success_only,
+                sliding=args.sliding_window,
+                frame_aug=args.frame_aug,
+            )
+        else:
+            dataset = FeatureDataset(
+                args.data,
+                require_pairs=not args.single_task,
+                min_sequence_length=args.min_sequence_length,
+                pair_start_atol=args.pair_start_atol,
+                min_pair_action_delta=args.min_pair_action_delta,
+                pair_start_cosine=args.pair_start_cosine,
+                vision_key=vision_key,
+                step_targets=c2_step_targets,
+                step_mask=c2_step_mask,
+                local_tokens=local_tokens,
+                coords=(local_payload["coords"] if local_payload is not None else None),
+            )
         config = VACompoundConfig(
             language_dim=int(dataset.payload["language_hidden"].shape[-1]),
-            vision_dim=int(dataset.payload[vision_key].shape[-1]),
+            vision_dim=(
+                768 if args.live_vjepa else int(dataset.payload[vision_key].shape[-1])
+            ),
             action_horizon=int(dataset.payload["actions"].shape[-2]),
             action_dim=int(dataset.payload["actions"].shape[-1]),
             proprio_dim=int(dataset.payload["proprio"].shape[-1]),
@@ -1682,6 +1978,7 @@ def main() -> None:
             future_predict=args.future_predict,
             sequential_coupling=args.sequential_coupling,
             flow_cond=args.flow_cond,
+            flow_layers=args.flow_layers,
             evsm=args.evsm,
             evsm_kappa=args.evsm_kappa,
             evsm_temp=args.evsm_temp,
@@ -1693,7 +1990,7 @@ def main() -> None:
             role_query_tokens=args.role_query_tokens,
             dual_attention=args.dual_attention,
             flow_semantic=args.flow_semantic,
-            local_slots=args.local_slots_data is not None,
+            local_slots=(args.local_slots_data is not None) or args.live_vjepa,
             local_slots_direct288=args.local_slots_direct288,
             local_slots_fixed_query=args.local_slots_fixed_query,
         )
@@ -1702,11 +1999,44 @@ def main() -> None:
                 dataset,
                 batch_size=c2_clean_n if args.c2_controller else args.batch_size,
                 shuffle=True,
+                num_workers=args.num_workers,
+                persistent_workers=args.num_workers > 0,
             )
         else:
             loader = DataLoader(
                 dataset,
                 batch_sampler=PairedBatchSampler(dataset, args.batch_size, args.seed),
+            )
+        fork_iter = None
+        if args.fork_data is not None:
+            # pair 生死门（Q5b）：fork 数据集独立 loader（PairedBatchSampler，
+            # 每批 2 对=4 行全真配对），与 v5 批按 --fork-k 交替。
+            from va_compound.live_vjepa import _slot_coords  # noqa: F401
+
+            fork_dataset = FeatureDataset(
+                args.fork_data,
+                # E 组（打乱配对）不满足同帧契约 → 跳过校验（采样器走
+                # build_pair_groups 泛化回退）；D 组严格校验。
+                require_pairs=not args.fork_skip_contract,
+                min_sequence_length=args.min_sequence_length,
+                pair_start_atol=args.pair_start_atol,
+                min_pair_action_delta=args.min_pair_action_delta,
+                pair_start_cosine=args.pair_start_cosine,
+                vision_key=(
+                    "vision_tokens_spatial"
+                    if args.vision_pooling == "spatial"
+                    else "vision_tokens"
+                ),
+            )
+            fork_loader = DataLoader(
+                fork_dataset,
+                batch_sampler=PairedBatchSampler(fork_dataset, args.batch_size, args.seed),
+            )
+            fork_iter = iter_forever(fork_loader)
+            print(
+                f"fork-data: {args.fork_data}（{len(fork_dataset)} 行，"
+                f"交替比 1:{args.fork_k}，pair_loss_weight={args.pair_loss_weight}）",
+                flush=True,
             )
         iterator = iter(loader)
         smoke_batch = None
@@ -1728,6 +2058,7 @@ def main() -> None:
             future_predict=args.future_predict,
             sequential_coupling=args.sequential_coupling,
             flow_cond=args.flow_cond,
+            flow_layers=args.flow_layers,
             evsm=args.evsm,
             evsm_kappa=args.evsm_kappa,
             evsm_temp=args.evsm_temp,
@@ -1816,6 +2147,13 @@ def main() -> None:
         )
     elif args.single_task:
         model = VACompoundPolicy(config).to(device)
+        vision_backbone = _maybe_build_live_vision(args, device)
+        if args.role_seeds and config.local_slots:
+            seeds = torch.load(args.role_seeds, map_location="cpu", weights_only=True)[
+                "role_seeds"
+            ]
+            model.role_compiler.set_role_description_embeddings(seeds)
+            print(f"PULSE-VA: role seeds initialized from {args.role_seeds}")
         if args.c2_controller:
             # C² Stage B：冻结 PCA 控制投影 P 的权重来自 v6b 恢复数据的
             # recovery 差空间 top-16 PCA + whitening（Codex 修正 2，P 不端到端学）。
@@ -1832,20 +2170,19 @@ def main() -> None:
                 )
             else:
                 print("c2: --c2-unfreeze-stage-a 全量微调（P 仍冻结）")
-        optimizer = torch.optim.AdamW(
-            [parameter for parameter in model.parameters() if parameter.requires_grad],
-            lr=args.lr,
-            weight_decay=1e-4,
-        )
+        groups = _feature_optimizer_groups(args, model, vision_backbone)
+        optimizer = torch.optim.AdamW(groups, weight_decay=1e-4)
     else:
         model = VACompoundPolicy(config).to(device)
+        vision_backbone = _maybe_build_live_vision(args, device)
         if args.role_seeds and config.local_slots:
             seeds = torch.load(args.role_seeds, map_location="cpu", weights_only=True)[
                 "role_seeds"
             ]
             model.role_compiler.set_role_description_embeddings(seeds)
             print(f"PULSE-VA: role seeds initialized from {args.role_seeds}")
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+        groups = _feature_optimizer_groups(args, model, vision_backbone)
+        optimizer = torch.optim.AdamW(groups, weight_decay=1e-4)
 
     # Plan-Cache 方案 A：加载冻结 Qwen（local files only，fp16/bf16）+ 可训练
     # SceneTeacher（projector + readout tokens 进 optimizer）。指令文本从
@@ -1952,9 +2289,28 @@ def main() -> None:
                         f"missing c2 keys = {len(missing)}, unexpected = {len(unexpected)}"
                     )
                 else:
-                    model.load_state_dict(resume_ckpt["model"])
+                    missing, unexpected = model.load_state_dict(
+                        resume_ckpt["model"], strict=False
+                    )
+                    # entry→adaln flow 迁移：新 flow 参数（ada_mlps/ca_*）允许
+                    # missing（随机初始化），V-JEPA/VA/共享 head 权重仍继承。
+                    if missing or unexpected:
+                        print(
+                            f"resume (non-strict): missing={len(missing)} "
+                            f"unexpected={len(unexpected)}"
+                        )
             else:
-                model.load_state_dict(resume_ckpt["model"])
+                missing, unexpected = model.load_state_dict(
+                    resume_ckpt["model"], strict=False
+                )
+                if missing or unexpected:
+                    print(
+                        f"resume (non-strict): missing={len(missing)} "
+                        f"unexpected={len(unexpected)}"
+                    )
+            if vision_backbone is not None and resume_ckpt.get("vjepa_state_dict") is not None:
+                vision_backbone.model.load_state_dict(resume_ckpt["vjepa_state_dict"])
+                print("live-vjepa: V-JEPA 权重从 checkpoint 恢复")
             if scene_teacher is not None:
                 if resume_ckpt.get("scene_teacher") is None:
                     raise ValueError(
@@ -1974,8 +2330,17 @@ def main() -> None:
     if args.c2_controller:
         clean_iter = iter_forever(loader)
         rec_iter = iter_forever(recovery_loader)
+    if args.lang_fixed_vector:
+        # grounding 对照（Codex 2026-08-08）：语言通道 = 数据集全局均值常量向量，
+        # 循环外预计算一次；完整模型 vs 固定语言基线的差距即语言条件的因果贡献。
+        if args.live_vjepa:
+            raise ValueError("--lang-fixed-vector 仅支持 feature 路径（非 live）")
+        lang_fixed_vec = dataset.payload["language_hidden"].mean(dim=(0, 1), keepdim=True)
+        print(f"lang-fixed-vector: 语言通道替换为全局均值（shape={tuple(lang_fixed_vec.shape)}）")
+
     for step in range(1, args.steps + 1):
         rec_batch = None
+        is_fork_batch = fork_iter is not None and step % (args.fork_k + 1) == 0
         if args.c2_controller:
             # C² 3:1 混合：clean 部分（v5 + v6a 目标）+ recovery 部分（v6b）。
             batch = move_batch(next(clean_iter), device)
@@ -1983,12 +2348,35 @@ def main() -> None:
         elif iterator is None:
             batch = smoke_batch
         else:
-            try:
-                batch = next(iterator)
-            except StopIteration:
-                iterator = iter(loader)
-                batch = next(iterator)
-            batch = move_batch(batch, device)
+            is_fork_batch = fork_iter is not None and step % (args.fork_k + 1) == 0
+            if is_fork_batch:
+                batch = move_batch(next(fork_iter), device)
+            else:
+                try:
+                    batch = next(iterator)
+                except StopIteration:
+                    iterator = iter(loader)
+                    batch = next(iterator)
+                batch = move_batch(batch, device)
+        if args.live_vjepa:
+            # Stage B：在线 V-JEPA 编码（frames 仍为 CPU numpy；编码在 GPU 上，
+            # 输出 [B, T, 288, D] 与 ST288 同构，替换进 batch）。
+            # Codex P0-3：FP32 参数 + BF16 autocast 前向（FP16 参数 AdamW 更新归零）。
+            from va_compound.live_vjepa import encode_live_frames
+
+            frames = batch.pop("frames")
+            if isinstance(frames, torch.Tensor):
+                frames = frames.cpu().numpy()
+            with torch.autocast(
+                device_type="cuda",
+                dtype=torch.bfloat16,
+                enabled=any(
+                    p.requires_grad for p in vision_backbone.parameters()
+                ),
+            ):
+                encoded = encode_live_frames(frames, vision_backbone, device)
+            batch["vision_tokens"] = encoded.float()  # VA 期待 fp32（与 v5 缓存一致）
+            batch["vision_tokens_st"] = batch["vision_tokens"]
         if e2e_model is None:
             batch = ensure_sequence(batch, args.min_sequence_length)
         if args.prev_dropout > 0.0:
@@ -2003,7 +2391,7 @@ def main() -> None:
                 ~prev_mask
             ).view(-1, 1, 1).float()
         if args.save_every > 0 and step % args.save_every == 0:
-            save_checkpoint(args, config, model, e2e_model, scene_teacher)
+            save_checkpoint(args, config, model, e2e_model, scene_teacher, vision_backbone)
             print(f"step={step} periodic checkpoint saved to {args.save}")
 
         if model.config.c2_controller:
@@ -2037,6 +2425,13 @@ def main() -> None:
                 f"grad={float(gradient_norm):.6f}{contract_log}"
             )
             continue
+
+        if args.lang_fixed_vector:
+            batch["language_hidden"] = lang_fixed_vec.expand(
+                batch["language_hidden"].shape
+            ).to(device)
+            if "language_mask" in batch:
+                batch["language_mask"] = torch.ones_like(batch["language_mask"])
 
         noisy_actions, flow_time, target_velocity = sample_flow_matching_inputs(
             batch["actions"]
@@ -2119,12 +2514,34 @@ def main() -> None:
                     tgt_delta = flow_loss.new_zeros(())
                 else:
                     flow_loss = model.flow_matching_loss(predicted_velocity, target_velocity)
-                    if args.single_task:
+                    if args.single_task and not is_fork_batch:
                         pair_loss = flow_loss.new_zeros(())
                         pred_delta = flow_loss.new_zeros(())
                         tgt_delta = flow_loss.new_zeros(())
                     else:
                         partner = paired_partner_indices(batch["pair_id"], batch["instruction_id"])
+                        if args.fork_data is not None and not args.fork_skip_contract:
+                            # 生死门契约断言（Q5b③）：fork 对必须同帧同 proprio/prev
+                            # （语言是 pair 内唯一输入差）。E 组打乱数据跳过。
+                            if not (
+                                torch.equal(
+                                    batch["proprio"], batch["proprio"][partner]
+                                )
+                                and torch.equal(
+                                    batch["previous_action"],
+                                    batch["previous_action"][partner],
+                                )
+                                and torch.allclose(
+                                    batch["vision_tokens"],
+                                    batch["vision_tokens"][partner],
+                                    atol=1e-4,
+                                    rtol=1e-4,
+                                )
+                            ):
+                                raise ValueError(
+                                    "fork pair contract violated: proprio/previous_action/"
+                                    "vision_tokens must be identical within each pair"
+                                )
                         if args.pair_mode == "legacy":
                             # 旧 L_pair：tau=0 共享噪声 delta-only（消融对照）。
                             pair_noise, pair_time, pair_target_velocity = sample_pair_intervention(
@@ -2315,7 +2732,11 @@ def main() -> None:
             else (
                 [*model.parameters(), *scene_teacher.parameters()]
                 if scene_teacher is not None
-                else model.parameters()
+                else (
+                    [*model.parameters(), *vision_backbone.parameters()]
+                    if vision_backbone is not None
+                    else model.parameters()
+                )
             )
         )
         gradient_norm = torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
@@ -2368,7 +2789,7 @@ def main() -> None:
         )
 
     if args.save:
-        save_checkpoint(args, config, model, e2e_model, scene_teacher)
+        save_checkpoint(args, config, model, e2e_model, scene_teacher, vision_backbone)
 
 
 if __name__ == "__main__":

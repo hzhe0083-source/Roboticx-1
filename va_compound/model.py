@@ -1554,9 +1554,14 @@ class VACompoundPolicy(nn.Module):
             num_layers=config.flow_layers,
             dropout=config.dropout,
             flow_cond=config.flow_cond,
-            # flow_semantic：语义上下文（compile readout tokens）在语言空间，
-            # head 内部投影到 hidden 供逐层 cross-attn 使用。
-            semantic_in_dim=config.language_dim if config.flow_semantic else None,
+            # flow_semantic：语义上下文来源随路径——e2e/compile 在语言空间
+            # （2048），live+local_slots 是槽输出（vision 空间 768）；
+            # head 内部统一经 semantic_proj 投影到 hidden 供逐层 cross-attn。
+            semantic_in_dim=(
+                (config.vision_dim if config.local_slots else config.language_dim)
+                if config.flow_semantic
+                else None
+            ),
         )
         if config.direct_head:
             self.direct_head = DirectActionHead(

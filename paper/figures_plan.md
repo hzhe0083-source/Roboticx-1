@@ -64,6 +64,19 @@ Sans SC, dpi 130 (existing scripts in artifacts/figures/).
 - Script: artifacts/figures/make_fig_libero100.py — READY (TBD slots).
 - Status: script ready, numbers pending queue step 6/7.
 
+## Fig 12 — PULSE-VA Stage A readout grid (NEW)
+- 四格单步 arm pass（6k/20k）：flat64 参照 88.64%（direct 40k）vs
+  direct288（分辨率隔离）/ fixedslot（槽压缩）/ langslot（语言编程槽）。
+- 附加：288 vs 64 token 的逐决策 chunk MAE 分布。
+- Script: artifacts/figures/make_fig_stageA.py — TODO.
+- Status: numbers pending Stage A 筛选（队列自动跑）。
+
+## Fig 13 — Stage B V-JEPA unfreeze curve (NEW)
+- 解冻前/后单步 arm pass + 闭环 5 任务 smoke（V-JEPA train/eval 一致性对照）。
+- 曲线：live 训练 step vs arm pass（batch 2，低 LR 3e-6）。
+- Script: artifacts/figures/make_fig_stageB.py — TODO.
+- Status: numbers pending Stage B 冒烟 + 正式训练。
+
 ## Tables
 - Table 1: PNPW ablations (§5.1) — DONE.
 - Table 2: literature comparison (§5.4) — DONE (footnotes per protocol).
@@ -71,3 +84,5 @@ Sans SC, dpi 130 (existing scripts in artifacts/figures/).
 - Table 4: C1/C2 vs A vs B40k 2x2 (cosine + trio + C_OL) — TODO (C2 eval).
 - Table 5: L_m per pair (D, O, L_m, CI) — TODO.
 - Table 6: VLA-RL IL vs RL (per task + macro) — TODO.
+- Table 7: Stage A 四格（6k/20k 单步 + 闭环 5 任务）— TODO (NEW).
+- Table 8: Stage B V-JEPA 解冻 IL→闭环 — TODO (NEW).

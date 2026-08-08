@@ -99,7 +99,12 @@ class LanguageRoleCompiler(nn.Module):
                 f"got {tuple(desc_emb.shape)}"
             )
         with torch.no_grad():
-            projected = self.lang_proj(desc_emb.to(dtype=self.lang_proj.weight.dtype))
+            projected = self.lang_proj(
+                desc_emb.to(
+                    dtype=self.lang_proj.weight.dtype,
+                    device=self.lang_proj.weight.device,
+                )
+            )
             self.role_seeds.copy_(projected)
 
     def forward(

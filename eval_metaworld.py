@@ -36,6 +36,33 @@ from va_compound.model import (
 IMAGE_MEAN = torch.tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1)
 IMAGE_STD = torch.tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1)
 
+try:
+    from va_compound.live_vjepa import _slot_coords as _stage_coords
+except Exception:  # pragma: no cover - 环境裁剪场景
+    _stage_coords = None
+
+
+def _apply_local_vision(model, tokens, language_cache):
+    """Stage A/B：local_slots 读出路径（direct288 恒等；slots 走槽 cross-attn）。
+
+    训练侧 rollout_policy 用 build_local_vision(st, coords, role_queries) 喂
+    encode_condition；闭环评估必须走同一路径，否则 288-token checkpoint 的
+    槽/坐标读出被跳过（闭环数字失真）。
+    """
+    if not model.config.local_slots:
+        return tokens
+    if _stage_coords is None:
+        raise RuntimeError("local_slots eval requires va_compound.live_vjepa")
+    role_queries = (
+        getattr(language_cache, "role_queries", None)
+        if language_cache is not None
+        else None
+    )
+    coords = torch.from_numpy(_stage_coords()).to(
+        device=tokens.device, dtype=tokens.dtype
+    )
+    return model.build_local_vision(tokens, coords, role_queries)
+
 VISION_WINDOW = 4
 DECISION_STRIDE = 6  # 80 FPS, decide every 6 frames (13.3 Hz), matches training
 ACTION_HORIZON = 8
@@ -46,6 +73,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--features", type=Path, required=True, help="metaworld_features.pt for normalization")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--vision-pooling",
+        choices=("flat", "spatial", "spatiotemporal"),
+        default=None,
+        help="在线 V-JEPA 池化（覆盖 training_contract；Stage A/B 288-token "
+        "checkpoint 必须为 spatiotemporal，否则闭环数字失真）",
+    )
     parser.add_argument("--trials-per-task", type=int, default=10)
     parser.add_argument("--max-tasks", type=int, default=49)
     parser.add_argument(
@@ -516,6 +550,16 @@ def main() -> None:
     vision_pooling = str(
         (ckpt.get("training_contract", {}) or {}).get("vision_pooling", "flat")
     )
+    if args.vision_pooling is not None:
+        vision_pooling = args.vision_pooling
+    if config.local_slots and vision_pooling != "spatiotemporal":
+        # Stage A/B：local_slots 训练（ST288/live）必为 spatiotemporal 288 token，
+        # 旧 contract 可能漏记；强制对齐避免 flat 64-token 闭环失真。
+        print(
+            f"eval: config.local_slots=True 但 vision_pooling={vision_pooling}；"
+            "强制 spatiotemporal（288 token，与训练一致）"
+        )
+        vision_pooling = "spatiotemporal"
     if args.direct_head != "auto":
         config = dataclasses.replace(config, direct_head=args.direct_head == "on")
     # P0-3：semantic-compiler ckpt 同样按需逐决策重建语言缓存（场景条件化）。
@@ -579,7 +623,10 @@ def main() -> None:
             f"oracle_ref={args.c2_oracle_ref} zero_gain={args.c2_zero_gain}"
         )
     vision_backbone = VJEPA21Backbone.from_pretrained(
-        device=device, dtype="float16", max_tokens=64, local_files_only=True
+        device=device,
+        dtype="float16",
+        max_tokens=144 if vision_pooling == "spatiotemporal" else 64,
+        local_files_only=True,
     )
     if ckpt.get("vjepa_state_dict"):
         # e2e checkpoint：V-JEPA 被微调过，必须加载训练后权重（2026-08-06 P0 #4）
@@ -771,9 +818,12 @@ def main() -> None:
                         )[None, None]
                         with torch.inference_mode():
                             tokens = vision_backbone(clip.unsqueeze(0), pooling=vision_pooling)
+                            vision_in = _apply_local_vision(
+                                model, tokens, task_caches[task_index]
+                            )
                             c_current = model.control_projector(tokens)
                             cond, memory = model.encode_condition(
-                                tokens,
+                                vision_in,
                                 proprio[0],
                                 previous[0],
                                 language_cache=task_caches[task_index],
@@ -885,8 +935,11 @@ def main() -> None:
                         dtype=torch.float32, device=device,
                     )[None, None]
                     with torch.inference_mode():
+                        vision_in = _apply_local_vision(
+                            model, tokens, task_caches[task_index]
+                        )
                         cond, memory = model.encode_condition(
-                            tokens,
+                            vision_in,
                             proprio[0],
                             previous[0],
                             language_cache=task_caches[task_index],

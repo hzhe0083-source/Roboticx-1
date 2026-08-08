@@ -198,3 +198,70 @@ class TrainingContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ForkModeTests(unittest.TestCase):
+    """pair 生死门（Codex Q5b）：fork 数据集契约与 E 组打乱形态。"""
+
+    def _write(self, directory: str, payload: dict) -> Path:
+        path = Path(directory) / "fork.pt"
+        torch.save(payload, path)
+        return path
+
+    def _fork_payload(self, shuffled: bool = False) -> dict:
+        """2 对 × 2 行：同帧同 proprio/prev、不同指令不同动作（D 组形态）；
+        shuffled=True 时同 pair 内视觉不同（E 组形态，契约不满足）。"""
+        torch.manual_seed(11)
+        samples, sequence, visual_tokens = 4, 4, 5
+        if shuffled:
+            vision = torch.randn(samples, sequence, visual_tokens, 6)
+        else:
+            vision = torch.randn(2, sequence, visual_tokens, 6).repeat_interleave(2, dim=0)
+        proprio = torch.randn(2, sequence, 3).repeat_interleave(2, dim=0)
+        previous = torch.randn(2, sequence, 2).repeat_interleave(2, dim=0)
+        instruction_id = torch.tensor([0, 1, 0, 1])
+        language = torch.randn(samples, 3, 7)
+        actions = torch.randn(samples, sequence, 3, 2)
+        actions[1] = actions[0] + 1.0
+        actions[3] = actions[2] - 1.0
+        return {
+            "vision_tokens": vision,
+            "language_hidden": language,
+            "language_mask": torch.ones(samples, 3, dtype=torch.bool),
+            "proprio": proprio,
+            "previous_action": previous,
+            "actions": actions,
+            "pair_id": torch.tensor([20, 20, 21, 21]),
+            "instruction_id": instruction_id,
+        }
+
+    def test_fork_payload_passes_strict_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            path = self._write(d, self._fork_payload(shuffled=False))
+            dataset = FeatureDataset(path, require_pairs=True)
+            self.assertEqual(len(dataset), 4)
+            self.assertEqual(len(dataset.pair_groups), 2)
+
+    def test_shuffled_payload_fails_strict_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            path = self._write(d, self._fork_payload(shuffled=True))
+            with self.assertRaises(ValueError):
+                FeatureDataset(path, require_pairs=True)
+
+    def test_shuffled_payload_sampler_still_pairs_two_instructions(self) -> None:
+        """E 组：require_pairs=False + PairedBatchSampler（泛化回退）仍产出
+        2 行/组、不同指令的批。"""
+        with tempfile.TemporaryDirectory() as d:
+            path = self._write(d, self._fork_payload(shuffled=True))
+            dataset = FeatureDataset(path, require_pairs=False)
+            sampler = PairedBatchSampler(dataset, batch_size=4, seed=0)
+            for batch in sampler:
+                self.assertEqual(len(batch), 4)
+                ids = dataset.payload["pair_id"][batch].tolist()
+                inst = dataset.payload["instruction_id"][batch].tolist()
+                for p in set(ids):
+                    rows = [i for i, pid in zip(batch, ids) if pid == p]
+                    self.assertEqual(len(rows), 2)
+                    self.assertNotEqual(
+                        inst[batch.index(rows[0])], inst[batch.index(rows[1])]
+                    )

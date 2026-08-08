@@ -218,7 +218,9 @@ VJEPA21_CHECKPOINT_URL = (
 )
 
 
-def _dtype(name: str) -> torch.dtype:
+def _dtype(name: str | torch.dtype) -> torch.dtype:
+    if isinstance(name, torch.dtype):
+        return name
     choices = {
         "float32": torch.float32,
         "float16": torch.float16,
@@ -1327,6 +1329,10 @@ class QwenSemanticBackbone(nn.Module):
             p, a = prior, adapted
         p = F.normalize(p.float(), dim=-1).detach()
         a = F.normalize(a.float(), dim=-1)
+        if p.shape[0] < 2:
+            # microbatch=1：Gram [1,1] 恒为 1（归一化自相似），监督信号消失；
+            # 退化为逐 token L2（与 anchor 同语义），避免恒零。
+            return F.mse_loss(a, p)
         gram_a = a @ a.transpose(-1, -2)  # [B, B]
         gram_p = p @ p.transpose(-1, -2)
         return (gram_a - gram_p).square().mean(dim=1).mean()

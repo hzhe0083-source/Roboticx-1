@@ -36,9 +36,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument(
         "--vision-pooling",
-        choices=("flat", "spatial"),
+        choices=("flat", "spatial", "spatiotemporal"),
         default=None,
         help="defaults to the pooling recorded in the checkpoint contract",
+    )
+    parser.add_argument(
+        "--local-slots-data",
+        type=Path,
+        default=None,
+        help="Stage A/B：ST288 索引 .pt（含 vision_tokens_st_npy 与 coords），"
+        "local_slots checkpoint 的消融评估用",
     )
     parser.add_argument(
         "--max-samples", type=int, default=None,
@@ -47,6 +54,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--taskid-lang", action="store_true",
         help="add task-id condition: language replaced by Qwen-encoded 'task {i}' texts",
+    )
+    parser.add_argument(
+        "--perturb",
+        choices=("wrong", "blank", "swap", "none"),
+        default="wrong",
+        help="language-stream perturbation (vs clean): wrong = 同分布错误指令；"
+        "blank = 语言流置零（zero hidden + zero mask）；swap = 换到另一任务指令；"
+        "none = 只评估 clean",
     )
     parser.add_argument(
         "--model-dtype", default="bfloat16",
@@ -112,6 +127,8 @@ def eval_ablation(
     batch_size: int,
     language_override: tuple[torch.Tensor, torch.Tensor | None] | None,
     vision_key: str = "vision_tokens",
+    local_tokens: torch.Tensor | None = None,
+    coords: torch.Tensor | None = None,
 ) -> dict[str, float]:
     """开环逐决策点评估；统计决策点 0 与全序列的 chunk_mae（归一化）。"""
     model.eval()
@@ -138,8 +155,18 @@ def eval_ablation(
         visual_memory = None
         conditions = []
         for time_index in range(batch[vision_key].shape[1]):
+            if local_tokens is not None:
+                if coords is None:
+                    raise ValueError("local_tokens requires coords")
+                vision_in = model.build_local_vision(
+                    local_tokens[batch_indices][:, time_index].to(device),
+                    coords.to(device),
+                    language_cache.role_queries,
+                )
+            else:
+                vision_in = batch[vision_key][:, time_index]
             condition, visual_memory = model.encode_condition(
-                batch[vision_key][:, time_index],
+                vision_in,
                 batch["proprio"][:, time_index],
                 batch["previous_action"][:, time_index],
                 language_cache=language_cache,
@@ -205,36 +232,86 @@ def main() -> None:
     model = VACompoundPolicy(config).to(device)
     model.load_state_dict(checkpoint["model"])
 
+    # Stage A/B：local_slots 288-token 消融支持（与 mw_single_step_acc 同模式）。
+    local_payload = None
+    if args.local_slots_data:
+        import numpy as np
+
+        local_payload = torch.load(
+            args.local_slots_data,
+            map_location="cpu",
+            weights_only=False,  # meta 含 numpy coords（本地可信 scratch 文件）
+        )
+        if not config.local_slots:
+            raise ValueError("--local-slots-data 需要 config.local_slots 的 checkpoint")
+    local_tokens = None
+    coords = None
+    if local_payload is not None:
+        from va_compound.live_vjepa import load_st288_memmap
+
+        npy_path = local_payload["vision_tokens_st_npy"]
+        local_tokens = load_st288_memmap(npy_path, local_payload["metadata"])
+        coords = torch.from_numpy(local_payload["coords"])
+        print(f"local-slots: ST288 loaded ({tuple(local_tokens.shape)})")
     dataset = FeatureDataset(args.data, require_pairs=False, vision_key=vision_key)
     payload = dataset.payload
     indices = list(range(dataset.length))
     if args.max_samples is not None:
         indices = indices[: args.max_samples]
-    wrong_language = build_wrong_language(payload, device)
 
     clean = eval_ablation(
         model, payload, indices, device,
         flow_steps=flow_steps, batch_size=args.batch_size, language_override=None,
-        vision_key=vision_key,
+        vision_key=vision_key, local_tokens=local_tokens, coords=coords,
     )
-    wrong = eval_ablation(
-        model, payload, indices, device,
-        flow_steps=flow_steps, batch_size=args.batch_size,
-        language_override=(wrong_language, None),
-        vision_key=vision_key,
-    )
-    baseline = persistence_baseline(payload, indices, success_threshold=0.05)
-
     n_tasks = len(set(payload["instruction_id"].tolist()))
     print(f"samples={len(indices)} tasks={n_tasks} flow_steps={flow_steps}")
     print(f"clean: chunk0={clean['chunk0']:.5f} chunk_all={clean['chunk_all']:.5f}")
-    print(f"wrong: chunk0={wrong['chunk0']:.5f} chunk_all={wrong['chunk_all']:.5f}")
-    delta0 = wrong["chunk0"] / clean["chunk0"] - 1.0
-    delta_all = wrong["chunk_all"] / clean["chunk_all"] - 1.0
-    print(
-        f"delta: chunk0 {delta0:+.1%} chunk_all {delta_all:+.1%} "
-        f"(positive = wrong instruction hurts, language stream matters)"
-    )
+
+    if args.perturb == "wrong":
+        override: tuple[torch.Tensor, torch.Tensor | None] = (
+            build_wrong_language(payload, device), None,
+        )
+    elif args.perturb == "blank":
+        override = (
+            torch.zeros_like(payload["language_hidden"]).to(device),
+            torch.zeros_like(payload["language_mask"]).to(device)
+            if "language_mask" in payload else None,
+        )
+    elif args.perturb == "swap":
+        inst = payload["instruction_id"].tolist()
+        unique = sorted(set(inst))
+        per_inst = {
+            value: payload["language_hidden"][inst.index(value)] for value in unique
+        }
+        override = (
+            torch.stack(
+                [per_inst[(value + 1) % len(unique)] for value in inst]
+            ).to(device),
+            None,
+        )
+    else:
+        override = None
+
+    perturbed = None
+    if override is not None:
+        perturbed = eval_ablation(
+            model, payload, indices, device,
+            flow_steps=flow_steps, batch_size=args.batch_size,
+            language_override=override,
+            vision_key=vision_key, local_tokens=local_tokens, coords=coords,
+        )
+        print(
+            f"{args.perturb}: chunk0={perturbed['chunk0']:.5f} "
+            f"chunk_all={perturbed['chunk_all']:.5f}"
+        )
+        delta0 = perturbed["chunk0"] / clean["chunk0"] - 1.0
+        delta_all = perturbed["chunk_all"] / clean["chunk_all"] - 1.0
+        print(
+            f"delta: chunk0 {delta0:+.1%} chunk_all {delta_all:+.1%} "
+            f"(positive = perturbation hurts, language stream matters)"
+        )
+    baseline = persistence_baseline(payload, indices, success_threshold=0.05)
 
     if args.taskid_lang:
         taskid_language = build_taskid_language(
@@ -244,7 +321,7 @@ def main() -> None:
             model, payload, indices, device,
             flow_steps=flow_steps, batch_size=args.batch_size,
             language_override=taskid_language,
-            vision_key=vision_key,
+            vision_key=vision_key, local_tokens=local_tokens, coords=coords,
         )
         print(f"taskid: chunk0={taskid['chunk0']:.5f} chunk_all={taskid['chunk_all']:.5f}")
         delta_tid0 = taskid["chunk0"] / clean["chunk0"] - 1.0

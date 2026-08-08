@@ -25,12 +25,23 @@ def make_fake_payload(samples: int = 4, n_st: int = 288) -> dict:
     torch.manual_seed(7)
     sequence = 4
     vision = torch.randn(samples, sequence, 64, 768)
+    # pair 契约：同一 pair_id 的样本首决策视觉完全一致（Codex P0 路径测试）。
+    vision[1, 0] = vision[0, 0]
+    vision[3, 0] = vision[2, 0]
     st = torch.randn(samples, sequence, n_st, 768)
+    st[1, 0] = st[0, 0]
+    st[3, 0] = st[2, 0]
     proprio = torch.randn(samples, sequence, 4)
+    proprio[1, 0] = proprio[0, 0]
+    proprio[3, 0] = proprio[2, 0]
     previous = torch.randn(samples, sequence, 4)
+    previous[1, 0] = previous[0, 0]
+    previous[3, 0] = previous[2, 0]
     instruction_id = torch.tensor([0, 1, 0, 1])
     language = torch.randn(2, 8, 1536)[instruction_id]
     actions = torch.randn(samples, sequence, 6, 4)
+    actions[1] = actions[0] + 1.0
+    actions[3] = actions[2] - 1.0
     return {
         "vision_tokens": vision,
         "vision_tokens_st": st,
@@ -121,3 +132,40 @@ class LocalSlotE2ETests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LocalSlotDataLoaderTests(unittest.TestCase):
+    def test_dataloader_collate_coords_and_local_vision(self) -> None:
+        """Codex P0-2：DataLoader 会把 coords [288,3] 堆叠成 [B,288,3]——
+        必须取 [0] 再进 reader；本测试走真实 collate 路径。"""
+        import torch.utils.data as data_utils
+        from train import FeatureDataset
+        import tempfile
+
+        payload = make_fake_payload(samples=4)
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "features.pt"
+            torch.save(payload, path)
+            ds = FeatureDataset(
+                path,
+                require_pairs=True,
+                local_tokens=payload["vision_tokens_st"],
+                coords=payload["coords"],
+            )
+            loader = data_utils.DataLoader(ds, batch_size=2, shuffle=False)
+            batch = next(iter(loader))
+            assert batch["coords"].shape == (2, 288, 3), batch["coords"].shape
+            assert batch["vision_tokens_st"].shape == (2, 4, 288, 768)
+            cfg = VACompoundConfig(
+                language_dim=1536, vision_dim=768, hidden_dim=256, num_layers=2,
+                num_heads=4, action_horizon=6, action_dim=4, proprio_dim=4,
+                direct_head=True, local_slots=True,
+            )
+            model = VACompoundPolicy(cfg).eval()
+            cache = model.build_language_cache(batch["language_hidden"], batch["language_mask"])
+            vision = model.build_local_vision(
+                batch["vision_tokens_st"][:, 0],
+                batch["coords"][0],  # collate 修复：共享坐标取首个
+                cache.role_queries,
+            )
+            assert vision.shape == (2, 25, 768)

@@ -24,7 +24,9 @@ and loses language sensitivity (+1.5%). A 2x2 control (frozen/LoRA language x
 frozen/unfrozen vision) isolates the collapse to the trainable language
 adapter. Our action head is a lightweight flow-matching module (43.5M
 trainable parameters, 40.6 Hz deployment), trained with a two-term loss
-(flow-matching + paired instruction contrast) — no auxiliary losses such as
+(flow-matching + paired instruction contrast [λ_pair = 0 in the config-A runs;
+the pair term's causal contribution is UNVERIFIED — see §5.2]) — no auxiliary
+losses such as
 image reconstruction or world-model objectives used by memory-based VLA
 baselines. The C² mainline controller (§3.5) additionally trains its
 reference/gain heads with a per-step expected-visual target (L_f) and
@@ -85,7 +87,9 @@ Our contributions:
 2. **Causal language-grounding evidence under same-scene counterfactuals.** On
    LIBERO's same-scene different-instruction regime — exactly the regime that
    exposes visual shortcuts — the frozen-cache policy shows language to be a
-   necessary input: zeroing the language stream increases chunk error by
+   necessary input for the measured behavior [behavioral sensitivity, measured;
+   attribution to the pair loss UNVERIFIED — see §5.2 note]: zeroing the
+   language stream increases chunk error by
    +2381% (3-scene, 12-task) and +13751% (1-scene), and swapping instructions
    by +607%/+1518%. On MetaWorld MT50, the C² mainline shows the strongest
    language sensitivity in this work: substituting a wrong instruction
@@ -333,7 +337,10 @@ $$
 \mathrm{Huber}(v_\theta(x,\tau,C_i)-v_\theta(x,\tau,C_j),\,(a_i-a_j)/(1-\tau)).
 $$
 
-Pairs are genuine same-scene forks: instructions sharing a scene whose first
+Pairs are near-identical same-scene forks (not bitwise: the target object
+layout is part of the task definition, so first states differ up to measured
+feature cosine ≥ 0.99 / proprio max-diff ≤ 0.15 / visual max diff 2.6):
+instructions sharing a scene whose first
 state satisfies a cosine-gated contract (feature cosine ≥ 0.99, proprio
 max-diff ≤ 0.15, previous action exactly zero — the deployment contract at
 episode start). [Data fact, measured: MetaWorld MT50 episodes are single-goal
@@ -479,16 +486,21 @@ same-scene dual-objective pairs where only the language cache differs between
 otherwise identical rollouts (Sec. 5.6).
 
 **Smoke protocol** (fixed before the VA2 evaluation, run on the checkpoint
-only). 800 genuine same-state fork pairs from 3 MetaWorld tasks: the two rows
-of each pair share vision/proprio/previous-action at every time step and
-differ only in the language stream. Metric A (source probe): with one shared
-flow noise ε per pair, v_θ(ε, 0; C_i) − v_θ(ε, 0; C_j) must align with the
-expert action split a_i − a_j; directional accuracy = fraction of pairs whose
-mean cosine is positive, bar ≥ 16/18 = 88.9% (converted to 712/800). Metric B
-(execution): 32-step Euler rollout, first-step directional accuracy plus
-per-condition chunk MAE. Both measured models remain below the 88.9% bar on
-the execution metric — C² mainline 84.4% (2702/3200), v5 direct 86.7%
-(2775/3200) — i.e. the policy forks with language but not yet at bar level
+only). 800 *synthetic code-path* smoke pairs assembled from 3 MetaWorld tasks
+(scripts/build_smoke_pairs.py): the two rows of a pair attach the language +
+action chunk of a different-task row to the vision/proprio/previous-action of
+one row, so they share state by construction — not as physically executed
+same-state forks (real fork data is not yet collected; the build script marks
+itself "code-path smoke only; real fork data TODO"). This smoke validates the
+code path only and is NOT mechanism evidence. Metric A (source probe): with
+one shared flow noise ε per pair, v_θ(ε, 0; C_i) − v_θ(ε, 0; C_j) must align
+with the expert action split a_i − a_j; directional accuracy = fraction of
+pairs whose mean cosine is positive, bar ≥ 16/18 = 88.9% (converted to
+712/800). Metric B (execution): 32-step Euler rollout, first-step directional
+accuracy plus per-condition chunk MAE. Both measured models remain below the
+88.9% bar on the execution metric — C² mainline 84.4% (2702/3200), v5 direct
+86.7% (2775/3200) — i.e. the output forks with the attached language on
+synthetic pairs, but not yet at bar level
 (logs/mw_v5_c2_full_smoke.log, mw_v5_direct_smoke.log).
 
 **Training.** VA composite 8 layers (PNPW/MW) or 4 layers (LIBERO e2e
@@ -533,8 +545,12 @@ multi-instruction data is required to test the language stream (Sec. 5.2).
 | 1-scene (4 tasks) | 0.00106 | +13751% | +1518% |
 | 3-scene (12 tasks) | 0.00254 | +2381% | +607% |
 
-Language is causally necessary under same-scene different-instruction data —
-the design regime where VLA shortcut risk is highest.
+Language is behaviorally necessary under same-scene different-instruction
+data — zeroing/swapping the stream measurably changes policy output, the
+design regime where VLA shortcut risk is highest. [UNVERIFIED: attribution
+of this sensitivity to the paired contrast loss L_CF. Config A ran with
+λ_CF = 0; a matched λ_CF = 0 vs λ_CF > 0 adjudication on strict fork data is
+pending (Sec. 5.6).]
 
 ### 5.3 MetaWorld MT50
 
