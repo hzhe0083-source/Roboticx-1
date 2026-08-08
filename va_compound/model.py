@@ -368,6 +368,10 @@ class RoleQueryResampler(nn.Module):
         out = self._from_heads(torch.matmul(weights, v))
         out = self.out(out)
         out = out + self.ffn(self.norm(out))
+        # P0-高优：全 False mask 时 softmax(-inf) 是均匀分布而非零——语言序列
+        # 全被遮蔽（如空序列）时 role 输出必须严格为零。
+        valid = language_mask.bool().any(dim=-1, keepdim=True)  # [B, 1]
+        out = out * valid[:, None, :]
         return out.to(dtype=language_key.dtype)
 
     def _heads(self, x: Tensor) -> Tensor:
@@ -922,6 +926,10 @@ class VACouplingLayer(nn.Module):
         sem_weights = torch.softmax(sem_scores, dim=-1).to(dtype=value.dtype)
         sem_weights = F.dropout(sem_weights, p=self.dropout, training=self.training)
         sem_update = self._from_heads(torch.matmul(sem_weights, lang_value))
+        # P0-高优：全 False 语言 mask 时 softmax(-inf) 是均匀分布而非零——
+        # semantic 更新必须严格为零（语言列全被遮蔽时没有可读的语义）。
+        valid = lang_mask.any(dim=-1)  # [B]
+        sem_update = sem_update * valid[:, None, None]
         flat_lang = lang_key.transpose(1, 2).reshape(
             query.shape[0], -1, self.hidden_dim
         )

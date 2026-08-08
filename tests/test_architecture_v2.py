@@ -238,6 +238,26 @@ class RoleQueryResamplerTests(unittest.TestCase):
             out3 = resampler(key3, mask)
             self.assertFalse(torch.allclose(out[1], out3[1]))
 
+    def test_all_false_mask_outputs_strict_zero(self):
+        # P0-高优：全 False mask 时 softmax(-inf) 是均匀分布而非零——语言序列
+        # 全被遮蔽时 role 输出必须严格为零。
+        resampler = RoleQueryResampler(
+            hidden_dim=16, language_dim=32, n_role=4, num_heads=4
+        )
+        key = torch.randn(2, 6, 16)
+        mask = torch.zeros(2, 6, dtype=torch.bool)
+        with torch.no_grad():
+            out = resampler(key, mask)
+        self.assertEqual(tuple(out.shape), (2, 4, 16))
+        torch.testing.assert_close(out, torch.zeros_like(out), rtol=0, atol=0)
+        # 混合批：一行全 False → 该行严格零，另一行正常
+        mask_mixed = torch.tensor(
+            [[0, 0, 0, 0, 0, 0], [1, 1, 1, 1, 1, 1]], dtype=torch.bool
+        )
+        out_mixed = resampler(key, mask_mixed)
+        torch.testing.assert_close(out_mixed[0], torch.zeros_like(out_mixed[0]), rtol=0, atol=0)
+        self.assertTrue(torch.isfinite(out_mixed[1]).all())
+
     def test_task_resampler_role_path_differs_from_mean(self):
         config = tiny_config(memory_split=True, role_query=True, role_query_tokens=8)
         policy = VACompoundPolicy(config)
@@ -332,6 +352,34 @@ class DualAttentionTests(unittest.TestCase):
             self.assertFalse(torch.allclose(a1, a3))
             # 视觉行仍走共享路径（含语言列）→ key 变化时视觉输出变化
             self.assertFalse(torch.allclose(v1, v2))
+
+    def test_all_false_language_mask_semantic_update_strict_zero(self):
+        # P0-高优：全 False 语言 mask 时 semantic 分支必须严格零（旧实现
+        # softmax(-inf) → 均匀分布，输出垃圾值）。
+        config = tiny_config(dual_attention=True)
+        policy = VACompoundPolicy(config)
+        layer = policy.layers[0]
+        layer.eval()
+        visual = torch.randn(2, 5, 16)
+        action = torch.randn(2, 3, 16)
+        mask = torch.zeros(2, 6, dtype=torch.bool)
+        with torch.no_grad():
+            v1, a1, _ = layer(
+                visual, action, head_cache(torch.randn(2, 6, 16), torch.randn(2, 6, 16), 4), mask
+            )
+            # 与语言列缺失（长度 0）对照：动作行输出与"无 semantic 贡献"一致
+            # ——即语言 key/value 置零（semantic 更新为零）+ 物理路径不读语言。
+            v2, a2, _ = layer(
+                visual, action, head_cache(torch.zeros(2, 6, 16), torch.zeros(2, 6, 16), 4), mask
+            )
+            torch.testing.assert_close(a1, a2)
+        # 有有效语言时同一权重下动作行应不同（semantic 更新非零）
+        mask_ok = torch.ones(2, 6, dtype=torch.bool)
+        with torch.no_grad():
+            _, a3, _ = layer(
+                visual, action, head_cache(torch.randn(2, 6, 16), torch.randn(2, 6, 16), 4), mask_ok
+            )
+        self.assertFalse(torch.allclose(a1, a3))
 
     def test_sequential_layers_keep_legacy_path(self):
         config = tiny_config(dual_attention=True, sequential_coupling=2, num_layers=4)
@@ -589,7 +637,9 @@ class LoraSuffixTests(unittest.TestCase):
 
 class TrainArgRound2Tests(unittest.TestCase):
     def test_role_query_tokens_must_be_positive(self):
-        args = parse_args(["--role-query", "--role-query-tokens", "0"])
+        args = parse_args(
+            ["--role-query", "--memory-split", "--role-query-tokens", "0"]
+        )
         with self.assertRaisesRegex(ValueError, "role-query-tokens"):
             validate_args(args)
 
@@ -613,16 +663,23 @@ class TrainArgRound2Tests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "lora-suffixes"):
             validate_args(args)
 
-    def test_new_flags_independent_of_compile_task(self):
-        # role-query/dual-attention/flow-semantic 可独立开（无强制依赖）
-        args = parse_args(
-            ["--role-query", "--dual-attention", "--flow-semantic", "--single-task"]
-        )
-        validate_args(args)
-        # 与 compile-task 组合也合法
+    def test_new_flags_have_structural_prerequisites(self):
+        # P0-高优 fail-fast：flow-semantic 需要 compile-task + adaln；role-query
+        # 需要 memory-split/action-query-cond 之一（旧版静默失效，改为报错）。
+        with self.assertRaisesRegex(ValueError, "compile-task"):
+            validate_args(parse_args(["--flow-semantic", "--single-task"]))
+        with self.assertRaisesRegex(ValueError, "adaln"):
+            validate_args(
+                parse_args(["--flow-semantic", "--compile-task", "--e2e-data", "x.pt",
+                            "--flow-cond", "entry", "--single-task"])
+            )
+        with self.assertRaisesRegex(ValueError, "memory-split"):
+            validate_args(parse_args(["--role-query", "--single-task"]))
+        # 满足前置条件后合法
         args = parse_args(
             [
-                "--role-query", "--dual-attention", "--flow-semantic",
+                "--role-query", "--action-query-cond",
+                "--flow-semantic", "--flow-cond", "adaln",
                 "--compile-task", "--e2e-data", "x.pt", "--single-task",
             ]
         )
@@ -632,8 +689,15 @@ class TrainArgRound2Tests(unittest.TestCase):
         args = parse_args(["--dual-attention", "--sequential-coupling", "2"])
         validate_args(args)  # 仅打印警告，不报错
 
-    def test_flow_semantic_with_entry_cond_allowed(self):
-        args = parse_args(["--flow-semantic", "--flow-cond", "entry"])
+    def test_dual_attention_with_coupling_one_rejected(self):
+        # P0-高优：coupling=1 时每层都是 sequential，双注意力永不生效 → 报错
+        args = parse_args(["--dual-attention", "--sequential-coupling", "1"])
+        with self.assertRaisesRegex(ValueError, "dual-attention"):
+            validate_args(args)
+
+    def test_flow_semantic_with_adaln_allowed(self):
+        args = parse_args(["--flow-semantic", "--flow-cond", "adaln", "--compile-task",
+                           "--e2e-data", "x.pt"])
         validate_args(args)
 
     def test_round2_defaults(self):

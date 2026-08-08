@@ -23,7 +23,10 @@ from prepare_pnpw_features import QwenTextBackbone
 
 _DEBUG_FA_DONE: dict[str, bool] = {}
 _ALIGN_ACTS: list | None = None
-from va_compound.backbones import VJEPA21Backbone
+from va_compound.backbones import (
+    QwenSemanticBackbone,
+    VJEPA21Backbone,
+)
 from va_compound.model import (
     ControllerParams,
     VACompoundConfig,
@@ -214,6 +217,7 @@ def run_c2_recovery_eval(
     scale_s,
     aq01,
     aq99,
+    vision_pooling="flat",
 ) -> None:
     """C² 恢复评估（Codex go/no-go ③）：从 v6b held-out 扰动分支初始状态出发
     闭环，测"拉回"成功率。分支状态由 prepare_mw_recovery.py 的 snapshot
@@ -292,7 +296,7 @@ def run_c2_recovery_eval(
                     last_norm, dtype=torch.float32, device=device
                 )[None, None]
                 with torch.inference_mode():
-                    tokens = vision_backbone(clip.unsqueeze(0), pooling="flat")
+                    tokens = vision_backbone(clip.unsqueeze(0), pooling=vision_pooling)
                     c_current = model.control_projector(tokens)
                     cond, memory = model.encode_condition(
                         tokens,
@@ -314,7 +318,7 @@ def run_c2_recovery_eval(
             if feedback_due and c2_token < ACTION_HORIZON and c2_params is not None:
                 with torch.inference_mode():
                     if step != plan_step:
-                        tokens = vision_backbone(clip.unsqueeze(0), pooling="flat")
+                        tokens = vision_backbone(clip.unsqueeze(0), pooling=vision_pooling)
                     c_current = model.control_projector(tokens)
                     if args.c2_oracle_ref:
                         norm_action = c2_params.nominal[0, c2_token].cpu().numpy()
@@ -355,6 +359,77 @@ def run_c2_recovery_eval(
     )
 
 
+def restore_text_backbone(
+    ckpt: dict,
+    device: torch.device,
+    language_dtype: str = "float16",
+    language_max_length: int = 64,
+) -> QwenTextBackbone | QwenSemanticBackbone:
+    """P0-3：按 training_contract 恢复文本分支（普通 / semantic adapter）。
+
+    - 普通 ckpt：QwenTextBackbone + contract.lora_rank 建 LoRA + 加载
+      qwen_state_dict / lora（旧行为不变）；
+    - semantic ckpt（contract.semantic_adapter=True）：QwenSemanticBackbone
+      （按 semantic_lora_rank / semantic_top_layers / semantic_lora_suffixes
+      构造，构造器内部建 LoRA）+ 加载 qwen_state_dict / lora /
+      semantic_gate。旧实现用 contract.lora_rank（semantic 模式下恒 0）建
+      LoRA 且不构造 wrapper/门控，semantic checkpoint 完全无法恢复。
+    返回加载完毕的 backbone（eval 模式）。
+    """
+    contract = ckpt.get("training_contract", {}) or {}
+    text_backbone = QwenTextBackbone.from_pretrained(
+        device=device,
+        dtype=language_dtype,
+        local_files_only=True,
+        max_length=int(contract.get("language_max_length", language_max_length)),
+    )
+    if contract.get("semantic_adapter"):
+        text_backbone = QwenSemanticBackbone(
+            text_backbone,
+            lora_rank=int(contract.get("semantic_lora_rank", 8)),
+            lora_alpha=float(contract.get("semantic_lora_alpha", 32.0)),
+            top_layers=int(contract.get("semantic_top_layers", 4)),
+            lora_suffixes=tuple(
+                s.strip()
+                for s in str(
+                    contract.get(
+                        "semantic_lora_suffixes",
+                        "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+                    )
+                ).split(",")
+                if s.strip()
+            ),
+        )
+    elif ckpt.get("lora"):
+        # 旧路径（--lora-rank > 0）：按 contract.lora_rank 建 LoRA 再复制权重
+        # （语义路径的 LoRA 由 QwenSemanticBackbone 构造器按 semantic_lora_rank
+        # 建立，P0-3）。
+        from va_compound.backbones import apply_lora
+
+        rank = int(contract.get("lora_rank", 32))
+        apply_lora(text_backbone.text_model, rank=rank)
+    qwen_state = {
+        k.removeprefix("text_backbone.").removeprefix("text_model."): v
+        for k, v in (ckpt.get("qwen_state_dict") or {}).items()
+    }
+    if qwen_state:
+        missing, unexpected = text_backbone.text_model.load_state_dict(
+            qwen_state, strict=False
+        )
+        print(f"eval: qwen loaded missing={len(missing)} unexpected={len(unexpected)}")
+    if ckpt.get("lora"):
+        own = dict(text_backbone.text_model.named_parameters())
+        for name, value in ckpt["lora"].items():
+            clean = name.removeprefix("text_backbone.").removeprefix("text_model.")
+            if clean in own:
+                own[clean].data.copy_(value)
+    gate = getattr(text_backbone, "gate", None)
+    if gate is not None and ckpt.get("semantic_gate"):
+        gate.load_state_dict(ckpt["semantic_gate"])
+    text_backbone.text_model.eval()
+    return text_backbone
+
+
 def build_plan_language_cache(
     model,
     hidden: torch.Tensor,
@@ -364,16 +439,54 @@ def build_plan_language_cache(
     instruction: str | None = None,
     text_backbone=None,
     scene_teacher=None,
+    compiler=None,
+    scene_tokens: torch.Tensor | None = None,
+    semantic_history: torch.Tensor | None = None,
+    scene_delta: torch.Tensor | None = None,
 ):
     """Build the VA language cache with scene-conditioned plan tokens appended.
 
     ``hidden``/``mask`` are the single-task language slice [1, L, D]; the
     scene summary is the global mean of the current vision window tokens.
     With ``plan_resampler`` the policy's PlanResampler produces the plan
-    tokens; with ``scene_teacher`` the frozen Qwen readout path is used.
+    tokens; with ``scene_teacher`` the frozen Qwen readout path is used;
+    with a ``SemanticCompiler``（P0-3）the semantic readout tokens are
+    compiled from the window ``scene_tokens``（semantic_history / scene_delta
+    首决策为零向量，与训练 rollout t=0 一致）。
     """
     if model.config.plan_resampler:
         return model.build_plan_cache(scene_summary, hidden, mask)
+    if compiler is not None:
+        if (
+            instruction is None
+            or text_backbone is None
+            or scene_tokens is None
+            or semantic_history is None
+            or scene_delta is None
+        ):
+            raise ValueError(
+                "compile cache build requires the Qwen text backbone + "
+                "scene tokens/history/delta"
+            )
+        semantic, _ = compiler(
+            text_backbone,
+            [instruction],
+            scene_tokens,
+            semantic_history,
+            scene_delta,
+        )
+        semantic = semantic.to(dtype=hidden.dtype)
+        extended = torch.cat((hidden, semantic), dim=1)
+        extended_mask = torch.cat(
+            (
+                mask,
+                torch.ones(
+                    semantic.shape[:2], dtype=torch.bool, device=semantic.device
+                ),
+            ),
+            dim=1,
+        )
+        return model.build_language_cache(extended, extended_mask)
     if model.config.scene_teacher:
         if instruction is None or text_backbone is None or scene_teacher is None:
             raise ValueError("scene-teacher cache build requires the Qwen text backbone")
@@ -399,14 +512,21 @@ def main() -> None:
     device = torch.device(args.device)
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     config = VACompoundConfig(**ckpt["config"])
+    # spatial-pooling ckpt 评估：vision_pooling 存在 training_contract 而非 config。
+    vision_pooling = str(
+        (ckpt.get("training_contract", {}) or {}).get("vision_pooling", "flat")
+    )
     if args.direct_head != "auto":
         config = dataclasses.replace(config, direct_head=args.direct_head == "on")
-    has_plan = config.plan_resampler or config.scene_teacher
+    # P0-3：semantic-compiler ckpt 同样按需逐决策重建语言缓存（场景条件化）。
+    has_compile = ckpt.get("semantic_compiler") is not None
+    has_plan = config.plan_resampler or config.scene_teacher or has_compile
     if args.plan_refresh < 0:
         raise ValueError("--plan-refresh must be >= 0")
     if args.plan_refresh > 0 and not has_plan:
         raise ValueError(
-            "--plan-refresh requires a checkpoint with plan_resampler or scene_teacher"
+            "--plan-refresh requires a checkpoint with plan_resampler, "
+            "scene_teacher, or a semantic compiler"
         )
     model = VACompoundPolicy(config).eval().to(device)
     ckpt_direct_head = bool(ckpt["config"].get("direct_head", False))
@@ -479,31 +599,28 @@ def main() -> None:
             scale_s,
             aq01,
             aq99,
+            vision_pooling=vision_pooling,
         )
         return
 
-    text_backbone = QwenTextBackbone.from_pretrained(
-        device=device, dtype="float16", local_files_only=True
-    )
-    if ckpt.get("qwen_state_dict"):
-        qwen_state = {
-            k.removeprefix("text_model."): v for k, v in ckpt["qwen_state_dict"].items()
-        }
-        missing, unexpected = text_backbone.text_model.load_state_dict(
-            qwen_state, strict=False
-        )
-        print(f"eval: qwen loaded missing={len(missing)} unexpected={len(unexpected)}")
-    if ckpt.get("lora"):
-        from va_compound.backbones import apply_lora
+    # P0-3：统一恢复路径（普通 LoRA / semantic adapter 都按 training_contract
+    # 构造并加载 qwen_state_dict / lora / semantic_gate）。
+    text_backbone = restore_text_backbone(ckpt, device, language_dtype="float16")
+    compiler = None
+    if has_compile:
+        from va_compound.backbones import SemanticCompiler
 
-        rank = int(ckpt.get("training_contract", {}).get("lora_rank", 32))
-        apply_lora(text_backbone.text_model, rank=rank)
-        own = dict(text_backbone.text_model.named_parameters())
-        for name, value in ckpt["lora"].items():
-            clean = name.removeprefix("text_model.")
-            if clean in own:
-                own[clean].data.copy_(value)
-    text_backbone.text_model.eval()
+        compiler = SemanticCompiler(
+            language_dim=config.language_dim,
+            vision_dim=config.vision_dim,
+            history_in_dim=config.hidden_dim,
+            n_readout=int(
+                ckpt.get("training_contract", {}).get("compile_n_readout", 16)
+            ),
+        ).to(device)
+        compiler.load_state_dict(ckpt["semantic_compiler"])
+        compiler.eval()
+        print("eval: semantic_compiler loaded from checkpoint")
     all_tasks = features["metadata"]["tasks"]
     if args.task_ids is not None:
         task_indices = [int(token) for token in args.task_ids.split(",")]
@@ -515,7 +632,15 @@ def main() -> None:
         tasks = all_tasks[: args.max_tasks]
     if not tasks:
         raise ValueError("no tasks selected for evaluation")
-    hidden, mask = text_backbone.encode(tasks)
+    if isinstance(text_backbone, QwenSemanticBackbone):
+        # P0-3：semantic adapter ckpt——语言 hidden 用 fused 嵌入
+        # （prior + g ⊙ (adapted − prior)），不是裸冻结先验。
+        with torch.no_grad():
+            prior, mask = text_backbone.encode_prior(tasks)
+            adapted, _ = text_backbone.encode_adapted(tasks)
+            hidden = text_backbone.fused_embedding(prior, adapted)
+    else:
+        hidden, mask = text_backbone.encode(tasks)
 
     scene_teacher = None
     if config.scene_teacher:
@@ -531,9 +656,9 @@ def main() -> None:
         print("eval: scene_teacher loaded from checkpoint")
     if has_plan:
         # Plan-Cache：缓存按 episode 逐任务懒构建（首帧场景 → plan tokens），
-        # --plan-refresh R 控制后续重建；Qwen 仅在 scene_teacher 下常驻。
+        # --plan-refresh R 控制后续重建；Qwen 仅在 scene_teacher / compiler 下常驻。
         task_caches: list | None = [None] * len(tasks)
-        if not config.scene_teacher:
+        if not config.scene_teacher and compiler is None:
             del text_backbone
     else:
         task_caches = [
@@ -645,7 +770,7 @@ def main() -> None:
                             dtype=torch.float32, device=device,
                         )[None, None]
                         with torch.inference_mode():
-                            tokens = vision_backbone(clip.unsqueeze(0), pooling="flat")
+                            tokens = vision_backbone(clip.unsqueeze(0), pooling=vision_pooling)
                             c_current = model.control_projector(tokens)
                             cond, memory = model.encode_condition(
                                 tokens,
@@ -674,7 +799,7 @@ def main() -> None:
                         with torch.inference_mode():
                             if step != plan_step:
                                 # feedback 刷新：重新编码当前窗口 → c_current。
-                                tokens = vision_backbone(clip.unsqueeze(0), pooling="flat")
+                                tokens = vision_backbone(clip.unsqueeze(0), pooling=vision_pooling)
                             c_current = model.control_projector(tokens)
                             if args.c2_oracle_ref:
                                 # 参考零误差上界：c̄ ≡ c_current（e ≡ 0，K 空转）。
@@ -710,7 +835,7 @@ def main() -> None:
                     # 与训练数据方向相反，V-JEPA 时序注意力对帧序敏感 → MW 闭环数字无效
                     clip = torch.cat([preprocess(f, 384) for f in frames], dim=0).to(device)
                     with torch.inference_mode():
-                        tokens = vision_backbone(clip.unsqueeze(0), pooling="flat")
+                        tokens = vision_backbone(clip.unsqueeze(0), pooling=vision_pooling)
                     if has_plan and plan_refresh_due(decision_count, args.plan_refresh):
                         # Plan-Cache：用当前窗口场景（vision 全局均值）重建该任务缓存
                         scene_summary = tokens.mean(dim=1)  # [1, vision_dim]
@@ -719,10 +844,37 @@ def main() -> None:
                             hidden[task_index : task_index + 1].to(device),
                             mask[task_index : task_index + 1].to(device),
                             scene_summary,
-                            instruction=tasks[task_index] if config.scene_teacher else None,
+                            instruction=(
+                                tasks[task_index]
+                                if config.scene_teacher or compiler is not None
+                                else None
+                            ),
                             # plan_resampler 分支不访问 text_backbone；短路避免 NameError
-                            text_backbone=text_backbone if config.scene_teacher else None,
+                            text_backbone=(
+                                text_backbone
+                                if config.scene_teacher or compiler is not None
+                                else None
+                            ),
                             scene_teacher=scene_teacher,
+                            compiler=compiler,
+                            scene_tokens=tokens if compiler is not None else None,
+                            semantic_history=(
+                                torch.zeros(
+                                    1,
+                                    compiler.history_in_dim,
+                                    device=device,
+                                    dtype=torch.float32,
+                                )
+                                if compiler is not None
+                                else None
+                            ),
+                            scene_delta=(
+                                torch.zeros(
+                                    1, config.vision_dim, device=device
+                                )
+                                if compiler is not None
+                                else None
+                            ),
                         )
                     state = np.clip(
                         2.0 * (obs[:4] - sq01) / scale_s - 1.0, -1.0, 1.0

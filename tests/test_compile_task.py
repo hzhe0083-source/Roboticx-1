@@ -21,11 +21,13 @@ from torch.nn import functional as F
 
 from train import parse_args, save_checkpoint, validate_args
 from va_compound.backbones import (
+    LoRALinear,
     QwenSemanticBackbone,
     QwenTextBackbone,
     SceneTeacher,
     SemanticCompiler,
     VJEPA21Backbone,
+    apply_lora,
     pool_flat_tokens,
 )
 from va_compound.end_to_end import EndToEndPolicy, build_e2e_policy, parameter_groups
@@ -65,13 +67,35 @@ class FakeDecoderLayer(nn.Module):
         return x + attn + gated
 
 
+class MixingDecoderLayer(FakeDecoderLayer):
+    """带真实跨 token 注意力的假层（仅 P0-2 场景条件 readout 测试用）。
+
+    默认 FakeDecoderLayer 的 ``attn = o_proj(q*k+v)`` 是逐位置元素运算，
+    readout 位置看不到场景 token——无法演示"相同指令 + 不同场景 → 不同
+    readout"。本层用完整 softmax 注意力跨 token 混合（结构与真实 Qwen
+    一致，真实模型下场景伪 token 经注意力影响 readout）。
+    """
+
+    def forward(self, x):
+        q = self.self_attn.q_proj(x)
+        k = self.self_attn.k_proj(x)
+        v = self.self_attn.v_proj(x)
+        scale = q.shape[-1] ** 0.5
+        attn = torch.softmax(q @ k.transpose(-1, -2) / scale, dim=-1) @ v
+        gated = self.mlp.down_proj(F.gelu(self.mlp.gate_proj(x)) * self.mlp.up_proj(x))
+        return x + self.self_attn.o_proj(attn) + gated
+
+
 class FakeDecoder(nn.Module):
     """Fake Qwen decoder: hidden_states = (embed, h0, h1, ..., norm(hN-1))."""
 
-    def __init__(self, dim: int = 32, vocab: int = 16, num_layers: int = 2):
+    def __init__(
+        self, dim: int = 32, vocab: int = 16, num_layers: int = 2,
+        layer_cls: type[nn.Module] = FakeDecoderLayer,
+    ):
         super().__init__()
         self.embed_tokens = nn.Embedding(vocab, dim)
-        self.layers = nn.ModuleList([FakeDecoderLayer(dim) for _ in range(num_layers)])
+        self.layers = nn.ModuleList([layer_cls(dim) for _ in range(num_layers)])
         self.norm = nn.LayerNorm(dim)
 
     def forward(
@@ -409,30 +433,109 @@ class SemanticCompilerTests(unittest.TestCase):
         self.assertEqual(tuple(plan.shape), (1, 8, 32))
         self.assertEqual(mask.shape[1], 5 + 8 + 2 + 2 + 8)
 
+    def test_forward_semantic_wrapper_uses_scene_fused_path(self):
+        # P0-4 回归：SemanticCompiler 对 QwenSemanticBackbone 必须走
+        # prior/adapted/fused 场景双路径，而不是解包直走裸 encode_with_scene。
+        backbone = make_backbone(num_layers=2)
+        adapter = QwenSemanticBackbone(
+            backbone, lora_rank=4, top_layers=1, anchor_layers=(1,)
+        )
+        # 初始（lora_b=0、门控 σ(−4.595)≈0.01）：fused == 裸冻结前向（prior）。
+        scene = torch.randn(1, 16, 16)
+        plan_fused, mask_fused = self.compiler(
+            adapter, ["a"], scene, torch.randn(1, 16), torch.randn(1, 16)
+        )
+        plan_raw, mask_raw = backbone.encode_with_scene(
+            ["a"],
+            scene,
+            self.compiler.scene_projector,
+            self.compiler.readout_tokens,
+            n_scene=self.compiler.n_scene,
+            extra_embeds=self.compiler._project_embeds(
+                scene, torch.randn(1, 16), torch.randn(1, 16), None
+            ),
+        )
+        torch.testing.assert_close(plan_fused, plan_raw, rtol=0, atol=1e-6)
+        torch.testing.assert_close(mask_fused, mask_raw)
+        # 扰动 lora_b 后 adapted 偏离先验 → fused != 裸前向（双路径真正生效）
+        bumped = [
+            parameter
+            for name, parameter in adapter.named_parameters()
+            if "lora_b" in name
+        ][0]
+        bumped.data.normal_(mean=0.0, std=0.5)
+        plan_fused2, _ = self.compiler(
+            adapter, ["a"], scene, torch.randn(1, 16), torch.randn(1, 16)
+        )
+        self.assertFalse(torch.allclose(plan_fused2, plan_raw, rtol=0, atol=1e-6))
+
+    def test_scene_states_anchor_support(self):
+        # P0-4：scene_states 返回 (prior_layers, adapted_layers, mask)，可直接
+        # 喂 anchor_loss/geometry_loss；prior 侧 no_grad + LoRA 关闭。
+        adapter = QwenSemanticBackbone(
+            make_backbone(num_layers=2), lora_rank=4, top_layers=1, anchor_layers=(1,)
+        )
+        scene = torch.randn(2, 16, 16)
+        history = torch.randn(2, 16)
+        delta = torch.randn(2, 16)
+        prior_layers, adapted_layers, s_mask = self.compiler.scene_states(
+            adapter, ["a", "b"], scene, history, delta, output_layers=[1]
+        )
+        self.assertEqual(set(prior_layers), {1})
+        self.assertEqual(tuple(prior_layers[1].shape), (2, 5 + 8 + 2 + 2 + 8, 32))
+        self.assertFalse(prior_layers[1].requires_grad)  # prior 侧 no_grad
+        self.assertTrue(adapted_layers[1].requires_grad)  # adapted 侧带梯度
+        self.assertEqual(s_mask.shape, prior_layers[1].shape[:2])
+        # 扰动 lora_b：prior 严格不变（LoRA 关闭），adapted 变化，anchor > 0
+        anchor0 = adapter.anchor_loss(prior_layers, adapted_layers).item()
+        self.assertEqual(anchor0, 0.0)  # lora_b=0 → adapted == prior
+        bumped = [
+            parameter
+            for name, parameter in adapter.named_parameters()
+            if "lora_b" in name
+        ][0]
+        bumped.data.normal_(mean=0.0, std=0.5)
+        prior2, _, _ = self.compiler.scene_states(
+            adapter, ["a", "b"], scene, history, delta, output_layers=[1]
+        )
+        _, adapted2, _ = self.compiler.scene_states(
+            adapter, ["a", "b"], scene, history, delta, output_layers=[1]
+        )
+        torch.testing.assert_close(prior2[1], prior_layers[1], rtol=0, atol=0)
+        self.assertFalse(torch.allclose(adapted2[1], prior_layers[1], rtol=0, atol=1e-6))
+        self.assertGreater(adapter.anchor_loss(prior2, adapted2).item(), 0.0)
+        # 普通 QwenTextBackbone 无 prior/adapted 之分 → 报错
+        with self.assertRaisesRegex(ValueError, "QwenSemanticBackbone"):
+            self.compiler.scene_states(
+                self.backbone, ["a"], scene[:1], history[:1], delta[:1],
+                output_layers=[1],
+            )
+
 
 class EndToEndCompileTests(unittest.TestCase):
     def test_compile_semantic_builds_extended_cache(self):
         e2e, config = make_compile_e2e()
-        visual_tokens = torch.randn(2, 64, 16)
-        history = torch.randn(2, 16)
-        delta = torch.randn(2, 16)
+        visual_tokens = torch.randn(3, 64, 16)
+        history = torch.randn(3, 16)
+        delta = torch.randn(3, 16)
         cache = e2e.compile_semantic(["a", "a", "b"], visual_tokens, history, delta)
         self.assertIsInstance(cache, LanguageCache)
         n_readout = e2e.compiler.n_readout
         self.assertEqual(tuple(cache.attention_mask.shape), (3, 5 + n_readout))
         self.assertEqual(cache.layers[0].key.shape[2], 5 + n_readout)
         # 与手工参考逐位一致：语言 hidden（encode_trainable，按去重索引展开）+
-        # compiler 语义 token（同样展开到样本批）
+        # compiler 语义 token（P0-2：按原始 B 逐样本运行，不再按去重索引展开——
+        # 场景条件 readout 是逐样本输出）。
         hidden, mask = e2e.text_backbone.encode_trainable(["a", "b"])
         scene_tokens = pool_flat_tokens(visual_tokens, e2e.n_scene_tokens)
         semantic, _ = e2e.compiler(
-            e2e.text_backbone, ["a", "b"], scene_tokens, history, delta
+            e2e.text_backbone, ["a", "a", "b"], scene_tokens, history, delta
         )
         lookup = {"a": 0, "b": 1}
         indices = torch.tensor(
             [lookup[text] for text in ["a", "a", "b"]], dtype=torch.long
         )
-        extended = torch.cat((hidden[indices], semantic[indices]), dim=1)
+        extended = torch.cat((hidden[indices], semantic), dim=1)
         extended_mask = torch.cat(
             (
                 mask[indices],
@@ -444,6 +547,66 @@ class EndToEndCompileTests(unittest.TestCase):
         torch.testing.assert_close(cache.layers[0].key, reference.layers[0].key)
         torch.testing.assert_close(cache.layers[0].value, reference.layers[0].value)
         torch.testing.assert_close(cache.attention_mask, reference.attention_mask)
+
+    def test_compile_semantic_duplicate_instructions_per_sample_scene_readout(self):
+        # P0-2 回归：相同指令 + 不同场景 → 语义 readout 逐样本且互不相同；
+        # 旧实现对 compiler 调用做文本去重，重复指令直接 batch 不匹配崩溃。
+        # 用带真实跨 token 注意力的假解码器（readout 位置能看到场景伪 token）。
+        config = tiny_config()
+        policy = VACompoundPolicy(config)
+        vision = VJEPA21Backbone(FakeVideoModel(), max_tokens=64)
+        backbone = QwenTextBackbone(
+            FakeTokenizer(), FakeDecoder(num_layers=2, layer_cls=MixingDecoderLayer)
+        )
+        compiler = SemanticCompiler(
+            language_dim=config.language_dim,
+            vision_dim=config.vision_dim,
+            n_scene=8,
+            n_hist=2,
+            n_delta=2,
+            n_readout=8,
+            hidden=24,
+        )
+        e2e = EndToEndPolicy(
+            text_backbone=backbone,
+            vision_backbone=vision,
+            policy=policy,
+            compiler=compiler,
+            n_scene_tokens=16,
+        )
+        visual_tokens = torch.randn(2, 64, 16) * torch.tensor([[[1.0]], [[-1.0]]])
+        history = torch.randn(2, 16)
+        delta = torch.randn(2, 16)
+        cache, semantic = e2e.compile_semantic(
+            ["pick cup", "pick cup"], visual_tokens, history, delta,
+            return_semantic=True,
+        )
+        self.assertEqual(tuple(semantic.shape), (2, compiler.n_readout, 32))
+        self.assertEqual(tuple(cache.attention_mask.shape), (2, 5 + compiler.n_readout))
+        # 与逐样本手工参考逐位一致（不再按去重索引展开）
+        scene_tokens = pool_flat_tokens(visual_tokens, e2e.n_scene_tokens)
+        reference, _ = compiler(
+            backbone, ["pick cup", "pick cup"], scene_tokens, history, delta
+        )
+        torch.testing.assert_close(semantic, reference, rtol=0, atol=1e-6)
+        # 相同指令文本但场景不同 → 语义 readout 不同（真实注意力下场景伪
+        # token 影响 readout 位置）
+        self.assertFalse(
+            torch.allclose(semantic[0], semantic[1], rtol=0, atol=1e-6)
+        )
+        # 相同场景 + 相同 history/delta + 相同指令 → readout 严格相同
+        # （场景条件化的确定性；场景/历史/变化全对齐）
+        same_tokens = torch.randn(2, 64, 16)
+        same_tokens[1] = same_tokens[0]
+        same_history = history.clone()
+        same_history[1] = same_history[0]
+        same_delta = delta.clone()
+        same_delta[1] = same_delta[0]
+        _, semantic_same = e2e.compile_semantic(
+            ["pick cup", "pick cup"], same_tokens, same_history, same_delta,
+            return_semantic=True,
+        )
+        torch.testing.assert_close(semantic_same[0], semantic_same[1])
 
     def test_compile_semantic_requires_compiler_and_shapes(self):
         config = tiny_config()
@@ -768,6 +931,166 @@ class CompileCheckpointTests(unittest.TestCase):
             adapter.text_model.layers[0].self_attn.q_proj.weight,
             stage_a.text_model.layers[0].self_attn.q_proj.weight,
         )
+
+
+class SemanticCheckpointRoundTripTests(unittest.TestCase):
+    def test_semantic_checkpoint_round_trip_through_real_loader(self):
+        # P0-3：save_checkpoint → eval_metaworld.restore_text_backbone（真实
+        # 加载路径，仅 mock 模型构造）→ 前向输出逐位一致。旧实现 contract 不存
+        # semantic 字段、加载器不构造 wrapper/门控 → 新 checkpoint 无法恢复。
+        from eval_metaworld import restore_text_backbone
+
+        config = tiny_config()
+        policy = VACompoundPolicy(config)
+        vision = VJEPA21Backbone(FakeVideoModel(), max_tokens=64)
+        base_backbone = make_backbone(num_layers=2)
+        # lora_alpha=32.0 与 build_e2e_policy 的默认一致（训练侧 --lora-alpha
+        # 默认 32.0 且透传给 semantic adapter；恢复侧从 contract 读同一值）。
+        adapter = QwenSemanticBackbone(
+            base_backbone,
+            lora_rank=4,
+            lora_alpha=32.0,
+            top_layers=1,
+            anchor_layers=(1,),
+        )
+        compiler = SemanticCompiler(
+            language_dim=32, vision_dim=16, hidden=24, n_readout=16
+        )
+        e2e = EndToEndPolicy(
+            text_backbone=adapter,
+            vision_backbone=vision,
+            policy=policy,
+            compiler=compiler,
+            n_scene_tokens=12,
+        )
+        # 扰动权重（脱离初始化，验证真恢复而非碰巧一致）
+        for name, parameter in adapter.named_parameters():
+            if "lora_b" in name:
+                parameter.data.normal_(std=0.5)
+        adapter.gate[-1].bias.data.normal_()
+        compiler.readout_tokens.data.normal_(std=0.05)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ck.pt"
+            args = parse_args(
+                [
+                    "--save", str(path), "--semantic-adapter",
+                    "--compile-task", "--e2e-data", "x.pt",
+                    "--semantic-lora-rank", "4",
+                    "--semantic-top-layers", "1",
+                    "--compile-n-scene", "12",
+                    "--compile-n-readout", "16",
+                    "--single-task",
+                ]
+            )
+            save_checkpoint(args, config, None, e2e)
+            ckpt = torch.load(path, map_location="cpu", weights_only=True)
+
+        contract = ckpt["training_contract"]
+        self.assertTrue(contract["semantic_adapter"])
+        self.assertEqual(contract["semantic_lora_rank"], 4)
+        self.assertEqual(contract["semantic_top_layers"], 1)
+        self.assertEqual(contract["semantic_lora_alpha"], 32.0)
+        self.assertTrue(contract["compile_task"])
+        self.assertEqual(contract["n_scene_tokens"], 12)
+        self.assertEqual(contract["compile_n_readout"], 16)
+        self.assertFalse(contract["flow_semantic"])
+        self.assertIn("semantic_gate", ckpt)
+        self.assertIn("semantic_compiler", ckpt)
+
+        fake_qwen = make_backbone(num_layers=2)
+        # 模拟 from_pretrained 的确定性：返回的"预训练"基座与原始模型同权重
+        # （真实流程中两者都来自同一份磁盘权重；测试里两个 make_backbone()
+        # 随机初始化不同，需显式对齐基座）。QwenSemanticBackbone 原地把顶部层
+        # 包成 LoRALinear——原始冻结权重在 .base 子模块里，键去掉 .base 前缀。
+        unwrapped = {
+            key.replace(".base.weight", ".weight").replace(".base.bias", ".bias"): value
+            for key, value in base_backbone.text_model.state_dict().items()
+            if not key.endswith((".lora_a", ".lora_b"))
+        }
+        fake_qwen.text_model.load_state_dict(unwrapped)
+        with mock.patch.object(
+            QwenTextBackbone, "from_pretrained", return_value=fake_qwen
+        ):
+            restored = restore_text_backbone(ckpt, torch.device("cpu"))
+        self.assertIsInstance(restored, QwenSemanticBackbone)
+        self.assertEqual(restored.lora_rank, 4)
+        self.assertEqual(restored.top_layers, 1)
+        restored_compiler = SemanticCompiler(
+            language_dim=32, vision_dim=16, hidden=24, n_readout=16
+        )
+        restored_compiler.load_state_dict(ckpt["semantic_compiler"])
+
+        instructions = ["pick cup", "push box"]
+        scene = torch.randn(2, 16, 16)
+        history = torch.randn(2, 16)
+        delta = torch.randn(2, 16)
+        with torch.no_grad():
+            prior_a, _ = adapter.encode_prior(instructions)
+            prior_b, _ = restored.encode_prior(instructions)
+            adapted_a, _ = adapter.encode_adapted(instructions)
+            adapted_b, _ = restored.encode_adapted(instructions)
+            fused_a = adapter.fused_embedding(prior_a, adapted_a)
+            fused_b = restored.fused_embedding(prior_b, adapted_b)
+            semantic_a, _ = compiler(adapter, instructions, scene, history, delta)
+            semantic_b, _ = restored_compiler(
+                restored, instructions, scene, history, delta
+            )
+        torch.testing.assert_close(prior_a, prior_b, rtol=0, atol=0)
+        torch.testing.assert_close(adapted_a, adapted_b, rtol=0, atol=1e-6)
+        torch.testing.assert_close(fused_a, fused_b, rtol=0, atol=1e-6)
+        torch.testing.assert_close(semantic_a, semantic_b, rtol=0, atol=1e-6)
+
+    def test_plain_lora_checkpoint_restore_unchanged(self):
+        # 默认（非 semantic）checkpoint 走旧加载路径，行为不变：contract 无
+        # semantic 字段 → 恢复为裸 QwenTextBackbone；lora-rank>0 时按
+        # contract.lora_rank 建 LoRA 并复制权重（P0-3 回归：旧路径的
+        # apply_lora 不能丢）。
+        from eval_metaworld import restore_text_backbone
+
+        config = tiny_config()
+        policy = VACompoundPolicy(config)
+        vision = VJEPA21Backbone(FakeVideoModel(), max_tokens=64)
+        text_backbone = make_backbone(num_layers=2)
+        apply_lora(text_backbone.text_model, rank=8)
+        # 扰动 lora 权重（脱离初始化，验证真恢复）
+        for name, parameter in text_backbone.named_parameters():
+            if "lora_b" in name:
+                parameter.data.normal_(std=0.5)
+        e2e = EndToEndPolicy(
+            text_backbone=text_backbone,
+            vision_backbone=vision,
+            policy=policy,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ck.pt"
+            args = parse_args(
+                ["--save", str(path), "--lora-rank", "8", "--single-task"]
+            )
+            save_checkpoint(args, config, None, e2e)
+            ckpt = torch.load(path, map_location="cpu", weights_only=True)
+        self.assertFalse(ckpt["training_contract"].get("semantic_adapter"))
+        self.assertEqual(ckpt["training_contract"]["lora_rank"], 8)
+        fake_qwen = make_backbone(num_layers=2)
+        # 基座权重从 e2e.text_backbone 的 LoRALinear.base 提取（同权重模拟）
+        unwrapped = {
+            key.replace(".base.weight", ".weight").replace(".base.bias", ".bias"): value
+            for key, value in e2e.text_backbone.text_model.state_dict().items()
+            if not key.endswith((".lora_a", ".lora_b"))
+        }
+        fake_qwen.text_model.load_state_dict(unwrapped)
+        with mock.patch.object(
+            QwenTextBackbone, "from_pretrained", return_value=fake_qwen
+        ):
+            restored = restore_text_backbone(ckpt, torch.device("cpu"))
+        self.assertNotIsInstance(restored, QwenSemanticBackbone)
+        self.assertIsInstance(
+            restored.text_model.layers[1].self_attn.q_proj, LoRALinear
+        )
+        with torch.no_grad():
+            hidden_a, _ = e2e.text_backbone.encode_trainable(["a"])
+            hidden_b, _ = restored.encode_trainable(["a"])
+        torch.testing.assert_close(hidden_a, hidden_b, rtol=0, atol=1e-6)
 
 
 if __name__ == "__main__":

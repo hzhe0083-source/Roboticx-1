@@ -1,6 +1,6 @@
 # Bidirectional Visual-Action Memory with Frozen Language Cache: Structural Language Grounding for Lightweight VLA Policies
 
-**Draft v0.1 — 2026-08-06 — work-in-progress (pending: L_m verdict, VLA-RL, MW multi-start, LIBERO-100)**
+**Draft v0.1 — 2026-08-08 — work-in-progress (pending: L_m verdict, VLA-RL, LIBERO-100)**
 
 ---
 
@@ -28,7 +28,7 @@ trainable parameters, 40.6 Hz deployment), trained with a two-term loss
 image reconstruction or world-model objectives used by memory-based VLA
 baselines.
 
-<!-- [TBD: L_m verdict, VLA-RL gains, MW multi-start closed loop, LIBERO-100] -->
+<!-- [TBD: L_m verdict, VLA-RL gains, LIBERO-100] -->
 
 ## 1. Introduction
 
@@ -84,10 +84,11 @@ Our contributions:
    exposes visual shortcuts — the frozen-cache policy shows language to be a
    necessary input: zeroing the language stream increases chunk error by
    +2381% (3-scene, 12-task) and +13751% (1-scene), and swapping instructions
-   by +607%/+1518%. On MetaWorld MT50, substituting a wrong instruction
-   degrades action error by +108.5%, and replacing language with a task-id
-   token by +81.5% — language content beyond task identity participates in
-   decisions.
+   by +607%/+1518%. On MetaWorld MT50, the C² mainline shows the strongest
+   language sensitivity in this work: substituting a wrong instruction
+   degrades chunk-0 action error by +1427.1%, and replacing language with
+   a task-id token by +1355.4% — language content beyond task identity
+   participates in decisions (Sec. 5.3).
 
 3. **Lightweight and simple.** The trainable part of the policy is 43.5M
    parameters (a 4-layer VA composite plus an 8-layer flow head); deployment
@@ -97,14 +98,17 @@ Our contributions:
    (no image reconstruction, no world-model targets, no retrieval modules)
    used by memory-augmented VLA baselines.
 
-4. **Honest scaling report.** We report the closed-loop gap of the
-   single-start training data (samples covered only the first 0.33 s of each
-   episode) and
-   trace it to data coverage rather than architecture, verified by
-   in-distribution tasks succeeding 10/10. The multi-start full-coverage
-   rebuild and the structural upgrade chain (AQC → VA2, Sec. 3) retest this
-   gap; VLA-RL gains and LIBERO-100 complete the scaling picture
-   [TBD: VA2 numbers, LIBERO-100, RL].
+4. **Honest scaling report.** On MetaWorld MT50 the full-coverage C²
+   mainline (contraction control with per-step expected-visual targets and
+   recovery data) reaches 18.2% [11.4, 25.7] (89/490) closed-loop — below
+   the direct-head variant (31.8%) and far below imitation SOTA (Evo-1
+   80.6%) — while delivering held-out recovery of 40.0% (4× the direct
+   pilot) and the strongest language sensitivity in this work (wrong
+   instruction +1427.1%). We trace the gap to a measured single-step
+   action fit of 89.3343% (below the 99% base-capability gate), a
+   precision-insertion failure mode, and short-trajectory reference
+   mismatch (Sec. 6.5); VLA-RL and LIBERO-100 complete the scaling
+   picture [TBD: RL, LIBERO-100].
 
 We emphasize the scope of our claims: we do not argue that end-to-end VLA
 fine-tuning universally destroys semantic representations — only that within
@@ -362,6 +366,56 @@ macro actions) and 10 Hz on LIBERO (20 Hz env, 2-frame stride); per-step
 re-inference (`--execute-steps 1`) is available as a protocol probe
 (Sec. 5.3).
 
+### 3.5 C² contraction control (mainline controller)
+
+Open-loop imitation — even with a well-fitted direct head — cannot recover
+from execution error: once the arm drifts, the policy re-emits the training
+action template instead of a correction. Our mainline controller therefore
+replaces the plain action token with a **local feedback controller**. Each
+VA action token now emits, per chunk step $i$:
+
+- a nominal action $\bar u_i$ (the direct-head output),
+- an expected control state $\bar c_i$ (a reference in a 16-dim controllable
+  projection of the V-JEPA features), and
+- a feedback gain $K_i$ ($4\times 16$).
+
+At deployment, every environment step computes
+$e_i = c_{\mathrm{current}}-\bar c_i$ and executes
+$a_i=\mathrm{clip}(\bar u_i - K_i e_i, -1, 1)$: the visual deviation is
+mapped directly into an action correction. The projection
+$P:\ \mathrm{LayerNorm}(\mathrm{mean}(V))\mapsto c\in\mathbb R^{16}$ is a
+frozen PCA-whitened map (top-16 of the recovery difference space), shared by
+$c_{\mathrm{current}}$, $\bar c_i$ and the future targets — a single
+representation keeps the error direction meaningful and prevents the
+$P\to\alpha P,\ K\to K/\alpha$ degeneracy.
+
+**Training** adds two supervised terms to the IL loss (no RL):
+
+$$
+\mathcal L=\mathcal L_{act}
++\lambda_f\,\mathcal L_{future}+\lambda_r\,\mathcal L_{recovery},
+\qquad \lambda_f=0.1,\ \lambda_r=1.0.
+$$
+
+$\mathcal L_{future}$ fits $\bar c_i$ to per-chunk-step expected control
+targets (V-JEPA flat features projected through $P$, precomputed for every
+decision step of the full MT50 dataset); $\mathcal L_{recovery}$ is a
+DAgger-style term
+$\mathrm{Huber}(K_i e_i,\ \mathrm{sg}(\bar u_i-a^E_\delta))$ on perturbed
+transitions collected from the scripted expert, where $e_i$ is the recorded
+deviation between the perturbed and nominal projected states. Pure clean
+demonstrations carry no information about $K$ (the contraction index
+$\max(0,\|e_{t+1}\|-\rho\|e_t\|)$ is monitored, not trained), so the
+recovery branch is what gives the gain its correction direction. The gain
+is zero-initialized: the model starts as the direct head and only departs
+from it when recovery evidence accumulates.
+
+**Deployment cadence.** The controller is re-planned every
+`plan-stride` environment steps (default 6, one decision) and the current
+projection is refreshed every step; tokens are consumed sequentially across
+the chunk. This keeps the feedback loop at the environment rate while the VA
+forward (and the frozen Qwen semantic path) runs once per decision.
+
 ### 3.4 Why the frozen cache prevents representation erosion
 
 The causal chain behind the first mechanism of instruction blindness is:
@@ -429,7 +483,10 @@ flow noise ε per pair, v_θ(ε, 0; C_i) − v_θ(ε, 0; C_j) must align with th
 expert action split a_i − a_j; directional accuracy = fraction of pairs whose
 mean cosine is positive, bar ≥ 16/18 = 88.9% (converted to 712/800). Metric B
 (execution): 32-step Euler rollout, first-step directional accuracy plus
-per-condition chunk MAE.
+per-condition chunk MAE. Both measured models remain below the 88.9% bar on
+the execution metric — C² mainline 84.4% (2702/3200), v5 direct 86.7%
+(2775/3200) — i.e. the policy forks with language but not yet at bar level
+(logs/mw_v5_c2_full_smoke.log, mw_v5_direct_smoke.log).
 
 **Training.** VA composite 8 layers (PNPW/MW) or 4 layers (LIBERO e2e
 variants), 40k steps, batch size 1 (legacy rows) or 4 (VA2, 4× decision
@@ -531,6 +588,14 @@ Wrong instructions degrade actions more than task-id tokens (+150.7% vs
 +119.1% at chunk@all-seq) — language content beyond task identity causally
 participates in decisions (logs/mw_va2_v4_ablation.log).
 
+**Language ablation (v5 direct head, executed-action contract, 40k steps,
+same 49 tasks).** The v5 mainline shows a sharper wrong-vs-task-id gap —
+wrong instructions degrade chunk error by +1182.6% while the task-id
+substitute degrades it by +851.4% (clean chunk_all 0.02504; both conditions
+on the same multi-start full-coverage data): the full instruction text
+carries causal information beyond task identity by a wide margin
+(logs/mw_v5_direct_ablation.log).
+
 **Closed loop (49 tasks × 10 trials, fixed seeds).** The chain of
 improvements: 7.1% [2.7%, 12.7%] (35/490, single-start data, coverage
 limited) → 16.3% [9.4%, 24.1%] (80/490, multi-start full-coverage rebuild)
@@ -543,7 +608,8 @@ is attributed in Sec. 6.5 to exposure (≈40× fewer decision presentations),
 the 6-step open-loop execution protocol, and the flat 64-token visual
 pooling; the VA2 architecture (Sec. 3: causal-decomposed memory, sequential
 coupling, deep flow conditioning, 4× exposure, prev-contract fix) retests
-this chain [TBD: logs/mw_va2_closedloop.log].
+this chain (C² mainline closed-loop: logs/mw_v5_c2_full_closedloop.log,
+89/490 = 18.2%).
 
 **Executed-action contract and direct head (pilot).** We rebuilt the
 action labels as the *executed* actions (the environment clips raw expert
@@ -569,17 +635,70 @@ trained). Results on button-press (10 trials each):
 | deployment | clean closed-loop | held-out recovery |
 |---|---|---|
 | direct head (no C²) | 10/10 | 30% |
-| C² K full | 6/10 | **50%** |
+| C² K full (6k steps) | 6/10 | **50%** |
 | C² K × 0.5 | 9/10 | 30% |
 | C² error-deadzone τ=0.3 | 8/10 | — |
+| C² K full (40k steps) | 10/10 | 10% |
 
 The learned gain transfers genuine recovery capability (+20 pp on
-perturbed-start branches, 30%→50%), but every clean closed-loop
-deployment trails the direct head: the reference prediction is imperfect
-(future loss 0.013) and K amplifies that noise when the policy is already
-near-expert. We report C² as partial validation — recovery value is real,
-universal deployment is not — and keep it as an ablation rather than the
-mainline controller (logs/mw_pilot_c2v2_*, mw_pilot_c2v2_recovery*).
+perturbed-start branches, 30%→50%), but it costs clean closed-loop
+performance (10/10 → 6/10) at short training budgets. Extending the
+training budget to 40k steps lets K retreat to a conservative solution
+that no longer disturbs clean execution (10/10) but also loses the
+recovery gain (50%→10%): the two objectives are in tension under this
+single-gain formulation. We report C² as partial validation — recovery
+value is real, universal deployment is not — and keep it as an ablation
+rather than the mainline controller (logs/mw_pilot_c2v2_*,
+mw_pilot_c2v2_recovery*, mw_pilot_c2_40k_*).
+
+**Joint 30k fine-tuning breaks the clean/recovery tension.** Continuing
+from the C² 40k checkpoint, we jointly fine-tune the full policy on
+clean + recovery data for 30k more steps (--c2-unfreeze-stage-a). The
+resulting controller holds clean closed-loop at 10/50 = 20.0% (same
+5-task protocol) while doubling held-out recovery to 2/10 = 20.0% (vs
+1/10 = 10.0% at 40k): the joint training lets K keep its corrective
+behavior without disturbing clean execution, removing the tension
+observed at shorter budgets (logs/mw_pilot_c2_joint30k_train.log,
+mw_pilot_c2_joint30k_closedloop.log).
+
+**Same-exposure comparison (C² vs direct pilot).** On the same 5-task
+evaluation set, the direct-head pilot trained on the same 2-task data
+scores 10/50 = 20.0% and C² 40k scores 10/50 = 20.0%, with per-task
+identical zeros on the three unexposed tasks (door/nut/plate: both 0/10
+— neither model ever saw these tasks, isolating data coverage rather
+than controller choice as the cause; logs/mw_pilot_direct_cl.log,
+mw_pilot_c2_40k_closedloop.log). The earlier 23/50 = 46.0% direct figure
+comes from the full 49-task checkpoint (mw_v5_direct_40k.pt), which is
+not a same-exposure control. Under same-exposure, C² is not worse than
+direct; its measured cost remains the clean-vs-recovery tension above.
+
+**Full-scale C² mainline (49 tasks, full-coverage data).** We then train
+the C² mainline on the full 49-task v5 features with two additions:
+per-chunk-step expected-visual targets over the full dataset
+(9927 samples × 4 decisions × 6 steps, alignment-verified at
+neighbor-window cosine 0.9960 vs the v5 rows, `make_v6a_full.py`) and
+the button-press recovery branches (`mw_buttonpress_v6b.pt`), resuming
+from the full direct checkpoint for 40k steps
+(`mw_v5_c2_full_40k.pt`, final act loss 0.0024). The closed-loop result
+is 89/490 = 18.2% [11.4%, 25.7%] — below the direct head's 31.8% on the
+same protocol — but two properties change qualitatively. First,
+**held-out recovery jumps to 4/10 = 40.0%** (vs 10% for the direct
+pilot): the contraction controller's corrective behavior now operates
+at full task coverage (logs/mw_v5_c2_full_closedloop.log,
+mw_v5_c2_full_recovery.log). Second, **language sensitivity is the
+strongest measured in this work**: wrong-instruction chunk-0 MAE rises
++1427.1% over clean (vs +1182.6% for the direct mainline), and the
+task-id-only delta remains +1355.4%, i.e. full language text still
+carries information beyond task identity
+(logs/mw_v5_c2_full_ablation.log). The cost is a clean-execution
+regression concentrated in precision-insertion tasks (nut-on-peg,
+peg-sideways, sweeps, gripper-in-hole: all 0/10) and in short
+trajectories where the learned reference c̄ cannot yet track a
+near-trivial motion (e.g. reach-goal 0/10), consistent with the
+single-step action fit of 89.3343% (per-dim 83.0/86.9/88.2/99.2) staying
+below the 99% gate the C² design analysis set for base capability.
+Directional language adherence (fork smoke) is 84.4% vs the 88.9%
+(16/18) bar — the model forks with language but not yet at bar level.
 
 ### 5.4 Comparison to literature baselines
 
@@ -596,15 +715,23 @@ protocols), not trained by us; protocols noted per row family.
 | SmolVLA \cite{shukor2025smolvlavisionlanguageactionmodelaffordable} | ~68% † | ~89% † | 10 trials/task, VLM-init only |
 | π0.5 \cite{intelligence2025pi05visionlanguageactionmodelopenworld} | — | ~97% ‡ | 50 trials (OpenPI/LeRobot) |
 | TurboVLA \cite{xie2026turbovlarealtimevisionlanguageactionmodel} | — | 97.7% ‡ (99.2/99.8/97.4/94.2) | 0.2B, no LLM trunk |
+| OpenVLA \cite{kim2024openvlaopensourcevisionlanguageactionmodel} | — | 76.5 ± 0.6% ‡ | 3 seeds × 50 trials/task; no MW result in paper |
 | π0 \cite{black2026pi0visionlanguageactionflowmodel} | 47.9% § | 94.2% ‡ | MW third-party citation |
-| **ours (open-loop)** | chunk 0.0806 [-13% vs persistence] | — | not comparable to closed-loop |
-| **ours (closed-loop)** | 17.8% [11.0, 25.3] | — | chain: 7.1 → 16.3 → 17.8; VA2 [TBD] |
+| **ours (open-loop)** | chunk 0.0251 [0.0229, 0.0273] (direct, v5) | — | not comparable to closed-loop |
+| **ours (closed-loop, direct head)** | 31.8% [22.6, 41.4] (156/490) | — | v5 contract, 49×10 |
+| **ours (closed-loop, C² mainline)** | 18.2% [11.4, 25.7] (89/490) | — | C² contraction control, 49×10, full-coverage data (v6a+v6b); recovery 40.0% (held-out) vs 10% direct |
 
-† MT50: 50 demos/task, 10 trials/task (Seo difficulty split); VLM-init only.
+† MT50: 50 demos/task, 10 trials/task, 5 seeds (Seo difficulty split);
+VLM-init only. All numbers Grok-verified against the original papers
+(Evo-1 arXiv:2511.04555; SmolVLA Table 2; TurboVLA Table 1).
 ‡ LIBERO: OpenVLA reports 3 seeds × 50 ep/task; SmolVLA/Evo-1 report 10
 trials/task; OpenPI π0/π0.5 use 50 trials/task. Protocols are not mixed
-within one family. § π0 MT50 number is a third-party citation, not from the
-original paper.
+within one family. π0.5's ≈97% (exact 96.9%, suites 98.8/98.2/98.0/92.4)
+is not in the π0.5 paper body; it comes from the openpi checkpoint and
+later papers (TurboVLA Table 1). § π0 LIBERO 94.2% is the fine-tuned π0
+reported by OpenVLA-OFT (the original π0 paper reports neither LIBERO nor
+Meta-World); π0 MT50 47.9% is a third-party citation (SmolVLA Table 2,
+robot-pretrained 3.5B).
 
 ### 5.5 End-to-end fine-tuning collapse and the 2x2 control
 
@@ -730,7 +857,29 @@ Macro actions: 8-step chunks executed for the first 6 primitives; reward = 1
 if any executed primitive succeeds; episodes end on success/termination
 without critic bootstrapping (time truncation bootstraps). GAE
 (gamma=0.99, lambda=0.95), 4 PPO epochs, minibatch 128, clip 0.1, actor LR
-3e-6, critic LR 1e-4. [TBD: MT10 subset IL→RL closed-loop comparison after
+3e-6, critic LR 1e-4.
+
+**C² mainline: Gaussian-action PPO.** For the C² contraction controller
+(our mainline), the same PPO machinery applies with a Gaussian policy:
+the action mean is the deterministic controller output
+$\bar a=\mathrm{clip}(\bar u-K(c_{\mathrm{current}}-\bar c),-1,1)$
+(`decode_actions(cond, c_current)` with `c_current` from the frozen
+projection $P$), and the sampled chunk is
+$a\sim\mathcal N(\bar a,\,\mathrm{diag}(\exp(2\,\mathrm{log\_std})))$
+with a 4-dim trainable log-std (init −1.0, std≈0.37). Rollouts store
+$(a_{\mathrm{sampled}},\ \mathrm{old\_logp})$; the update recomputes
+$\bar a$ from the stored condition and projected vision tokens and forms
+the importance ratio with the Gaussian log-probability. The reference/gain
+heads train alongside the VA composite (PPO clip + LR 1e-3·3e-6 scale
+bounds the correction), while $P$, V-JEPA and Qwen stay frozen. At
+evaluation the sampling noise is dropped, recovering the deterministic C²
+controller. In the literature, this IL→RL step is the single largest
+closed-loop lever in the same data regime: πRL \cite{chen2025prlscalingreinforcementlearningpretrained}
+reports π0 +35 pp on MetaWorld MT50 (50.8% → 85.8%, 2,500 demos) and
++40 pp on LIBERO few-shot (57.6% → 97.6%), and ReinFlow
+\cite{su2025reinflowrealtimeflowmatchingreinforcementlearning}
+reports +52 pp on Robomimic Square at 100 demos (25.1% → 77.4%).
+[TBD: MT10 subset IL→RL closed-loop comparison after
 the multi-start IL checkpoint; smoke protocol first.]
 
 ### 5.8 Efficiency
@@ -757,13 +906,26 @@ on physical rollouts.
 
 ## 6.5 Limitations
 
-- **Closed-loop data coverage**: MW training samples covered only the first
-  0.33s of each episode → closed-loop rollouts mostly OOD (7.1% [2.7, 12.7]);
-  in-distribution tasks succeed at ceiling. The multi-start full-coverage
-  rebuild lifted the closed-loop result to 16.3% → 17.8% (AQC), and the VA2
-  architecture (Sec. 3) retests the chain with 4× exposure and the
-  prev-contract fix [TBD: VA2 closed-loop]. No closed-loop parity claims
-  until the VA2 retest.
+- **Closed-loop success remains far below imitation SOTA on MT50**: the
+  full-coverage C² mainline reaches 18.2% [11.4, 25.7] (89/490) on the
+  49×10 closed-loop protocol — below the direct-head variant (31.8%) and
+  far below SmolVLA (~68%) / Evo-1 (80.6%). We attribute the gap to four
+  measured factors, in order of estimated contribution: (i) *single-step
+  action fit*: the trained policy reproduces training actions within
+  0.05 only 89.3343% of the time (per-dim 83.0/86.9/88.2/99.2) — below the
+  99% gate the C² design analysis set for base capability, so closed-loop
+  compounding dominates; (ii) *precision-insertion failure mode*: all
+  peg/sweep/nut-into-hole tasks score 0/10 (the 6-step open-loop chunk
+  executes with no corrective re-plan inside the chunk); (iii)
+  *short-trajectory reference mismatch*: trivial motions such as
+  reach-goal score 0/10 under the learned contraction reference c̄; (iv)
+  *direction asymmetry*: push-open 8/10 vs push-close 0/10 shows residual
+  task-id-style shortcuts despite the +1427% language-ablation
+  sensitivity. The C² mainline's qualitative wins — held-out recovery
+  40.0% (4× direct) and the strongest language sensitivity in this work —
+  are reported without over-claiming deployment readiness. [TBD: VLA-RL
+  (Sec. 5.7) and structural improvements target the single-step fit
+  directly.]
 - **Genuine same-state forks do not exist in MetaWorld MT50** (measured:
   open/close families start from opposite states, min first-state distance
   0.64; every episode is single-goal). The shared-source counterfactual
@@ -815,17 +977,22 @@ the pretrained instruction embedding space exactly (cosine 0.857) and
 behavioral language sensitivity (+2381% blank sensitivity), while end-to-end
 fine-tuning of a LoRA language adapter collapses the embedding space (0.999)
 and removes behavioral selectivity (+1.5%). Counterfactual evaluation on
-MetaWorld MT50 confirms that language content beyond task identity is used
-(wrong-instruction +108.5% chunk error).
+MetaWorld MT50 confirms that language content beyond task identity is used,
+with the full-coverage C² contraction mainline showing the strongest
+measured sensitivity in this work (wrong-instruction +1427.1% chunk-0
+error) while simultaneously delivering held-out recovery at 4× the
+direct-head pilot (40.0% vs 10%).
 
-We remain deliberately scoped: the visual-shortcut mechanism is not solved by
-any architecture alone — it is a property of the data distribution — and our
-closed-loop numbers are currently limited by training-data coverage, not
-architecture (in-distribution tasks succeed at ceiling). [TBD: after
-multi-start rebuild, VLA-RL, LIBERO-100 and L_m verdicts, final conclusion.]
+We remain deliberately scoped: the closed-loop gap on MT50 (18.2% vs
+imitation SOTA 80.6%) is traced to a measured single-step action fit of
+89.3343% — below the 99% base-capability gate — plus precision-insertion and
+short-trajectory failure modes (Sec. 6.5), not to language grounding, which
+the counterfactual suite shows to be the strongest asset of the design.
+VLA-RL fine-tuning, LIBERO-100, and the L_m verdict complete the picture
+[TBD: final numbers].
 
 ## References
 
-*[43 entries in paper/references.bib (verified 2026-08-07: 4 unrelated + 1
-duplicate removed; all keys unique). Assemble with \cite keys during the final
+*[47 entries in paper/references.bib (verified 2026-08-08: πRL and ReinFlow
+added for §5.7; all keys unique). Assemble with \cite keys during the final
 LaTeX/Markdown pass.]*

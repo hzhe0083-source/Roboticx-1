@@ -1,30 +1,53 @@
 """Fig 9: MetaWorld MT50 — open-loop, language ablation, closed-loop.
 
 Data: §8.2 (open loop chunk MAE vs persistence), §8.3 (wrong/taskid ablation),
-§8.5 (closed loop; multi-start retest numbers to replace the coverage-limited row).
+§8.5 (closed loop). Closed-loop rows are parsed from the actual run logs so
+the figure always matches the logs (audit-friendly).
 Run: python artifacts/figures/make_fig_mw.py
 """
+import re
+import os
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 
-# ---- EDIT HERE with final numbers ----
-OPEN_LOOP = {"model": 0.0803, "persistence": 0.15935}  # chunk MAE, VA2 v4 开环（logs/mw_va2_v4_openloop.log）
-OPEN_LOOP_CI = (0.0710, 0.0915)
-ABLATION = {"clean": 0.07984, "wrong": 0.20018, "task-id": 0.17496}  # chunk@all-seq, VA2 v4 消融（logs/mw_va2_v4_ablation.log）
-CLOSED_LOOP = {
-    "old (0.33s coverage)": 7.1,  # 49x10, [2.7, 12.7]
-    "multi-start rebuild": 16.3,  # logs/mw_full_closedloop.log, [9.4, 24.1]
-    "AQC (lang queries)": 17.8,  # logs/mw_aqc_closedloop.log, [11.0, 25.3]
-    "VA2 (this work)": None,  # TODO: logs/mw_va2_closedloop.log
-}
-CLOSED_LOOP_CI = {
-    "old (0.33s coverage)": (2.7, 12.7),
-    "multi-start rebuild": (9.4, 24.1),
-    "AQC (lang queries)": (11.0, 25.3),
-    "VA2 (this work)": None,
-}
+LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "logs")
+
+
+def closed_loop_from_log(name, logfile):
+    """Parse 'CLOSED-LOOP SUCCESS: X/Y = Z%' and 'macro ... [95% CI: a%, b%]'."""
+    path = os.path.join(LOG, logfile)
+    if not os.path.exists(path):
+        return None, None
+    with open(path) as f:
+        text = f.read()
+    m = re.search(r"CLOSED-LOOP SUCCESS:\s*([\d.]+)\s*/\s*([\d.]+)\s*=\s*([\d.]+)%", text)
+    ci = re.search(r"95% CI:\s*([\d.]+)%,\s*([\d.]+)%", text)
+    if not m:
+        return None, None
+    rate = float(m.group(3))
+    bounds = tuple(float(x) for x in ci.groups()) if ci else None
+    return rate, bounds
+
+
+# ---- closed-loop rows (parsed from logs; None until the run exists) ----
+_rows = [
+    ("v5 direct 40k", "mw_v5_direct_closedloop.log"),
+    ("C2 joint30k (pilot)", "mw_pilot_c2_joint30k_closedloop.log"),
+    ("C2 full 40k (mainline)", "mw_v5_c2_full_closedloop.log"),
+]
+CLOSED_LOOP = {}
+CLOSED_LOOP_CI = {}
+for label, logfile in _rows:
+    rate, bounds = closed_loop_from_log(label, logfile)
+    CLOSED_LOOP[label] = rate
+    CLOSED_LOOP_CI[label] = bounds
+
+# v5 direct 开环/消融（chunk@all-seq，logs/mw_v5_direct_ablation.log）
+OPEN_LOOP = {"model": 0.0251, "persistence": 0.1354}  # v5 direct 32-step chunk MAE
+OPEN_LOOP_CI = (0.0229, 0.0273)
+ABLATION = {"clean": 0.02504, "wrong": 0.25774, "task-id": 0.23823}  # chunk@all-seq
 LIT = {"SmolVLA 0.45B": 57.3, "Evo-1": 80.6, "FabriVLA": 90.0}  # closed-loop literature anchors
 # --------------------------------------------------------------------------
 
@@ -42,7 +65,6 @@ ax.set_ylabel('chunk MAE (norm)')
 ax.set_title('(a) Open-loop accuracy', fontsize=11)
 for b, v in zip(bars, vals):
     ax.text(b.get_x()+b.get_width()/2, v+0.003, f'{v:.4f}', ha='center', fontsize=9)
-ax.text(0.5, 0.155, 'VA2 v4 待回填', ha='center', fontsize=9, color='#2E8B57')
 
 # (b) ablation
 ax = axes[1]
@@ -53,7 +75,6 @@ ax.set_ylabel('chunk MAE (norm)')
 ax.set_title('(b) Language ablation', fontsize=11)
 for b, v in zip(bars, vals):
     ax.text(b.get_x()+b.get_width()/2, v+0.004, f'{v:.4f}', ha='center', fontsize=9)
-ax.text(0.5, 0.17, 'VA2 v4 待回填', ha='center', fontsize=9, color='#C44E52')
 
 # (c) closed loop vs literature
 ax = axes[2]

@@ -67,7 +67,17 @@ def main() -> None:
     conditions = torch.stack(conditions, dim=1).reshape(B * T, *conditions[0].shape[1:])
 
     def step() -> None:
-        model.sample_actions(conditions, steps=args.flow_steps)
+        if config.c2_controller:
+            # C² 部署契约：P 投影当前视觉 → 收缩解码（无 32 步积分）。
+            # conditions 为 [B*T, ...]（T 个决策点），每个决策点配自己的 c_current。
+            c_current = model.control_projector(
+                vision[:, 0].repeat(conditions.shape[0], 1, 1)
+            )
+            model.decode_actions(conditions, c_current=c_current)
+        elif config.direct_head:
+            model.decode_actions(conditions)
+        else:
+            model.sample_actions(conditions, steps=args.flow_steps)
 
     for _ in range(args.warmup):
         step()

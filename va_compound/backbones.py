@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from contextlib import contextmanager
 from math import isqrt
 from pathlib import Path
 
@@ -17,6 +18,8 @@ class LoRALinear(nn.Module):
 
     ``base`` stays frozen; only ``lora_a``/``lora_b`` are trainable.  With
     ``rank=0`` the module degenerates to the plain frozen projection.
+    ``lora_enabled=False``（P0-1）暂时旁路 LoRA 分支，退化为纯冻结投影——
+    ``QwenSemanticBackbone.encode_prior`` 用它跑真正的冻结先验。
     """
 
     def __init__(
@@ -24,6 +27,7 @@ class LoRALinear(nn.Module):
         base: nn.Linear,
         rank: int = 32,
         alpha: float = 32.0,
+        lora_enabled: bool = True,
     ) -> None:
         super().__init__()
         if rank < 0:
@@ -31,6 +35,7 @@ class LoRALinear(nn.Module):
         self.base = base
         self.rank = rank
         self.scaling = alpha / rank if rank else 0.0
+        self.lora_enabled = lora_enabled
         self.base.requires_grad_(False)
         if rank:
             dtype = base.weight.dtype
@@ -45,9 +50,29 @@ class LoRALinear(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         out = self.base(x)
-        if self.rank:
+        if self.rank and self.lora_enabled:
             out = out + (x @ self.lora_a @ self.lora_b) * self.scaling
         return out
+
+
+@contextmanager
+def set_lora_enabled(model: nn.Module, enabled: bool):
+    """Temporarily enable/disable every ``LoRALinear`` adapter under ``model``.
+
+    Context-manager form guarantees the prior state is restored even when the
+    block raises.  Used by ``QwenSemanticBackbone`` so ``encode_prior`` runs
+    the true frozen prior (LoRA off) while ``encode_adapted`` keeps the LoRA
+    residual (LoRA on).
+    """
+    adapters = [module for module in model.modules() if isinstance(module, LoRALinear)]
+    states = [adapter.lora_enabled for adapter in adapters]
+    for adapter in adapters:
+        adapter.lora_enabled = enabled
+    try:
+        yield
+    finally:
+        for adapter, state in zip(adapters, states):
+            adapter.lora_enabled = state
 
 
 def apply_lora(
@@ -594,8 +619,9 @@ class SemanticCompiler(nn.Module):
     ``forward`` 把 scene/history/delta/(error) 伪 token 依次插在指令 token 之后、
     readout 之前（encode_with_scene 的 ``extra_embeds`` 槽位），readout 位置
     输出 plan hidden [B, n_readout, D] 与全序列 mask [B, L+K+H+M+E+N]。
-    ``text_backbone`` 为 QwenSemanticBackbone 时自动解包到其内部
-    QwenTextBackbone（wrapper 本身不暴露 encode_with_scene）。
+    ``text_backbone`` 为 QwenSemanticBackbone 时（P0-4）走
+    ``encode_scene_fused``（prior/adapted 双路径 + 非负门控融合）；普通
+    QwenTextBackbone 保持旧路径（encode_with_scene）。
     """
 
     def __init__(
@@ -648,21 +674,17 @@ class SemanticCompiler(nn.Module):
         self.readout_tokens = nn.Parameter(torch.empty(n_readout, language_dim))
         nn.init.normal_(self.readout_tokens, std=0.02)
 
-    def forward(
+    def _project_embeds(
         self,
-        text_backbone: "QwenTextBackbone",
-        instructions: Sequence[str],
         scene_tokens: Tensor,
         semantic_history: Tensor,
         scene_delta: Tensor,
-        execution_error: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor]:
-        """Returns (readout plan hidden [B, n_readout, D], full mask).
+        execution_error: Tensor | None,
+    ) -> list[Tensor]:
+        """共享的逐样本伪 token 投影（forward / scene_states 复用，P0-4）。
 
-        ``execution_error`` [B, error_in_dim] is optional (第二轮架构重构):
-        None keeps the legacy scene+history+delta behavior byte-identical;
-        given, its ``n_err`` pseudo tokens are inserted after the delta
-        segment and before the readout tokens.
+        输入校验 + history/delta/(error) 投影，返回 ``extra_embeds`` 列表
+        （与 ``encode_with_scene`` 的 extra_embeds 槽位一一对应）。
         """
         if scene_tokens.ndim != 3 or scene_tokens.shape[-1] != self.vision_dim:
             raise ValueError(f"scene_tokens must have shape [B, K, {self.vision_dim}]")
@@ -687,7 +709,6 @@ class SemanticCompiler(nn.Module):
         delta_embeds = self.delta_projector(
             scene_delta.to(device=device, dtype=projector_dtype)
         ).view(batch, self.n_delta, self.language_dim)
-        extra_embeds: list[Tensor]
         if execution_error is not None:
             if execution_error.ndim != 2 or execution_error.shape[-1] != self.error_in_dim:
                 raise ValueError(
@@ -698,27 +719,55 @@ class SemanticCompiler(nn.Module):
             error_embeds = self.error_projector(
                 execution_error.to(device=device, dtype=projector_dtype)
             ).view(batch, self.n_err, self.language_dim)
-            extra_embeds = [history_embeds, delta_embeds, error_embeds]
-        else:
-            # execution_error=None:不追加 error 段(输出逐字节一致),但让
-            # error_projector 以零输入进入计算图——贡献恒 0(梯度为 0 而非
-            # None),参数保持可训练状态(test_parameters_trainable 断言全部
-            # 参数有 grad)。注意列表在分支内重建,否则 delta_embeds 的新
-            # 计算图引用会丢失。
-            zero_error = torch.zeros(
-                batch, self.error_in_dim, device=device, dtype=projector_dtype
-            )
-            error_embeds = self.error_projector(zero_error).view(
-                batch, self.n_err, self.language_dim
-            )
-            delta_embeds = delta_embeds + 0.0 * error_embeds.mean(dim=1, keepdim=True)
-            extra_embeds = [history_embeds, delta_embeds]
-        text_model = (
-            text_backbone.text_backbone
-            if isinstance(text_backbone, QwenSemanticBackbone)
-            else text_backbone
+            return [history_embeds, delta_embeds, error_embeds]
+        # execution_error=None:不追加 error 段(输出逐字节一致),但让
+        # error_projector 以零输入进入计算图——贡献恒 0(梯度为 0 而非
+        # None),参数保持可训练状态(test_parameters_trainable 断言全部
+        # 参数有 grad)。注意列表在分支内重建,否则 delta_embeds 的新
+        # 计算图引用会丢失。
+        zero_error = torch.zeros(
+            batch, self.error_in_dim, device=device, dtype=projector_dtype
         )
-        return text_model.encode_with_scene(
+        error_embeds = self.error_projector(zero_error).view(
+            batch, self.n_err, self.language_dim
+        )
+        delta_embeds = delta_embeds + 0.0 * error_embeds.mean(dim=1, keepdim=True)
+        return [history_embeds, delta_embeds]
+
+    def forward(
+        self,
+        text_backbone: "QwenTextBackbone",
+        instructions: Sequence[str],
+        scene_tokens: Tensor,
+        semantic_history: Tensor,
+        scene_delta: Tensor,
+        execution_error: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        """Returns (readout plan hidden [B, n_readout, D], full mask).
+
+        ``execution_error`` [B, error_in_dim] is optional (第二轮架构重构):
+        None keeps the legacy scene+history+delta behavior byte-identical;
+        given, its ``n_err`` pseudo tokens are inserted after the delta
+        segment and before the readout tokens.
+
+        P0-4：``text_backbone`` 为 QwenSemanticBackbone 时不再解包直走裸
+        ``encode_with_scene``（那会绕过 prior/adapted/fused 双路径）——改走
+        ``encode_scene_fused``：场景条件 readout 同样由冻结先验 + LoRA 残差 +
+        非负门控融合得到。
+        """
+        extra_embeds = self._project_embeds(
+            scene_tokens, semantic_history, scene_delta, execution_error
+        )
+        if isinstance(text_backbone, QwenSemanticBackbone):
+            return text_backbone.encode_scene_fused(
+                instructions,
+                scene_tokens,
+                self.scene_projector,
+                self.readout_tokens,
+                n_scene=self.n_scene,
+                extra_embeds=extra_embeds,
+            )
+        return text_backbone.encode_with_scene(
             instructions,
             scene_tokens,
             self.scene_projector,
@@ -726,6 +775,50 @@ class SemanticCompiler(nn.Module):
             n_scene=self.n_scene,
             extra_embeds=extra_embeds,
         )
+
+    def scene_states(
+        self,
+        text_backbone: "QwenTextBackbone",
+        instructions: Sequence[str],
+        scene_tokens: Tensor,
+        semantic_history: Tensor,
+        scene_delta: Tensor,
+        output_layers: list[int],
+        execution_error: Tensor | None = None,
+    ) -> tuple[dict[int, Tensor], dict[int, Tensor], Tensor]:
+        """场景条件路径的 (prior_layers, adapted_layers, mask)（P0-4 anchor）。
+
+        与 ``forward`` 完全相同的投影与伪 token 拼接，但返回全序列逐层
+        hidden（``output_layers`` 层索引）而不是 readout plan：prior 侧
+        no_grad + LoRA 关闭，adapted 侧带梯度，可直接喂给
+        ``QwenSemanticBackbone.anchor_loss`` / ``geometry_loss``。
+        仅支持 QwenSemanticBackbone（普通 QwenTextBackbone 没有
+        prior/adapted 之分）。
+        """
+        if not isinstance(text_backbone, QwenSemanticBackbone):
+            raise ValueError("scene_states requires a QwenSemanticBackbone")
+        extra_embeds = self._project_embeds(
+            scene_tokens, semantic_history, scene_delta, execution_error
+        )
+        prior_layers, mask = text_backbone.encode_scene_prior_states(
+            instructions,
+            scene_tokens,
+            self.scene_projector,
+            self.readout_tokens,
+            output_layers=output_layers,
+            n_scene=self.n_scene,
+            extra_embeds=extra_embeds,
+        )
+        adapted_layers, _ = text_backbone.encode_scene_adapted_states(
+            instructions,
+            scene_tokens,
+            self.scene_projector,
+            self.readout_tokens,
+            output_layers=output_layers,
+            n_scene=self.n_scene,
+            extra_embeds=extra_embeds,
+        )
+        return prior_layers, adapted_layers, mask
 
 
 class VJEPA21Backbone(nn.Module):
@@ -886,12 +979,15 @@ class VJEPA21Backbone(nn.Module):
 
 
 class QwenSemanticBackbone(nn.Module):
-    """第三种方案（2026-08-07 落地）：冻结 Qwen 先验 + 顶部层 LoRA + 零初始化门控。
+    """第三种方案（2026-08-07 落地）：冻结 Qwen 先验 + 顶部层 LoRA + 非负门控。
 
     冻结原始 Qwen 作为不可破坏的先验，仅对最后 ``top_layers`` 个 transformer
     层挂 LoRA 适配器学习具身语义残差；``fused_embedding`` 用输入条件相关的
-    门控（读 (prior, adapted) 的逐样本均值）把残差加回 —— 门控末层零初始化，
-    训练起点 fused == prior（与原始 Qwen 完全一致）。``anchor_loss`` /
+    门控（读 (prior, adapted) 的逐样本均值）把残差加回 —— 门控末层零初始化
+    （权重 0 + bias −4.595 → sigmoid ≈ 0.01），训练起点 fused ≈ prior（与原始
+    Qwen 几乎一致，残差门控非负不会反向削弱先验）。``encode_prior`` 在 LoRA
+    关闭 + no_grad 下运行（P0-1：真·冻结先验，否则 prior ≡ adapted，anchor/
+    geometry 恒为零）；``encode_adapted`` LoRA 开启。``anchor_loss`` /
     ``geometry_loss`` 约束适配表征不偏离先验（防止指令表征坍塌）。
     """
 
@@ -960,14 +1056,14 @@ class QwenSemanticBackbone(nn.Module):
             nn.GELU(),
             nn.Linear(self.language_dim, self.language_dim),
         )
-        # 门控末层零初始化：初始 g ≈ −0.01，fused == prior（训练起点完全等于
-        # 原始 Qwen）。bias 取小的负值而非严格 0：若 g ≡ 0 且 lora_b ≡ 0，
-        # fused 对门控/LoRA 的梯度恒为 0（精确零梯度死点，Adam 永远不动）；
-        # g ≈ −0.01 给 lora_b 提供非零梯度（Adam 对梯度尺度不敏感），
+        # 门控末层零初始化：初始 g = σ(−4.595) ≈ 0.01，fused ≈ prior（训练起点
+        # 几乎等于原始 Qwen）。bias 取小正值而非严格 0：若 g ≡ 0 且 lora_b ≡ 0，
+        # fused 对 LoRA 的梯度恒为 0（精确零梯度死点，Adam 永远不动）；
+        # g ≈ 0.01 给 lora_b 提供非零梯度（Adam 对梯度尺度不敏感），
         # 而 fused−prior = g ⊙ (adapted−prior) 在 adapted == prior 时仍逐位为 0。
         nn.init.zeros_(self.gate[-1].weight)
         nn.init.zeros_(self.gate[-1].bias)
-        self.gate[-1].bias.data.fill_(-0.01)
+        self.gate[-1].bias.data.fill_(-4.595)  # sigmoid(-4.595) ≈ 0.01
 
     @property
     def text_model(self) -> nn.Module:
@@ -995,32 +1091,170 @@ class QwenSemanticBackbone(nn.Module):
 
     @torch.no_grad()
     def encode_prior(self, instructions: Sequence[str]) -> tuple[Tensor, Tensor]:
-        """完整前向（no_grad，LoRA 不产生梯度），返回 (last_hidden, mask)。"""
-        return self.text_backbone.encode(instructions)
+        """完整前向（no_grad + LoRA 关闭 → 真·冻结先验），返回 (last_hidden, mask)。
+
+        P0-1：旧实现不关 LoRA，prior 实际等于 adapted（同一套 LoRA 权重），
+        anchor/geometry 损失恒为零。现在 LoRA 在上下文内旁路。
+        """
+        with set_lora_enabled(self, False):
+            return self.text_backbone.encode(instructions)
 
     def encode_adapted(self, instructions: Sequence[str]) -> tuple[Tensor, Tensor]:
-        """带梯度的完整前向（LoRA 生效），返回 (last_hidden, mask)。"""
-        return self.text_backbone.encode_trainable(instructions)
+        """带梯度的完整前向（LoRA 开启，与 prior 区分），返回 (last_hidden, mask)。"""
+        with set_lora_enabled(self, True):
+            return self.text_backbone.encode_trainable(instructions)
 
     @torch.no_grad()
     def encode_prior_states(
         self, instructions: Sequence[str], output_layers: list[int]
     ) -> tuple[dict[int, Tensor], Tensor]:
-        """no_grad 前向 + 指定层 hidden states，供 anchor_loss 的 prior 侧使用。"""
-        return self.text_backbone.encode(instructions, output_layers=output_layers)
+        """no_grad + LoRA 关闭的前向 + 指定层 hidden states（anchor 的 prior 侧）。"""
+        with set_lora_enabled(self, False):
+            return self.text_backbone.encode(instructions, output_layers=output_layers)
 
     def encode_adapted_states(
         self, instructions: Sequence[str], output_layers: list[int]
     ) -> tuple[dict[int, Tensor], Tensor]:
-        """带梯度前向 + 指定层 hidden states（LoRA 生效），anchor 的 adapted 侧。"""
-        return self.text_backbone.encode_trainable(instructions, output_layers=output_layers)
+        """带梯度前向 + 指定层 hidden states（LoRA 开启），anchor 的 adapted 侧。"""
+        with set_lora_enabled(self, True):
+            return self.text_backbone.encode_trainable(
+                instructions, output_layers=output_layers
+            )
+
+    @torch.no_grad()
+    def encode_scene_prior(
+        self,
+        instructions: Sequence[str],
+        scene_summary: Tensor,
+        scene_projector: nn.Module,
+        readout_tokens: Tensor,
+        n_scene: int = 8,
+        output_layers: list[int] | None = None,
+        extra_embeds: list[Tensor] | None = None,
+    ) -> tuple[Tensor | dict[int, Tensor], Tensor]:
+        """场景条件前向的 prior 侧（P0-4）：no_grad + LoRA 关闭。
+
+        参数契约与 ``QwenTextBackbone.encode_with_scene`` 一致（scene 路径也
+        走 prior/adapted 双路径 + 门控融合，不再直接解包到裸 encode_with_scene）。
+        """
+        with set_lora_enabled(self, False):
+            return self.text_backbone.encode_with_scene(
+                instructions,
+                scene_summary,
+                scene_projector,
+                readout_tokens,
+                n_scene=n_scene,
+                output_layers=output_layers,
+                extra_embeds=extra_embeds,
+            )
+
+    def encode_scene_adapted(
+        self,
+        instructions: Sequence[str],
+        scene_summary: Tensor,
+        scene_projector: nn.Module,
+        readout_tokens: Tensor,
+        n_scene: int = 8,
+        output_layers: list[int] | None = None,
+        extra_embeds: list[Tensor] | None = None,
+    ) -> tuple[Tensor | dict[int, Tensor], Tensor]:
+        """场景条件前向的 adapted 侧（P0-4）：带梯度 + LoRA 开启。"""
+        with set_lora_enabled(self, True):
+            return self.text_backbone.encode_with_scene(
+                instructions,
+                scene_summary,
+                scene_projector,
+                readout_tokens,
+                n_scene=n_scene,
+                output_layers=output_layers,
+                extra_embeds=extra_embeds,
+            )
+
+    def encode_scene_fused(
+        self,
+        instructions: Sequence[str],
+        scene_summary: Tensor,
+        scene_projector: nn.Module,
+        readout_tokens: Tensor,
+        n_scene: int = 8,
+        extra_embeds: list[Tensor] | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        """场景条件路径的 prior/adapted/门控融合（P0-4）。
+
+        readout 位置输出 ``prior + g ⊙ (adapted − prior)``（与纯文本
+        ``fused_embedding`` 同一门控），返回 (fused [B, n_readout, D], mask)。
+        prior 侧 no_grad + LoRA 关闭，adapted 侧带梯度。
+        """
+        prior, mask = self.encode_scene_prior(
+            instructions,
+            scene_summary,
+            scene_projector,
+            readout_tokens,
+            n_scene=n_scene,
+            extra_embeds=extra_embeds,
+        )
+        adapted, _ = self.encode_scene_adapted(
+            instructions,
+            scene_summary,
+            scene_projector,
+            readout_tokens,
+            n_scene=n_scene,
+            extra_embeds=extra_embeds,
+        )
+        return self.fused_embedding(prior, adapted), mask
+
+    @torch.no_grad()
+    def encode_scene_prior_states(
+        self,
+        instructions: Sequence[str],
+        scene_summary: Tensor,
+        scene_projector: nn.Module,
+        readout_tokens: Tensor,
+        output_layers: list[int],
+        n_scene: int = 8,
+        extra_embeds: list[Tensor] | None = None,
+    ) -> tuple[dict[int, Tensor], Tensor]:
+        """场景条件前向 + 指定层 hidden（no_grad + LoRA 关闭），anchor 的 prior 侧。"""
+        with set_lora_enabled(self, False):
+            return self.text_backbone.encode_with_scene(
+                instructions,
+                scene_summary,
+                scene_projector,
+                readout_tokens,
+                n_scene=n_scene,
+                output_layers=output_layers,
+                extra_embeds=extra_embeds,
+            )
+
+    def encode_scene_adapted_states(
+        self,
+        instructions: Sequence[str],
+        scene_summary: Tensor,
+        scene_projector: nn.Module,
+        readout_tokens: Tensor,
+        output_layers: list[int],
+        n_scene: int = 8,
+        extra_embeds: list[Tensor] | None = None,
+    ) -> tuple[dict[int, Tensor], Tensor]:
+        """场景条件前向 + 指定层 hidden（带梯度 + LoRA 开启），anchor 的 adapted 侧。"""
+        with set_lora_enabled(self, True):
+            return self.text_backbone.encode_with_scene(
+                instructions,
+                scene_summary,
+                scene_projector,
+                readout_tokens,
+                n_scene=n_scene,
+                output_layers=output_layers,
+                extra_embeds=extra_embeds,
+            )
 
     def fused_embedding(self, prior: Tensor, adapted: Tensor) -> Tensor:
         """``prior + g ⊙ (adapted - prior)``，g 为输入条件相关的残差门控。
 
-        门控读 (prior, adapted) 的逐样本 token 均值 → 小 MLP → tanh 限幅；
-        末层零初始化（权重 0 + 小负偏置 −0.01）保证训练起点 g ≈ 0
-        （fused == prior，与原始 Qwen 完全一致）。
+        门控读 (prior, adapted) 的逐样本 token 均值 → 小 MLP → sigmoid 限幅
+        到 (0, 1)；末层零初始化（权重 0 + bias −4.595 → σ ≈ 0.01）保证训练
+        起点 g ≈ 0.01（fused ≈ prior，与原始 Qwen 几乎一致；门控非负，残差
+        只能按比例加回，不会反向削弱先验）。
         """
         if prior.shape != adapted.shape:
             raise ValueError("prior and adapted must share the same shape")
@@ -1028,7 +1262,7 @@ class QwenSemanticBackbone(nn.Module):
         p = prior.to(dtype=gate_dtype)
         a = adapted.to(dtype=gate_dtype)
         gate = self.gate(torch.cat((p.mean(dim=1), a.mean(dim=1)), dim=-1))  # [B, D]
-        gate = torch.tanh(gate).to(dtype=prior.dtype)[:, None, :]
+        gate = torch.sigmoid(gate).to(dtype=prior.dtype)[:, None, :]
         return prior + gate * (adapted - prior)
 
     def anchor_loss(

@@ -13,6 +13,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, Sampler
 
 from va_compound import VACompoundConfig, VACompoundPolicy
+from va_compound.backbones import pool_flat_tokens
 
 
 def build_pair_groups(
@@ -970,8 +971,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--dual-attention",
         action="store_true",
         help="第二轮架构重构：非 sequential VA 层动作 query 拆 physical/semantic "
-        "双注意力（sequential 层保持旧共享路径；与 --sequential-coupling 同开时"
-        "仅警告，sequential 层不拆）",
+        "双注意力（sequential 层保持旧共享路径；与 --sequential-coupling=1 同开"
+        "时报错——每层都是 sequential 双注意力永不生效；>1 时仅警告）",
     )
     parser.add_argument(
         "--flow-semantic",
@@ -1308,8 +1309,23 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--semantic-top-layers must be positive with --semantic-adapter")
     if args.semantic_anchor_weight < 0.0 or args.semantic_geometry_weight < 0.0:
         raise ValueError("semantic anchor/geometry weights must be non-negative")
-    # 第二轮架构重构（2026-08-08）参数校验；role-query/dual-attention/
-    # flow-semantic 与 --compile-task 无强制依赖（可独立开）。
+    # 第二轮架构重构（2026-08-08）参数校验。P0-高优 fail-fast：语义上下文/
+    # role query/双注意力有结构性前置条件时直接报错，而不是静默失效。
+    if args.flow_semantic and not args.compile_task:
+        raise ValueError(
+            "--flow-semantic requires --compile-task (semantic_context comes "
+            "from the compiler readout tokens)"
+        )
+    if args.flow_semantic and args.flow_cond != "adaln":
+        raise ValueError(
+            "--flow-semantic requires --flow-cond=adaln (entry mode has no "
+            "per-layer cross-attention and ignores semantic_context)"
+        )
+    if args.role_query and not (args.memory_split or args.action_query_cond):
+        raise ValueError(
+            "--role-query requires --memory-split or --action-query-cond "
+            "(role queries summarize the language key for exactly these two paths)"
+        )
     if args.role_query_tokens < 1:
         raise ValueError("--role-query-tokens must be >= 1")
     if args.compile_n_readout < 1:
@@ -1322,7 +1338,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "--semantic-lora-suffixes must be a non-empty comma-separated list"
         )
-    if args.dual_attention and args.sequential_coupling > 0:
+    if args.dual_attention and args.sequential_coupling == 1:
+        raise ValueError(
+            "--dual-attention is incompatible with --sequential-coupling=1 "
+            "(every VA layer is sequential; dual attention would never apply)"
+        )
+    if args.dual_attention and args.sequential_coupling > 1:
         print(
             "warning: --dual-attention only splits the non-sequential VA layers; "
             "sequential layers keep the legacy shared path"
@@ -1366,7 +1387,7 @@ def save_checkpoint(args, config, model, e2e_model, scene_teacher=None) -> None:
                 if "lora_a" in name or "lora_b" in name
             },
             "qwen_state_dict": {
-                name.removeprefix("text_model."): parameter.detach().cpu()
+                name.removeprefix("text_backbone.").removeprefix("text_model."): parameter.detach().cpu()
                 for name, parameter in e2e_model.text_backbone.named_parameters()
                 if parameter.requires_grad
                 and "lora_a" not in name
@@ -1387,6 +1408,21 @@ def save_checkpoint(args, config, model, e2e_model, scene_teacher=None) -> None:
                     if args.unfreeze_blocks is not None
                     else len(e2e_model.vision_backbone.model.blocks)
                 ),
+                # P0-3：semantic adapter / compile-task 恢复所需字段。旧实现
+                # 不存这些 → eval_metaworld 用 lora_rank=32 建 LoRA、不构造
+                # QwenSemanticBackbone/门控/compiler，新 checkpoint 无法恢复。
+                "semantic_adapter": args.semantic_adapter,
+                "semantic_lora_rank": args.semantic_lora_rank,
+                "semantic_lora_alpha": args.lora_alpha,
+                "semantic_top_layers": args.semantic_top_layers,
+                "semantic_anchor_layers": args.semantic_anchor_layers,
+                "semantic_lora_suffixes": args.semantic_lora_suffixes,
+                "compile_task": args.compile_task,
+                "compile_every": args.compile_every,
+                "n_scene_tokens": args.compile_n_scene,
+                "compile_n_readout": args.compile_n_readout,
+                "language_max_length": args.language_max_length,
+                "flow_semantic": args.flow_semantic,
             },
         }
         gate = getattr(e2e_model.text_backbone, "gate", None)
@@ -1797,7 +1833,7 @@ def main() -> None:
             e2e_model.vision_backbone.model.load_state_dict(resume_ckpt["vjepa_state_dict"])
             if resume_ckpt.get("qwen_state_dict"):
                 qwen_state = {
-                    k.removeprefix("text_model."): v
+                    k.removeprefix("text_backbone.").removeprefix("text_model."): v
                     for k, v in resume_ckpt["qwen_state_dict"].items()
                 }
                 e2e_model.text_backbone.text_model.load_state_dict(qwen_state, strict=False)
@@ -1958,11 +1994,31 @@ def main() -> None:
                     # 配对 E2E（2026-08-07）：与 feature 路径同构的共享源
                     # 反事实干预——语言是 pair 内唯一输入差，速度场差即语言贡献。
                     partner = paired_partner_indices(batch["pair_id"], batch["instruction_id"])
+                    # P0-高优：pair 契约——vision/proprio/prev 严格相同，
+                    # 反事实干预的输入差只能是语言（否则语言贡献被污染）。
+                    if not (
+                        torch.equal(mb["video_frames"], mb["video_frames"][partner])
+                        and torch.equal(mb["proprio"], mb["proprio"][partner])
+                        and torch.equal(
+                            mb["previous_action"], mb["previous_action"][partner]
+                        )
+                    ):
+                        raise ValueError(
+                            "e2e pair contract violated: video_frames/proprio/"
+                            "previous_action must be identical within each pair"
+                        )
                     pair_noise, pair_time, pair_target_velocity = sample_pair_intervention(
                         batch["actions"], partner, probe_tau_max=args.pair_probe_tau_max
                     )
                     pair_predicted_velocity = e2e_model.policy.flow_velocity(
-                        action_conditions[:, 0], pair_noise, pair_time
+                        action_conditions[:, 0],
+                        pair_noise,
+                        pair_time,
+                        # P0-高优：flow_semantic 下 pair 分支复用 t=0 编译的
+                        # 语义上下文（与 action_conditions[:, 0] 同一决策点）。
+                        semantic_context=getattr(
+                            e2e_model, "first_semantic_context", None
+                        ),
                     )
                     pair_loss, pred_delta, tgt_delta = semantic_pair_loss(
                         pair_predicted_velocity, pair_target_velocity, partner
@@ -2068,7 +2124,8 @@ def main() -> None:
             semantic_geom_loss = flow_loss.new_zeros(())
             if args.semantic_adapter:
                 # 第三种方案（2026-08-07）：anchor/geometry 约束。prior 侧永远
-                # no_grad（encode_prior_states 带 @torch.no_grad）；adapted 单次
+                # no_grad（encode_prior_states 带 @torch.no_grad + LoRA 关闭，
+                # P0-1：旧实现 prior 实际走 LoRA，anchor 恒为零）；adapted 单次
                 # 前向取 output_hidden_states 复用给 anchor + geometry。
                 semantic = e2e_model.text_backbone  # QwenSemanticBackbone
                 unique = list(dict.fromkeys(mb["instruction"]))
@@ -2092,22 +2149,60 @@ def main() -> None:
                             adapted_layers[semantic.num_layers - 1],
                             prior_mask,
                         )
+                    # P0-4：scene 条件路径同样参与 anchor/geometry——用 rollout
+                    # t=0 编译的真实场景输入（与 compiler 前向逐位一致）。
+                    compiler = getattr(e2e_model, "compiler", None)
+                    scene_inputs = getattr(e2e_model, "_compile_scene_inputs", None)
+                    if (
+                        args.compile_task
+                        and compiler is not None
+                        and scene_inputs is not None
+                    ):
+                        # scene 输入从 rollout 图 detach：场景 anchor 只反传到
+                        # compiler/Qwen（视觉侧梯度由动作损失的 rollout 图提供），
+                        # 且避免与 action_total 共享图边导致拆分 backward 时
+                        # "backward through the graph a second time"（P0-5）。
+                        scene_tokens0, history0, delta0 = (
+                            tensor.detach() for tensor in scene_inputs
+                        )
+                        scene_tokens = pool_flat_tokens(
+                            scene_tokens0, e2e_model.n_scene_tokens
+                        )
+                        s_prior, s_adapted, s_mask = compiler.scene_states(
+                            semantic,
+                            mb["instruction"],
+                            scene_tokens,
+                            history0,
+                            delta0,
+                            layers_needed,
+                        )
+                        if need_anchor:
+                            semantic_anchor_loss = semantic_anchor_loss + semantic.anchor_loss(
+                                s_prior, s_adapted
+                            )
+                        if need_geom:
+                            semantic_geom_loss = semantic_geom_loss + semantic.geometry_loss(
+                                s_prior[semantic.num_layers - 1],
+                                s_adapted[semantic.num_layers - 1],
+                                s_mask,
+                            )
             evsm_gate_mean = (
                 sum(evsm_gates) / len(evsm_gates) if evsm_gates else None
             )
-            total = (
+            # P0-5：动作损失与语义损失分开返回——backward 时 LoRA 参数只缩放
+            # 动作侧梯度（η_act），anchor/geometry 梯度完整。
+            action_total = (
                 flow_loss
                 + args.pair_loss_weight * pair_loss
                 + args.future_predict_weight * future_loss
             )
-            if args.semantic_adapter:
-                total = (
-                    total
-                    + args.semantic_anchor_weight * semantic_anchor_loss
-                    + args.semantic_geometry_weight * semantic_geom_loss
-                )
+            semantic_total = (
+                args.semantic_anchor_weight * semantic_anchor_loss
+                + args.semantic_geometry_weight * semantic_geom_loss
+            )
             return (
-                total,
+                action_total,
+                action_total + semantic_total,
                 flow_loss,
                 pair_loss,
                 pred_delta,
@@ -2119,7 +2214,8 @@ def main() -> None:
             )
 
         (
-            loss,
+            action_total,
+            total_loss,
             flow_loss,
             pair_loss,
             predicted_delta,
@@ -2131,11 +2227,17 @@ def main() -> None:
         ) = compute_loss(batch, noisy_actions, flow_time)
 
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        # P0-5：动作损失与语义损失分开 backward——LoRA 参数只缩放动作侧梯度
+        # （η_act），anchor/geometry 梯度完整（旧实现统一缩放两者）。
+        action_total.backward()
         if e2e_model is not None and args.semantic_adapter:
             scale_semantic_lora_grads(
                 e2e_model.text_backbone, args.semantic_act_grad_scale
             )
+        if args.semantic_adapter and (
+            args.semantic_anchor_weight > 0.0 or args.semantic_geometry_weight > 0.0
+        ):
+            semantic_total.backward()
         clip_params = (
             e2e_model.parameters()
             if e2e_model is not None
@@ -2148,16 +2250,23 @@ def main() -> None:
         gradient_norm = torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
         if args.sam_rho > 0:
             # SAM：先沿梯度方向扰动权重（worst-case 邻域），重算 loss 后走真实步。
-            # η_act 对两次 backward 的梯度都缩放（见 scale_semantic_lora_grads
-            # 文档：first_step 的扰动方向与缩放无关，实际步长由第二次缩放后的
-            # 梯度决定，因此两次缩放才使 η_act 对 SAM 生效）。
+            # η_act 对两次 backward 都按动作/语义拆分缩放（见 scale_semantic_lora_grads
+            # 文档：first_step 的扰动方向与缩放无关——ρ·g/‖g‖ 与缩放无关；实际步长
+            # 由第二次缩放后的梯度决定，因此两次缩放才使 η_act 对 SAM 生效）。
             optimizer.first_step(zero_grad=True)
-            loss2, _, _, _, _, _, _, _, _ = compute_loss(batch, noisy_actions, flow_time)
-            loss2.backward()
+            action_total2, semantic_total2, _, _, _, _, _, _, _, _ = compute_loss(
+                batch, noisy_actions, flow_time
+            )
+            action_total2.backward()
             if e2e_model is not None and args.semantic_adapter:
                 scale_semantic_lora_grads(
                     e2e_model.text_backbone, args.semantic_act_grad_scale
                 )
+            if args.semantic_adapter and (
+                args.semantic_anchor_weight > 0.0
+                or args.semantic_geometry_weight > 0.0
+            ):
+                semantic_total2.backward()
             torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
             optimizer.second_step(zero_grad=True)
         else:
@@ -2180,7 +2289,7 @@ def main() -> None:
             f"step={step} mode={args.mode} contract="
             f"{'e2e_single' if e2e_model is not None else ('single' if args.single_task else 'paired')} "
             f"sequence={noisy_actions.shape[1]} "
-            f"loss={loss.item():.6f} flow={flow_loss.item():.6f} "
+            f"loss={total_loss.item():.6f} flow={flow_loss.item():.6f} "
             f"pair={pair_loss.item():.6f} future={future_loss.item():.6f} "
             f"goal_delta={predicted_delta.item():.6f}/"
             f"{target_delta.item():.6f} grad={float(gradient_norm):.6f}"

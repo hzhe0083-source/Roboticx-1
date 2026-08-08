@@ -46,6 +46,11 @@ class EndToEndPolicy(nn.Module):
         self.pooling = pooling
         self.compiler = compiler
         self.n_scene_tokens = n_scene_tokens
+        # P0-4/P0-高优：rollout 内部记录 t=0 编译的场景输入与语义上下文——
+        # train.py 的 scene 路径 anchor 损失与 pair flow 分支需要与 rollout
+        # 完全一致的输入/上下文（compile_every=0 或无 compiler 时保持 None）。
+        self._compile_scene_inputs: tuple[Tensor, Tensor, Tensor] | None = None
+        self.first_semantic_context: Tensor | None = None
 
     @property
     def config(self) -> VACompoundConfig:
@@ -114,9 +119,15 @@ class EndToEndPolicy(nn.Module):
         ``visual_tokens`` [B, Nv, vision_dim] 按 token 轴 adaptive-avg-pool 抽到
         ``n_scene_tokens`` 个，连同 ``semantic_history`` / ``scene_delta``
         （分别 [B, history_in_dim] / [B, vision_dim]）经 ``SemanticCompiler``
-        编译为 ``n_readout`` 个语义 token（走冻结 Qwen 的 encode_with_scene，
-        保留梯度）。语言 hidden 仍用现有路径（fused 或 encode_trainable），
-        语义 token 拼到语言序列末尾后 build_language_cache（语义段 mask 恒真）。
+        编译为 ``n_readout`` 个语义 token（QwenSemanticBackbone 走 prior/
+        adapted/门控融合的 encode_scene_fused，普通 QwenTextBackbone 走冻结
+        encode_with_scene，均保留梯度）。语言 hidden 仍用现有路径（fused 或
+        encode_trainable），语义 token 拼到语言序列末尾后 build_language_cache
+        （语义段 mask 恒真）。
+
+        P0-2：``SemanticCompiler`` 按原始 B 逐样本运行（语义 readout 是场景
+        条件化的；相同指令 + 不同场景 → 不同 readout）。纯文本 prior/adapted
+        与场景无关，仍按 unique 编码后经 indices 展开省算力。
 
         ``compiler`` 非 None 时覆盖 ``self.compiler``（rollout 的外部注入路径）。
         ``return_semantic=True``（第二轮架构重构）额外返回展开到样本批的
@@ -139,15 +150,8 @@ class EndToEndPolicy(nn.Module):
             )
         if scene_delta.ndim != 2 or scene_delta.shape[-1] != self.config.vision_dim:
             raise ValueError(f"scene_delta must have shape [B, {self.config.vision_dim}]")
+        # 纯文本 prior/adapted 与场景无关，按 unique 编码后经 indices 展开省算力。
         unique = list(dict.fromkeys(instructions))
-        scene_tokens = pool_flat_tokens(visual_tokens, self.n_scene_tokens)
-        semantic, _ = compiler(
-            self.text_backbone,
-            unique,
-            scene_tokens,
-            semantic_history,
-            scene_delta,
-        )
         if isinstance(self.text_backbone, QwenSemanticBackbone):
             prior, mask = self.text_backbone.encode_prior(unique)
             adapted, _ = self.text_backbone.encode_adapted(unique)
@@ -162,7 +166,19 @@ class EndToEndPolicy(nn.Module):
         )
         batched = hidden[indices]
         batched_mask = mask[indices]
-        semantic = semantic[indices].to(device=batched.device, dtype=batched.dtype)
+        scene_tokens = pool_flat_tokens(visual_tokens, self.n_scene_tokens)
+        # P0-2：compiler 按原始 B 运行——语义 readout 是场景条件化的逐样本
+        # 输出（相同指令 + 不同场景 → 不同语义 readout）；旧实现对 compiler
+        # 调用做文本去重，重复指令时 scene_tokens/semantic_history/scene_delta
+        # 的 B 与 unique 不匹配直接崩溃。
+        semantic, _ = compiler(
+            self.text_backbone,
+            instructions,
+            scene_tokens,
+            semantic_history,
+            scene_delta,
+        )
+        semantic = semantic.to(device=batched.device, dtype=batched.dtype)
         extended = torch.cat((batched, semantic), dim=1)
         extended_mask = torch.cat(
             (
@@ -244,6 +260,14 @@ class EndToEndPolicy(nn.Module):
                     if time_index == 0
                     else current_mean - visual[:, time_index - 1].mean(dim=1)
                 )
+                if time_index == 0:
+                    # P0-4：记录 t=0 编译的场景输入（train.py 的 scene 路径
+                    # anchor/geometry 损失复用同一批输入，保证与编译一致）。
+                    self._compile_scene_inputs = (
+                        visual[:, time_index],
+                        semantic_history,
+                        scene_delta,
+                    )
                 if self.policy.config.flow_semantic:
                     language_cache, semantic_context = self.compile_semantic(
                         instructions,
@@ -253,6 +277,9 @@ class EndToEndPolicy(nn.Module):
                         compiler=compiler,
                         return_semantic=True,
                     )
+                    if time_index == 0:
+                        # P0-高优：pair 反事实分支复用 t=0 的语义上下文。
+                        self.first_semantic_context = semantic_context
                 else:
                     language_cache = self.compile_semantic(
                         instructions,

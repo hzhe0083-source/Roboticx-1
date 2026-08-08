@@ -25,6 +25,7 @@ from va_compound.backbones import (
     SceneTeacher,
     VJEPA21Backbone,
     apply_lora,
+    set_lora_enabled,
 )
 from va_compound.end_to_end import EndToEndPolicy, build_e2e_policy
 from va_compound.model import LanguageCache, VACompoundConfig, VACompoundPolicy
@@ -291,6 +292,138 @@ class SemanticBackboneTests(unittest.TestCase):
         self.assertLess(float((fused - prior).detach().abs().max()), 0.05)
         with self.assertRaisesRegex(ValueError, "shape"):
             adapter.fused_embedding(prior, adapted[:, :4])
+
+    def test_lora_enable_disable_prior_invariant_adapted_changes(self):
+        # P0-1 回归：encode_prior 必须在 LoRA 关闭 + no_grad 下运行（真·冻结
+        # 先验）。旧实现 LoRA 无启停开关 → prior ≡ adapted，anchor 恒为零。
+        backbone = make_backbone(num_layers=2)
+        adapter = QwenSemanticBackbone(
+            backbone, lora_rank=4, top_layers=1, anchor_layers=(1,)
+        )
+        bumped = [
+            parameter
+            for name, parameter in adapter.named_parameters()
+            if "lora_b" in name
+        ][0]
+        bumped.data.normal_(mean=0.0, std=0.5)
+        prior, mask = adapter.encode_prior(["hi there"])
+        adapted, _ = adapter.encode_adapted(["hi there"])
+        self.assertFalse(prior.requires_grad)
+        self.assertTrue(adapted.requires_grad)
+        # LoRA 生效 → adapted != prior
+        self.assertFalse(torch.allclose(adapted, prior, rtol=0, atol=1e-6))
+        # adapted 与裸 encode_trainable（LoRA 常开）逐位一致
+        adapted_direct, _ = backbone.encode_trainable(["hi there"])
+        torch.testing.assert_close(adapted, adapted_direct, rtol=0, atol=1e-6)
+        # prior 与"冻结前向 + LoRA 关闭"逐位一致（裸 encode 不管理 LoRA 开关，
+        # lora_b≠0 时包含 LoRA 贡献——这正是 P0-1 要修的：prior 必须显式关 LoRA）
+        with set_lora_enabled(adapter, False):
+            prior_direct, _ = backbone.encode(["hi there"])
+        torch.testing.assert_close(prior, prior_direct, rtol=0, atol=1e-6)
+        # 再次扰动 lora_b：prior 严格不变（旧实现 prior 会跟着 adapted 变）
+        prior_before = prior.clone()
+        for name, parameter in adapter.named_parameters():
+            if "lora_b" in name:
+                parameter.data.normal_(mean=0.0, std=1.0)
+        prior2, _ = adapter.encode_prior(["hi there"])
+        torch.testing.assert_close(prior2, prior_before, rtol=0, atol=0)
+        # anchor_loss > 0（旧实现 prior 走同一套 LoRA → anchor 恒为 0）
+        prior_layers, _ = adapter.encode_prior_states(["hi there"], [1])
+        adapted_layers, _ = adapter.encode_adapted_states(["hi there"], [1])
+        anchor = adapter.anchor_loss(prior_layers, adapted_layers)
+        self.assertGreater(anchor.item(), 0.0)
+
+    def test_set_lora_enabled_context_manager_restores_state(self):
+        backbone = make_backbone(num_layers=2)
+        adapter = QwenSemanticBackbone(backbone, lora_rank=4, top_layers=1)
+        q_proj = adapter.text_backbone.text_model.layers[1].self_attn.q_proj
+        self.assertIsInstance(q_proj, LoRALinear)
+        self.assertTrue(q_proj.lora_enabled)  # 默认开启（旧行为不变）
+        with set_lora_enabled(adapter, False):
+            self.assertFalse(q_proj.lora_enabled)
+        self.assertTrue(q_proj.lora_enabled)  # 退出后恢复
+        # 异常路径同样恢复
+        with self.assertRaises(RuntimeError):
+            with set_lora_enabled(adapter, False):
+                raise RuntimeError("boom")
+        self.assertTrue(q_proj.lora_enabled)
+        # LoRA 关闭时输出 == 冻结 base 投影
+        base = q_proj.base
+        x = torch.randn(2, 4, 32)
+        with set_lora_enabled(adapter, False):
+            torch.testing.assert_close(q_proj(x), base(x), rtol=0, atol=0)
+
+    def test_gate_sigmoid_non_negative_and_initial_value(self):
+        backbone = make_backbone(num_layers=2)
+        adapter = QwenSemanticBackbone(backbone, lora_rank=4, top_layers=1)
+        # 初始门控 σ(−4.595) ≈ 0.01（非负，P0-1：旧 tanh −0.01 给融合前向
+        # 用 adapted 但反向给 LoRA 负 ×0.01 梯度）
+        self.assertAlmostEqual(
+            float(torch.sigmoid(adapter.gate[-1].bias.detach()).mean()), 0.01, places=3
+        )
+        prior = torch.randn(2, 5, 32)
+        adapted = prior + 1.0 * torch.randn_like(prior)
+        fused = adapter.fused_embedding(prior, adapted)
+        delta = fused - prior
+        # 门控非负：fused−prior 与 adapted−prior 逐位同号（或为零）
+        self.assertTrue(torch.all(delta * (adapted - prior) >= 0))
+        self.assertLess(float(delta.abs().max()), 0.05)
+
+    def test_split_backward_scales_only_action_grads(self):
+        # P0-5：动作损失 backward 后缩放 LoRA 梯度、再 backward 语义损失——
+        # 最终 LoRA 梯度 = η_act·g_action + g_semantic（anchor/geometry 梯度
+        # 完整，不被 η_act 缩放；旧实现统一缩放两者）。
+        from train import scale_semantic_lora_grads
+
+        backbone = make_backbone(num_layers=2)
+        adapter = QwenSemanticBackbone(
+            backbone, lora_rank=4, top_layers=1, anchor_layers=(1,)
+        )
+        for name, parameter in adapter.named_parameters():
+            if "lora_b" in name:
+                parameter.data.normal_(std=0.5)  # 使 adapted != prior
+        lora_b = [
+            parameter
+            for name, parameter in adapter.named_parameters()
+            if "lora_b" in name
+        ][0]
+        # 动作损失（fused 路径）
+        prior, _ = adapter.encode_prior(["hi there"])
+        adapted, _ = adapter.encode_adapted(["hi there"])
+        fused = adapter.fused_embedding(prior, adapted)
+        fused.float().square().mean().backward()
+        g_action = lora_b.grad.clone()
+        self.assertIsNotNone(g_action)
+        self.assertGreater(float(g_action.abs().sum()), 0.0)
+        # 门控梯度先记录（缩放只动 lora_a/lora_b，不动门控）
+        gate_bias = adapter.gate[-1].bias
+        g_gate_before = gate_bias.grad.clone()
+        scale_semantic_lora_grads(adapter, 0.25)
+        torch.testing.assert_close(lora_b.grad, 0.25 * g_action, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(gate_bias.grad, g_gate_before, rtol=0, atol=0)
+        # 语义损失（anchor）backward 累加完整梯度
+        prior_l, _ = adapter.encode_prior_states(["hi there"], [1])
+        adapted_l, _ = adapter.encode_adapted_states(["hi there"], [1])
+        adapter.anchor_loss(prior_l, adapted_l).backward()
+        g_final = lora_b.grad.clone()
+        # 对照：单独跑语义 backward 的梯度
+        adapter.zero_grad(set_to_none=True)
+        prior_l2, _ = adapter.encode_prior_states(["hi there"], [1])
+        adapted_l2, _ = adapter.encode_adapted_states(["hi there"], [1])
+        adapter.anchor_loss(prior_l2, adapted_l2).backward()
+        g_sem_only = lora_b.grad.clone()
+        torch.testing.assert_close(
+            g_final, 0.25 * g_action + g_sem_only, rtol=1e-5, atol=1e-6
+        )
+        # scale == 1.0 为空操作
+        adapter.zero_grad(set_to_none=True)
+        adapter.fused_embedding(
+            adapter.encode_prior(["hi there"])[0],
+            adapter.encode_adapted(["hi there"])[0],
+        ).square().mean().backward()
+        before = lora_b.grad.clone()
+        scale_semantic_lora_grads(adapter, 1.0)
+        torch.testing.assert_close(lora_b.grad, before, rtol=0, atol=0)
 
     def test_anchor_loss_numerics(self):
         backbone = make_backbone(num_layers=2)

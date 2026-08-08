@@ -35,6 +35,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--flow-steps", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument(
+        "--vision-pooling",
+        choices=("flat", "spatial"),
+        default=None,
+        help="defaults to the pooling recorded in the checkpoint contract",
+    )
+    parser.add_argument(
         "--max-samples", type=int, default=None,
         help="limit sample count (smoke-test use)",
     )
@@ -105,13 +111,14 @@ def eval_ablation(
     flow_steps: int,
     batch_size: int,
     language_override: tuple[torch.Tensor, torch.Tensor | None] | None,
+    vision_key: str = "vision_tokens",
 ) -> dict[str, float]:
     """开环逐决策点评估；统计决策点 0 与全序列的 chunk_mae（归一化）。"""
     model.eval()
     per_episode: dict[int, dict[str, list[float]]] = defaultdict(
         lambda: defaultdict(list)
     )
-    keys = ("vision_tokens", "language_hidden", "proprio", "previous_action", "actions")
+    keys = (vision_key, "language_hidden", "proprio", "previous_action", "actions")
     for start in range(0, len(indices), batch_size):
         batch_indices = torch.tensor(indices[start : start + batch_size])
         batch = {key: payload[key][batch_indices] for key in keys}
@@ -130,9 +137,9 @@ def eval_ablation(
         )
         visual_memory = None
         conditions = []
-        for time_index in range(batch["vision_tokens"].shape[1]):
+        for time_index in range(batch[vision_key].shape[1]):
             condition, visual_memory = model.encode_condition(
-                batch["vision_tokens"][:, time_index],
+                batch[vision_key][:, time_index],
                 batch["proprio"][:, time_index],
                 batch["previous_action"][:, time_index],
                 language_cache=language_cache,
@@ -141,15 +148,17 @@ def eval_ablation(
             )
             conditions.append(condition)
         conditions = torch.stack(conditions, dim=1)  # [B, T, H, D]
-        if getattr(model.config, "direct_head", False):
-            predictions = model.decode_actions(
-                conditions.reshape(-1, conditions.shape[-2], conditions.shape[-1])
+        flat = conditions.reshape(-1, conditions.shape[-2], conditions.shape[-1])
+        if getattr(model.config, "c2_controller", False):
+            # C² 部署契约：P 投影当前视觉 → 收缩解码。
+            c_current = model.control_projector(
+                batch[vision_key].reshape(-1, *batch[vision_key].shape[2:])
             )
+            predictions = model.decode_actions(flat, c_current=c_current)
+        elif getattr(model.config, "direct_head", False):
+            predictions = model.decode_actions(flat)
         else:
-            predictions = model.sample_actions(
-                conditions.reshape(-1, conditions.shape[-2], conditions.shape[-1]),
-                steps=flow_steps,
-            )
+            predictions = model.sample_actions(flat, steps=flow_steps)
         predicted = predictions.reshape(
             conditions.shape[0], conditions.shape[1], predictions.shape[-2], -1
         )
@@ -180,11 +189,23 @@ def main() -> None:
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     contract = checkpoint.get("training_contract", {})
     config = VACompoundConfig(**checkpoint["config"])
+    contract_pooling = contract.get("vision_pooling")
+    if (
+        args.vision_pooling
+        and contract_pooling
+        and args.vision_pooling != contract_pooling
+    ):
+        raise ValueError(
+            f"--vision-pooling {args.vision_pooling} conflicts with the checkpoint "
+            f"contract ({contract_pooling}); omit the flag to use the recorded pooling"
+        )
+    pooling = args.vision_pooling or contract_pooling or "flat"
+    vision_key = "vision_tokens_spatial" if pooling == "spatial" else "vision_tokens"
     flow_steps = args.flow_steps or int(contract.get("flow_steps", 8))
     model = VACompoundPolicy(config).to(device)
     model.load_state_dict(checkpoint["model"])
 
-    dataset = FeatureDataset(args.data, require_pairs=False)
+    dataset = FeatureDataset(args.data, require_pairs=False, vision_key=vision_key)
     payload = dataset.payload
     indices = list(range(dataset.length))
     if args.max_samples is not None:
@@ -194,11 +215,13 @@ def main() -> None:
     clean = eval_ablation(
         model, payload, indices, device,
         flow_steps=flow_steps, batch_size=args.batch_size, language_override=None,
+        vision_key=vision_key,
     )
     wrong = eval_ablation(
         model, payload, indices, device,
         flow_steps=flow_steps, batch_size=args.batch_size,
         language_override=(wrong_language, None),
+        vision_key=vision_key,
     )
     baseline = persistence_baseline(payload, indices, success_threshold=0.05)
 
@@ -221,6 +244,7 @@ def main() -> None:
             model, payload, indices, device,
             flow_steps=flow_steps, batch_size=args.batch_size,
             language_override=taskid_language,
+            vision_key=vision_key,
         )
         print(f"taskid: chunk0={taskid['chunk0']:.5f} chunk_all={taskid['chunk_all']:.5f}")
         delta_tid0 = taskid["chunk0"] / clean["chunk0"] - 1.0
