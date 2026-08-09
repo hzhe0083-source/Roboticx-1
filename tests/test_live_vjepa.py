@@ -8,25 +8,29 @@ import pytest
 import torch
 
 from va_compound.live_vjepa import (
+    N_DENSE_TOKENS,
     N_TOKENS,
     SEQUENCE_LENGTH,
     VISION_WINDOW,
+    _dense_coords,
     _slot_coords,
     encode_live_frames,
 )
 
 
 class _FakeBackbone:
-    """伪 V-JEPA：_encode → [B, 2, 12, 12, D]；_pool(spatiotemporal) → [B, 288, D]。"""
+    """伪 V-JEPA：_encode → [B, 2*grid*grid, D] 扁平 tokens（真实 2.1 契约）；
+    _pool(spatiotemporal) → [B, 288, D]。"""
 
-    def __init__(self, dim: int = 768) -> None:
+    def __init__(self, dim: int = 768, grid: int = 12) -> None:
         self.dim = dim
+        self.grid = grid
         self.device = torch.device("cpu")
         self.dtype = torch.float16
 
     def _encode(self, inputs: torch.Tensor) -> torch.Tensor:
         B = inputs.shape[0]
-        return torch.randn(B, 2, 12, 12, self.dim, dtype=self.dtype)
+        return torch.randn(B, 2 * self.grid * self.grid, self.dim, dtype=self.dtype)
 
     def _pool(self, raw: torch.Tensor, pooling: str) -> torch.Tensor:
         assert pooling == "spatiotemporal"
@@ -82,6 +86,52 @@ class TestEncodeLiveFrames:
         assert not out.requires_grad
 
 
+class TestDenseReadout:
+    """Step 0 dense readout：不池化分支 + [1152, 3] 全量 patch 网格坐标。"""
+
+    def test_dense_coords_shape_range_order(self) -> None:
+        coords = _dense_coords()
+        assert coords.shape == (N_DENSE_TOKENS, 3)
+        assert coords.dtype == np.float32
+        assert coords.min() >= -1.0 - 1e-6
+        assert coords.max() <= 1.0 + 1e-6
+        # (t∈{-1,1}, y, x)，t 外层循环：每个时间片 24×24=576 patch。
+        assert int((coords[:, 0] == -1.0).sum()) == N_DENSE_TOKENS // 2
+        assert int((coords[:, 0] == 1.0).sum()) == N_DENSE_TOKENS // 2
+        # 与 _slot_coords(grid=24) 逐位一致（同一生成器，仅网格尺寸不同）。
+        assert np.allclose(coords, _slot_coords(grid=24))
+        # y/x 步长为 2/23（24 格归一化），与 12 格（2/11）同一公式。
+        assert np.allclose(
+            coords[:3],
+            [[-1.0, -1.0, -1.0], [-1.0, -1.0, -1.0 + 2.0 / 23.0], [-1.0, -1.0, -1.0 + 4.0 / 23.0]],
+        )
+
+    def test_encode_live_frames_dense(self) -> None:
+        B, T, W, S = 2, SEQUENCE_LENGTH, VISION_WINDOW, 384
+        frames = (np.random.rand(B, T, W, S, S, 3) * 255).astype(np.uint8)
+        out = encode_live_frames(
+            frames, _FakeBackbone(grid=24), torch.device("cpu"), dense=True
+        )
+        assert tuple(out.shape) == (B, T, N_DENSE_TOKENS, 768)
+
+    def test_dense_single_sample(self) -> None:
+        T, W, S = SEQUENCE_LENGTH, VISION_WINDOW, 384
+        frames = np.zeros((1, T, W, S, S, 3), dtype=np.uint8)
+        out = encode_live_frames(
+            frames, _FakeBackbone(dim=512, grid=24), torch.device("cpu"), dense=True
+        )
+        assert tuple(out.shape) == (1, T, N_DENSE_TOKENS, 512)
+
+    def test_dense_rejects_wrong_layout(self) -> None:
+        """raw token 数不是 1152（如 288 路径的 12×12 池化网格）必须报错。"""
+        B, T, W, S = 1, SEQUENCE_LENGTH, VISION_WINDOW, 384
+        frames = np.zeros((B, T, W, S, S, 3), dtype=np.uint8)
+        with pytest.raises(ValueError, match="raw tokens"):
+            encode_live_frames(
+                frames, _FakeBackbone(grid=12), torch.device("cpu"), dense=True
+            )
+
+
 class TestArgValidation:
     def _args(self, **overrides) -> argparse.Namespace:
         base = dict(
@@ -100,6 +150,7 @@ class TestArgValidation:
             c2_lambda_c=0.1, c2_recovery_ratio=0.25,
             direct_head=True, c2_controller=False, data=argparse.Namespace(),
             e2e_data=None, local_slots_data=None, live_vjepa=False,
+            dense_readout=False, multi_mode=False, local_slots_direct288=False,
             fork_data=None, fork_k=83, fork_skip_contract=False,
             live_root=argparse.Namespace(), vision_unfreeze_all=False,
             vision_unfreeze_last=0, vision_pooling="spatiotemporal",
@@ -137,3 +188,32 @@ class TestArgValidation:
         # 合法组合不抛错
         validate_args(self._args(live_vjepa=True, vision_unfreeze_all=True))
         validate_args(self._args(live_vjepa=True, vision_unfreeze_last=4))
+
+    def test_dense_readout_requires_local_slots_path(self) -> None:
+        from train import validate_args
+
+        # 无 live / 预计算路径 → 拒绝
+        with pytest.raises(ValueError, match="requires --live-vjepa or --local-slots-data"):
+            validate_args(self._args(dense_readout=True))
+        # live 与预计算两条合法路径都通过
+        validate_args(self._args(dense_readout=True, live_vjepa=True))
+        validate_args(self._args(dense_readout=True, local_slots_data=argparse.Namespace()))
+
+    def test_dense_readout_conflicts_direct288(self) -> None:
+        from train import validate_args
+
+        # §九：1152 token 直送 VA 会在 VA 内做 1152×1152 自注意力，必须互斥。
+        with pytest.raises(ValueError, match="互斥"):
+            validate_args(
+                self._args(
+                    dense_readout=True, live_vjepa=True, local_slots_direct288=True
+                )
+            )
+        with pytest.raises(ValueError, match="互斥"):
+            validate_args(
+                self._args(
+                    dense_readout=True,
+                    local_slots_data=argparse.Namespace(),
+                    local_slots_direct288=True,
+                )
+            )

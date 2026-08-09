@@ -1,6 +1,8 @@
-# 基线对照表（文献数字，Grok 查证 2026-08-08）
+# 基线对照表（文献数字，Grok 查证 2026-08-08 / 2026-08-09）
 
 > 状态：数字已逐条经 Grok Web 查证，来源 arXiv 号 + 出处位置在案。
+> FabriVLA/LA4VLA/π0+ALAM/Evo-Depth 四行于 2026-08-09 补查（arXiv 2607.08575 T1 /
+> 2606.27295 T4 / 2605.10819 T1 / Evo-Depth 原文，均闭环 MT50 口径）。
 > 用途：论文对比表素材。所有数字均为**文献原文/官方源**，本项目不自行训练基线（边界）。
 > 口径差异一律脚注，不与本项目数字直接硬比。
 
@@ -8,6 +10,10 @@
 
 | 模型 | Params | 机器人预训练 | LIBERO Avg | MetaWorld | 评估 trials | 闭环 | 来源 |
 |---|---|---:|---:|---:|---:|---|---|
+| FabriVLA | — | — | — | **90.0%** | 10 ep×50 tasks, H5 | 闭环 | arXiv:2607.08575 Table 1（Easy 95.0/Med 88.2/Hard 86.7/VH 90.0；imitation SOTA 注） |
+| LA4VLA-1B (MixPT) | ~1B | — | — | **87.53%** | — | 闭环 | arXiv:2606.27295 Table 4（Easy 88.9/Med 94.5/Hard 66.7/VH 100.0；论文写 MetaWorld avg，MT50 为转引口径） |
+| π0+ALAM | 3B+ | 有 | — | **85.0%** | — | 闭环 | arXiv:2605.10819 Table 1（Easy 89.3/Med 83.6/Hard 85.0/VH 82.0；π0 47.9→85.0，交叉证实 π0 47.9% 第三方数） |
+| Evo-Depth | — | — | — | **84.4%** | — | 闭环 | Evo-Depth 原文（论文标注 Meta-World；MT50 为 FabriVLA 等转引口径） |
 | Evo-1 | 0.77B | 无 | **94.8%** | **80.6%** | 10 trials/task × 5 runs | 闭环+chunk | arXiv:2511.04555 Table 1 |
 | SmolVLA 2.25B | 2.25B | 无 | **88.75%** | **68.24%** | 10 trials/task | 闭环每步 replan | arXiv:2506.01844 Table 2 |
 | SmolVLA 0.45B | 0.45B | 无 | **87.3%** | **57.3%** | 10 trials/task | 同上 | arXiv:2506.01844 Table 2 |

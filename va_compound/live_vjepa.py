@@ -15,6 +15,7 @@ Stage B 限定 --single-task（配对帧级契约留待数据侧；动作头 dir
 from __future__ import annotations
 
 import collections
+from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
@@ -49,6 +50,8 @@ ACTION_HORIZON = 8
 SPE = 4
 SLOT_GRID = 12  # per time-slice pooled grid -> 12x12
 N_TOKENS = 2 * SLOT_GRID * SLOT_GRID  # 288 (spatiotemporal 双时间片)
+DENSE_GRID = 24  # Step 0 dense readout：384/16 patch 网格（不池化）
+N_DENSE_TOKENS = 2 * DENSE_GRID * DENSE_GRID  # 1152（2 时间片 × 24×24 patch）
 IMAGE_SIZE = 384
 MAX_CACHE_FRAMES = 512  # Codex P0-4：512 帧 ≈ 0.22 GiB（有界，防 oomd）
 MAX_PARQUET_TABLES = 2  # 解码表 LRU：最多持有 2 个 parquet 全列（防 43 GiB 全缓存）
@@ -206,7 +209,8 @@ class LiveVJEPADataset:
 
     - ``vision_tokens`` 键被移除（省 ~7.8 GiB RAM，对抗 systemd-oomd）；
     - ``frames``: [T, VISION_WINDOW, IMAGE_SIZE, IMAGE_SIZE, 3] uint8；
-    - ``coords`` 常量 [288, 3]（与 ST288 相同的 slot 网格坐标）。
+    - ``coords`` 常量 [288, 3]（与 ST288 相同的 slot 网格坐标）；
+      ``dense_readout=True``（Step 0）时为 [1152, 3] 全量 patch 网格坐标。
 
     与 v5 的差异仅在视觉侧；language/proprio/actions/pair 语义不变。
     """
@@ -225,6 +229,8 @@ class LiveVJEPADataset:
         success_only: bool = False,
         sliding: bool = False,
         frame_aug: bool = False,
+        frame_aug_geometric: bool = True,
+        dense_readout: bool = False,
     ) -> None:
         from train import FeatureDataset  # 延迟导入避免循环依赖
 
@@ -240,6 +246,7 @@ class LiveVJEPADataset:
         self.payload = self._inner.payload
         self.control_stride = control_stride
         self.frame_aug = frame_aug
+        self.frame_aug_geometric = frame_aug_geometric
         # Codex P0-1：build_mw_plans 需要 vision_tokens 的形状 → 先建 plans 再释放。
         self.plans = build_mw_plans(
             self.payload,
@@ -255,7 +262,8 @@ class LiveVJEPADataset:
         self.payload.pop("vision_tokens", None)
         self.payload.pop("vision_tokens_spatial", None)
         self.decoder = FrameDecoder(root)
-        self.coords = _slot_coords()
+        # Step 0 dense readout：coords 随读出模式切换（1152 全量 patch vs 288 池化槽）。
+        self.coords = _dense_coords() if dense_readout else _slot_coords()
 
     def __len__(self) -> int:
         return self.length
@@ -278,24 +286,33 @@ class LiveVJEPADataset:
             frames.append([self.decoder(global_row(ep, idx)) for idx in indices])
         item["frames"] = np.stack(frames)  # [T, W, 384, 384, 3] uint8
         if self.frame_aug:
-            item["frames"] = augment_frames(item["frames"])
+            item["frames"] = augment_frames(item["frames"], geometric=self.frame_aug_geometric)
         item["coords"] = self.coords
         return item
 
 
-def _slot_coords() -> np.ndarray:
-    """[288, 3]：与 ST288 提取（prepare_mw_local_features.build_coords）逐位一致
-    ——(t∈{-1,1}, y, x)，t 外层循环 → y → x（Codex P0-5：曾为 (x,y,t) 顺序错位）。"""
-    half = (SLOT_GRID - 1) / 2
+def _slot_coords(grid: int = SLOT_GRID) -> np.ndarray:
+    """[2*grid*grid, 3]：与 ST288 提取（prepare_mw_local_features.build_coords）逐位一致
+    ——(t∈{-1,1}, y, x)，t 外层循环 → y → x（Codex P0-5：曾为 (x,y,t) 顺序错位）。
+
+    ``grid`` 默认 12（288 token，既有行为逐位不变）；``grid=24`` 生成 dense 读出
+    （--dense-readout）的 [1152, 3] 全量 patch 网格坐标。
+    """
+    half = (grid - 1) / 2
     coords = []
     for t in range(2):
-        for y in range(SLOT_GRID):
-            for x in range(SLOT_GRID):
+        for y in range(grid):
+            for x in range(grid):
                 coords.append((t * 2.0 - 1.0, (y - half) / half, (x - half) / half))
     return np.asarray(coords, dtype=np.float32)
 
 
-def augment_frames(frames: np.ndarray) -> np.ndarray:
+def _dense_coords() -> np.ndarray:
+    """[1152, 3]：Step 0 dense readout 的 2×24×24 patch 网格坐标（不池化）。"""
+    return _slot_coords(grid=DENSE_GRID)
+
+
+def augment_frames(frames: np.ndarray, geometric: bool = True) -> np.ndarray:
     """π0.5 式帧增强：RandomCrop(0.95) → Resize(384) → Rotate(±5°) → ColorJitter。
 
     输入 [T, W, 384, 384, 3] uint8，输出同形状；每 epoch 重新随机。
@@ -305,6 +322,9 @@ def augment_frames(frames: np.ndarray) -> np.ndarray:
     帧甚至会被增强成 4 个不同视图。
     注意：几何增强（crop/rotate）会扰动 slot 坐标网格（coords [288,3]）与
     场景点的对应关系——local_slots 开启时该通道变噪声，需自行权衡。
+    ``geometric=False`` 时跳过 crop/rotate，只保留光度增强（ColorJitter）：
+    精细定位任务（抓取/插入）下几何扰动 ≈ ±10px ≈ ±1cm 定位噪声，
+    且 slot 坐标未同步变换（2026-08-09 审计 R4，E1 修复）。
     """
     import torch
     import torchvision.transforms as T
@@ -316,16 +336,19 @@ def augment_frames(frames: np.ndarray) -> np.ndarray:
     for t_idx in range(frames.shape[0]):
         # 每组增强参数采样一次（该 clip 的 4 帧共享）。
         dummy = Image.new("RGB", (IMAGE_SIZE, IMAGE_SIZE))
-        top, left, h, w = T.RandomCrop.get_params(dummy, (crop, crop))
-        angle = float(torch.empty(1).uniform_(-5.0, 5.0))
+        top, left, h, w = (
+            T.RandomCrop.get_params(dummy, (crop, crop)) if geometric else (0, 0, IMAGE_SIZE, IMAGE_SIZE)
+        )
+        angle = float(torch.empty(1).uniform_(-5.0, 5.0)) if geometric else 0.0
         b, c, s, _hue = T.ColorJitter.get_params(
             brightness=(0.7, 1.3), contrast=(0.6, 1.4), saturation=(0.5, 1.5), hue=None
         )[-4:]
         for w_idx in range(frames.shape[1]):
             img = Image.fromarray(frames[t_idx, w_idx])
-            img = F.crop(img, top, left, h, w)
-            img = F.resize(img, (IMAGE_SIZE, IMAGE_SIZE))
-            img = F.rotate(img, angle)
+            if geometric:
+                img = F.crop(img, top, left, h, w)
+                img = F.resize(img, (IMAGE_SIZE, IMAGE_SIZE))
+                img = F.rotate(img, angle)
             img = F.adjust_brightness(img, b)
             img = F.adjust_contrast(img, c)
             img = F.adjust_saturation(img, s)
@@ -337,10 +360,22 @@ def encode_live_frames(
     frames_batch: np.ndarray,
     vision_backbone,
     device: torch.device,
-) -> torch.Tensor:
-    """[B, T, W, 384, 384, 3] uint8 → [B, T, N_TOKENS, D]（backbone dtype）。
+    *,
+    dense: bool = False,
+    out_layers: Sequence[int] | None = None,
+) -> torch.Tensor | list[torch.Tensor]:
+    """[B, T, W, 384, 384, 3] uint8 → [B, T, N, D]（backbone dtype）。
 
-    V-JEPA 前向 +（解冻时）反向；输出与 ST288 同构（288 token）。
+    V-JEPA 前向 +（解冻时）反向；``dense=False`` 输出与 ST288 同构
+    （288 token，既有行为不变）；``dense=True``（Step 0 dense readout）
+    跳过池化，输出全量 2×24×24 = 1152 patch token [B, T, N_DENSE_TOKENS, D]，
+    供角色查询 cross-attention 直接读出（Q≈6 × N=1152；1152 不进 VA 自注意力，
+    设计文档 §九）。
+
+    ``out_layers``（Step 4）非 None 时改走 ``encode_multi``：返回
+    ``list[Tensor]``（顺序与 out_layers 一致），每层按同一 dense/池化规则
+    折叠成 [B, T, N, D]（H⁵/H¹¹ 多层输出，只作只读 evidence）；默认 None
+    保持既有行为（返回单个 Tensor）。
     """
     if preprocess_batch is None:
         raise RuntimeError("prepare_metaworld 导入失败")
@@ -348,15 +383,31 @@ def encode_live_frames(
     clips = frames_batch.reshape(B * T, W, H, Wc, 3)
     clips_list = [list(clip) for clip in clips]
     inputs = preprocess_batch(clips_list, IMAGE_SIZE).to(device)  # [B*T, W, 3, 384, 384]
-    raw = vision_backbone._encode(inputs)  # [B*T, t_grid, h, w, D]
-    st = vision_backbone._pool(raw, "spatiotemporal")  # [B*T, N_TOKENS, D]
-    return st.reshape(B, T, N_TOKENS, -1)
+
+    def fold(raw: torch.Tensor) -> torch.Tensor:
+        """单层 token 折叠：[B*T, N, D] → [B, T, N', D]（dense 不池化 / 其余 ST288）。"""
+        if dense:
+            # Step 0 dense readout：不池化。raw 必须是全量 patch（4 帧窗口 →
+            # 2 时间片 × 24×24 = 1152；与 _dense_coords() 的 t→y→x 顺序一致）。
+            if raw.ndim != 3 or raw.shape[1] != N_DENSE_TOKENS:
+                raise ValueError(
+                    f"dense readout 需要 raw tokens [., {N_DENSE_TOKENS}, D]"
+                    f"（2×24×24 patch，4 帧窗口 → 2 时间片），got {tuple(raw.shape)}"
+                )
+            return raw.reshape(B, T, N_DENSE_TOKENS, -1)
+        st = vision_backbone._pool(raw, "spatiotemporal")  # [B*T, N_TOKENS, D]
+        return st.reshape(B, T, N_TOKENS, -1)
+
+    if out_layers is None:
+        return fold(vision_backbone._encode(inputs))  # [B*T, t_grid*h*w, D] 扁平（t→h→w）
+    # Step 4：多层输出透传（encode_multi）——每层按同一 dense/池化规则折叠。
+    return [fold(raw) for raw in vision_backbone.encode_multi(inputs, out_layers=out_layers)]
 
 
 def load_st288_memmap(npy_path: str | Path, metadata: dict) -> torch.Tensor:
     """加载 ST288 大数组（mmap 零拷贝）。
 
-    prepare_mw_local_features.py 用 np.memmap(mode="w+") 写裸数据（无 npy header），
+    scripts/extract_st288_finetuned.py 用 np.memmap(mode="w+") 写裸数据（无 npy header），
     np.load 会误判为 pickle 而拒绝；此处先检查 magic，带 header 走 np.load，
     裸数据则从 metadata + 文件大小推断 shape。
     """

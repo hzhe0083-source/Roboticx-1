@@ -64,6 +64,24 @@ def parse_args() -> argparse.Namespace:
         "none = 只评估 clean",
     )
     parser.add_argument(
+        "--state-take",
+        type=int,
+        default=4,
+        choices=(0, 4),
+        help="proprio 截取协议（开环 chunk-MAE 消融专用）：本脚本的 proprio 来自"
+        "预计算 features（数据侧 4 维，eval_metaworld.py 的 --state-take 8/39"
+        "需要环境 obs + 零初始化投影扩展，此处不适用——仅 0/4 合法）；"
+        "0 = proprio 恒零（RGB-only 开环消融）",
+    )
+    parser.add_argument(
+        "--servo-ablation",
+        choices=("none", "zero-gain", "gain-shuffle", "wrong-role", "open-loop"),
+        default="none",
+        help="不支持项标注：servo 四消融（--servo-ablation/--fovea）只在"
+        "eval_metaworld.py 的闭环 C² 部署中有意义；本脚本是开环 chunk-MAE 消融，"
+        "传非 none 会明确报错而不是静默忽略",
+    )
+    parser.add_argument(
         "--model-dtype", default="bfloat16",
         help="dtype for the Qwen encoder used in --taskid-lang",
     )
@@ -129,8 +147,12 @@ def eval_ablation(
     vision_key: str = "vision_tokens",
     local_tokens: torch.Tensor | None = None,
     coords: torch.Tensor | None = None,
+    state_take: int = 4,
 ) -> dict[str, float]:
-    """开环逐决策点评估；统计决策点 0 与全序列的 chunk_mae（归一化）。"""
+    """开环逐决策点评估；统计决策点 0 与全序列的 chunk_mae（归一化）。
+
+    ``state_take=0``（--state-take 0）：proprio 恒零（RGB-only 开环消融）。
+    """
     model.eval()
     per_episode: dict[int, dict[str, list[float]]] = defaultdict(
         lambda: defaultdict(list)
@@ -148,12 +170,22 @@ def eval_ablation(
                 batch["language_mask"] = mask_override[batch_indices]
         batch["episode_id"] = payload["episode_id"][batch_indices]
         batch = ensure_sequence(move_batch(batch, device), 1)
+        if state_take == 0:
+            batch["proprio"] = torch.zeros_like(batch["proprio"])
         language_cache = model.build_language_cache(
             batch["language_hidden"],
             batch.get("language_mask"),
         )
         visual_memory = None
         conditions = []
+        semantic_contexts = []
+        # 训练侧 rollout_policy 在 flow_semantic 时把槽输出（vision_in）作为
+        # flow head 逐层 cross-attn 的语义上下文；评估必须走同一路径，否则
+        # 槽语义通道被静默丢弃（cond_kv 回退为 action_condition）。
+        use_flow_semantic = (
+            getattr(model.config, "flow_semantic", False)
+            and not getattr(model.config, "direct_head", False)
+        )
         for time_index in range(batch[vision_key].shape[1]):
             if local_tokens is not None:
                 if coords is None:
@@ -174,8 +206,17 @@ def eval_ablation(
                 return_visual_memory=True,
             )
             conditions.append(condition)
+            if use_flow_semantic:
+                semantic_contexts.append(vision_in)
         conditions = torch.stack(conditions, dim=1)  # [B, T, H, D]
         flat = conditions.reshape(-1, conditions.shape[-2], conditions.shape[-1])
+        semantic_flat = (
+            torch.stack(semantic_contexts, dim=1).reshape(
+                -1, *semantic_contexts[0].shape[1:]
+            )
+            if semantic_contexts
+            else None
+        )
         if getattr(model.config, "c2_controller", False):
             # C² 部署契约：P 投影当前视觉 → 收缩解码。
             c_current = model.control_projector(
@@ -185,7 +226,9 @@ def eval_ablation(
         elif getattr(model.config, "direct_head", False):
             predictions = model.decode_actions(flat)
         else:
-            predictions = model.sample_actions(flat, steps=flow_steps)
+            predictions = model.sample_actions(
+                flat, steps=flow_steps, semantic_context=semantic_flat
+            )
         predicted = predictions.reshape(
             conditions.shape[0], conditions.shape[1], predictions.shape[-2], -1
         )
@@ -227,6 +270,14 @@ def main() -> None:
             f"contract ({contract_pooling}); omit the flag to use the recorded pooling"
         )
     pooling = args.vision_pooling or contract_pooling or "flat"
+    if args.servo_ablation != "none":
+        # 不支持项标注：开环 chunk-MAE 消融没有闭环伺服环节（设计 §七 Step 2
+        # 四消融只在 eval_metaworld.py 的 C² plan/feedback 部署中有意义）。
+        raise ValueError(
+            "--servo-ablation 仅支持 none：本脚本是开环 chunk-MAE 消融，"
+            "servo 四消融（zero-gain/gain-shuffle/wrong-role/open-loop）与 "
+            "--fovea 只在 eval_metaworld.py 闭环 C² 部署中有意义"
+        )
     vision_key = "vision_tokens_spatial" if pooling == "spatial" else "vision_tokens"
     flow_steps = args.flow_steps or int(contract.get("flow_steps", 8))
     model = VACompoundPolicy(config).to(device)
@@ -252,6 +303,13 @@ def main() -> None:
         npy_path = local_payload["vision_tokens_st_npy"]
         local_tokens = load_st288_memmap(npy_path, local_payload["metadata"])
         coords = torch.from_numpy(local_payload["coords"])
+        if getattr(config, "dense_readout", False):
+            # Step 0 dense readout checkpoint：数据必须已是 1152-token 密集特征。
+            if local_tokens.shape[-2] != 1152:
+                raise ValueError(
+                    f"dense_readout checkpoint requires 1152-token dense features, "
+                    f"got {local_tokens.shape[-2]}"
+                )
         print(f"local-slots: ST288 loaded ({tuple(local_tokens.shape)})")
     dataset = FeatureDataset(args.data, require_pairs=False, vision_key=vision_key)
     payload = dataset.payload
@@ -263,6 +321,7 @@ def main() -> None:
         model, payload, indices, device,
         flow_steps=flow_steps, batch_size=args.batch_size, language_override=None,
         vision_key=vision_key, local_tokens=local_tokens, coords=coords,
+        state_take=args.state_take,
     )
     n_tasks = len(set(payload["instruction_id"].tolist()))
     print(f"samples={len(indices)} tasks={n_tasks} flow_steps={flow_steps}")
@@ -300,6 +359,7 @@ def main() -> None:
             flow_steps=flow_steps, batch_size=args.batch_size,
             language_override=override,
             vision_key=vision_key, local_tokens=local_tokens, coords=coords,
+            state_take=args.state_take,
         )
         print(
             f"{args.perturb}: chunk0={perturbed['chunk0']:.5f} "
@@ -322,6 +382,7 @@ def main() -> None:
             flow_steps=flow_steps, batch_size=args.batch_size,
             language_override=taskid_language,
             vision_key=vision_key, local_tokens=local_tokens, coords=coords,
+            state_take=args.state_take,
         )
         print(f"taskid: chunk0={taskid['chunk0']:.5f} chunk_all={taskid['chunk_all']:.5f}")
         delta_tid0 = taskid["chunk0"] / clean["chunk0"] - 1.0

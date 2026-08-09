@@ -79,7 +79,19 @@ def preprocess(image: np.ndarray, image_size: int) -> torch.Tensor:
 def set_viewer_camera(handle, model, camera_name: str) -> None:
     import mujoco
 
-    cam_id = model.camera_name2id(camera_name)
+    # mujoco API 演进：3.1+ camera_name2id；3.3+ 改为 model.camera(name).id；
+    # 最旧的 3.0.x 用 camera_names 数组。逐级回退保证各版本可用。
+    cam_id = -1
+    if hasattr(model, "camera_name2id"):
+        cam_id = model.camera_name2id(camera_name)
+    else:
+        try:
+            cam_id = model.camera(camera_name).id
+        except (AttributeError, ValueError):
+            try:
+                cam_id = list(model.camera_names).index(camera_name.encode())
+            except (AttributeError, ValueError):
+                cam_id = -1
     handle.cam.type = mujoco.mjtCamera.mjCAMERA_FIXED
     handle.cam.fixedcamid = cam_id if cam_id >= 0 else -1
     handle.cam.distance = 1.0
@@ -145,6 +157,13 @@ def main() -> None:
         for trial in range(args.trials):
             obs, _ = env.reset(seed=1000 * env_i + trial)
             print(f"[{name} trial {trial}] reset; opening viewer window ...", flush=True)
+            # mujoco 3.3 + pyGLFW 3.4 重复 launch_passive 会因 glfw monitor 状态
+            # 失效断言崩溃（close 后未 terminate / 二次初始化）；launch 前显式
+            # init 保持 glfw 生命周期（幂等，已在初始化时返回 True）。
+            try:
+                mujoco.glfw.glfw.init()
+            except Exception:
+                pass
             handle = mujoco.viewer.launch_passive(
                 env.model, env.data, show_left_ui=False, show_right_ui=False
             )

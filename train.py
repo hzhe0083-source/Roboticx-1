@@ -14,6 +14,8 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 
 from va_compound import VACompoundConfig, VACompoundPolicy
 from va_compound.backbones import pool_flat_tokens
+from va_compound.servo import InteractionServo
+from scripts.mt50_difficulty import task_weights_for
 
 
 def build_pair_groups(
@@ -84,9 +86,14 @@ class FeatureDataset(Dataset):
 
         payload = torch.load(path, map_location="cpu", weights_only=True)
         missing = [key for key in self.REQUIRED if key not in payload]
+        if local_tokens is not None:
+            # ST288 特征路径（--local-slots-data）：vision_tokens 由 local_tokens
+            # 派生（__getitem__ 同源给出 vision_tokens/vision_tokens_st），
+            # payload 无需存储 18.6GB 占位（2026-08-09 E7 长轨迹数据）。
+            missing = [key for key in missing if key != "vision_tokens"]
         if missing:
             raise ValueError(f"missing tensors in dataset: {missing}")
-        if vision_key not in payload:
+        if vision_key not in payload and local_tokens is None:
             raise ValueError(
                 f"dataset has no vision variant '{vision_key}'; "
                 f"available: {sorted(key for key in payload if key.startswith('vision_tokens'))}"
@@ -96,7 +103,11 @@ class FeatureDataset(Dataset):
         self.length = int(payload["actions"].shape[0])
         if self.length == 0:
             raise ValueError("training dataset is empty")
-        if any(payload[key].shape[0] != self.length for key in self.REQUIRED):
+        if any(
+            payload[key].shape[0] != self.length
+            for key in self.REQUIRED
+            if key in payload  # vision_tokens 缺失时由 local_tokens 派生（ST288 路径）
+        ):
             raise ValueError("dataset tensors have different sample counts")
         if step_targets is not None:
             # C²-VA Stage B：v6a per-chunk-step 期望视觉目标 [N, T, 6, C]
@@ -132,7 +143,11 @@ class FeatureDataset(Dataset):
             )
 
     def _validate_shapes(self, min_sequence_length: int) -> None:
-        vision = self.payload[self.vision_key]
+        vision = (
+            self.local_tokens
+            if self.local_tokens is not None
+            else self.payload[self.vision_key]
+        )
         language = self.payload["language_hidden"]
         proprio = self.payload["proprio"]
         previous = self.payload["previous_action"]
@@ -147,8 +162,18 @@ class FeatureDataset(Dataset):
             raise ValueError("actions must have shape [N,T,H,Da]")
         if previous.shape[-1] != actions.shape[-1]:
             raise ValueError("previous_action and actions must use the same action dimension")
-        sequence_keys = (self.vision_key, "proprio", "previous_action", "actions")
-        sequence_lengths = {int(self.payload[key].shape[1]) for key in sequence_keys}
+        vision_seq = (
+            self.local_tokens
+            if self.local_tokens is not None
+            else self.payload[self.vision_key]
+        )
+        sequence_keys = (
+            vision_seq,
+            self.payload["proprio"],
+            self.payload["previous_action"],
+            self.payload["actions"],
+        )
+        sequence_lengths = {int(key.shape[1]) for key in sequence_keys}
         if len(sequence_lengths) != 1:
             raise ValueError("all sequence tensors must use the same T")
         sequence_length = sequence_lengths.pop()
@@ -230,17 +255,20 @@ class FeatureDataset(Dataset):
         return self.length
 
     def __getitem__(self, index: int) -> dict[str, Tensor]:
-        item = {key: self.payload[key][index] for key in self.REQUIRED}
-        item["vision_tokens"] = self.payload[self.vision_key][index]
+        item = {key: self.payload[key][index] for key in self.REQUIRED if key in self.payload}
+        if self.local_tokens is not None:
+            vision = self.local_tokens[index]  # [4, 288, 768] ST288（与 vision_tokens_st 同源）
+            item["vision_tokens"] = vision
+            item["vision_tokens_st"] = vision
+            item["coords"] = self.coords
+        else:
+            item["vision_tokens"] = self.payload[self.vision_key][index]
         if "language_mask" in self.payload:
             item["language_mask"] = self.payload["language_mask"][index]
         if self.step_targets is not None:
             item["step_targets"] = self.step_targets[index]
         if self.step_mask is not None:
             item["step_mask"] = self.step_mask[index]
-        if self.local_tokens is not None:
-            item["vision_tokens_st"] = self.local_tokens[index]
-            item["coords"] = self.coords
         return item
 
 
@@ -335,9 +363,18 @@ class E2EDataset(Dataset):
             )
         if "pair_id" in payload and "instruction_id" in payload:
             # 配对 E2E 数据（2026-08-07）：pair 结构与 feature 数据一致（每 pair 两行）。
-            self.pair_groups = build_pair_groups(
-                payload["pair_id"], payload["instruction_id"]
-            )
+            # 仅当存在真 pair（某组 id>=0 且 >1 行）时才构建 pair 组并严格校验；
+            # 旧版单任务 e2e payload（libero_video/v2 的 pair_id 每组仅 1 行）
+            # 视为无配对，走 --single-task 兼容路径（与 FeatureDataset 的
+            # require_pairs=False 语义一致）。
+            vals, counts = payload["pair_id"].unique(return_counts=True)
+            has_real_pairs = bool(int(((vals > -1) & (counts > 1)).sum()))
+            if has_real_pairs:
+                self.pair_groups = build_pair_groups(
+                    payload["pair_id"], payload["instruction_id"]
+                )
+            else:
+                self.pair_groups = {}
         else:
             # 旧数据无 pair 字段：无配对，走 --single-task 兼容路径。
             self.pair_groups = {}
@@ -358,6 +395,19 @@ class E2EDataset(Dataset):
             "pair_id": int(payload["pair_id"][index]) if has_pairs else index,
             "instruction_id": int(payload["instruction_id"][index]) if has_pairs else 0,
         }
+
+
+class IndexedDataset(Dataset):
+    """带原始行索引的 Dataset 包装（--perturb-data 混批需索引 payload 视觉/帧）。"""
+
+    def __init__(self, dataset: Dataset) -> None:
+        self.dataset = dataset
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, index: int) -> tuple[int, dict]:
+        return index, self.dataset[index]
 
 
 class PairedBatchSampler(Sampler[list[int]]):
@@ -405,6 +455,40 @@ class PairedBatchSampler(Sampler[list[int]]):
                 batch = []
         if batch:
             yield batch
+
+
+class TaskWeightedSampler(Sampler[list[int]]):
+    """难度分层采样（E7，2026-08-09，sota_plan_v2.md 第 11 项）：
+
+    per-sample 权重（instruction_id → MT50 难度：easy 0.5 / med 1.0 /
+    hard 2.0 / vh 3.0，除以任务窗口数消除长度偏置，Codex P1-2）多项式抽样；
+    每 epoch 有放回（replacement=True，实现困难任务过采样）抽取 n 个样本、
+    分批 yield，最后不足一批丢弃（等效 drop_last）。epoch 递增种子，
+    训练循环 StopIteration 重建 loader 时自动进入下一个 epoch。
+    """
+
+    def __init__(self, per_sample_weights: Tensor, batch_size: int, seed: int = 0) -> None:
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        if per_sample_weights.ndim != 1:
+            raise ValueError("per_sample_weights must be 1-D")
+        self.weights = per_sample_weights.to(torch.float64)
+        self.batch_size = int(batch_size)
+        self.seed = int(seed)
+        self.epoch = 0
+
+    def __len__(self) -> int:
+        return max(1, len(self.weights) // self.batch_size)
+
+    def __iter__(self) -> Iterator[list[int]]:
+        generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        self.epoch += 1
+        n = len(self.weights)
+        indices = torch.multinomial(
+            self.weights, n, replacement=True, generator=generator
+        ).tolist()
+        for start in range(0, len(indices) - self.batch_size + 1, self.batch_size):
+            yield indices[start:start + self.batch_size]
 
 
 def synthetic_sequence(
@@ -509,6 +593,186 @@ def sample_flow_matching_inputs(
     return noisy_actions, flow_time, target_velocity
 
 
+def sample_flow_matching_inputs_paired(
+    actions: Tensor,
+    is_perturbed: Tensor,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """clean/perturbed 配对行共享同一 (τ, ε)（设计 §六.2：两条监督间的动作差异
+    不被随机 flow noise 淹没）。
+
+    配对布局契约（mix_perturb_batch）：perturbed 行 k 的配对 clean 行 = 前一行
+    （[c0,p0,c1,p1,...]），故 ``is_perturbed`` 中第 k 个 True 行直接复制前一行的
+    (τ, ε)。其余行为独立采样（与 ``sample_flow_matching_inputs`` 语义一致）。
+    """
+    if actions.ndim != 4:
+        raise ValueError("actions must have shape [batch, sequence, horizon, action_dim]")
+    if is_perturbed.ndim != 1 or is_perturbed.shape[0] != actions.shape[0]:
+        raise ValueError("is_perturbed must be [batch] bool 且与 actions 同批")
+    noise = torch.randn_like(actions)
+    flow_time = torch.rand(
+        actions.shape[:2],
+        device=actions.device,
+        dtype=actions.dtype,
+    )
+    p_idx = torch.nonzero(is_perturbed, as_tuple=False).flatten()
+    if p_idx.numel():
+        c_idx = p_idx - 1
+        if bool((c_idx < 0).any()) or bool(is_perturbed[c_idx].any()):
+            raise ValueError(
+                "配对布局契约破坏：perturbed 行的前一行必须是 clean 行"
+            )
+        # 共享 (τ, ε)：复制配对 clean 行（randn 后原地覆盖，无梯度历史）。
+        noise[p_idx] = noise[c_idx]
+        flow_time[p_idx] = flow_time[c_idx]
+    tau = flow_time[:, :, None, None]
+    noisy_actions = (1.0 - tau) * noise + tau * actions
+    target_velocity = actions - noise
+    return noisy_actions, flow_time, target_velocity
+
+
+def mix_perturb_batch(
+    clean: dict[str, Tensor],
+    perturbed: dict[str, Tensor],
+    p_vision: Tensor,
+    m: int,
+) -> tuple[dict[str, Tensor], Tensor]:
+    """clean [n_clean] 与 perturbed [m] 交错配对 → [B=n_clean+m]（--perturb-data
+    混合加载；clean:perturbed 比例由 ``m = round(B·ratio)`` 决定）。
+
+    布局 ``[c0,p0,c1,p1,..., tail]``：paired 段 2m 行（clean 前 m 行与全部
+    perturbed 行交错），tail = clean[m:]（不丢行）；``p_vision`` [m, T, N, D]
+    为 perturbed 行的视觉 token（与训练路径同构，dtype 以 p_vision 为准）。
+    返回 (mixed, is_perturbed [B] bool)——is_perturbed 供
+    ``sample_flow_matching_inputs_paired`` 共享 (τ, ε)。
+    """
+    n_clean = int(clean["actions"].shape[0])
+    if not (1 <= m <= n_clean):
+        raise ValueError(f"m={m} 需满足 1 ≤ m ≤ clean 行数 {n_clean}")
+    if int(perturbed["actions"].shape[0]) != m:
+        raise ValueError(
+            f"perturbed 行数 {perturbed['actions'].shape[0]} != m={m}"
+        )
+    mixed: dict[str, Tensor] = {}
+    for key, value in clean.items():
+        if not isinstance(value, Tensor):
+            mixed[key] = value
+            continue
+        if key in ("vision_tokens", "vision_tokens_st"):
+            continue  # 视觉键单独拼接（paired 段用 p_vision）
+        if key in perturbed:
+            head = torch.stack([value[:m], perturbed[key]], dim=1).flatten(0, 1)
+            mixed[key] = torch.cat([head, value[m:]], dim=0)
+        elif key == "coords":
+            # 全局坐标常量（行无关）：扩展行数保持一致。
+            mixed[key] = value[0:1].expand(n_clean + m, -1, -1).contiguous()
+        else:
+            raise ValueError(
+                f"混批契约破坏：perturbed 批缺少键 {key!r}"
+            )
+    for key in ("vision_tokens", "vision_tokens_st"):
+        if key in clean:
+            head = torch.stack(
+                [clean[key][:m].to(dtype=p_vision.dtype), p_vision], dim=1
+            ).flatten(0, 1)
+            mixed[key] = torch.cat(
+                [head, clean[key][m:].to(dtype=p_vision.dtype)], dim=0
+            )
+    is_perturbed = torch.zeros(n_clean + m, dtype=torch.bool)
+    is_perturbed[1 : 2 * m : 2] = True
+    return mixed, is_perturbed
+
+
+def _encode_perturb_frames(
+    frames: Tensor,
+    backbone,
+    device: torch.device,
+    *,
+    dense: bool,
+) -> Tensor:
+    """perturb 存储帧 [m, T, W, 96, 96, 3] uint8 → [m, T, N, D] fp32。
+
+    冻结 V-JEPA 在线编码（``preprocess_batch`` 内部 bicubic 放大到 384）。
+    注意：扰动数据当前为 96×96 低分辨率小样本 + 原始预训练骨干，与 clean 侧
+    微调特征存在域差——精确配对路径须数据侧重提取（--local-slots 变体）。
+    """
+    if frames.ndim != 6 or frames.shape[-1] != 3:
+        raise ValueError(
+            f"perturb frames 必须为 [m, T, W, H, W, 3] uint8，got {tuple(frames.shape)}"
+        )
+    from va_compound.live_vjepa import encode_live_frames
+
+    with torch.no_grad():
+        encoded = encode_live_frames(
+            frames.numpy(), backbone, device, dense=dense
+        )
+    return encoded.float()
+
+
+def _maybe_build_perturb_backbone(
+    args: argparse.Namespace,
+    device: torch.device,
+    vision_backbone,
+    use_payload_vision: bool,
+) -> None:
+    """--perturb-data 帧在线编码骨干：live 路径复用主骨干（no_grad）；feature
+    路径构建冻结 V-JEPA（~238 MiB，设计 §九 显存纪律：只读、冻结）。"""
+    if (
+        args.perturb_data is None
+        or args.live_vjepa
+        or use_payload_vision
+        or args.e2e_data
+    ):
+        return None
+    from va_compound.backbones import VJEPA21Backbone
+
+    backbone = VJEPA21Backbone.from_pretrained(
+        device=device,
+        dtype="float32",
+        max_tokens=144,
+        local_files_only=True,
+    )
+    backbone.freeze_all()
+    print(
+        "perturb-data: perturbed 帧在线编码用冻结 V-JEPA（~238 MiB，只读）；"
+        "与 clean 特征可能存在骨干域差（数据侧重提取为精确路径）",
+        flush=True,
+    )
+    return backbone
+
+
+def servo_correction_t0(
+    model: VACompoundPolicy,
+    servo: InteractionServo,
+    batch: dict[str, Tensor],
+    device: torch.device,
+) -> Tensor:
+    """t=0 决策点的伺服修正 [B, A]（pair 分支复用；确定性重算）。
+
+    与 rollout_policy 主路径 t=0 完全相同的输入（g_prev=None → ν≡0），因此
+    结果逐位一致——pair 探针与主分支保持同一策略输出（角色查询经
+    build_language_cache 重建，确定性）。
+    """
+    target_dtype = model.vision_projection.weight.dtype
+    language_cache = model.build_language_cache(
+        batch["language_hidden"], batch.get("language_mask")
+    )
+    dense = batch["vision_tokens_st"][:, 0].to(dtype=target_dtype)
+    coords = batch["coords"][0].to(device=device)
+    readout = model.slot_reader(
+        dense,
+        language_cache.role_queries.to(dtype=target_dtype),
+        coords,
+    )
+    out = servo(
+        readout,
+        batch["proprio"][:, 0],
+        language_cache.role_queries.mean(dim=1).to(dtype=target_dtype),
+        a_prev=None,  # t=0 无 g_prev → ν≡0（与 rollout_policy 主路径一致）
+        g_prev=None,
+    )
+    return out.correction.to(dtype=target_dtype)
+
+
 def sample_pair_intervention(
     actions: Tensor,
     partner: Tensor,
@@ -561,6 +825,8 @@ def rollout_policy(
     text_backbone=None,
     scene_teacher=None,
     tasks=None,
+    servo: InteractionServo | None = None,
+    servo_stats: dict | None = None,
 ) -> tuple[Tensor, Tensor]:
     if model.config.plan_resampler:
         # Plan-Cache 方案 B：首决策场景摘要（vision 全局均值）→ plan tokens，
@@ -605,6 +871,19 @@ def rollout_policy(
     memories: list[VisualMemory] | None = [] if model.config.future_predict else None
     direct_predictions = [] if model.config.direct_head else None
     c2_references = [] if model.config.c2_controller else None
+    # Step 2 双新息伺服：语言条件（role queries 均值）与跨决策关系状态。
+    target_dtype = model.vision_projection.weight.dtype
+    lang_cond = None
+    g_prev = None
+    if servo is not None:
+        if model.slot_reader is None or language_cache.role_queries is None:
+            raise ValueError(
+                "servo 需要 local_slots + multi_mode 角色读出路径（--servo 校验）"
+            )
+        lang_cond = language_cache.role_queries.mean(dim=1).to(dtype=target_dtype)
+        if servo_stats is not None:
+            for key in ("stage", "innovation_flag", "beta", "hyp_entropy", "correction"):
+                servo_stats[key] = []
     for time_index in range(batch["vision_tokens"].shape[1]):
         semantic_context = None
         if model.config.local_slots:
@@ -638,14 +917,51 @@ def rollout_policy(
             # C²-VA Stage A：Direct Head 一次前向解码完整 chunk（无采样噪声）。
             direct_predictions.append(model.decode_actions(condition))
         else:
-            predicted_velocities.append(
-                model.flow_velocity(
-                    condition,
-                    noisy_actions[:, time_index],
-                    flow_time[:, time_index],
-                    semantic_context=semantic_context,
-                )
+            velocity = model.flow_velocity(
+                condition,
+                noisy_actions[:, time_index],
+                flow_time[:, time_index],
+                semantic_context=semantic_context,
             )
+            if servo is not None:
+                # Step 2：双新息伺服（设计 §七 Step 2 / 最小完整算法）——
+                # MultiModeReadout 由角色读出路径提供（与 build_local_vision
+                # 内部重复一次 reader 前向；按 Agent E 文件契约不改 model.py，
+                # Q=6×N keys 开销可忽略）。修正加到 flow 速度输出（直路径 FM
+                # 的 v 目标 = a−noise → v 修正等价最终动作空间修正
+                # a = clip(a_base + βΔa, −1, 1)）。g_prev 跨决策 detach 维护
+                # （ν 的增益缩放仍可微，跨步时序不建图）。
+                dense = batch["vision_tokens_st"][:, time_index].to(dtype=target_dtype)
+                coords = batch["coords"][0].to(device=batch["vision_tokens"].device)
+                readout = model.slot_reader(
+                    dense,
+                    language_cache.role_queries.to(dtype=target_dtype),
+                    coords,
+                )
+                servo_out = servo(
+                    readout,
+                    batch["proprio"][:, time_index],
+                    lang_cond,
+                    a_prev=(
+                        batch["previous_action"][:, time_index]
+                        if g_prev is not None
+                        else None  # 首决策 ν≡0（无 g_prev，无新息信息）
+                    ),
+                    g_prev=g_prev,
+                )
+                correction = servo_out.correction.to(dtype=target_dtype)
+                g_prev = servo_out.g.detach()
+                velocity = velocity + correction[:, None, :]  # [B, H, A]
+                if servo_stats is not None:
+                    for key, value in (
+                        ("stage", servo_out.stage),
+                        ("innovation_flag", servo_out.innovation_flag),
+                        ("beta", servo_out.beta),
+                        ("hyp_entropy", servo_out.hyp_entropy),
+                        ("correction", correction),
+                    ):
+                        servo_stats[key].append(value.detach().cpu())
+            predicted_velocities.append(velocity)
         action_conditions.append(condition)
         if memories is not None:
             memories.append(visual_memory)
@@ -656,6 +972,9 @@ def rollout_policy(
         ),
         torch.stack(action_conditions, dim=1),
     )
+    if servo_stats is not None and servo_stats.get("stage") is not None:
+        for key in ("stage", "innovation_flag", "beta", "hyp_entropy", "correction"):
+            servo_stats[key] = torch.stack(servo_stats[key], dim=1)  # [B, T, ...]
     if c2_references is not None:
         return out + (torch.stack(c2_references, dim=1),)
     if memories is not None:
@@ -951,6 +1270,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "注意：几何增强会扰动 local_slots 的坐标网格对应关系。",
     )
     parser.add_argument(
+        "--no-frame-aug-geometric",
+        dest="frame_aug_geometric",
+        action="store_false",
+        default=True,
+        help="--frame-aug 开启时仅保留光度增强（ColorJitter），关闭几何增广"
+        "（crop/rotate）：几何扰动 ≈ ±1cm 定位噪声且 slot 坐标未同步变换，"
+        "精细任务（抓取/插入）下按 E1 修复（2026-08-09 审计 R4）。",
+    )
+    parser.add_argument(
         "--lr-vision",
         type=float,
         default=3e-6,
@@ -1215,8 +1543,88 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=None,
         help="PULSE-VA Stage A：dense spatiotemporal tokens [N,4,288,768] + coords "
-        "[288,3]（prepare_mw_local_features.py 输出）。开启后视觉流变为 "
+        "[288,3]（scripts/extract_st288_finetuned.py 产出，Stage B 用微调 backbone "
+        "重提取；Stage A 为 prepare_mw_local_features.py 同款契约）。开启后视觉流变为 "
         "16 coarse + 6 语言角色槽 + 3 关系 token = 25 tokens；仅 action loss。",
+    )
+    parser.add_argument(
+        "--dense-readout",
+        action="store_true",
+        help="Step 0（C²-IRF v2 设计 §七）：角色查询直接读出 1152 个 dense patch "
+        "token（2×24×24，V-JEPA 不池化）；VA 视觉流仍为 16 coarse（从 1152 "
+        "avg-pool）+ 6 角色槽 + 3 关系 token = 25 tokens。需要 --live-vjepa 或 "
+        "--local-slots-data（1152-token 密集特征）；与 --local-slots-direct288 "
+        "互斥（§九：1152 不进 VA 自注意力）。",
+    )
+    parser.add_argument(
+        "--multi-mode",
+        action="store_true",
+        help="Step 1（C²-IRF v2 设计 §七 Step 1）：多模式读出——每角色 heatmap "
+        "（2 时间片 × grid²）局部 NMS 取 top-2 峰 + 5×5 局部 soft-argmax "
+        "（跨 patch 亚像素 μ/Σ，修复全局加权平均的假中点）+ learned NULL 键值"
+        "（遮挡时查询选 NULL，vis=1−P(∅)）+ 寻址偏置 b_coord/b_track（γ=0.01）。"
+        "视觉流变为 16 coarse + 12 modes + 3 relations = 31 tokens。与 "
+        "--dense-readout 兼容（1152 网格；288 网格亦可）；需要 --live-vjepa 或 "
+        "--local-slots-data；与 --local-slots-direct288 互斥。",
+    )
+    parser.add_argument(
+        "--servo",
+        action="store_true",
+        help="Step 2（C²-IRF v2 设计 §七 Step 2）：双新息中央凹交互伺服——显式"
+        "关系状态 g（RelationStateProjector，G=16）→ 任务误差 r=g*−g（g* 零初始"
+        "化，初始 ≡0 对齐）+ 模型新息 ν（缩放 β、触发重读 flag）+ 低秩有界增益"
+        "（κ=κ_max·tanh(ρ)，ρ 零初始化 → 训练起点修正≈0；只称 learned gain）+ "
+        "4 假设配对混合（H(w)>τ_H 降 β）。修正加到 flow 速度输出（等价最终动作"
+        "修正 a=clip(a_base+βΔa)），损失仍 L_FM。需要 --multi-mode；与 "
+        "--direct-head/--c2-controller/--head-only/--scene-teacher 互斥。",
+    )
+    parser.add_argument(
+        "--servo-only",
+        action="store_true",
+        help="Step 2 第一阶段（设计 §六.3）：冻结 base policy（VA/flow/入口投影），"
+        "只训 reader（role_compiler/slot_reader/vis_conditioner）+ relation 投影 + "
+        "servo——否则 base path 吸收恢复数据、servo 分支保持关闭。隐含启用 --servo。",
+    )
+    parser.add_argument(
+        "--servo-dls",
+        action="store_true",
+        help="Step 2 阻尼最小二乘开关（设计 §一.2）：Δa=(KWKᵀ+λI)⁻¹KWr（W=diag(w_g)"
+        "由视觉协方差与可见度决定；仅解 4×4 线性系统），替代低秩直乘 K·r。",
+    )
+    parser.add_argument(
+        "--servo-lambda",
+        type=float,
+        default=1e-2,
+        help="--servo-dls 阻尼系数 λ（(KWKᵀ+λI)⁻¹ 中的 λ）",
+    )
+    parser.add_argument(
+        "--servo-rank",
+        type=int,
+        default=2,
+        help="低秩增益 K=κ·U·Vᵀ 的秩 r（设计 §五：rank 2 或 4）",
+    )
+    parser.add_argument(
+        "--lr-servo",
+        type=float,
+        default=None,
+        help="Step 2 伺服模块 LR（默认 = --lr-slot → --lr）",
+    )
+    parser.add_argument(
+        "--perturb-data",
+        type=Path,
+        default=None,
+        help="微扰恢复数据（data/metaworld_perturbations.pt，v5 同构 + "
+        "perturb_type/perturb_magnitude 标注；设计 §六.1）：与 --data clean 行按 "
+        "--servo-perturb-ratio 混合训练，clean/perturbed 配对行共享同一 (τ,ε)（"
+        "动作差异不被 flow noise 淹没）。需要 --single-task；与 --fork-data 互斥。"
+        "视觉与路径同构时直接用 payload 特征；否则（--servo 路径）用存储帧冻结 "
+        "V-JEPA 在线编码（96×96 放大 384，近似）。",
+    )
+    parser.add_argument(
+        "--servo-perturb-ratio",
+        type=float,
+        default=0.5,
+        help="--perturb-data 每批 perturbed 行占比（(0, 0.5]；配对行共享 (τ,ε)）",
     )
     parser.add_argument(
         "--role-seeds",
@@ -1303,6 +1711,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="DataLoader worker 数（--live-vjepa 帧解码是 CPU 瓶颈：单线程冷解码 "
         "64 帧 ≈ 1.7s/step 而 GPU 仅忙 ~0.5s；num_workers>=4 与 GPU 重叠解码，"
         "step 时间降至 GPU 上限。0 = 现状主进程串行）",
+    )
+    parser.add_argument(
+        "--task-sampling",
+        choices=("uniform", "weighted"),
+        default="uniform",
+        help="难度分层采样（E7 用 weighted，2026-08-09）：按 instruction_id → "
+        "MT50 难度权重（easy 0.5/med 1.0/hard 2.0/vh 3.0，scripts/mt50_difficulty.py）"
+        "多项式抽样，困难任务过采样、简单任务降采样；uniform = 原始均匀采样",
     )
     parser.add_argument(
         "--fork-data",
@@ -1516,6 +1932,76 @@ def validate_args(args: argparse.Namespace) -> None:
                 "16GB 卡建议 batch-size <= 8）",
                 flush=True,
             )
+    if args.dense_readout:
+        # Step 0 dense readout：只允许 local_slots 读出路径（live 在线或
+        # 预计算 1152-token 特征），角色查询 cross-attn 压缩到 25 tokens 后
+        # 才进 VA——1152 直送 VA 会在 VA 内做 1152×1152 自注意力（§九 禁止）。
+        if not (args.live_vjepa or args.local_slots_data):
+            raise ValueError(
+                "--dense-readout requires --live-vjepa or --local-slots-data "
+                "（1152 patch 只在 local_slots 读出路径可用）"
+            )
+        if args.local_slots_direct288:
+            raise ValueError(
+                "--dense-readout 与 --local-slots-direct288 互斥：1152 token 直送 "
+                "VA 会在 VA 内做 1152×1152 自注意力（设计文档 §九 明确禁止）"
+            )
+    if args.multi_mode:
+        # Step 1 多模式读出：只允许 local_slots 读出路径（与 dense_readout 同约束）；
+        # 与 --dense-readout 兼容（1152 网格），288 网格亦可（12×12 消融）。
+        if not (args.live_vjepa or args.local_slots_data):
+            raise ValueError(
+                "--multi-mode requires --live-vjepa or --local-slots-data "
+                "（角色查询读出路径）"
+            )
+        if args.local_slots_direct288:
+            raise ValueError(
+                "--multi-mode 与 --local-slots-direct288 互斥：direct288 无角色读出路径"
+            )
+    if getattr(args, "servo_only", False):
+        args.servo = True  # --servo-only 隐含启用 --servo（第一阶段冻结模式）
+    if getattr(args, "servo", False):
+        # Step 2 双新息伺服：消费 MultiModeReadout（--multi-mode 读出路径）；
+        # 修正作用于 flow 速度输出 → 与 direct/c2 互斥；head-only 下 servo 无梯度。
+        if not args.multi_mode:
+            raise ValueError("--servo requires --multi-mode（伺服消费 MultiModeReadout）")
+        if args.direct_head or args.c2_controller:
+            raise ValueError(
+                "--servo 与 --direct-head/--c2-controller 互斥（修正作用于 flow 输出）"
+            )
+        if args.head_only:
+            raise ValueError("--servo 与 --head-only 互斥（servo 需要可训练参数路径）")
+        if args.scene_teacher:
+            raise ValueError(
+                "--servo 与 --scene-teacher 互斥（scene_teacher 重建 optimizer，"
+                "servo 参数会掉出参数组）"
+            )
+        if getattr(args, "servo_rank", 2) < 1:
+            raise ValueError("--servo-rank 必须为正")
+    if getattr(args, "servo_dls", False) and not getattr(args, "servo", False):
+        raise ValueError("--servo-dls requires --servo")
+    if getattr(args, "servo_lambda", 1e-2) <= 0.0:
+        raise ValueError("--servo-lambda 必须为正")
+    perturb_data = getattr(args, "perturb_data", None)
+    if perturb_data is not None:
+        # Step 2 微扰混合（设计 §六.1/§六.2）：paired 批与 perturbed 行 pair_id
+        # 冲突；fork 契约与混批互斥；配对布局需要 m ∈ [1, B//2]。
+        if args.e2e_data:
+            raise ValueError("--perturb-data is not supported with --e2e-data")
+        if not args.single_task:
+            raise ValueError(
+                "--perturb-data requires --single-task（配对批与 perturbed 行 pair_id 冲突）"
+            )
+        if args.fork_data is not None:
+            raise ValueError("--perturb-data 与 --fork-data 互斥（混批破坏 fork 配对契约）")
+        if not (0.0 < getattr(args, "servo_perturb_ratio", 0.5) <= 0.5):
+            raise ValueError("--servo-perturb-ratio 须在 (0, 0.5]（每批 perturbed 占比）")
+        if args.batch_size < 2:
+            raise ValueError("--perturb-data requires --batch-size >= 2（配对混批）")
+        if not args.data:
+            raise ValueError("--perturb-data requires --data（clean 行来源）")
+        if args.c2_controller:
+            raise ValueError("--perturb-data 与 --c2-controller 互斥（混批破坏 C² 干净/恢复契约）")
     if args.c2_controller and (
         args.future_predict or args.evsm or args.plan_resampler or args.scene_teacher
     ):
@@ -1655,6 +2141,36 @@ def _feature_optimizer_groups(args, model, vision_backbone):
             f"（{len(rest_names)} 组参数 requires_grad=False）"
         )
         return [{"params": head_params, "lr": args.lr}]
+    if args.servo_only:
+        # Step 2 第一阶段（设计 §六.3）：冻结 base policy（VA/flow/入口投影），
+        # 只训 reader（角色编译/多模式读出/vis 条件）+ relation 投影——否则
+        # 89% 拟合能力的 base path 会吸收恢复数据，servo 分支保持关闭。
+        trainable_prefixes = (
+            "role_compiler.",
+            "slot_reader.",
+            "relation_tokens.",
+            "vis_conditioner.",
+        )
+        trainable_params, frozen_names = [], []
+        for name, param in model.named_parameters():
+            if name.startswith(trainable_prefixes):
+                trainable_params.append(param)
+            else:
+                frozen_names.append(name)
+                param.requires_grad_(False)
+        if not trainable_params:
+            raise ValueError("--servo-only 需要局部槽模块（--local-slots-data/--live-vjepa）")
+        print(
+            f"servo-only: 冻结 VA/flow 等 {len(frozen_names)} 组参数，只训 "
+            f"reader/relation/servo（可训练 {sum(p.numel() for p in trainable_params):,}）",
+            flush=True,
+        )
+        return [
+            {
+                "params": trainable_params,
+                "lr": args.lr_slot if args.lr_slot is not None else args.lr,
+            }
+        ]
     groups = None
     if model.config.local_slots:
         slot_names = ("role_compiler", "slot_reader", "relation_tokens")
@@ -1680,7 +2196,7 @@ def _feature_optimizer_groups(args, model, vision_backbone):
     return groups
 
 
-def save_checkpoint(args, config, model, e2e_model, scene_teacher=None, vision_backbone=None) -> None:
+def save_checkpoint(args, config, model, e2e_model, scene_teacher=None, vision_backbone=None, servo=None) -> None:
     """原子保存 checkpoint（tmp 文件 + rename），供周期/最终保存复用。"""
     if not args.save:
         return
@@ -1757,7 +2273,9 @@ def save_checkpoint(args, config, model, e2e_model, scene_teacher=None, vision_b
                     "direct_head" if args.direct_head else "conditional_flow_matching"
                 ),
                 "c2_controller": args.c2_controller,
-                "vision_pooling": args.vision_pooling,
+                "vision_pooling": (
+                    "dense" if args.dense_readout else args.vision_pooling
+                ),
                 "flow_steps": args.flow_steps,
                 "min_sequence_length": args.min_sequence_length,
                 "pair_loss_weight": args.pair_loss_weight,
@@ -1765,8 +2283,16 @@ def save_checkpoint(args, config, model, e2e_model, scene_teacher=None, vision_b
                 "pair_probe_tau_max": args.pair_probe_tau_max,
                 "pair_start_atol": args.pair_start_atol,
                 "min_pair_action_delta": args.min_pair_action_delta,
+                # Step 2（C²-IRF v2）：双新息伺服契约（评估侧据此重建 InteractionServo）。
+                "servo": args.servo,
+                "servo_only": args.servo_only,
+                "servo_dls": args.servo_dls,
+                "servo_rank": args.servo_rank,
+                "servo_lambda": args.servo_lambda,
             },
         }
+        if servo is not None:
+            payload["servo"] = servo.state_dict()
         if scene_teacher is not None:
             payload["scene_teacher"] = scene_teacher.state_dict()
         if args.live_vjepa and vision_backbone is not None:
@@ -1851,6 +2377,11 @@ def main() -> None:
     model = None
     e2e_model = None
     vision_backbone = None
+    perturb_payload = None
+    perturb_iter = None
+    use_payload_vision = True
+    m = 0
+    fork_iter = None  # 修复 HEAD 隐患：无 --data 的合成冒烟路径此前 UnboundLocalError
     if args.e2e_data:
         dataset = E2EDataset(args.e2e_data, min_sequence_length=args.min_sequence_length)
         payload = dataset.payload
@@ -1928,6 +2459,14 @@ def main() -> None:
 
             npy_path = local_payload["vision_tokens_st_npy"]
             local_tokens = load_st288_memmap(npy_path, local_payload["metadata"])
+            if args.dense_readout:
+                # Step 0 预计算路径：数据必须已是 1152-token 密集特征
+                # （coords [1152,3] 随数据；FeatureDataset 不限制 token 数）。
+                if local_tokens.shape[-2] != 1152:
+                    raise ValueError(
+                        f"--dense-readout with --local-slots-data requires "
+                        f"1152-token dense features, got {local_tokens.shape[-2]}"
+                    )
         if args.live_vjepa:
             # Stage B：在线 V-JEPA 编码（帧变体；vision_tokens 键被移除）。
             from va_compound.live_vjepa import LiveVJEPADataset
@@ -1944,6 +2483,8 @@ def main() -> None:
                 success_only=args.success_only,
                 sliding=args.sliding_window,
                 frame_aug=args.frame_aug,
+                frame_aug_geometric=args.frame_aug_geometric,
+                dense_readout=args.dense_readout,
             )
         else:
             dataset = FeatureDataset(
@@ -1962,7 +2503,10 @@ def main() -> None:
         config = VACompoundConfig(
             language_dim=int(dataset.payload["language_hidden"].shape[-1]),
             vision_dim=(
-                768 if args.live_vjepa else int(dataset.payload[vision_key].shape[-1])
+                768 if args.live_vjepa
+                else int(local_tokens.shape[-1])
+                if local_tokens is not None  # ST288 路径无 vision_tokens 键（Codex P0-4）
+                else int(dataset.payload[vision_key].shape[-1])
             ),
             action_horizon=int(dataset.payload["actions"].shape[-2]),
             action_dim=int(dataset.payload["actions"].shape[-1]),
@@ -1993,15 +2537,104 @@ def main() -> None:
             local_slots=(args.local_slots_data is not None) or args.live_vjepa,
             local_slots_direct288=args.local_slots_direct288,
             local_slots_fixed_query=args.local_slots_fixed_query,
+            dense_readout=args.dense_readout,
+            multi_mode=args.multi_mode,
+            local_slot_tokens=1152 if args.dense_readout else 288,
         )
-        if args.single_task:
-            loader = DataLoader(
-                dataset,
-                batch_size=c2_clean_n if args.c2_controller else args.batch_size,
+        if args.perturb_data is not None:
+            # Step 2 微扰混合（设计 §六.1）：clean [B−m] + perturbed [m] → [B]。
+            # 视觉与路径同构（token 数一致）时直接用 payload 特征；否则（--servo
+            # 的 local_slots 路径，payload 为 flat-64）用存储帧在线编码（近似）。
+            perturb_payload = torch.load(
+                args.perturb_data, map_location="cpu", weights_only=True
+            )
+            expected_n = (
+                config.local_slot_tokens
+                if config.local_slots
+                else int(dataset.payload[vision_key].shape[-2])
+            )
+            use_payload_vision = (
+                int(perturb_payload["vision_tokens"].shape[-2]) == expected_n
+            )
+            if not use_payload_vision:
+                frames = perturb_payload.get("frames")
+                if frames is None or frames.ndim != 6 or frames.shape[0] == 0:
+                    raise ValueError(
+                        "--servo/local_slots 路径下 --perturb-data 需要 dense/ST 特征或存储帧："
+                        f"payload vision_tokens={tuple(perturb_payload['vision_tokens'].shape)} "
+                        f"（期望 {expected_n}），且无帧（--no-store-frames 生成的数据不可用）"
+                    )
+            m = max(
+                1,
+                min(
+                    int(round(args.batch_size * args.servo_perturb_ratio)),
+                    args.batch_size // 2,
+                ),
+            )
+            perturb_dataset = FeatureDataset(
+                args.perturb_data,
+                require_pairs=False,
+                min_sequence_length=args.min_sequence_length,
+                vision_key="vision_tokens",
+            )
+            perturb_loader = DataLoader(
+                IndexedDataset(perturb_dataset),
+                batch_size=m,
                 shuffle=True,
                 num_workers=args.num_workers,
                 persistent_workers=args.num_workers > 0,
+                drop_last=True,  # 100 行微扰数据 → 最后不足 m 的批会触发 mix 报错（2026-08-09 修复）
             )
+            perturb_iter = iter_forever(perturb_loader)
+            print(
+                f"perturb-data: {args.perturb_data}（{len(perturb_dataset)} 行，"
+                f"每批 {m} 行，paired 共享 (τ,ε)；"
+                f"vision={'payload' if use_payload_vision else 'frames-online'}）",
+                flush=True,
+            )
+        if args.single_task:
+            effective_batch = (
+                args.batch_size - m
+                if args.perturb_data is not None
+                else (c2_clean_n if args.c2_controller else args.batch_size)
+            )
+            if args.task_sampling == "weighted":
+                tasks = list(dataset.payload.get("metadata", {}).get("tasks", []))
+                if not tasks:
+                    raise ValueError(
+                        "--task-sampling weighted 需要数据集 metadata.tasks "
+                        "（instruction_id → 难度权重映射）"
+                    )
+                task_w = torch.tensor(task_weights_for(tasks), dtype=torch.float64)
+                # Codex P1-2（2026-08-09）：曝光 = 窗口数 × 难度权重会引入轨迹
+                # 长度偏置（各任务窗口 360-2186）。除以任务窗口数 → 每任务总曝光
+                # ∝ 难度权重，消除窗口数偏置（任务级分层）。
+                task_rows = torch.bincount(
+                    dataset.payload["instruction_id"], minlength=len(tasks)
+                ).to(torch.float64)
+                task_w = task_w / task_rows.clamp_min(1.0)
+                per_sample = task_w[dataset.payload["instruction_id"]]
+                print(
+                    "--task-sampling weighted: 难度权重 "
+                    f"{sorted(set(task_w.tolist()))}（tasks={len(tasks)}，"
+                    f"samples={len(per_sample)}，easy 档样本占比 "
+                    f"{(per_sample < 1.0).float().mean().item() * 100:.1f}%）",
+                    flush=True,
+                )
+                loader = DataLoader(
+                    dataset,
+                    batch_sampler=TaskWeightedSampler(per_sample, effective_batch, args.seed),
+                    num_workers=args.num_workers,
+                    persistent_workers=args.num_workers > 0,
+                )
+            else:
+                loader = DataLoader(
+                    dataset,
+                    batch_size=effective_batch,
+                    shuffle=True,
+                    num_workers=args.num_workers,
+                    persistent_workers=args.num_workers > 0,
+                )
         else:
             loader = DataLoader(
                 dataset,
@@ -2075,6 +2708,33 @@ def main() -> None:
             args.batch_size,
             args.sequence_length,
             device,
+        )
+
+    # Step 2：双新息中央凹交互伺服（C²-IRF v2 §七 Step 2；--servo-only 隐含
+    # --servo 已在 validate_args 生效）。独立模块（契约文件 va_compound/servo.py），
+    # 不进 VACompoundPolicy；checkpoint 单独存 "servo" 键 + training_contract 字段。
+    servo = None
+    servo_stats = None
+    if args.servo:
+        servo = InteractionServo(
+            vision_dim=config.vision_dim,
+            lang_dim=config.hidden_dim,
+            action_dim=config.action_dim,
+            rank=args.servo_rank,
+            dls=args.servo_dls,
+            dls_lambda=args.servo_lambda,
+        ).to(device)
+        servo_stats = {}
+        servo_lr = (
+            args.lr_servo
+            if args.lr_servo is not None
+            else (args.lr_slot if args.lr_slot is not None else args.lr)
+        )
+        print(
+            f"servo: params={sum(p.numel() for p in servo.parameters()):,} "
+            f"dls={args.servo_dls} rank={args.servo_rank} lr={servo_lr} "
+            f"only={args.servo_only}",
+            flush=True,
         )
 
     if args.e2e_data:
@@ -2171,6 +2831,8 @@ def main() -> None:
             else:
                 print("c2: --c2-unfreeze-stage-a 全量微调（P 仍冻结）")
         groups = _feature_optimizer_groups(args, model, vision_backbone)
+        if servo is not None:
+            groups.append({"params": list(servo.parameters()), "lr": servo_lr})
         optimizer = torch.optim.AdamW(groups, weight_decay=1e-4)
     else:
         model = VACompoundPolicy(config).to(device)
@@ -2182,6 +2844,8 @@ def main() -> None:
             model.role_compiler.set_role_description_embeddings(seeds)
             print(f"PULSE-VA: role seeds initialized from {args.role_seeds}")
         groups = _feature_optimizer_groups(args, model, vision_backbone)
+        if servo is not None:
+            groups.append({"params": list(servo.parameters()), "lr": servo_lr})
         optimizer = torch.optim.AdamW(groups, weight_decay=1e-4)
 
     # Plan-Cache 方案 A：加载冻结 Qwen（local files only，fp16/bf16）+ 可训练
@@ -2300,9 +2964,26 @@ def main() -> None:
                             f"unexpected={len(unexpected)}"
                         )
             else:
-                missing, unexpected = model.load_state_dict(
-                    resume_ckpt["model"], strict=False
-                )
+                # 架构迁移（Codex P0-5，2026-08-09）：H8→H48 时 action_queries
+                # [8,512]→[48,512] 等 shape 不匹配键在 strict=False 下仍会崩。
+                # 显式过滤并重新初始化（其余权重正常继承）。
+                state = dict(resume_ckpt["model"])
+                own_shapes = {
+                    key: tuple(value.shape)
+                    for key, value in model.state_dict().items()
+                }
+                mismatched = [
+                    key for key in state
+                    if key in own_shapes and tuple(state[key].shape) != own_shapes[key]
+                ]
+                if mismatched:
+                    print(
+                        f"resume migration: {len(mismatched)} 个键 shape 不匹配，"
+                        f"重新初始化（新架构）：{sorted(mismatched)[:8]}"
+                    )
+                    state = {key: value for key, value in state.items()
+                             if key not in mismatched}
+                missing, unexpected = model.load_state_dict(state, strict=False)
                 if missing or unexpected:
                     print(
                         f"resume (non-strict): missing={len(missing)} "
@@ -2317,6 +2998,12 @@ def main() -> None:
                         "resume checkpoint has no scene_teacher weights (--scene-teacher run required)"
                     )
                 scene_teacher.load_state_dict(resume_ckpt["scene_teacher"])
+            if servo is not None:
+                if resume_ckpt.get("servo") is not None:
+                    servo.load_state_dict(resume_ckpt["servo"])
+                    print("servo: 权重从 checkpoint 恢复")
+                else:
+                    print("resume: checkpoint 无 servo 权重（servo 随机初始化）")
             print(f"resumed from {args.resume}")
     if args.c2_controller and recovery_loader is not None:
         # resume 之后再次注入 PCA：P 的权重恒取自当前 v6b 文件（冻结），
@@ -2330,6 +3017,10 @@ def main() -> None:
     if args.c2_controller:
         clean_iter = iter_forever(loader)
         rec_iter = iter_forever(recovery_loader)
+    # --perturb-data 帧在线编码骨干（live 路径复用主骨干；feature 路径冻结 V-JEPA）。
+    perturb_backbone = _maybe_build_perturb_backbone(
+        args, device, vision_backbone, use_payload_vision
+    )
     if args.lang_fixed_vector:
         # grounding 对照（Codex 2026-08-08）：语言通道 = 数据集全局均值常量向量，
         # 循环外预计算一次；完整模型 vs 固定语言基线的差距即语言条件的因果贡献。
@@ -2357,7 +3048,6 @@ def main() -> None:
                 except StopIteration:
                     iterator = iter(loader)
                     batch = next(iterator)
-                batch = move_batch(batch, device)
         if args.live_vjepa:
             # Stage B：在线 V-JEPA 编码（frames 仍为 CPU numpy；编码在 GPU 上，
             # 输出 [B, T, 288, D] 与 ST288 同构，替换进 batch）。
@@ -2374,9 +3064,33 @@ def main() -> None:
                     p.requires_grad for p in vision_backbone.parameters()
                 ),
             ):
-                encoded = encode_live_frames(frames, vision_backbone, device)
+                encoded = encode_live_frames(
+                    frames, vision_backbone, device, dense=args.dense_readout
+                )
             batch["vision_tokens"] = encoded.float()  # VA 期待 fp32（与 v5 缓存一致）
             batch["vision_tokens_st"] = batch["vision_tokens"]
+        if perturb_iter is not None and not is_fork_batch:
+            # Step 2 微扰混合（设计 §六）：clean [B−m] + perturbed [m] → [B]；
+            # 配对布局 [c0,p0,c1,p1,...] 供 sample_flow_matching_inputs_paired
+            # 共享同一 (τ,ε)（动作差异不被随机 flow noise 淹没）。
+            batch = move_batch(batch, device)
+            p_indices, p_batch = next(perturb_iter)
+            p_batch = move_batch(p_batch, device)
+            if use_payload_vision:
+                p_vision = perturb_payload["vision_tokens"][p_indices].to(device)
+            else:
+                p_vision = _encode_perturb_frames(
+                    perturb_payload["frames"][p_indices],
+                    perturb_backbone
+                    if perturb_backbone is not None
+                    else vision_backbone,
+                    device,
+                    dense=args.dense_readout,
+                )
+            batch, is_perturbed = mix_perturb_batch(batch, p_batch, p_vision, m)
+            batch["is_perturbed"] = is_perturbed.to(device)
+        else:
+            batch = move_batch(batch, device)
         if e2e_model is None:
             batch = ensure_sequence(batch, args.min_sequence_length)
         if args.prev_dropout > 0.0:
@@ -2391,7 +3105,7 @@ def main() -> None:
                 ~prev_mask
             ).view(-1, 1, 1).float()
         if args.save_every > 0 and step % args.save_every == 0:
-            save_checkpoint(args, config, model, e2e_model, scene_teacher, vision_backbone)
+            save_checkpoint(args, config, model, e2e_model, scene_teacher, vision_backbone, servo=servo)
             print(f"step={step} periodic checkpoint saved to {args.save}")
 
         if model.config.c2_controller:
@@ -2433,8 +3147,11 @@ def main() -> None:
             if "language_mask" in batch:
                 batch["language_mask"] = torch.ones_like(batch["language_mask"])
 
-        noisy_actions, flow_time, target_velocity = sample_flow_matching_inputs(
-            batch["actions"]
+        noisy_actions, flow_time, target_velocity = (
+            sample_flow_matching_inputs_paired(batch["actions"], batch["is_perturbed"])
+            if batch.get("is_perturbed") is not None
+            and bool(batch["is_perturbed"].any())
+            else sample_flow_matching_inputs(batch["actions"])
         )
 
         def compute_loss(batch, noisy_actions, flow_time):
@@ -2499,6 +3216,8 @@ def main() -> None:
                     text_backbone=text_backbone,
                     scene_teacher=scene_teacher,
                     tasks=tasks,
+                    servo=servo,
+                    servo_stats=servo_stats,
                 )
                 if model.config.future_predict:
                     predicted_velocity, action_conditions, memories = rollout
@@ -2550,6 +3269,15 @@ def main() -> None:
                             pair_predicted_velocity = model.flow_velocity(
                                 action_conditions[:, 0], pair_noise, pair_time
                             )
+                            if servo is not None:
+                                # Step 2：pair 探针与主分支同一策略输出——t=0
+                                # 伺服修正（确定性重算，与 rollout_policy 同值）。
+                                pair_predicted_velocity = (
+                                    pair_predicted_velocity
+                                    + servo_correction_t0(model, servo, batch, device)[
+                                        :, None, :
+                                    ]
+                                )
                             pair_loss, pred_delta, tgt_delta = semantic_pair_loss_legacy(
                                 pair_predicted_velocity, pair_target_velocity, partner
                             )
@@ -2562,6 +3290,15 @@ def main() -> None:
                             pair_predicted_velocity = model.flow_velocity(
                                 action_conditions[:, 0], pair_noise, pair_time
                             )
+                            if servo is not None:
+                                # Step 2：pair 探针与主分支同一策略输出——t=0
+                                # 伺服修正（确定性重算，与 rollout_policy 同值）。
+                                pair_predicted_velocity = (
+                                    pair_predicted_velocity
+                                    + servo_correction_t0(model, servo, batch, device)[
+                                        :, None, :
+                                    ]
+                                )
                             pair_loss, pred_delta, tgt_delta = semantic_pair_loss(
                                 pair_predicted_velocity, pair_target_velocity, partner
                             )
@@ -2739,6 +3476,8 @@ def main() -> None:
                 )
             )
         )
+        if servo is not None:
+            clip_params = [*clip_params, *servo.parameters()]
         gradient_norm = torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
         if args.sam_rho > 0:
             # SAM：先沿梯度方向扰动权重（worst-case 邻域），重算 loss 后走真实步。
@@ -2777,6 +3516,27 @@ def main() -> None:
             compile_step_log = f" compile={args.compile_every}"
             if args.training_stage:
                 compile_step_log += f" stage={args.training_stage}"
+        servo_log = ""
+        if servo_stats is not None:
+            # Step 2 伺服运行日志：信任缩放 β / 重读触发率 / 假设熵 / 修正幅度 / 阶段分布。
+            stage = servo_stats["stage"]  # [B, T] long
+            counts = {
+                name: int((stage == idx).sum())
+                for idx, name in (
+                    (0, "coarse"),
+                    (1, "appr"),
+                    (2, "pre"),
+                    (3, "contact"),
+                    (4, "unc"),
+                )
+            }
+            servo_log = (
+                f" servo[β={float(servo_stats['beta'].mean()):.3f} "
+                f"flag={float(servo_stats['innovation_flag'].mean()):.2f} "
+                f"H={float(servo_stats['hyp_entropy'].mean()):.2f} "
+                f"|Δa|={float(servo_stats['correction'].norm(dim=-1).mean()):.4f} "
+                f"stage={'/'.join(f'{k}:{v}' for k, v in counts.items())}]"
+            )
         print(
             f"step={step} mode={args.mode} contract="
             f"{'e2e_single' if e2e_model is not None else ('single' if args.single_task else 'paired')} "
@@ -2785,11 +3545,11 @@ def main() -> None:
             f"pair={pair_loss.item():.6f} future={future_loss.item():.6f} "
             f"goal_delta={predicted_delta.item():.6f}/"
             f"{target_delta.item():.6f} grad={float(gradient_norm):.6f}"
-            f"{gate_log}{semantic_log}{compile_step_log}"
+            f"{gate_log}{semantic_log}{compile_step_log}{servo_log}"
         )
 
     if args.save:
-        save_checkpoint(args, config, model, e2e_model, scene_teacher, vision_backbone)
+        save_checkpoint(args, config, model, e2e_model, scene_teacher, vision_backbone, servo=servo)
 
 
 if __name__ == "__main__":

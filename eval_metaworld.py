@@ -1,9 +1,17 @@
 """Closed-loop evaluation on MetaWorld MT50 (language-conditioned).
 
 Protocol: 10 episodes per task, four difficulty tiers.  The policy receives
-the corner2 camera image (480x480, resized to 384), the 4-dim state
-(hand x/y/z + gripper, normalized with dataset quantiles), the previous
-action, and the task language condition.
+the corner2 camera image (480x480, resized to 384), the state
+(--state-take 截取：4 = EEF xyz + gripper，现状默认；8 = Evo-1 官方评测口径；
+39 = 完整 obs；0 = proprio 恒零), the previous action, and the task
+language condition.
+
+C²-IRF v2 部署（设计文档 c2irf_v2_vision_ablation.md）：
+- ``--servo-ablation``：Step 2 低秩伺服四消融（zero-gain / gain-shuffle /
+  wrong-role / open-loop），挂 c2 plan/feedback 节奏；
+- ``--fovea``：Step 3 foveal 双速率部署（plan_due 全图 dense 重读 + ROI，
+  feedback 步 foveal crop 局部关系更新 + 伺服修正，servo 新息超阈值立即
+  提前全局刷新）。
 """
 from __future__ import annotations
 
@@ -11,12 +19,14 @@ import argparse
 import dataclasses
 import os
 from pathlib import Path
+from typing import Any, Callable
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("EGL_PLATFORM", "surfaceless")
 
 import numpy as np
 import torch
+from torch import nn
 from torch.nn import functional as F
 
 from prepare_pnpw_features import QwenTextBackbone
@@ -32,13 +42,26 @@ from va_compound.model import (
     VACompoundConfig,
     VACompoundPolicy,
 )
+from va_compound.fovea import (
+    FoveaPrefixEncoder,
+    apply_unified_crop,
+    compute_roi,
+    crop_to_full_cov,
+    crop_to_full_norm,
+    full_to_crop_norm,
+)
+from va_compound.local_control_slots import (
+    MultiModeReadout,
+    build_va_vision_input,
+)
 
 IMAGE_MEAN = torch.tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1)
 IMAGE_STD = torch.tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1)
 
 try:
-    from va_compound.live_vjepa import _slot_coords as _stage_coords
+    from va_compound.live_vjepa import _dense_coords, _slot_coords as _stage_coords
 except Exception:  # pragma: no cover - 环境裁剪场景
+    _dense_coords = None
     _stage_coords = None
 
 
@@ -47,18 +70,22 @@ def _apply_local_vision(model, tokens, language_cache):
 
     训练侧 rollout_policy 用 build_local_vision(st, coords, role_queries) 喂
     encode_condition；闭环评估必须走同一路径，否则 288-token checkpoint 的
-    槽/坐标读出被跳过（闭环数字失真）。
+    槽/坐标读出被跳过（闭环数字失真）。``config.dense_readout``（Step 0）时
+    坐标切换为 [1152, 3] 全量 patch 网格（与 288 池化槽坐标互斥）。
     """
     if not model.config.local_slots:
         return tokens
-    if _stage_coords is None:
+    if _stage_coords is None or _dense_coords is None:
         raise RuntimeError("local_slots eval requires va_compound.live_vjepa")
     role_queries = (
         getattr(language_cache, "role_queries", None)
         if language_cache is not None
         else None
     )
-    coords = torch.from_numpy(_stage_coords()).to(
+    coords_arr = (
+        _dense_coords() if getattr(model.config, "dense_readout", False) else _stage_coords()
+    )
+    coords = torch.from_numpy(coords_arr).to(
         device=tokens.device, dtype=tokens.dtype
     )
     return model.build_local_vision(tokens, coords, role_queries)
@@ -75,10 +102,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--vision-pooling",
-        choices=("flat", "spatial", "spatiotemporal"),
+        choices=("flat", "spatial", "spatiotemporal", "dense"),
         default=None,
         help="在线 V-JEPA 池化（覆盖 training_contract；Stage A/B 288-token "
-        "checkpoint 必须为 spatiotemporal，否则闭环数字失真）",
+        "checkpoint 必须为 spatiotemporal，Step 0 dense_readout checkpoint "
+        "必须为 dense（1152 patch 不池化），否则闭环数字失真）",
     )
     parser.add_argument("--trials-per-task", type=int, default=10)
     parser.add_argument("--max-tasks", type=int, default=49)
@@ -193,6 +221,53 @@ def parse_args() -> argparse.Namespace:
         default="heldout",
         help="恢复评估用 v6b 的哪个 split（go/no-go 用 held-out 扰动种子）",
     )
+    parser.add_argument(
+        "--state-take",
+        type=int,
+        default=4,
+        choices=STATE_TAKE_VALUES,
+        help="proprio 截取协议（protocol_verification_evo_fabri.md §3.2 三协议）："
+        "4 = EEF xyz + gripper（现状默认，与 Evo-1/FabriVLA 训练口径一致）；"
+        "8 = Evo-1 官方评测输入（+obj1 pos3 + quat_w；后 4 维为训练分布外输入，"
+        "经零初始化投影扩展，模型行为不变——协议复刻）；39 = 完整 MetaWorld "
+        "obs；0 = proprio 恒零（RGB-only 协议）",
+    )
+    parser.add_argument(
+        "--servo-ablation",
+        choices=("none", "zero-gain", "gain-shuffle", "wrong-role", "open-loop"),
+        default="none",
+        help="C²-IRF v2 Step 2 伺服四消融（设计文档 §七 Step 2）：none = 正常低秩"
+        "伺服；zero-gain = β≡0（增益恒零，仅名义执行）；gain-shuffle = 部署时"
+        "固定种子随机打乱 K 行/列（增益语义破坏）；wrong-role = 角色循环移位"
+        "（关系状态角色错位）；open-loop = 不施加任何伺服修正。需要含 servo "
+        "权重的 c2 checkpoint（local_slots + multi_mode 读出）",
+    )
+    parser.add_argument(
+        "--fovea",
+        action="store_true",
+        help="C²-IRF v2 Step 3 foveal 双速率部署（设计 §三.3）：plan_due 全图 dense "
+        "重读 + ROI 计算，feedback 步 foveal crop 局部关系更新 + 伺服修正；"
+        "servo 新息超阈值（innovation_flag）立即提前全局刷新。需要 c2 + "
+        "multi_mode + servo 权重",
+    )
+    parser.add_argument(
+        "--fovea-nu-thresh",
+        type=float,
+        default=0.1,
+        help="新息幅度 |ν| 阈值（归一化关系坐标；fovea 立即刷新，设计 §三.3）",
+    )
+    parser.add_argument(
+        "--fovea-h-thresh",
+        type=float,
+        default=0.7,
+        help="配对熵 H(w) 阈值（位；fovea 立即刷新，设计 §三.3）",
+    )
+    parser.add_argument(
+        "--fovea-vis-thresh",
+        type=float,
+        default=0.3,
+        help="最小可见度阈值（fovea 立即刷新，设计 §三.3）",
+    )
     return parser.parse_args()
 
 
@@ -239,6 +314,564 @@ def c2_schedule(
         return True, True, 0
     feedback_due = (step - plan_step) % feedback_stride == 0
     return False, feedback_due, token_index
+
+
+# ---------------------------------------------------------------------------
+# C²-IRF v2 评估协议：--state-take / --servo-ablation / --fovea
+# （设计文档 c2irf_v2_vision_ablation.md §三/§七；protocol_verification_evo_fabri.md §3.2）
+# ---------------------------------------------------------------------------
+
+STATE_TAKE_VALUES = (0, 4, 8, 39)
+# 4 = EEF xyz + gripper（现状默认，与 Evo-1/FabriVLA 训练口径一致）；
+# 8 = Evo-1 官方评测输入（+obj1 pos3 + quat_w，后 4 维训练分布外）；
+# 39 = 完整 MetaWorld obs；0 = proprio 恒零（RGB-only 协议）。
+
+# MetaWorld（gymnasium 版）39 维 obs 布局的物理范围表
+# （protocol_verification_evo_fabri.md §1.2）：仅供 --state-take 8/39 的
+# 第 4 维起（训练分布外维度）归一化使用；前 4 维永远用数据统计
+# （state_q01/q99），与旧行为一致。布局：0-2 eef pos，3 gripper，
+# 4-6 obj1 pos，7-10 obj1 quat，11-13 obj2 pos，14-17 obj2 quat，
+# 18-20 prev eef，21 prev gripper，22-28 prev obj1（pos3+quat4），
+# 29-35 prev obj2，36-38 goal pos。
+_STATE_LAYOUT_Q01 = np.zeros(39, dtype=np.float32)
+_STATE_LAYOUT_Q99 = np.zeros(39, dtype=np.float32)
+for _i in range(39):
+    if _i in (0, 4, 11, 18, 22, 29, 36):  # x 坐标（eef/obj1/obj2/goal 及上一帧）
+        _lo, _hi = -0.5, 0.5
+    elif _i in (1, 5, 12, 19, 23, 30, 37):  # y 坐标
+        _lo, _hi = 0.35, 0.95
+    elif _i in (2, 6, 13, 20, 24, 31, 38):  # z 坐标
+        _lo, _hi = 0.0, 0.55
+    elif _i in (3, 21):  # gripper 开度
+        _lo, _hi = 0.0, 1.0
+    else:  # 四元数分量（7-10, 14-17, 25-28, 32-35）
+        _lo, _hi = -1.0, 1.0
+    _STATE_LAYOUT_Q01[_i], _STATE_LAYOUT_Q99[_i] = _lo, _hi
+
+
+def state_take_normalize(
+    obs: np.ndarray, take: int, sq01: np.ndarray, scale_s: np.ndarray
+) -> np.ndarray:
+    """--state-take 截取 + 归一化 → [-1, 1]（纯函数；take=4 与旧行为逐位一致）。
+
+    - 0：恒零 4 维（RGB-only 协议，proprio 无信息）；
+    - 4：obs[:4] 用数据 q01/q99 归一化（现状默认，公式逐字不变）；
+    - 8/39：数据统计覆盖的维度（本仓库 features 为前 4 维）用数据 q01/q99，
+      其余为训练分布外输入，用 39 维布局物理范围表（_STATE_LAYOUT_Q01/Q99）
+      归一化——数值只进入零初始化扩展投影（无学习贡献，模型输出不变），
+      纯协议复刻（protocol_verification_evo_fabri.md §3.2）。
+    """
+    if take == 0:
+        return np.zeros(4, dtype=np.float32)
+    if take > obs.shape[0]:
+        raise ValueError(f"--state-take {take} 超出 obs 维度 {obs.shape[0]}")
+    n_stats = min(take, sq01.shape[0])
+    state = np.clip(
+        2.0 * (obs[:n_stats] - sq01[:n_stats]) / scale_s[:n_stats] - 1.0,
+        -1.0,
+        1.0,
+    ).astype(np.float32)
+    if n_stats < take:
+        span = _STATE_LAYOUT_Q99[n_stats:take] - _STATE_LAYOUT_Q01[n_stats:take]
+        span = np.where(np.abs(span) < 1e-6, 1.0, span)
+        ext = np.clip(
+            2.0 * (obs[n_stats:take] - _STATE_LAYOUT_Q01[n_stats:take]) / span - 1.0,
+            -1.0,
+            1.0,
+        ).astype(np.float32)
+        state = np.concatenate([state, ext])
+    return state
+
+
+def extend_state_projection(model, take: int) -> None:
+    """--state-take > 4：把 state_projection 输入宽度扩展到 take + action_dim。
+
+    零初始化扩展：前（proprio_dim+action_dim）列拷贝原权重，扩展列权重零 →
+    分布外维度的模型输出逐位不变（与 Evo-1 训练 4 维、评测喂 8 维的 OOD
+    输入同构，protocol_verification_evo_fabri.md E3）。仅替换 eval 会话内的
+    模块属性，不动 model.py 与训练；``config.proprio_dim == take``（未来用
+    take 维训练的 checkpoint）时无需扩展。
+    """
+    proj = model.state_projection
+    target_in = take + model.config.action_dim
+    if proj.in_features == target_in:
+        return
+    if proj.in_features != model.config.proprio_dim + model.config.action_dim:
+        raise ValueError(
+            f"state_projection 输入宽度 {proj.in_features} 与 proprio_dim+action_dim"
+            f"（{model.config.proprio_dim}+{model.config.action_dim}）不符，无法扩展"
+        )
+    if take < model.config.proprio_dim:
+        return  # take=0 仍走 proprio_dim 维零向量
+    ext = nn.Linear(target_in, proj.out_features)
+    with torch.no_grad():
+        ext.weight.zero_()
+        ext.weight[:, : proj.in_features].copy_(proj.weight)
+        ext.bias.copy_(proj.bias)
+    model.state_projection = ext.to(
+        device=proj.weight.device, dtype=proj.weight.dtype
+    )
+
+
+def validate_servo_args(args, config) -> None:
+    """servo/fovea 参数校验（独立成函数便于测试；--state-take 由 argparse 限制）。
+
+    servo 消融与 fovea 是 C²-IRF v2 部署机制：需要 local_slots + multi_mode
+    读出（mu/cov/vis/slots 由多模式读出提供）；servo 训练与 c2_controller/
+    direct_head 互斥（train.py --servo 校验：修正作用于 flow 输出），故 servo
+    部署需要 flow checkpoint（direct 也拒：--servo 与 --direct-head 互斥）。
+    """
+    servo_on = args.servo_ablation != "none" or args.fovea
+    if servo_on and config.c2_controller:
+        raise ValueError(
+            "--servo-ablation/--fovea 需要 flow checkpoint：servo 训练与 "
+            "c2_controller 互斥（train.py --servo 校验，修正作用于 flow 输出）"
+        )
+    if servo_on and getattr(config, "direct_head", False):
+        raise ValueError(
+            "--servo-ablation/--fovea 需要 flow checkpoint：servo 训练与 "
+            "direct_head 互斥（train.py --servo 校验）"
+        )
+    if servo_on and not (
+        getattr(config, "local_slots", False)
+        and getattr(config, "multi_mode", False)
+        and not getattr(config, "local_slots_direct288", False)
+    ):
+        raise ValueError(
+            "--servo-ablation/--fovea 需要 local_slots + multi_mode 读出"
+            "（mu/cov/vis/slots 由多模式读出提供；local_slots_direct288 跳过 reader）"
+        )
+    if args.fovea and not getattr(config, "dense_readout", False):
+        raise ValueError(
+            "--fovea 需要 dense_readout checkpoint（foveal H11 固定输出 1152 token）"
+        )
+    if servo_on and (args.c2_oracle_ref or args.c2_zero_gain):
+        # 与 main() 既有的非 c2 校验同一口径（--c2-* 需要 c2 checkpoint）。
+        raise ValueError(
+            "--c2-oracle-ref/--c2-zero-gain 需要 c2 checkpoint，与 servo 部署互斥"
+        )
+    if min(args.fovea_nu_thresh, args.fovea_h_thresh, args.fovea_vis_thresh) < 0:
+        raise ValueError("--fovea-*-thresh 必须非负")
+
+
+MODE_PLAN = "plan"          # 全图 dense 重读（plan_due；fovea 时同时重算 ROI）
+MODE_FOVEAL = "foveal"      # ROI crop → 冻结前缀 → 局部关系更新（feedback_due，仅 fovea）
+MODE_FEEDBACK = "feedback"  # 全图重读（feedback_due，非 fovea——与现状一致）
+MODE_HOLD = "hold"          # 无视觉计算，保持上一动作
+
+
+def fovea_schedule(
+    step: int,
+    plan_step: int | None,
+    plan_stride: int,
+    feedback_stride: int,
+    horizon: int,
+    *,
+    fovea: bool,
+    innovation_flag: bool = False,
+) -> tuple[str, bool, int]:
+    """C²-IRF v2 双速率 fovea 部署节奏（设计 §三.3；纯函数）。
+
+    挂 ``c2_schedule(plan_due, feedback_due)``：plan_due 或上一步 servo 新息
+    超阈值（innovation_flag=True，立即提前全局刷新）→ MODE_PLAN；feedback_due
+    → fovea 时 MODE_FOVEAL（40Hz 局部关系更新），否则 MODE_FEEDBACK（全图
+    重读，现状）；其余 MODE_HOLD。correction_due：PLAN/FOVEAL/FEEDBACK 步
+    都施加伺服修正（40Hz 修正节奏）。返回 (mode, correction_due, token_index)
+    ——与 c2_schedule 的 token_index 约定一致（自规划以来应消费的 token）。
+    """
+    if plan_stride < 1 or feedback_stride < 1:
+        raise ValueError("plan/feedback stride must be positive")
+    plan_due, feedback_due, token_index = c2_schedule(
+        step, plan_step, plan_stride, feedback_stride, horizon
+    )
+    if plan_due or innovation_flag:
+        return MODE_PLAN, True, 0
+    if feedback_due:
+        return (MODE_FOVEAL if fovea else MODE_FEEDBACK), True, token_index
+    return MODE_HOLD, False, token_index
+
+
+def fovea_refresh_due(
+    *,
+    nu_norm: float | None = None,
+    mode_entropy: float | None = None,
+    vis_min: float | None = None,
+    nu_thresh: float = 0.1,
+    h_thresh: float = 0.7,
+    vis_thresh: float = 0.3,
+) -> bool:
+    """foveal 立即刷新判定（设计 §三.3）：|ν| > τ_ν 或 H(w) > τ_H 或 v < τ_v。
+
+    任一超阈值即刷新。servo 暴露 innovation_flag 时 eval 直接采用其标志
+    （阈值评估在 servo 内，设计 §一.1 新息机制）；本函数供回退与单元测试。
+    None 项不参与比较。
+    """
+    if nu_norm is not None and nu_norm > nu_thresh:
+        return True
+    if mode_entropy is not None and mode_entropy > h_thresh:
+        return True
+    if vis_min is not None and vis_min < vis_thresh:
+        return True
+    return False
+
+
+def vis_entropy(vis: torch.Tensor) -> float:
+    """角色可见度分布熵 H(p)，p = vis/Σvis（配对假设熵 H(w) 的可用代理）。"""
+    p = vis.float().clamp_min(0.0)
+    p = p / p.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+    entropy = -(p * (p + 1e-12).log()).sum(-1)
+    return float(entropy.mean())
+
+
+def select_roi_pair(
+    mu: torch.Tensor, cov: torch.Tensor, vis: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """多模式读出 [B,K,2,3] → 活动交互对（compute_roi 的 [B,2,3] 输入）。
+
+    设计 §三.1"只为当前活动交互关系生成一个 ROI"：角色对取可见度乘积
+    vis_i·vis_j 最大的两角色（遮挡/缺物角色不参与）；每角色取最强峰模式
+    （mode 0，topk 序）。返回 (mu_pair [B,2,3], cov_pair [B,2,3,3])。
+    """
+    if mu.ndim != 4 or mu.shape[1] < 2 or mu.shape[2] != 2 or mu.shape[3] != 3:
+        raise ValueError(f"mu 必须为 [B, K≥2, 2, 3]，got {tuple(mu.shape)}")
+    if tuple(cov.shape) != tuple(mu.shape[:-1]) + (3, 3):
+        raise ValueError(f"cov 必须为 [B, K, 2, 3, 3]，got {tuple(cov.shape)}")
+    if tuple(vis.shape) != tuple(mu.shape[:2]):
+        raise ValueError(f"vis 必须为 [B, K]，got {tuple(vis.shape)}")
+    mu, cov, vis = mu.detach().float(), cov.detach().float(), vis.detach().float()
+    batch, n_roles = mu.shape[0], mu.shape[1]
+    pairs = [(i, j) for i in range(n_roles) for j in range(i + 1, n_roles)]
+    best: list[tuple[int, int]] = []
+    for b in range(batch):
+        scores = [float(vis[b, i] * vis[b, j]) for i, j in pairs]
+        best.append(pairs[int(np.argmax(scores))])  # argmax 取首个（确定性）
+    mu_pair = torch.stack(
+        [torch.stack([mu[b, i, 0], mu[b, j, 0]]) for b, (i, j) in enumerate(best)]
+    )  # [B, 2, 3]（两角色各自的最强峰模式）
+    cov_pair = torch.stack(
+        [torch.stack([cov[b, i, 0], cov[b, j, 0]]) for b, (i, j) in enumerate(best)]
+    )  # [B, 2, 3, 3]
+    return mu_pair, cov_pair
+
+
+def build_multimode_stream(
+    model, readout: MultiModeReadout, dense_tokens: torch.Tensor, role_queries: torch.Tensor
+) -> torch.Tensor:
+    """servo/fovea 路径的 31-token 视觉流（与 build_local_vision multi_mode 分支一致）。
+
+    复刻 ``VACompoundPolicy.build_local_vision`` 的 multi_mode 尾部
+    （coarse → slots_flat → relations → vis_cond），唯一差异：readout 由调用
+    方提供（reader 可带 prev_mu 跟踪先验，避免双跑导致视觉流与伺服读出
+    不一致）。servo 路径外不使用；与 build_local_vision 的逐位一致性由
+    tests/test_eval_servo.py 断言。
+    """
+    target_dtype = model.vision_projection.weight.dtype
+    dense = dense_tokens.to(dtype=target_dtype)
+    coarse = model.coarse_pool(dense.transpose(1, 2)).transpose(1, 2)  # [B, C, D]
+    slots_flat = readout.slots.reshape(dense.shape[0], -1, model.config.vision_dim)
+    relations = model.relation_tokens(readout.slots[:, :, 0], readout.mu[:, :, 0])
+    stream = build_va_vision_input(coarse, slots_flat, relations)
+    vis_cond = model.vis_conditioner(readout.vis.to(dtype=target_dtype))
+    return stream + vis_cond[:, None, :]
+
+
+class ServoRuntime:
+    """C²-IRF v2 Step 2 伺服修正运行时（eval 侧薄包装，设计 §二/§五 MVP）。
+
+    控制器形态（以 ``va_compound/servo.py`` 的 ``InteractionServo`` 为准，
+    Agent E 交付；接口偏差以其 docstring 为准）：
+    - 真实前向接口（InteractionServo）：``controller(readout, proprio, lang_cond,
+      a_prev, g_prev) -> ServoOutput``——``correction`` [B, A] 已含阶段幅度上限、
+      假设混合权重与 β 信任缩放（评估侧 ``a = clip(a_base + correction, −1, 1)``）；
+      ``innovation_flag`` [B] float {0,1}（|ν|/H(w)/vis 阈值，设计 §三.3）；
+      ``g`` [B, G] 跨决策由本运行时维护（g_prev）；
+    - 旧契约接口（仅测试假控制器）：``relation_state(mu, cov, vis) -> g_t`` +
+      ``gain`` 属性（低秩 learned gain，可辨识性纪律：只称 learned gain）。
+
+    消融（--servo-ablation，设计 §七 Step 2）：
+    - zero-gain：β≡0——最终修正恒置零（感知照常、增益归零，仅名义执行）；
+    - gain-shuffle：固定种子随机打乱 K 行/列（U 行=动作维、V 行=关系维，
+      增益语义破坏、尺度保留）；
+    - wrong-role：角色循环移位（关系状态角色错位）；
+    - open-loop：跳过伺服前向与修正（纯名义执行）。
+    """
+
+    def __init__(
+        self,
+        controller: Any,
+        ablation: str,
+        *,
+        innovation_fn: Callable | None = None,
+        seed: int = 0,
+        nu_thresh: float = 0.1,
+        h_thresh: float = 0.7,
+        vis_thresh: float = 0.3,
+    ) -> None:
+        if ablation not in ("none", "zero-gain", "gain-shuffle", "wrong-role", "open-loop"):
+            raise ValueError(f"未知消融：{ablation}")
+        self.controller = controller
+        self.ablation = ablation
+        self.innovation_fn = innovation_fn
+        self.nu_thresh = nu_thresh
+        self.h_thresh = h_thresh
+        self.vis_thresh = vis_thresh
+        # 真实 InteractionServo 无 relation_state 属性 → 走前向接口。
+        self._forward_interface = not hasattr(controller, "relation_state")
+        params_fn = getattr(controller, "parameters", None)
+        params = list(params_fn()) if params_fn is not None else []
+        self.device = params[0].device if params else torch.device("cpu")
+        self.prev_mu: torch.Tensor | None = None  # reader 跟踪先验 [B,K,2,3]
+        self.prev_g: torch.Tensor | None = None  # 上一关系状态 g [B,G]（ν 依赖）
+        if ablation == "gain-shuffle":
+            self._shuffle_gain(seed)
+
+    def _gain(self) -> torch.Tensor:
+        gain = getattr(self.controller, "gain", None)
+        if gain is None:
+            raise ValueError("servo 控制器未暴露 gain（旧契约 [A, D_rel]）")
+        return gain() if callable(gain) else gain
+
+    def _shuffle_gain(self, seed: int) -> None:
+        """部署时固定种子随机打乱 K 的行与列（消融：增益语义破坏，尺度保留）。
+
+        InteractionServo 的 K = κ·U·Vᵀ 由 U/V 实时计算——打乱 U 行（动作维）
+        与 V 行（关系维），此后每次 gain() 都返回行列打乱的 K；旧契约控制器
+        直接置换缓存的 gain 张量。
+        """
+        rng = np.random.default_rng(seed)
+        inner = getattr(self.controller, "servo", None)
+        if inner is not None and hasattr(inner, "U") and hasattr(inner, "V"):
+            rows = rng.permutation(inner.U.shape[0])
+            cols = rng.permutation(inner.V.shape[0])
+            with torch.no_grad():
+                inner.U.data.copy_(inner.U.data[rows])
+                inner.V.data.copy_(inner.V.data[cols])
+            return
+        gain = self._gain()
+        rows = rng.permutation(gain.shape[0])
+        cols = rng.permutation(gain.shape[1])
+        with torch.no_grad():
+            gain.copy_(gain[rows][:, cols])  # 高级索引返回拷贝，原地安全
+
+    def _maybe_role_permute(
+        self, readout: MultiModeReadout
+    ) -> MultiModeReadout:
+        """wrong-role：角色索引循环移位 (i+1) % K（交互语义破坏）。"""
+        if self.ablation != "wrong-role":
+            return readout
+        n_roles = readout.mu.shape[1]
+        perm = [(i + 1) % n_roles for i in range(n_roles)]
+        return MultiModeReadout(
+            readout.slots[:, perm],
+            readout.mu[:, perm],
+            readout.cov[:, perm],
+            readout.vis[:, perm],
+            readout.weights[:, perm],
+        )
+
+    @staticmethod
+    def _as_tensor(x, device: torch.device):
+        """None → None；np 数组 → float32 tensor；一维 → 批维 [1, D]（评估单实例）。"""
+        if x is None:
+            return None
+        if isinstance(x, np.ndarray):
+            x = torch.from_numpy(np.ascontiguousarray(x)).float()
+        x = x.to(device=device)
+        if x.ndim == 1:
+            x = x.unsqueeze(0)
+        return x
+
+    def correct(
+        self,
+        readout: MultiModeReadout,
+        proprio: Any = None,
+        lang_cond: torch.Tensor | None = None,
+        a_prev: Any = None,
+    ) -> tuple[np.ndarray | None, bool]:
+        """单步伺服修正 → (Δa [A] 或 None, innovation_flag)。
+
+        open-loop → (None, False)（不施加任何修正）。真实接口：前向
+        InteractionServo（correction 已含 β/阶段上限/假设混合），g_prev 由
+        运行时跨决策维护；旧契约：g_t = relation_state(mu, cov, vis) →
+        Δa = K·(g* − g_t)（g*≡0）。zero-gain 在输出处把修正恒置零。
+        """
+        if self.ablation == "open-loop":
+            self.prev_mu = readout.mu
+            return None, False
+        readout_p = self._maybe_role_permute(readout)
+        if self._forward_interface:
+            if proprio is None or lang_cond is None:
+                raise ValueError(
+                    "InteractionServo 前向需要 proprio [B,4] 与 lang_cond [B,L]"
+                )
+            out = self.controller(
+                readout_p,
+                self._as_tensor(proprio, self.device),
+                lang_cond.to(device=self.device, dtype=torch.float32),
+                a_prev=self._as_tensor(a_prev, self.device),
+                g_prev=self.prev_g,
+            )
+            correction = out.correction[0].detach().cpu().numpy().astype(
+                np.float32
+            ).ravel()
+            flag = bool(out.innovation_flag.reshape(-1)[0].item())
+            self.prev_g = out.g.detach()
+        else:
+            g_t = self.controller.relation_state(readout_p.mu, readout_p.cov, readout_p.vis)
+            if g_t.ndim != 2:
+                raise ValueError(
+                    f"relation_state 必须返回 [B, D_rel]，got {tuple(g_t.shape)}"
+                )
+            correction = -(self._gain() @ g_t[0]).detach().cpu().numpy().astype(
+                np.float32
+            ).ravel()
+            flag = self._innovation_flag(readout_p, g_t)
+            self.prev_g = g_t.detach()
+        if self.ablation == "zero-gain":
+            correction = np.zeros_like(correction)  # β≡0：修正恒零
+        self.prev_mu = readout.mu
+        return correction, bool(flag)
+
+    def _innovation_flag(self, readout: MultiModeReadout, g_t: torch.Tensor) -> bool:
+        """新息标志（旧契约路径）：innovation() 优先；否则阈值回退。
+
+        真实 InteractionServo 的 innovation_flag 已含 |ν|/H(w)/vis 阈值
+        （设计 §三.3），不走此路径。
+        """
+        if self.innovation_fn is not None:
+            _nu, flag = self.innovation_fn(
+                readout.mu, readout.cov, readout.vis, self.prev_mu
+            )
+            if isinstance(flag, torch.Tensor):
+                flag = flag.item()
+            return bool(flag)
+        nu_norm = float((g_t - self.prev_g).norm()) if self.prev_g is not None else 0.0
+        return fovea_refresh_due(
+            nu_norm=nu_norm,
+            mode_entropy=vis_entropy(readout.vis),
+            vis_min=float(readout.vis.min()),
+            nu_thresh=self.nu_thresh,
+            h_thresh=self.h_thresh,
+            vis_thresh=self.vis_thresh,
+        )
+
+
+def _servo_vision(model, tokens: torch.Tensor, language_cache, coords_arr, prev_mu=None):
+    """servo 路径视觉：一次 reader 调用产出 (MultiModeReadout, 31-token 流)。
+
+    reader 带 prev_mu 跟踪先验（设计 §二.3 b_track）；视觉流与伺服读出
+    共用同一次读出（build_multimode_stream），保证闭环自洽。
+    """
+    if not (
+        getattr(model.config, "local_slots", False)
+        and getattr(model.config, "multi_mode", False)
+    ):
+        raise ValueError("servo 需要 local_slots + multi_mode 读出")
+    role_queries = getattr(language_cache, "role_queries", None)
+    if role_queries is None:
+        raise ValueError("servo 需要带 role_queries 的语言缓存（local_slots checkpoint）")
+    coords = torch.from_numpy(coords_arr).to(device=tokens.device, dtype=tokens.dtype)
+    dense = tokens.to(dtype=model.vision_projection.weight.dtype)
+    readout = model.slot_reader(dense, role_queries, coords, prev_mu=prev_mu)
+    stream = build_multimode_stream(model, readout, dense, role_queries)
+    return readout, stream
+
+
+def _foveal_tokens(
+    frames: list[np.ndarray],
+    roi: torch.Tensor,
+    device: torch.device,
+    vision_backbone=None,
+    fovea_encoder=None,
+    full_encoder: bool = True,
+) -> torch.Tensor:
+    """foveal 反馈步：ROI crop（渲染分辨率）→ 统一 resize 384 → 编码。
+
+    - 同一 4 帧窗口共用同一仿射 crop（apply_unified_crop，防假运动，§三.2）；
+    - ROI 在渲染像素空间（compute_roi(image_size=渲染高)），放大倍数
+      = 384/roi_size（96px crop → 4px/patch ≈ 亚厘米，§三.2）；
+    - 审查 P0-2：单决策窗口 [W,R,R,3] → [B=1,T=1,W,R,R,3] 六维，
+      取 crops[0,0] 还原四帧；
+    - 审查 P0-4：默认 ``full_encoder=True`` 走完整 V-JEPA（H11，pooling="dense"）
+      ——与 reader/servo 训练的特征层一致（前缀 blocks[:2] 特征未在训练中
+      出现过，直接喂 H11 reader 属域错配）；FoveaPrefixEncoder 保留为显式
+      ``full_encoder=False``（待 foveal adapter 训练接线后启用）。
+    """
+    window = np.stack(frames)  # [W, R, R, 3] uint8
+    render_size = window.shape[1]
+    crops = apply_unified_crop(
+        window[None, None], roi, image_size=render_size
+    )  # [1, 1, W, R, R, 3]
+    tensor = (
+        torch.from_numpy(np.ascontiguousarray(crops[0, 0]))
+        .permute(0, 3, 1, 2)
+        .float()
+        .div_(255.0)
+    )  # [W, 3, R, R]
+    if tensor.shape[-1] != 384:
+        tensor = F.interpolate(
+            tensor, size=(384, 384), mode="bicubic",
+            align_corners=False, antialias=True,  # 与 preprocess 管线一致
+        )
+    tensor = (tensor - IMAGE_MEAN) / IMAGE_STD
+    inp = tensor.to(device)[None]  # [1, W, 3, 384, 384]
+    if full_encoder:
+        if vision_backbone is None:
+            raise ValueError("full_encoder=True 需要 vision_backbone")
+        return vision_backbone(inp, pooling="dense")  # [1, 1152, D]（H11，与训练一致）
+    if fovea_encoder is None:
+        raise ValueError("full_encoder=False 需要 fovea_encoder")
+    return fovea_encoder(inp)  # [1, 1152, D]（冻结前缀 blocks[:2]）
+
+
+def _load_servo_controller(model, ckpt: dict, device, args) -> ServoRuntime | None:
+    """按契约加载 servo 运行时（无权重且未请求 → None；请求但不可用 → 报错）。
+
+    权重来源（Agent E 训练侧写入，以 servo.py docstring / train.py 构造为准）：
+    - ``ckpt["servo"]``：``InteractionServo`` 独立 state_dict（构造参数对齐
+      train.py Step 2：vision_dim/lang_dim/action_dim 取模型 config，
+      rank/dls/dls_lambda 存 training_contract 的 servo_rank/servo_dls/
+      servo_lambda）；
+    - ``model.servo``：servo 已并入 VA 政策（随 ``ckpt["model"]`` 加载）。
+    """
+    requested = args.servo_ablation != "none" or args.fovea
+    controller = getattr(model, "servo", None)
+    servo_sd = ckpt.get("servo")
+    if controller is None and servo_sd is not None:
+        try:
+            from va_compound.servo import InteractionServo
+        except ImportError as exc:  # Agent E 尚未交付
+            raise ValueError(
+                "va_compound/servo.py 尚未交付（Wave 2 Agent E）；"
+                "--servo-ablation/--fovea 需先集成 servo 模块"
+            ) from exc
+        contract = ckpt.get("training_contract", {}) or {}
+        controller = InteractionServo(
+            vision_dim=model.config.vision_dim,
+            lang_dim=model.config.hidden_dim,
+            action_dim=model.config.action_dim,
+            rank=int(contract.get("servo_rank", 2)),
+            dls=bool(contract.get("servo_dls", False)),
+            dls_lambda=float(contract.get("servo_lambda", 1e-2)),
+        )
+        controller.load_state_dict(servo_sd)
+        controller.to(device).eval()
+    if controller is None:
+        if requested:
+            raise ValueError(
+                "--servo-ablation/--fovea 需要含 servo 权重的 checkpoint"
+                "（ckpt['servo'] 或 model.servo）"
+            )
+        return None
+    innovation_fn = getattr(controller, "innovation", None)
+    return ServoRuntime(
+        controller,
+        args.servo_ablation,
+        innovation_fn=innovation_fn,
+        nu_thresh=args.fovea_nu_thresh,
+        h_thresh=args.fovea_h_thresh,
+        vis_thresh=args.fovea_vis_thresh,
+    )
 
 
 def run_c2_recovery_eval(
@@ -322,9 +955,7 @@ def run_c2_recovery_eval(
                 step, plan_step, args.plan_stride, args.feedback_stride, ACTION_HORIZON
             )
             if plan_due:
-                state = np.clip(
-                    2.0 * (obs[:4] - sq01) / scale_s - 1.0, -1.0, 1.0
-                ).astype(np.float32)
+                state = state_take_normalize(obs, args.state_take, sq01, scale_s)
                 proprio = torch.tensor(state, device=device)[None, None]
                 previous = torch.tensor(
                     last_norm, dtype=torch.float32, device=device
@@ -546,20 +1177,37 @@ def main() -> None:
     device = torch.device(args.device)
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     config = VACompoundConfig(**ckpt["config"])
+    # 2026-08-09：ACTION_HORIZON 从 checkpoint config 读（E7 H=48），不再硬编码 8。
+    global ACTION_HORIZON
+    ACTION_HORIZON = int(getattr(config, "action_horizon", 8))
+    # Codex P1-5：flow Euler 步数从 checkpoint contract 读（训练 --flow-steps），
+    # 不再硬编码 32（训练 8 步 / 评估 32 步 = 协议错配）。
+    flow_steps = int(ckpt.get("flow_steps", 8))
+    print(f"eval: action_horizon={ACTION_HORIZON} (from checkpoint config), "
+          f"flow_steps={flow_steps} (from checkpoint contract)")
     # spatial-pooling ckpt 评估：vision_pooling 存在 training_contract 而非 config。
     vision_pooling = str(
         (ckpt.get("training_contract", {}) or {}).get("vision_pooling", "flat")
     )
     if args.vision_pooling is not None:
         vision_pooling = args.vision_pooling
-    if config.local_slots and vision_pooling != "spatiotemporal":
-        # Stage A/B：local_slots 训练（ST288/live）必为 spatiotemporal 288 token，
-        # 旧 contract 可能漏记；强制对齐避免 flat 64-token 闭环失真。
-        print(
-            f"eval: config.local_slots=True 但 vision_pooling={vision_pooling}；"
-            "强制 spatiotemporal（288 token，与训练一致）"
-        )
-        vision_pooling = "spatiotemporal"
+    if config.local_slots:
+        if getattr(config, "dense_readout", False):
+            # Step 0 dense readout：1152 patch 不池化，池化模式必须为 dense。
+            if vision_pooling != "dense":
+                print(
+                    f"eval: config.dense_readout=True 但 vision_pooling={vision_pooling}；"
+                    "强制 dense（1152 patch 不池化，与训练一致）"
+                )
+                vision_pooling = "dense"
+        elif vision_pooling != "spatiotemporal":
+            # Stage A/B：local_slots 训练（ST288/live）必为 spatiotemporal 288 token，
+            # 旧 contract 可能漏记；强制对齐避免 flat 64-token 闭环失真。
+            print(
+                f"eval: config.local_slots=True 但 vision_pooling={vision_pooling}；"
+                "强制 spatiotemporal（288 token，与训练一致）"
+            )
+            vision_pooling = "spatiotemporal"
     if args.direct_head != "auto":
         config = dataclasses.replace(config, direct_head=args.direct_head == "on")
     # P0-3：semantic-compiler ckpt 同样按需逐决策重建语言缓存（场景条件化）。
@@ -596,6 +1244,27 @@ def main() -> None:
         raise ValueError("--c2-oracle-ref/--c2-zero-gain require a c2 checkpoint")
     if config.c2_controller and not config.direct_head:
         raise ValueError("c2 controller requires the direct head decoder")
+    validate_servo_args(args, config)
+    if args.state_take != 4:
+        # --state-take 8/39：零初始化扩展 proprio 投影（训练 4 维权重不变，
+        # 分布外维度零贡献——协议复刻，protocol_verification_evo_fabri.md E3）。
+        extend_state_projection(model, args.state_take)
+        print(
+            f"eval: state_projection extended to "
+            f"{args.state_take + config.action_dim} inputs (--state-take {args.state_take})"
+        )
+    # C²-IRF v2：servo 运行时（--servo-ablation/--fovea；flow checkpoint +
+    # ckpt["servo"] 权重）。放在节奏默认值之前（servo 也用 plan/feedback 节奏）。
+    servo_runtime = _load_servo_controller(model, ckpt, device, args)
+    dense_coords_arr = None
+    if servo_runtime is not None:
+        if _stage_coords is None or _dense_coords is None:
+            raise RuntimeError("servo 路径需要 va_compound.live_vjepa 坐标")
+        dense_coords_arr = _dense_coords() if config.dense_readout else _stage_coords()
+        print(
+            f"eval: servo runtime active "
+            f"(ablation={args.servo_ablation}, fovea={args.fovea})"
+        )
     print(
         f"eval: action decoder = "
         f"{'c2_controller (ū/c̄/K contraction)' if config.c2_controller else ('direct_head (MLP->tanh)' if config.direct_head else 'flow_matching (Euler steps=32)')}"
@@ -609,9 +1278,10 @@ def main() -> None:
     aq01 = features["normalization"]["action_q01"].numpy()
     aq99 = features["normalization"]["action_q99"].numpy()
 
-    if config.c2_controller:
-        # C² 部署默认：plan_stride=6（VA 生成 {ū,c̄,K} 一次），feedback_stride=1
-        # （每原始步刷新 V-JEPA → c_current → 应用 K 修正，Codex 修正 5）。
+    if config.c2_controller or servo_runtime is not None:
+        # C² / 伺服部署默认节奏：plan_stride=6（VA 生成 {ū,c̄,K} / 解码名义
+        # chunk 一次），feedback_stride=1（每原始步刷新读出并消费 token，
+        # Codex 修正 5）。
         args.plan_stride = (
             args.plan_stride if args.plan_stride is not None else DECISION_STRIDE
         )
@@ -619,7 +1289,8 @@ def main() -> None:
             args.feedback_stride if args.feedback_stride is not None else 1
         )
         print(
-            f"eval: c2 plan_stride={args.plan_stride} feedback_stride={args.feedback_stride} "
+            f"eval: {'c2' if config.c2_controller else 'servo'} "
+            f"plan_stride={args.plan_stride} feedback_stride={args.feedback_stride} "
             f"oracle_ref={args.c2_oracle_ref} zero_gain={args.c2_zero_gain}"
         )
     vision_backbone = VJEPA21Backbone.from_pretrained(
@@ -633,6 +1304,9 @@ def main() -> None:
         vision_backbone.model.load_state_dict(ckpt["vjepa_state_dict"])
         print("eval: loaded vjepa_state_dict from checkpoint")
     vision_backbone.freeze_all()
+    # --fovea：foveal 前缀编码器共享同一冻结 V-JEPA 实例（无新权重——
+    # 显存纪律：1152 只读、V-JEPA 冻结）。
+    fovea_encoder = FoveaPrefixEncoder(vision_backbone.model) if args.fovea else None
     if args.c2_recovery_eval is not None:
         if not config.c2_controller:
             raise ValueError("--c2-recovery-eval requires a c2 checkpoint")
@@ -764,14 +1438,23 @@ def main() -> None:
                         _ALIGN_ACTS = feat["actions"][idx].numpy()
             frame_buffer = []
             last_norm = np.zeros(4)  # 归一化动作（模型输入）
-            chunk = np.zeros((ACTION_HORIZON, 4))
+            chunk = (
+                None
+                if servo_runtime is not None
+                else np.zeros((ACTION_HORIZON, 4))
+            )
             chunk_start_step = 0  # 2026-08-06：--execute-steps 变节奏时 chunk 相位
             memory = None
             success = False
             decision_count = 0  # 2026-08-06：--memory-reset-every 的决策计数器
-            plan_step = None  # C²：上次 VA 规划的原始步
-            c2_token = 0  # C²：自规划以来消费的 token 索引
+            plan_step = None  # C²/伺服：上次规划的原始步
+            c2_token = 0  # C²/伺服：自规划以来消费的 token 索引
             c2_params = None  # C²：缓存的 {ū, c̄, K}
+            readout = None  # servo：最近一次 MultiModeReadout
+            roi = None  # --fovea：最近一次 plan 的 ROI（渲染像素空间 [1,3]）
+            innovation_flag = False  # servo 新息标志（True → 下一步立即全局刷新）
+            servo_lang_cond = None  # servo 语言条件（plan 时取 role queries 均值）
+            servo_first = True  # 首决策 a_prev=None（ν≡0，servo.py 契约）
             for step in range(args.horizon):
                 img = env.render()  # 数据图像与本地渲染一致（实测 MAE 0.48 vs flip 55，勿加 flip）
                 frame_buffer.append(img)
@@ -795,12 +1478,16 @@ def main() -> None:
                 frames = [frame_buffer[len(frame_buffer) + i] for i in indices]
                 if config.c2_controller:
                     # C² 部署（Codex 修正 5）：plan_stride 步重规划一次 {ū,c̄,K}；
-                    # 每 feedback_stride 步刷新 c_current 并顺序消费 token。
+                    # 每 feedback_stride 步刷新并消费 token。C²-IRF v2 扩展：
+                    # fovea 时 plan_due 全图重读 + ROI，feedback 步 foveal crop
+                    # 局部关系更新；servo 新息超阈值立即提前全局刷新。
                     clip = torch.cat([preprocess(f, 384) for f in frames], dim=0).to(device)
-                    plan_due, feedback_due, token_index = c2_schedule(
-                        step, plan_step, args.plan_stride, args.feedback_stride, ACTION_HORIZON
+                    mode, correction_due, _ = fovea_schedule(
+                        step, plan_step, args.plan_stride, args.feedback_stride,
+                        ACTION_HORIZON, fovea=args.fovea,
+                        innovation_flag=innovation_flag,
                     )
-                    if plan_due:
+                    if mode == MODE_PLAN:
                         if (
                             args.memory_reset_every > 0
                             and decision_count > 0
@@ -808,9 +1495,7 @@ def main() -> None:
                         ):
                             memory = None
                         decision_count += 1
-                        state = np.clip(
-                            2.0 * (obs[:4] - sq01) / scale_s - 1.0, -1.0, 1.0
-                        ).astype(np.float32)
+                        state = state_take_normalize(obs, args.state_take, sq01, scale_s)
                         proprio = torch.tensor(state, device=device)[None, None]
                         previous = torch.tensor(
                             np.zeros(4, dtype=np.float32) if args.prev_zero else last_norm,
@@ -818,9 +1503,32 @@ def main() -> None:
                         )[None, None]
                         with torch.inference_mode():
                             tokens = vision_backbone(clip.unsqueeze(0), pooling=vision_pooling)
-                            vision_in = _apply_local_vision(
-                                model, tokens, task_caches[task_index]
-                            )
+                            if servo_runtime is not None:
+                                # servo 路径：一次 reader 调用（带 prev_mu 跟踪先验）
+                                # 同时产出 MultiModeReadout 与 31-token 视觉流。
+                                readout, vision_in = _servo_vision(
+                                    model, tokens, task_caches[task_index],
+                                    dense_coords_arr, prev_mu=servo_runtime.prev_mu,
+                                )
+                                if args.fovea:
+                                    # ROI 在渲染像素空间（480×480）；同一仿射
+                                    # 应用于整个 4 帧窗口（§三.1/§三.2）。
+                                    render_size = frame_buffer[-1].shape[0]
+                                    if render_size % 16:
+                                        raise ValueError(
+                                            f"--fovea 需要渲染尺寸能被 16 整除，"
+                                            f"got {render_size}"
+                                        )
+                                    roi = compute_roi(
+                                        *select_roi_pair(
+                                            readout.mu, readout.cov, readout.vis
+                                        ),
+                                        image_size=render_size,
+                                    ).detach().cpu().float()
+                            else:
+                                vision_in = _apply_local_vision(
+                                    model, tokens, task_caches[task_index]
+                                )
                             c_current = model.control_projector(tokens)
                             cond, memory = model.encode_condition(
                                 vision_in,
@@ -845,31 +1553,257 @@ def main() -> None:
                                 )
                         plan_step = step
                         c2_token = 0
-                    if feedback_due and c2_token < ACTION_HORIZON and c2_params is not None:
-                        with torch.inference_mode():
-                            if step != plan_step:
-                                # feedback 刷新：重新编码当前窗口 → c_current。
-                                tokens = vision_backbone(clip.unsqueeze(0), pooling=vision_pooling)
-                            c_current = model.control_projector(tokens)
-                            if args.c2_oracle_ref:
-                                # 参考零误差上界：c̄ ≡ c_current（e ≡ 0，K 空转）。
-                                norm_action = c2_params.nominal[0, c2_token].cpu().numpy()
-                            else:
-                                error = c_current[0] - c2_params.reference[0, c2_token]
-                                if (
-                                    args.c2_error_threshold > 0.0
-                                    and float(error.norm()) < args.c2_error_threshold
-                                ):
+                    if correction_due and c2_token < ACTION_HORIZON and c2_params is not None:
+                        if servo_runtime is not None:
+                            # 注：validate_servo_args 保证 c2 checkpoint 下
+                            # servo_runtime 恒为 None（servo 训练与 c2 互斥）；
+                            # 此分支保留以备未来放开组合。
+                            with torch.inference_mode():
+                                if step != plan_step:
+                                    if args.fovea:
+                                        # foveal 局部更新：ROI crop → 编码 →
+                                        # 局部关系状态（40Hz，§三.3）。审查 P0-4：
+                                        # 默认完整 V-JEPA（H11）编码 crop，与
+                                        # reader 训练特征层一致；P0-3：prev_mu
+                                        # 先 full→crop 变换再进 reader，reader
+                                        # 输出的 mu/cov 逆变换回全图再送 servo
+                                        # （crop 归一化坐标 ≠ 全图坐标）。
+                                        render_size = frame_buffer[-1].shape[0]
+                                        tokens = _foveal_tokens(
+                                            frames, roi, device,
+                                            vision_backbone=vision_backbone,
+                                            fovea_encoder=fovea_encoder,
+                                        )
+                                        prev_crop = (
+                                            full_to_crop_norm(
+                                                servo_runtime.prev_mu, roi,
+                                                render_size,
+                                            )
+                                            if servo_runtime.prev_mu is not None
+                                            else None
+                                        )
+                                        readout, _ = _servo_vision(
+                                            model, tokens, task_caches[task_index],
+                                            dense_coords_arr, prev_mu=prev_crop,
+                                        )
+                                        readout = MultiModeReadout(
+                                            readout.slots,
+                                            crop_to_full_norm(
+                                                readout.mu, roi, render_size
+                                            ),
+                                            crop_to_full_cov(
+                                                readout.cov, roi, render_size
+                                            ),
+                                            readout.vis,
+                                            readout.weights,
+                                        )
+                                    else:
+                                        tokens = vision_backbone(
+                                            clip.unsqueeze(0), pooling=vision_pooling
+                                        )
+                                        readout, _ = _servo_vision(
+                                            model, tokens, task_caches[task_index],
+                                            dense_coords_arr,
+                                            prev_mu=servo_runtime.prev_mu,
+                                        )
+                                state_norm = state_take_normalize(
+                                    obs, args.state_take, sq01, scale_s
+                                )
+                                correction, innovation_flag = servo_runtime.correct(
+                                    readout,
+                                    state_norm[:4],
+                                    task_caches[task_index].role_queries.mean(dim=1),
+                                    a_prev=None if servo_first else last_norm,
+                                )
+                                nominal = c2_params.nominal[0, c2_token].cpu().numpy()
+                                if correction is None:
+                                    norm_action = nominal
+                                else:
+                                    norm_action = np.clip(
+                                        nominal + correction, -1.0, 1.0
+                                    )
+                            servo_first = False
+                            c2_token += 1
+                        else:
+                            with torch.inference_mode():
+                                if step != plan_step:
+                                    # feedback 刷新：重新编码当前窗口 → c_current。
+                                    tokens = vision_backbone(
+                                        clip.unsqueeze(0), pooling=vision_pooling
+                                    )
+                                c_current = model.control_projector(tokens)
+                                if args.c2_oracle_ref:
+                                    # 参考零误差上界：c̄ ≡ c_current（e ≡ 0，K 空转）。
                                     norm_action = c2_params.nominal[0, c2_token].cpu().numpy()
                                 else:
-                                    norm_action = (
-                                        c2_params.nominal[0, c2_token]
-                                        - c2_params.gain[0, c2_token] @ error
-                                    ).cpu().numpy()
-                        norm_action = np.clip(norm_action, -1.0, 1.0)
-                        c2_token += 1
+                                    error = c_current[0] - c2_params.reference[0, c2_token]
+                                    if (
+                                        args.c2_error_threshold > 0.0
+                                        and float(error.norm()) < args.c2_error_threshold
+                                    ):
+                                        norm_action = c2_params.nominal[0, c2_token].cpu().numpy()
+                                    else:
+                                        norm_action = (
+                                            c2_params.nominal[0, c2_token]
+                                            - c2_params.gain[0, c2_token] @ error
+                                        ).cpu().numpy()
+                            norm_action = np.clip(norm_action, -1.0, 1.0)
+                            c2_token += 1
                     else:
                         # 非刷新步：保持上一动作（feedback_stride > 1 时）。
+                        norm_action = last_norm
+                elif servo_runtime is not None:
+                    # 伺服部署（flow checkpoint + servo 权重；--servo-ablation/
+                    # --fovea）：c2_schedule 节奏——plan_due 全图重读 + 解码名义
+                    # chunk（ā），feedback 步伺服修正（fovea 时 foveal crop 局部
+                    # 关系更新）。修正 = clip(ā + correction)（correction 已含
+                    # 阶段上限/假设混合/β，va_compound/servo.py 契约）。
+                    mode, correction_due, _ = fovea_schedule(
+                        step, plan_step, args.plan_stride, args.feedback_stride,
+                        ACTION_HORIZON, fovea=args.fovea,
+                        innovation_flag=innovation_flag,
+                    )
+                    if mode == MODE_PLAN:
+                        if (
+                            args.memory_reset_every > 0
+                            and decision_count > 0
+                            and decision_count % args.memory_reset_every == 0
+                        ):
+                            memory = None
+                        decision_count += 1
+                        state = state_take_normalize(obs, args.state_take, sq01, scale_s)
+                        proprio = torch.tensor(state, device=device)[None, None]
+                        previous = torch.tensor(
+                            np.zeros(4, dtype=np.float32) if args.prev_zero else last_norm,
+                            dtype=torch.float32, device=device,
+                        )[None, None]
+                        # 审查 P0-1：servo 分支此前未构造 frames/clip（该变量只在
+                        # C²/普通分支创建），首个 plan 步即 UnboundLocalError。
+                        # 与 C² 分支同一时间升序窗口 [d-6, d-4, d-2, d]。
+                        indices = list(range(-2 * VISION_WINDOW + 1, 0, 2))
+                        frames = [frame_buffer[len(frame_buffer) + i] for i in indices]
+                        clip = torch.cat(
+                            [preprocess(f, 384) for f in frames], dim=0
+                        ).to(device)
+                        with torch.inference_mode():
+                            tokens = vision_backbone(clip.unsqueeze(0), pooling=vision_pooling)
+                            readout, vision_in = _servo_vision(
+                                model, tokens, task_caches[task_index],
+                                dense_coords_arr, prev_mu=servo_runtime.prev_mu,
+                            )
+                            # servo 语言条件：role queries 均值（与 train.py
+                            # servo_correction_t0 同一构造）。
+                            servo_lang_cond = (
+                                task_caches[task_index].role_queries.mean(dim=1)
+                            )
+                            if args.fovea:
+                                # ROI 在渲染像素空间（480×480）；同一仿射应用于
+                                # 整个 4 帧窗口（§三.1/§三.2）。
+                                render_size = frame_buffer[-1].shape[0]
+                                if render_size % 16:
+                                    raise ValueError(
+                                        f"--fovea 需要渲染尺寸能被 16 整除，"
+                                        f"got {render_size}"
+                                    )
+                                roi = compute_roi(
+                                    *select_roi_pair(
+                                        readout.mu, readout.cov, readout.vis
+                                    ),
+                                    image_size=render_size,
+                                ).detach().cpu().float()
+                            cond, memory = model.encode_condition(
+                                vision_in,
+                                proprio[0],
+                                previous[0],
+                                language_cache=task_caches[task_index],
+                                visual_memory=memory,
+                                return_visual_memory=True,
+                            )
+                            # 训练侧 flow_semantic 时槽输出（vision_in）作为
+                            # flow head 逐层 cross-attn 语义上下文（同常规路径）。
+                            semantic_ctx = (
+                                vision_in
+                                if (
+                                    getattr(config, "flow_semantic", False)
+                                    and not config.direct_head
+                                )
+                                else None
+                            )
+                            chunk = model.decode_actions(
+                                cond, steps=flow_steps, semantic_context=semantic_ctx
+                            )[0].cpu().numpy()
+                        plan_step = step
+                        c2_token = 0
+                    if correction_due and c2_token < ACTION_HORIZON and chunk is not None:
+                        with torch.inference_mode():
+                            if step != plan_step:
+                                if args.fovea:
+                                    # foveal 局部更新：ROI crop → 编码 → 局部
+                                    # 关系状态（40Hz，§三.3）。审查 P0-4：默认
+                                    # 完整 V-JEPA（H11）编码 crop（与 reader
+                                    # 训练特征层一致）；P0-3：prev_mu 先
+                                    # full→crop 变换再进 reader，reader 输出
+                                    # mu/cov 逆变换回全图再送 servo（crop 归一化
+                                    # 坐标 ≠ 全图坐标）。
+                                    render_size = frame_buffer[-1].shape[0]
+                                    tokens = _foveal_tokens(
+                                        frames, roi, device,
+                                        vision_backbone=vision_backbone,
+                                        fovea_encoder=fovea_encoder,
+                                    )
+                                    prev_crop = (
+                                        full_to_crop_norm(
+                                            servo_runtime.prev_mu, roi, render_size
+                                        )
+                                        if servo_runtime.prev_mu is not None
+                                        else None
+                                    )
+                                    readout, _ = _servo_vision(
+                                        model, tokens, task_caches[task_index],
+                                        dense_coords_arr, prev_mu=prev_crop,
+                                    )
+                                    readout = MultiModeReadout(
+                                        readout.slots,
+                                        crop_to_full_norm(
+                                            readout.mu, roi, render_size
+                                        ),
+                                        crop_to_full_cov(
+                                            readout.cov, roi, render_size
+                                        ),
+                                        readout.vis,
+                                        readout.weights,
+                                    )
+                                else:
+                                    feedback_clip = torch.cat(
+                                        [preprocess(f, 384) for f in frames], dim=0
+                                    ).to(device)
+                                    tokens = vision_backbone(
+                                        feedback_clip.unsqueeze(0), pooling=vision_pooling
+                                    )
+                                    readout, _ = _servo_vision(
+                                        model, tokens, task_caches[task_index],
+                                        dense_coords_arr,
+                                        prev_mu=servo_runtime.prev_mu,
+                                    )
+                            state_norm = state_take_normalize(
+                                obs, args.state_take, sq01, scale_s
+                            )
+                            correction, innovation_flag = servo_runtime.correct(
+                                readout,
+                                state_norm[:4],
+                                servo_lang_cond,
+                                a_prev=None if servo_first else last_norm,
+                            )
+                            nominal = chunk[c2_token]
+                            if correction is None:
+                                norm_action = nominal
+                            else:
+                                norm_action = np.clip(
+                                    nominal + correction, -1.0, 1.0
+                                )
+                        servo_first = False
+                        c2_token += 1
+                    else:
                         norm_action = last_norm
                 elif step % args.execute_steps == 0 and len(frame_buffer) >= VISION_WINDOW:
                     if (
@@ -926,9 +1860,7 @@ def main() -> None:
                                 else None
                             ),
                         )
-                    state = np.clip(
-                        2.0 * (obs[:4] - sq01) / scale_s - 1.0, -1.0, 1.0
-                    ).astype(np.float32)
+                    state = state_take_normalize(obs, args.state_take, sq01, scale_s)
                     proprio = torch.tensor(state, device=device)[None, None]
                     previous = torch.tensor(
                         np.zeros(4, dtype=np.float32) if args.prev_zero else last_norm,
@@ -946,7 +1878,20 @@ def main() -> None:
                             visual_memory=memory,
                             return_visual_memory=True,
                         )
-                        chunk = model.decode_actions(cond, steps=32)[0].cpu().numpy()
+                        # 训练侧 flow_semantic 时槽输出（vision_in）作为 flow
+                        # head 逐层 cross-attn 语义上下文；闭环必须传同一路径，
+                        # 否则语义通道静默回退为 action_condition（数字失真）。
+                        semantic_ctx = (
+                            vision_in
+                            if (
+                                getattr(config, "flow_semantic", False)
+                                and not config.direct_head
+                            )
+                            else None
+                        )
+                        chunk = model.decode_actions(
+                            cond, steps=flow_steps, semantic_context=semantic_ctx
+                        )[0].cpu().numpy()
                         chunk_start_step = step
                         if args.debug_first_action and not _DEBUG_FA_DONE.get("x"):
                             _DEBUG_FA_DONE["x"] = True
@@ -962,10 +1907,16 @@ def main() -> None:
                                         round(float(np.abs(chunk[0] - ref).mean()), 4),
                                     )
                 # 模型输出为归一化动作：与训练标签一致裁剪到 [-1,1]（robust_normalize
-                # 存盘即 clip），再反归一化到环境原始动作空间；prev 反馈同样用裁剪值
-                norm_action = np.clip(
-                    chunk[(step - chunk_start_step) % ACTION_HORIZON], -1.0, 1.0
-                ) if not config.c2_controller else norm_action
+                # 存盘即 clip），再反归一化到环境原始动作空间；prev 反馈同样用裁剪值。
+                # servo 部署的 norm_action 由伺服分支给出（clip(ā + correction)），
+                # 不能再用 chunk 覆盖。
+                norm_action = (
+                    np.clip(
+                        chunk[(step - chunk_start_step) % ACTION_HORIZON], -1.0, 1.0
+                    )
+                    if (not config.c2_controller and servo_runtime is None)
+                    else norm_action
+                )
                 action = norm_action * (aq99 - aq01) / 2 + (aq99 + aq01) / 2
                 obs, reward, terminated, truncated, info = env.step(action)
                 last_norm = norm_action

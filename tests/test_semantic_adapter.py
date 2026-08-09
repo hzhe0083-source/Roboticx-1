@@ -781,6 +781,42 @@ class TrainArgSemanticTests(unittest.TestCase):
         self.assertEqual(len(dataset), 2)
         self.assertEqual(dataset[0]["instruction"], "pick red cup")
 
+    def test_e2e_dataset_trivial_pair_id_is_single_task(self):
+        # Legacy libero_video/v2 payloads carry a trivial pair_id (one row
+        # per group): must construct and behave as unpaired (single-task),
+        # not raise in build_pair_groups.
+        payload = {
+            "video_frames": torch.randint(0, 256, (4, 4, 2, 3, 8, 8), dtype=torch.uint8),
+            "instructions": ["a", "b", "c", "d"],
+            "proprio": torch.randn(4, 4, 5),
+            "previous_action": torch.randn(4, 4, 4),
+            "actions": torch.randn(4, 4, 3, 4),
+            "pair_id": torch.arange(4, dtype=torch.long),
+            "instruction_id": torch.tensor([0, 0, 1, 1], dtype=torch.long),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "e2e.pt"
+            torch.save(payload, path)
+            dataset = E2EDataset(path, min_sequence_length=4)
+        self.assertEqual(dataset.pair_groups, {})
+
+    def test_e2e_dataset_real_pairs_still_validated(self):
+        payload = {
+            "video_frames": torch.randint(0, 256, (2, 4, 2, 3, 8, 8), dtype=torch.uint8),
+            "instructions": ["a", "b"],
+            "proprio": torch.randn(2, 4, 5),
+            "previous_action": torch.randn(2, 4, 4),
+            "actions": torch.randn(2, 4, 3, 4),
+            "pair_id": torch.zeros(2, dtype=torch.long),
+            "instruction_id": torch.tensor([0, 1], dtype=torch.long),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "e2e.pt"
+            torch.save(payload, path)
+            dataset = E2EDataset(path, min_sequence_length=4)
+        self.assertEqual(len(dataset.pair_groups), 1)
+        self.assertEqual(list(dataset.pair_groups[0].keys()), [0, 1])
+
 
 if __name__ == "__main__":
     unittest.main()

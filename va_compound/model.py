@@ -95,12 +95,23 @@ class VACompoundConfig:
     # 训练损失不变（仅 action loss）；C² 控制图在 Stage B 另行拟合。
     local_slots: bool = False
     local_slot_k: int = 6
-    local_slot_tokens: int = 288  # 每决策 dense token 数（2×12×12）
+    local_slot_tokens: int = 288  # 每决策 dense token 数（2×12×12；dense_readout 时为 1152）
     local_coarse: int = 16        # 粗上下文 token 数
     # 消融格：direct288 = 288 token 直送 VA（无槽）；fixed_query = 槽只用固定
     # 角色种子（无语言交叉注意）——与 language-slot 对照验证"语言定义"增益。
     local_slots_direct288: bool = False
     local_slots_fixed_query: bool = False
+    # Step 0（2026-08-09，C²-IRF v2 设计 §七）：dense readout——跳过 V-JEPA 池化，
+    # 角色查询直接读出 1152 个 patch token（2×24×24），coarse 仍从 1152 avg-pool
+    # 到 16。1152 只作槽 cross-attention 的 K/V（Q=6），不进 VA 自注意力（§九）。
+    dense_readout: bool = False
+    # Step 1（2026-08-09，C²-IRF v2 设计 §七 Step 1）：多模式读出——每角色
+    # heatmap（2 时间片 × grid²）局部 NMS 取 top-2 峰 + 5×5 局部 soft-argmax
+    # （跨 patch 亚像素 μ/Σ/z）+ learned NULL 键值（遮挡时查询选 NULL，
+    # vis=1−P(∅)）+ 寻址偏置 b_coord / b_track（γ=0.01）。视觉流变为
+    # 16 coarse + 12 modes + 3 relations = 31 tokens；vis 经零初始化投影注入。
+    # 与 --dense-readout 兼容（1152 网格）；288 网格同样可用（消融）。
+    multi_mode: bool = False
 
     def __post_init__(self) -> None:
         if self.hidden_dim % self.num_heads:
@@ -121,6 +132,24 @@ class VACompoundConfig:
             raise ValueError("c2_control_dim must be positive")
         if self.role_query_tokens < 1:
             raise ValueError("role_query_tokens must be positive")
+        if self.dense_readout and not self.local_slots:
+            raise ValueError("dense_readout requires local_slots (角色查询读出路径)")
+        if self.dense_readout and self.local_slots_direct288:
+            raise ValueError(
+                "dense_readout 与 local_slots_direct288 互斥：1152 token 直送 VA "
+                "会在 VA 内做 1152×1152 自注意力（设计文档 §九 明确禁止）"
+            )
+        if self.dense_readout and self.local_slot_tokens != 1152:
+            raise ValueError(
+                f"dense_readout 需要 local_slot_tokens=1152（2×24×24 patch），"
+                f"got {self.local_slot_tokens}"
+            )
+        if self.multi_mode and not self.local_slots:
+            raise ValueError("multi_mode requires local_slots (角色查询读出路径)")
+        if self.multi_mode and self.local_slots_direct288:
+            raise ValueError(
+                "multi_mode 与 local_slots_direct288 互斥：direct288 无角色读出路径"
+            )
 
 
 @dataclass(frozen=True)
@@ -1471,14 +1500,26 @@ class VACompoundPolicy(nn.Module):
                 hidden_dim=config.hidden_dim,
                 num_slots=config.local_slot_k,
                 num_heads=config.num_heads,
+                multi_mode=config.multi_mode,
             )
             self.relation_tokens = RelationTokens(vision_dim=config.vision_dim)
             self.coarse_pool = nn.AdaptiveAvgPool1d(config.local_coarse)
+            # Step 1：模式可见度条件向量（vis [B, K] → vision 空间广播加到
+            # 31-token 视觉流；零初始化 → 初始静默，不破坏 dense_readout 行为）。
+            self.vis_conditioner = (
+                nn.Linear(config.local_slot_k, config.vision_dim)
+                if config.multi_mode
+                else None
+            )
+            if self.vis_conditioner is not None:
+                nn.init.zeros_(self.vis_conditioner.weight)
+                nn.init.zeros_(self.vis_conditioner.bias)
         else:
             self.role_compiler = None
             self.slot_reader = None
             self.relation_tokens = None
             self.coarse_pool = None
+            self.vis_conditioner = None
 
         if config.action_query_cond:
             # 语言摘要（cache 第 0 层投影 key 的 mask 加权均值）→ 每 horizon 步 query 偏移。
@@ -1655,11 +1696,22 @@ class VACompoundPolicy(nn.Module):
 
     def build_local_vision(
         self,
-        dense_tokens: Tensor,   # [B, N, vision_dim] spatiotemporal 288 tokens
+        dense_tokens: Tensor,   # [B, N, vision_dim] spatiotemporal tokens（288 或 dense 1152）
         coords: Tensor,         # [N, 3] normalized t/y/x
         role_queries: Tensor,   # [B, K, hidden]
     ) -> Tensor:
         """PULSE-VA Stage A readout: 16 coarse + K slots + 3 relations -> 25 tokens.
+
+        对任意 ``N`` 生效：coarse 经 ``coarse_pool`` 自适应池化到 16；槽由
+        cross-attention（Q=K 个角色查询 × N 个 dense keys）读出，N=1152
+        （Step 0 ``dense_readout``）时该注意力仍在 K/V 侧、不进 VA 自注意力
+        （设计文档 §九），VA 视觉流恒为 25 tokens。
+
+        ``multi_mode``（Step 1）时读出的 2 模式/角色槽展平为 [B, K*2, D]，
+        视觉流变为 16 coarse + 12 modes + 3 relations = 31 tokens；模式可见度
+        vis 经 ``vis_conditioner`` 零初始化投影广播注入。关系 token 用每角色
+        最强模式（mode 0，峰评分最高）——多模式配对假设（§二.4）留给 Step 2
+        伺服；跟踪先验 prev_mu 由 reader 接收，闭环逐决策传递留待 Step 2/3。
 
         Ablation cell: ``local_slots_direct288`` returns the 288 dense tokens
         unchanged (no slots) to isolate the pooling-resolution gain.
@@ -1668,15 +1720,31 @@ class VACompoundPolicy(nn.Module):
             return dense_tokens.to(dtype=self.vision_projection.weight.dtype)
         if self.slot_reader is None or self.relation_tokens is None or self.coarse_pool is None:
             raise ValueError("local_slots modules not built (config.local_slots=False)")
+        if coords.ndim != 2 or coords.shape[0] != dense_tokens.shape[1]:
+            raise ValueError(
+                f"coords 必须为 [N, 3] 且 N == dense token 数（{dense_tokens.shape[1]}），"
+                f"got {tuple(coords.shape)}（288 槽坐标与 1152 dense 读出不可混用）"
+            )
         target_dtype = self.vision_projection.weight.dtype
-        dense = dense_tokens.to(dtype=target_dtype)
-        coarse = self.coarse_pool(dense.transpose(1, 2)).transpose(1, 2)  # [B, C, D]
-        slots, _, centers = self.slot_reader(
-            dense, role_queries.to(dtype=target_dtype), coords
-        )
-        relations = self.relation_tokens(slots, centers)
         from va_compound.local_control_slots import build_va_vision_input
 
+        dense = dense_tokens.to(dtype=target_dtype)
+        coarse = self.coarse_pool(dense.transpose(1, 2)).transpose(1, 2)  # [B, C, D]
+        role_queries = role_queries.to(dtype=target_dtype)
+        if self.config.multi_mode:
+            readout = self.slot_reader(dense, role_queries, coords)  # MultiModeReadout
+            slots_flat = readout.slots.reshape(
+                dense.shape[0], -1, self.config.vision_dim
+            )  # [B, K*2, D]（角色 → 模式 k 主序展平）
+            relations = self.relation_tokens(
+                readout.slots[:, :, 0], readout.mu[:, :, 0]
+            )  # 最强峰模式
+            stream = build_va_vision_input(coarse, slots_flat, relations)  # [B, 31, D]
+            # vis 作为附加条件向量注入：零初始化投影（初始静默）广播加到视觉流。
+            vis_cond = self.vis_conditioner(readout.vis.to(dtype=target_dtype))
+            return stream + vis_cond[:, None, :]
+        slots, _, centers = self.slot_reader(dense, role_queries, coords)
+        relations = self.relation_tokens(slots, centers)
         return build_va_vision_input(coarse, slots, relations)  # [B, 25, D]
 
     def encode_condition(

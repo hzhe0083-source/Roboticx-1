@@ -1,10 +1,14 @@
 #!/usr/bin/env python
-"""Stage B：用微调后的 V-JEPA（checkpoint 里的 vjepa_state_dict）重提取 ST288 特征。
+"""Stage B：用微调后的 V-JEPA（checkpoint 里的 vjepa_state_dict）重提取特征。
 
 动机：Stage B 训练是 live 在线编码（V-JEPA 全量解冻），评估时若用预计算
 v5 特征（原始冻结 V-JEPA）会与微调权重不匹配；开环/语言消融必须用同一
 backbone 重新编码。输出格式与 Stage A 的 mw_local288 一致（raw fp16 memmap
 + meta.pt），供 eval_mw_lang_ablation.py --local-slots-data 直接消费。
+
+默认产出 ST288（2×12×12=288 池化槽，既有行为逐位不变）；``--dense``（Step 0
+dense readout，C²-IRF v2 设计 §七）产出 2×24×24=1152 全量 patch 特征（不池化），
+供 --dense-readout checkpoint 的评估/消融使用（coords 为 [1152,3] 网格）。
 
 用法：
   python scripts/extract_st288_finetuned.py \
@@ -13,6 +17,13 @@ backbone 重新编码。输出格式与 Stage A 的 mw_local288 一致（raw fp1
       --output /media/ryan/robot-data/stageB_st288.npy \
       --meta /media/ryan/robot-data/stageB_st288_meta.pt \
       [--max-samples N]
+  # Step 0 dense readout（1152 patch 不池化）：
+  python scripts/extract_st288_finetuned.py \
+      --checkpoint checkpoints/stageB_langslot_40k.pt \
+      --data data/metaworld_features_v5.pt \
+      --output /media/ryan/robot-data/stageB_dense1152.npy \
+      --meta /media/ryan/robot-data/stageB_dense1152_meta.pt \
+      --dense [--max-samples N]
 """
 from __future__ import annotations
 
@@ -37,6 +48,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--meta", type=Path, required=True, help="meta.pt（vision_tokens_st_npy 路径）")
     p.add_argument("--max-samples", type=int, default=0, help="0 = 全部（debug 用）")
     p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument(
+        "--dense",
+        action="store_true",
+        help="Step 0 dense readout：输出 2×24×24=1152 全量 patch 特征（不池化），"
+        "coords [1152,3]；供 --dense-readout checkpoint 评估（默认 288 池化槽，既有行为不变）",
+    )
     p.add_argument("--device", default="cuda")
     return p.parse_args()
 
@@ -48,6 +65,7 @@ def main() -> None:
     from prepare_pnpw_features import VJEPA21Backbone
     from va_compound.live_vjepa import (
         LiveVJEPADataset,
+        _dense_coords,
         _slot_coords,
         encode_live_frames,
     )
@@ -73,10 +91,12 @@ def main() -> None:
     n = n_total if args.max_samples <= 0 else min(args.max_samples, n_total)
     D = 768
     seq = 4
-    tok = 288
+    tok = 1152 if args.dense else 288
+    pooling = "dense" if args.dense else "spatiotemporal"
+    coords = _dense_coords() if args.dense else _slot_coords()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     mm = np.memmap(args.output, dtype=np.float16, mode="w+", shape=(n, seq, tok, D))
-    coords = _slot_coords()
+    print(f"extracting {n} samples: tok={tok} pooling={pooling} (dense={args.dense})")
 
     batch_frames = []
     batch_indices = []
@@ -89,7 +109,9 @@ def main() -> None:
             with torch.inference_mode(), torch.autocast(
                 device_type="cuda", dtype=torch.bfloat16, enabled=True
             ):
-                encoded = encode_live_frames(frames, vision_backbone, device)
+                encoded = encode_live_frames(
+                    frames, vision_backbone, device, dense=args.dense
+                )
             encoded = encoded.float().cpu().half().numpy()
             for local, global_idx in enumerate(batch_indices):
                 mm[global_idx] = encoded[local]
@@ -106,8 +128,8 @@ def main() -> None:
         "rows": n,
         "tokens_per_decision": tok,
         "grid": [24, 24],
-        "slot_grid": 12,
-        "pooling": "spatiotemporal",
+        "slot_grid": 12 if not args.dense else None,
+        "pooling": pooling,
     }
     torch.save(
         {

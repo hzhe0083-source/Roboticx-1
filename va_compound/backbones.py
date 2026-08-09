@@ -10,7 +10,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 
-PoolingMode = str  # "flat" | "spatial" | "spatiotemporal"
+PoolingMode = str  # "flat" | "spatial" | "spatiotemporal" | "dense"
 
 
 class LoRALinear(nn.Module):
@@ -830,7 +830,12 @@ class VJEPA21Backbone(nn.Module):
     - "flat": adaptive 1D pooling over the flattened sequence (legacy A);
     - "spatial": time-mean then 2D grid pooling, one output token per
       spatial neighbourhood (B);
-    - "spatiotemporal": 2D grid pooling per frame, keeping the time axis (C).
+    - "spatiotemporal": 2D grid pooling per frame, keeping the time axis (C);
+    - "dense": no pooling — the full [t, h, w] grid is flattened in order
+      (Step 0 dense readout, 2×24×24 = 1152 tokens; reader-side only).
+
+    ``encode_multi``（Step 4）一次前向返回多个中间层输出（官方原生
+    ``out_layers`` 支持，H⁵/H¹¹），缺省路径不受影响。
     """
 
     def __init__(
@@ -948,19 +953,76 @@ class VJEPA21Backbone(nn.Module):
             param.requires_grad_(True)
         self.model.train()
 
-    def _encode(self, pixel_values_videos: Tensor) -> Tensor:
+    def _prepare_video(self, pixel_values_videos: Tensor) -> Tensor:
+        """校验 + 重排 + 移设备/精度：官方输入契约 [B, C, T, H, W]（C=3）。"""
         if pixel_values_videos.ndim != 5 or pixel_values_videos.shape[2] != 3:
             raise ValueError("video must have shape [batch, frames, 3, height, width]")
         if pixel_values_videos.shape[1] < 2 or pixel_values_videos.shape[1] % 2:
             raise ValueError("V-JEPA 2.1 needs a positive even number of frames")
         parameter = next(self.model.parameters())
-        video = pixel_values_videos.permute(0, 2, 1, 3, 4).to(
+        return pixel_values_videos.permute(0, 2, 1, 3, 4).to(
             device=parameter.device,
             dtype=parameter.dtype,
         )
-        return self.model(video)
+
+    def _encode(self, pixel_values_videos: Tensor) -> Tensor:
+        return self.model(self._prepare_video(pixel_values_videos))
+
+    def encode_multi(
+        self,
+        pixel_values_videos: Tensor,
+        out_layers: Sequence[int] = (5, 11),
+    ) -> list[Tensor]:
+        """Step 4：一次前向返回多个中间层输出（官方原生 ``out_layers`` 支持）。
+
+        官方 V-JEPA 2.1 forward 在 ``out_layers`` 里的 block 之后收集
+        ``self.norm(x)`` 并返回列表（此时不再走末尾 norm）；第 6/12 个 block
+        后即 (H⁵, H¹¹)（12-block ViT-B）。官方实现按 block 升序收集，此处对
+        非升序的 ``out_layers`` 重排输出，保持"返回值顺序与 out_layers 一致"
+        的契约；无序集合（set）规范为升序。
+
+        调用期间临时改写 ``self.model.out_layers``，finally 恢复原值——缺省
+        路径（``forward`` / ``_encode``）行为逐字节不变。V-JEPA 权重保持冻结
+        （``freeze_all``），多层输出只作只读 evidence（设计文档 §九：不进 VA
+        自注意力）。
+        """
+        if isinstance(out_layers, (set, frozenset)):
+            layers = sorted(out_layers)  # 无序集合：规范为升序
+        else:
+            layers = tuple(out_layers)
+        if not layers:
+            raise ValueError("out_layers must be a non-empty sequence of block indices")
+        for layer in layers:
+            if not isinstance(layer, int) or isinstance(layer, bool):
+                raise ValueError(f"out_layers entries must be ints, got {layer!r}")
+        if len(set(layers)) != len(layers):
+            raise ValueError(f"out_layers must not contain duplicates, got {layers}")
+        num_blocks = len(self.model.blocks)
+        if any(layer < 0 or layer >= num_blocks for layer in layers):
+            raise ValueError(
+                f"layer indices must be in [0, {num_blocks - 1}], got {layers}"
+            )
+        ascending = sorted(layers)
+        saved = self.model.out_layers
+        self.model.out_layers = ascending
+        try:
+            outs = self.model(self._prepare_video(pixel_values_videos))
+        finally:
+            self.model.out_layers = saved
+        if not isinstance(outs, list) or len(outs) != len(layers):
+            raise RuntimeError(
+                f"official forward with out_layers should return a list of "
+                f"{len(layers)} tensors, got {type(outs).__name__}"
+            )
+        # 官方按 block 升序收集 → 重排到调用方给定顺序（默认 (5, 11) 即原序）。
+        position = {layer: index for index, layer in enumerate(ascending)}
+        return [outs[position[layer]] for layer in layers]
 
     def _pool(self, tokens: Tensor, pooling: PoolingMode) -> Tensor:
+        if pooling == "dense":
+            # Step 0 dense readout：不池化，按 [t, h, w] 顺序扁平（2×24×24=1152），
+            # 与 _dense_coords() 的坐标顺序一致；仅供角色查询 cross-attn 读出。
+            return tokens.reshape(tokens.shape[0], -1, tokens.shape[-1])
         if pooling == "flat":
             return pool_flat_tokens(tokens, self.max_tokens)
         if pooling == "spatial":
