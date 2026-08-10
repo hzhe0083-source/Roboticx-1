@@ -114,21 +114,24 @@ SmoothL1 于 GT patch）`--grad-accum` `--fixed-data`（tiny 集模式：特征�
 
 ## 7. 后续路线（按序）
 
-1. **tiny gate v4 过门后**：同一配方开仿真流全量训练（三任务 × 三文本），判据 test RMSE < 10px
-   （保 5mm≈4px 需 offset 监督 + 后续 MicroRefiner）
+1. **仿真流全量训练**（v4 配方已过 tiny 门）：三任务 × 三文本，先 2-5k 步短跑，判据随机数据
+   test RMSE < 10px（保 5mm≈4px 需 offset 监督 + 后续 MicroRefiner）
 2. **语言条件化验证**（当前实验无法证明语言）：同图换指令 / text shuffle 配对测试；若失败，
    q_r 改 role token 对 Qwen token 序列 cross-attention（弃用均值池化）
-3. **DINOv2 同头正对照**（Claude 要求，1 天）：回答"特征预测式 SSL vs 判别式 SSL 的 dense 几何
-   线性可读性"，是潜在最有含金量的可写发现
-4. **阶段 A 重接**：metric checkpoint 修复后重训 dense readout 策略（注意 `train.py` 的
+3. **阶段 A 重接**：metric checkpoint 修复后重训 dense readout 策略（注意 `train.py` 的
    `_load_mtvj_metric_checkpoint` 按 ctor 签名过滤 config，新字段已记录）
-5. **多峰/NULL**：c2irf §3 的 top-2 峰 + NULL 可见度模式（遮挡鲁棒）
+4. **多峰/NULL**：c2irf §3 的 top-2 峰 + NULL 可见度模式（遮挡鲁棒）
 
-## 8. 关线决策树（评审一致）
+**不做 DINOv2 正对照**（用户决策，2026-08-10）：该对照原用于区分"V-JEPA 特征不可读"vs
+"读出/目标问题"；模板探针（8-13px）与 hinge 探针（8.5px）已直接证明 V-JEPA dense 特征
+线性可读，对照的目的已经达成，不再需要。若后续三任务泛化失败，按 §8 处理（先查数据/实现，
+再换读出架构），不回溯到骨干选择。
+
+## 8. 关线决策树（评审一致，已按"不做 DINOv2"调整）
 
 - hinge+模式读出仍 <15px 门失败 → 查实现 bug（连过拟合都不行 = 必有 bug）
-- 单任务定位过、三任务泛化失败 → 数据覆盖/特征稳定性，数据×算法交叉
-- V-JEPA 探针失败但 DINOv2 对照成功 → 换/混合骨干，且"SSL 类型 × dense 线性可读性"本身是可写发现
+- 单任务定位过、三任务泛化失败 → 先查数据覆盖/特征稳定性（数据×算法交叉）；仍失败 → 换读出
+  架构（role slots cross-attention / 小解码器），再失败才考虑骨干
 - 两者都失败 → 回去查标签/时序对齐/相机增广，不写表征负结果
 - 定位成功但 text shuffle 无影响 → 语言主张不成立，换指令歧义配对任务
 
