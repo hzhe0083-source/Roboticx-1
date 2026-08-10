@@ -93,7 +93,19 @@ def collect_episode(env, policy, task_name: str, rng: np.random.Generator,
     """跑一条长轨迹：完整任务 + 成功 hold + （可选）接触扰动恢复。
 
     返回 dict（帧/动作/状态均为原始值，后续统一归一化）或 None（失败）。
+
+    2026-08-10 保护：单条轨迹异常兜底——env 抖动/渲染失败不应炸掉整个
+    任务进程（此前 20 实例并发时多次全灭，疑似 OOM/异常无兜底）。
     """
+    try:
+        return _collect_episode_inner(env, policy, task_name, rng, perturb)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [collect_episode] 异常跳过本条: {type(exc).__name__}: {exc}")
+        return None
+
+
+def _collect_episode_inner(env, policy, task_name: str, rng: np.random.Generator,
+                           perturb: bool = True) -> dict | None:
     obs, _ = env.reset(seed=int(rng.integers(0, 2**31)))
     frames: list[np.ndarray] = []
     actions: list[np.ndarray] = []
@@ -236,7 +248,11 @@ def main() -> None:
         },
     }
     out_path = OUT_DIR / f"metaworld_longtraj_{args.task}.pt"
-    torch.save(out, out_path)
+    # 原子写入（2026-08-10 保护）：先写临时文件再 rename——进程被 kill 时
+    # 不会留下半截文件（旧实现直接 torch.save，被杀会损坏并被 skip 跳过）。
+    tmp_path = out_path.with_suffix(".pt.tmp")
+    torch.save(out, tmp_path)
+    tmp_path.replace(out_path)
     lens = [len(e["frames"]) for e in episodes]
     print(f"[out] {out_path}: {len(episodes)} eps, len mean={np.mean(lens):.0f} "
           f"min={min(lens)} max={max(lens)}")

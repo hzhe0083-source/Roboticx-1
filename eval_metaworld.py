@@ -90,6 +90,109 @@ def _apply_local_vision(model, tokens, language_cache):
     )
     return model.build_local_vision(tokens, coords, role_queries)
 
+
+def _load_mtvj_metric_checkpoint(path: Path, device, config) -> tuple[nn.Module, nn.Module]:
+    """MT-VJ（契约 §2/§7）：加载并冻结 LanguageMetricField + RelationStateEncoder。
+
+    与 train.py ``_load_mtvj_metric_checkpoint`` 同构：checkpoint 契约
+    ``{"config": {...}, "metric_head": state_dict, "relation_encoder": state_dict,
+    "contract": "mt_vj_metric_field_v1"}``；ctor 参数按 checkpoint config 签名
+    过滤注入（缺省用契约默认值）；两模块置 eval + requires_grad_(False)（冻结，
+    闭环 no_grad 只读）；启动即校验 relation encoder d_model == hidden_dim
+    （metric_tokens 加入每层 action cross-attention 需同维，fail-fast）。
+    """
+    import inspect
+
+    from va_compound.metric_visual_head import (
+        LanguageMetricField,
+        RelationStateEncoder,
+    )
+
+    ckpt = torch.load(path, map_location="cpu", weights_only=True)
+    for key in ("metric_head", "relation_encoder"):
+        if key not in ckpt:
+            raise ValueError(
+                f"--metric-visual-checkpoint {path} 缺少键 {key!r}（契约 §2）"
+            )
+    contract = ckpt.get("contract")
+    if contract is not None and contract != "mt_vj_metric_field_v1":
+        raise ValueError(
+            f"--metric-visual-checkpoint contract={contract!r} != "
+            f"'mt_vj_metric_field_v1'（阶段 V checkpoint 不匹配）"
+        )
+    ctor_config = ckpt.get("config") or {}
+
+    def ctor_kwargs(cls) -> dict:
+        return {
+            key: value
+            for key, value in ctor_config.items()
+            if key in inspect.signature(cls.__init__).parameters and key != "self"
+        }
+
+    metric_head = LanguageMetricField(**ctor_kwargs(LanguageMetricField)).to(device)
+    metric_head.load_state_dict(ckpt["metric_head"])
+    relation_encoder = RelationStateEncoder(
+        **ctor_kwargs(RelationStateEncoder)
+    ).to(device)
+    relation_encoder.load_state_dict(ckpt["relation_encoder"])
+    for module in (metric_head, relation_encoder):
+        module.eval()
+        for parameter in module.parameters():
+            parameter.requires_grad_(False)
+    state_dim = int(ctor_config.get("state_dim", 4)) if isinstance(ctor_config, dict) else 4
+    with torch.no_grad():
+        probe_g, _ = relation_encoder(
+            torch.zeros(1, state_dim, device=device),
+            torch.zeros(1, state_dim, device=device),
+        )
+    if probe_g.shape[-1] != config.hidden_dim:
+        raise ValueError(
+            f"relation encoder d_model={probe_g.shape[-1]} != "
+            f"VACompoundConfig.hidden_dim={config.hidden_dim}"
+            "（metric_tokens 加入每层 action cross-attention 需同维）"
+        )
+    print(
+        "eval: 冻结 metric head "
+        f"（params={sum(p.numel() for p in metric_head.parameters()):,}）"
+        "+ relation encoder "
+        f"（params={sum(p.numel() for p in relation_encoder.parameters()):,}）"
+        f" from {path}"
+    )
+    return metric_head, relation_encoder
+
+
+def _mtvj_metric_tokens(
+    metric_head,
+    relation_encoder,
+    dense_evidence: dict[int, torch.Tensor],
+    language_hidden: torch.Tensor,
+    language_mask: torch.Tensor,
+    coords: torch.Tensor,
+    g_prev: torch.Tensor | None,
+    device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """单决策 metric_tokens（与 train.py ``_mtvj_online_encode`` 的 metric 分支同构）。
+
+    - g_t = metric head 回归的 relation [4]（阶段 V 监督自模拟器 eef/object/
+      target 世界坐标：eef 来自仿真环境状态；闭环中 head 直接从视觉 evidence
+      回归同一量，无需额外 proprio 输入——与训练逐位同构）；
+    - ν_t = g_t − g_{t−1}（首决策 ν≡0，与训练 T 序列首决策一致）；
+    - z_g, z_nu = RelationStateEncoder(g, ν) → metric_tokens [B=1, 2, d_model]。
+    """
+    head_dtype = next(metric_head.parameters()).dtype
+    out = metric_head(
+        dense_evidence[5].to(dtype=head_dtype),
+        dense_evidence[11].to(dtype=head_dtype),
+        language_hidden.to(device=device, dtype=head_dtype),
+        language_mask.to(device=device),
+        coords.to(device=device, dtype=head_dtype),
+    )
+    g = out.relation.detach()[0]  # [4]（head 回归的 g_t）
+    nu = torch.zeros_like(g) if g_prev is None else g - g_prev
+    z_g, z_nu = relation_encoder(g[None], nu[None])
+    metric_tokens = torch.stack((z_g, z_nu), dim=1)  # [1, 2, d_model]
+    return metric_tokens, g.detach()
+
 VISION_WINDOW = 4
 DECISION_STRIDE = 6  # 80 FPS, decide every 6 frames (13.3 Hz), matches training
 ACTION_HORIZON = 8
@@ -107,6 +210,25 @@ def parse_args() -> argparse.Namespace:
         help="在线 V-JEPA 池化（覆盖 training_contract；Stage A/B 288-token "
         "checkpoint 必须为 spatiotemporal，Step 0 dense_readout checkpoint "
         "必须为 dense（1152 patch 不池化），否则闭环数字失真）",
+    )
+    parser.add_argument(
+        "--dense-readout-mtvj",
+        action="store_true",
+        help="MT-VJ 在线 dense 解码路径（契约 §7，与训练 §6 同构）：每决策点同一 "
+        "4 帧历史窗 [d-6, d-4, d-2, d] → 冻结 V-JEPA forward_hierarchical_dense "
+        "→ dense_evidence 注入 encode_condition（config.dense_readout_mtvj 强制 "
+        "True；ckpt 无 dense 权重时零初始化初始等价）。v1 仅支持普通 flow/direct "
+        "部署（与 c2/servo 互斥）",
+    )
+    parser.add_argument(
+        "--metric-visual-checkpoint",
+        type=Path,
+        default=None,
+        help="MT-VJ metric 视觉预训练 checkpoint（契约 §2：config/metric_head/"
+        "relation_encoder/contract='mt_vj_metric_field_v1'）。提供时每决策点经 "
+        "LanguageMetricField（g_t = head 回归 relation）+ RelationStateEncoder "
+        "（ν_t = g_t − g_{t−1}）生成 metric_tokens 注入模型；缺省 None（回退 "
+        "metric_tokens=None，与训练无 metric head 分支一致）",
     )
     parser.add_argument("--trials-per-task", type=int, default=10)
     parser.add_argument("--max-tasks", type=int, default=49)
@@ -1180,9 +1302,13 @@ def main() -> None:
     # 2026-08-09：ACTION_HORIZON 从 checkpoint config 读（E7 H=48），不再硬编码 8。
     global ACTION_HORIZON
     ACTION_HORIZON = int(getattr(config, "action_horizon", 8))
-    # Codex P1-5：flow Euler 步数从 checkpoint contract 读（训练 --flow-steps），
-    # 不再硬编码 32（训练 8 步 / 评估 32 步 = 协议错配）。
-    flow_steps = int(ckpt.get("flow_steps", 8))
+    # Codex P0-4（2026-08-10）：flow Euler 步数从 training_contract 读
+    # （train.py:2561 保存位置），不再硬编码 32 或误读顶层键。
+    flow_steps = int(
+        (ckpt.get("training_contract", {}) or {}).get("flow_steps")
+        or ckpt.get("flow_steps")
+        or 8
+    )
     print(f"eval: action_horizon={ACTION_HORIZON} (from checkpoint config), "
           f"flow_steps={flow_steps} (from checkpoint contract)")
     # spatial-pooling ckpt 评估：vision_pooling 存在 training_contract 而非 config。
@@ -1210,6 +1336,20 @@ def main() -> None:
             vision_pooling = "spatiotemporal"
     if args.direct_head != "auto":
         config = dataclasses.replace(config, direct_head=args.direct_head == "on")
+    # MT-VJ（契约 §5/§7）：--dense-readout-mtvj 强制打开 model 的 dense 层
+    # （与 train.py _mtvj_config_kwargs 同构）。ckpt 无 dense 权重时 W_o 零初始化
+    # → 初始输出逐位等价（下方非严格加载 + 警告）。
+    dense_forced = False
+    if args.dense_readout_mtvj:
+        if not getattr(config, "dense_readout_mtvj", False):
+            dense_forced = True
+            config = dataclasses.replace(config, dense_readout_mtvj=True)
+            print(
+                "eval: --dense-readout-mtvj 强制 config.dense_readout_mtvj=True"
+                "（零初始化 dense 层初始等价）"
+            )
+    if args.metric_visual_checkpoint is not None and not args.dense_readout_mtvj:
+        raise ValueError("--metric-visual-checkpoint 需要 --dense-readout-mtvj")
     # P0-3：semantic-compiler ckpt 同样按需逐决策重建语言缓存（场景条件化）。
     has_compile = ckpt.get("semantic_compiler") is not None
     has_plan = config.plan_resampler or config.scene_teacher or has_compile
@@ -1222,8 +1362,17 @@ def main() -> None:
         )
     model = VACompoundPolicy(config).eval().to(device)
     ckpt_direct_head = bool(ckpt["config"].get("direct_head", False))
-    if ckpt_direct_head == config.direct_head:
+    if ckpt_direct_head == config.direct_head and not dense_forced:
         model.load_state_dict(ckpt["model"])
+    elif dense_forced:
+        # --dense-readout-mtvj 强制：ckpt 训练时未开 dense 层 → dense 权重缺失，
+        # 非严格加载（W_o 零初始化 → 初始输出与无 dense 路径逐位一致）。
+        missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+        print(
+            f"eval: --dense-readout-mtvj 强制 dense 层（ckpt config "
+            f"dense_readout_mtvj={bool(ckpt['config'].get('dense_readout_mtvj', False))}）；"
+            f"非严格加载 missing={len(missing)} unexpected={len(unexpected)}"
+        )
     else:
         # --direct-head on/off 强制换解码器（消融）：另一头的 head 未训练，
         # 用非严格加载 + 显式警告。
@@ -1264,6 +1413,13 @@ def main() -> None:
         print(
             f"eval: servo runtime active "
             f"(ablation={args.servo_ablation}, fovea={args.fovea})"
+        )
+    if args.dense_readout_mtvj and (
+        config.c2_controller or servo_runtime is not None or args.c2_recovery_eval is not None
+    ):
+        raise ValueError(
+            "--dense-readout-mtvj（MT-VJ §7）v1 仅支持普通 flow/direct 部署，"
+            "与 c2/servo 部署互斥"
         )
     print(
         f"eval: action decoder = "
@@ -1307,6 +1463,34 @@ def main() -> None:
     # --fovea：foveal 前缀编码器共享同一冻结 V-JEPA 实例（无新权重——
     # 显存纪律：1152 只读、V-JEPA 冻结）。
     fovea_encoder = FoveaPrefixEncoder(vision_backbone.model) if args.fovea else None
+    # MT-VJ（契约 §6/§7）：冻结 fp16 独立 V-JEPA 实例做 dense evidence——
+    # 与 train.py _maybe_build_mtvj_backbone 同构（不加载 vjepa_state_dict，
+    # e2e checkpoint 的 dense 证据同样来自冻结原版权重，与训练一致）。
+    mtvj_backbone = None
+    metric_head = None
+    relation_encoder = None
+    coords_mtvj = None
+    if args.dense_readout_mtvj:
+        mtvj_backbone = VJEPA21Backbone.from_pretrained(
+            device=device,
+            dtype="float16",
+            max_tokens=144,
+            local_files_only=True,
+        )
+        mtvj_backbone.freeze_all()
+        print(
+            "eval: MT-VJ 冻结 V-JEPA dense evidence 骨干就绪（fp16，"
+            f"params={sum(p.numel() for p in mtvj_backbone.parameters()):,}）"
+        )
+        if args.metric_visual_checkpoint is not None:
+            if _dense_coords is None:
+                raise RuntimeError(
+                    "metric 路径需要 va_compound.live_vjepa._dense_coords"
+                )
+            metric_head, relation_encoder = _load_mtvj_metric_checkpoint(
+                args.metric_visual_checkpoint, device, config
+            )
+            coords_mtvj = torch.from_numpy(_dense_coords())
     if args.c2_recovery_eval is not None:
         if not config.c2_controller:
             raise ValueError("--c2-recovery-eval requires a c2 checkpoint")
@@ -1445,6 +1629,7 @@ def main() -> None:
             )
             chunk_start_step = 0  # 2026-08-06：--execute-steps 变节奏时 chunk 相位
             memory = None
+            metric_g_prev = None  # MT-VJ：上一决策的 g_t（ν_t = g_t − g_{t−1}，每 trial 重置）
             success = False
             decision_count = 0  # 2026-08-06：--memory-reset-every 的决策计数器
             plan_step = None  # C²/伺服：上次规划的原始步
@@ -1870,6 +2055,37 @@ def main() -> None:
                         vision_in = _apply_local_vision(
                             model, tokens, task_caches[task_index]
                         )
+                        dense_kwargs = {}
+                        if args.dense_readout_mtvj:
+                            # MT-VJ 在线 dense 解码（契约 §7，与训练 §6
+                            # _mtvj_online_encode 同构）：同一 4 帧历史窗
+                            # [d-6, d-4, d-2, d] → 冻结 V-JEPA 多层未池化
+                            # evidence {5, 11}（fp32 交付，与训练一致）；
+                            # metric head（若 checkpoint 提供）→ metric_tokens
+                            # （g_t = head 回归 relation，ν_t = g_t − g_{t−1}）。
+                            dense_evidence = mtvj_backbone.forward_hierarchical_dense(
+                                clip.unsqueeze(0)
+                            )
+                            dense_evidence = {
+                                layer: ev.float()
+                                for layer, ev in dense_evidence.items()
+                            }
+                            metric_tokens = None
+                            if metric_head is not None:
+                                metric_tokens, metric_g_prev = _mtvj_metric_tokens(
+                                    metric_head,
+                                    relation_encoder,
+                                    dense_evidence,
+                                    hidden[task_index : task_index + 1],
+                                    mask[task_index : task_index + 1],
+                                    coords_mtvj,
+                                    metric_g_prev,
+                                    device,
+                                )
+                            dense_kwargs = {
+                                "dense_evidence": dense_evidence,
+                                "metric_tokens": metric_tokens,
+                            }
                         cond, memory = model.encode_condition(
                             vision_in,
                             proprio[0],
@@ -1877,6 +2093,7 @@ def main() -> None:
                             language_cache=task_caches[task_index],
                             visual_memory=memory,
                             return_visual_memory=True,
+                            **dense_kwargs,
                         )
                         # 训练侧 flow_semantic 时槽输出（vision_in）作为 flow
                         # head 逐层 cross-attn 语义上下文；闭环必须传同一路径，

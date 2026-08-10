@@ -164,7 +164,8 @@ def phase1(horizon: int) -> None:
                 proprio = np.stack([
                     states[s + t * CONTROL_STRIDE] for t in range(SEQUENCE_LENGTH)
                 ])
-                # 帧索引：每个决策点的 4 帧窗口（编码阶段取帧）
+                # 帧索引：每个决策点的 4 帧窗口（编码阶段取帧）。
+                # 存纯 list（Codex P0-4：numpy 使 weights_only=True 加载失败）。
                 frame_idx = np.stack([
                     clip_frame_indices(s + t * CONTROL_STRIDE)
                     for t in range(SEQUENCE_LENGTH)
@@ -177,7 +178,7 @@ def phase1(horizon: int) -> None:
                     "ep_id": fi * 10000 + ei,
                     "task_file": data["task"],
                     "ep_idx": ei,
-                    "frame_idx": frame_idx,
+                    "frame_idx": frame_idx.tolist(),
                 })
     n = len(W)
     print(f"phase1(h={horizon}): {n} windows, tasks={len(set(w['task_id'] for w in W))}")

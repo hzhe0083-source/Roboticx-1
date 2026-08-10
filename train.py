@@ -8,6 +8,7 @@ from pathlib import Path
 import random
 
 import torch
+import numpy as np
 from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, Sampler
@@ -491,11 +492,57 @@ class TaskWeightedSampler(Sampler[list[int]]):
             yield indices[start:start + self.batch_size]
 
 
+class TaskLocalityWeightedSampler(Sampler[list[int]]):
+    """难度分层 + 任务局部性采样（MT-VJ 专用，Codex P1-13，2026-08-10）。
+
+    问题：LongTrajFramesDataset 按需加载任务文件（~300MB），纯随机加权采样
+    缓存命中率极低（实测 3148ms/样本 → 80k 步 ≈ 1119 小时，不可行）。
+
+    方案：先按任务权重（task_w/row_count，任务级分层语义不变）有放回地
+    抽任务序列，每个任务块内随机打乱该任务的窗口——同一任务 batch 连续，
+    dataset 缓存命中率 ~100%（每任务每 epoch 仅 1 次文件加载）。
+    """
+
+    def __init__(self, instruction_id: Tensor, task_weights: Tensor,
+                 batch_size: int, seed: int = 0) -> None:
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        self.task_ids = instruction_id.tolist()
+        self.task_w = task_weights.to(torch.float64)  # per-task（已除 row_count）
+        self.batch_size = int(batch_size)
+        self.seed = int(seed)
+        self.epoch = 0
+        self.by_task: dict[int, list[int]] = {}
+        for i, t in enumerate(self.task_ids):
+            self.by_task.setdefault(int(t), []).append(i)
+        self.tasks = sorted(self.by_task)
+        # 任务序列权重 = task_w（train.py 已做 task_w/row_count 归一化）
+        self.task_probs = torch.stack([self.task_w[t] for t in self.tasks])
+        self.task_probs = self.task_probs / self.task_probs.sum().clamp_min(1e-12)
+        self._n = len(self.task_ids)
+
+    def __len__(self) -> int:
+        return max(1, self._n // self.batch_size)
+
+    def __iter__(self) -> Iterator[list[int]]:
+        rng = random.Random(self.seed + self.epoch)
+        self.epoch += 1
+        task_seq = rng.choices(self.tasks, weights=self.task_probs.tolist(),
+                               k=len(self.task_ids))
+        indices: list[int] = []
+        for t in task_seq:
+            indices.extend(rng.sample(self.by_task[t], len(self.by_task[t])))
+        for start in range(0, len(indices) - self.batch_size + 1, self.batch_size):
+            yield indices[start:start + self.batch_size]
+
+
 def synthetic_sequence(
     config: VACompoundConfig,
     batch_size: int,
     sequence_length: int,
     device: torch.device,
+    *,
+    with_frames: bool = False,
 ) -> dict[str, Tensor]:
     """Build paired smoke data; each pair differs only in language at t=0."""
     if batch_size < 2 or batch_size % 2:
@@ -541,7 +588,7 @@ def synthetic_sequence(
         device=device,
     )[None, None, :, None]
     actions = base[:, :, None, :].expand(-1, -1, config.action_horizon, -1) + horizon
-    return {
+    batch = {
         "vision_tokens": vision,
         "language_hidden": language,
         "language_mask": torch.ones(batch_size, 8, dtype=torch.bool, device=device),
@@ -551,6 +598,17 @@ def synthetic_sequence(
         "pair_id": pair_id,
         "instruction_id": instruction_id,
     }
+    if with_frames:
+        # MT-VJ 冒烟：合成随机帧（与 LiveVJEPADataset 同款 [B, T, W, 384, 384, 3]
+        # uint8 契约；W=4 帧窗，384×384 为 live 解码器产物尺寸）。
+        batch["frames"] = torch.randint(
+            0,
+            256,
+            (batch_size, sequence_length, 4, 384, 384, 3),
+            dtype=torch.uint8,
+            device=device,
+        )
+    return batch
 
 
 def move_batch(batch: dict[str, Tensor], device: torch.device) -> dict[str, Tensor]:
@@ -564,9 +622,18 @@ def ensure_sequence(
     batch: dict[str, Tensor],
     min_sequence_length: int,
 ) -> dict[str, Tensor]:
-    if batch["vision_tokens"].ndim != 4 or batch["actions"].ndim != 4:
-        raise ValueError("vision/actions must be paired short sequences")
-    sequence_length = batch["vision_tokens"].shape[1]
+    # MT-VJ（dense_readout_mtvj）：batch 无 vision_tokens（在线 dense 用 frames），
+    # 序列长度以 actions 为准（2026-08-10）。
+    if "vision_tokens" in batch:
+        if batch["vision_tokens"].ndim != 4 or batch["actions"].ndim != 4:
+            raise ValueError("vision/actions must be paired short sequences")
+        sequence_length = batch["vision_tokens"].shape[1]
+    elif "frames" in batch:
+        if batch["frames"].ndim != 6 or batch["actions"].ndim != 4:
+            raise ValueError("frames/actions must be paired short sequences")
+        sequence_length = batch["frames"].shape[1]
+    else:
+        raise ValueError("batch 缺 vision_tokens/frames（无视觉输入的序列校验）")
     if sequence_length < min_sequence_length:
         raise ValueError(
             f"paired VA training requires T>={min_sequence_length}, got T={sequence_length}"
@@ -740,6 +807,217 @@ def _maybe_build_perturb_backbone(
     return backbone
 
 
+def _mtvj_config_kwargs(args: argparse.Namespace) -> dict:
+    """MT-VJ（契约 §5/§6）：--dense-readout-mtvj 时打开 model 的 dense 层。
+
+    flag 未给时返回空 dict——config 构造签名与旧版逐字一致（不要求 model.py
+    的 ``dense_readout_mtvj`` 字段存在，保证既有路径行为不变）。
+    """
+    if not getattr(args, "dense_readout_mtvj", False):
+        return {}
+    return {"dense_readout_mtvj": True}
+
+
+def _maybe_build_mtvj_backbone(device: torch.device):
+    """MT-VJ（契约 §6）：冻结 fp16 V-JEPA（本地缓存），与 live 可训练骨干独立。
+
+    dense evidence 只读（forward_hierarchical_dense {5,11}，绝不反向）；fp16
+    参数量减半（~119 MiB）。``prepare_pnpw_features.VJEPA21Backbone`` 与
+    ``va_compound.backbones.VJEPA21Backbone`` 是同一类（prepare_pnpw_features
+    顶部转导入）。
+    """
+    from prepare_pnpw_features import VJEPA21Backbone
+
+    backbone = VJEPA21Backbone.from_pretrained(
+        device=device,
+        dtype="float16",
+        max_tokens=144,
+        local_files_only=True,
+    )
+    backbone.freeze_all()
+    print(
+        "mtvj: 冻结 V-JEPA（fp16）dense evidence 骨干就绪，"
+        f"params={sum(p.numel() for p in backbone.parameters()):,}",
+        flush=True,
+    )
+    return backbone
+
+
+def _load_mtvj_metric_checkpoint(
+    path: Path,
+    device: torch.device,
+    config: VACompoundConfig,
+) -> tuple[nn.Module, nn.Module]:
+    """MT-VJ（契约 §2/§6）：加载并冻结 LanguageMetricField + RelationStateEncoder。
+
+    checkpoint 契约：``{"config": {...}, "metric_head": state_dict,
+    "relation_encoder": state_dict, "contract": "mt_vj_metric_field_v1"}``。
+    ctor 参数从 checkpoint config 按签名过滤注入（缺省用契约默认值）；
+    两模块置 eval + requires_grad_(False)（冻结，eval/no_grad）。
+    """
+    import inspect
+
+    from va_compound.metric_visual_head import LanguageMetricField, RelationStateEncoder
+
+    ckpt = torch.load(path, map_location="cpu", weights_only=True)
+    for key in ("metric_head", "relation_encoder"):
+        if key not in ckpt:
+            raise ValueError(
+                f"--metric-visual-checkpoint {path} 缺少键 {key!r}（契约 §2）"
+            )
+    contract = ckpt.get("contract")
+    if contract is not None and contract != "mt_vj_metric_field_v1":
+        raise ValueError(
+            f"--metric-visual-checkpoint contract={contract!r} != "
+            f"'mt_vj_metric_field_v1'（阶段 V checkpoint 不匹配）"
+        )
+    ctor_config = ckpt.get("config") or {}
+
+    def ctor_kwargs(cls) -> dict:
+        return {
+            key: value
+            for key, value in ctor_config.items()
+            if key in inspect.signature(cls.__init__).parameters and key != "self"
+        }
+
+    metric_head = LanguageMetricField(**ctor_kwargs(LanguageMetricField)).to(device)
+    metric_head.load_state_dict(ckpt["metric_head"])
+    relation_encoder = RelationStateEncoder(
+        **ctor_kwargs(RelationStateEncoder)
+    ).to(device)
+    relation_encoder.load_state_dict(ckpt["relation_encoder"])
+    for module in (metric_head, relation_encoder):
+        module.eval()
+        for parameter in module.parameters():
+            parameter.requires_grad_(False)
+    # metric_tokens [B, 2, d_model] 加入每层 action cross-attention（契约 §5）：
+    # d_model 必须等于 VACompoundConfig.hidden_dim，启动即校验（fail-fast）。
+    state_dim = int(ctor_config.get("state_dim", 6)) if isinstance(ctor_config, dict) else 6
+    with torch.no_grad():
+        try:
+            probe_g, _ = relation_encoder(
+                torch.zeros(1, state_dim, device=device),
+                torch.zeros(1, state_dim, device=device),
+            )
+        except RuntimeError as exc:
+            raise ValueError(
+                f"relation encoder 探针失败（state_dim={state_dim}？）：{exc}"
+            ) from exc
+    if probe_g.shape[-1] != config.hidden_dim:
+        raise ValueError(
+            f"relation encoder d_model={probe_g.shape[-1]} != "
+            f"VACompoundConfig.hidden_dim={config.hidden_dim}"
+            "（metric_tokens 加入每层 action cross-attention 需同维）"
+        )
+    print(
+        "mtvj: 冻结 metric head "
+        f"（params={sum(p.numel() for p in metric_head.parameters()):,}）"
+        "+ relation encoder "
+        f"（params={sum(p.numel() for p in relation_encoder.parameters()):,}）"
+        f" from {path}",
+        flush=True,
+    )
+    return metric_head, relation_encoder
+
+
+def _mtvj_online_encode(
+    frames,
+    backbone,
+    metric_head,
+    relation_encoder,
+    batch: dict[str, Tensor],
+    device: torch.device,
+) -> tuple[dict[int, Tensor], Tensor | None]:
+    """MT-VJ（契约 §6）：frames [B, T, W, 384, 384, 3] uint8 → (dense_evidence, metric_tokens)。
+
+    - dense_evidence：``{5: [B, T, 1152, D], 11: [B, T, 1152, D]}``——与 live 路径
+      同款 ``preprocess_batch`` 预处理（ImageNet 归一化 [B*T, W, 3, 384, 384]）→
+      冻结 ``forward_hierarchical_dense``（fp16）→ 未池化全 patch（t→y→x 序），
+      注入模型前以 fp32 交付（与既有 ``vision_tokens = encoded.float()`` 约定一致）；
+    - metric_tokens：有 metric_head 时 ``[B, T, 2, d_model] = stack(z_g, z_nu)``，
+      g_t = metric head 输出 ``relation``（契约 §2，head 输出约定即 g_t），
+      ν_t = g_t − g_{t−1}（首决策 ν≡0，与 servo g_prev 语义一致）。
+    全程 no_grad（骨干与 head 冻结）。
+    """
+    if frames.ndim != 6 or frames.shape[-1] != 3:
+        raise ValueError(
+            f"MT-VJ frames 必须为 [B, T, W, H, W, 3] uint8，got {tuple(frames.shape)}"
+        )
+    from va_compound.live_vjepa import IMAGE_SIZE, VISION_WINDOW, _dense_coords
+
+    batch_size, sequence_length, window, height, width, _ = frames.shape
+    if window != VISION_WINDOW:
+        raise ValueError(
+            f"MT-VJ 需要 W={VISION_WINDOW} 帧窗（契约 §1 与 live 路径一致），"
+            f"got W={window}"
+        )
+    # GPU 预处理（2026-08-10，Codex P1-13 优化 + phase2 卡死修复同款）：
+    # preprocess_batch 的 CPU bicubic+antialias + list() 逐元素转换极慢（曾卡死），
+    # 且 480 原尺寸帧由 GPU bicubic 缩到 384。与 phase2 编码路径同一实现。
+    frames_np = frames.cpu().numpy() if isinstance(frames, torch.Tensor) else frames
+    b, t, w, hh, ww, _ = frames_np.shape
+    flat = np.ascontiguousarray(frames_np.reshape(b * t * w, hh, ww, 3))
+    video = torch.from_numpy(flat).permute(0, 3, 1, 2).float().div_(255.0).to(device)
+    if video.shape[-1] != IMAGE_SIZE or video.shape[-2] != IMAGE_SIZE:
+        video = F.interpolate(
+            video, size=(IMAGE_SIZE, IMAGE_SIZE), mode="bicubic",
+            align_corners=False, antialias=True,
+        )
+    mean = torch.tensor((0.485, 0.456, 0.406), device=video.device).view(1, 3, 1, 1)
+    std = torch.tensor((0.229, 0.224, 0.225), device=video.device).view(1, 3, 1, 1)
+    inputs = ((video - mean) / std).reshape(b * t, w, 3, IMAGE_SIZE, IMAGE_SIZE)
+    with torch.no_grad():
+        hierarchical = backbone.forward_hierarchical_dense(inputs, out_layers=(5, 11))
+    dense_evidence = {
+        layer: tokens.reshape(batch_size, sequence_length, -1, tokens.shape[-1]).float()
+        for layer, tokens in hierarchical.items()
+    }
+    if sorted(dense_evidence) != [5, 11]:
+        raise ValueError(
+            f"forward_hierarchical_dense 应返回 {5, 11} 两层，"
+            f"got {sorted(dense_evidence)}"
+        )
+    metric_tokens = None
+    if metric_head is not None:
+        if relation_encoder is None:
+            raise ValueError("metric_head 存在但 relation_encoder 缺失（内部契约破坏）")
+        head_dtype = next(metric_head.parameters()).dtype
+        language_hidden = batch["language_hidden"].to(device=device, dtype=head_dtype)
+        language_mask = batch.get("language_mask")
+        if language_mask is None:
+            language_mask = torch.ones(
+                language_hidden.shape[:2], dtype=torch.bool, device=device
+            )
+        else:
+            language_mask = language_mask.to(device=device)
+        coords = torch.from_numpy(_dense_coords()).to(device=device, dtype=head_dtype)
+        flat = {
+            layer: ev.reshape(batch_size * sequence_length, -1, ev.shape[-1]).to(
+                dtype=head_dtype
+            )
+            for layer, ev in dense_evidence.items()
+        }
+        with torch.no_grad():
+            out = metric_head(
+                flat[5],
+                flat[11],
+                language_hidden.repeat_interleave(sequence_length, dim=0),
+                language_mask.repeat_interleave(sequence_length, dim=0),
+                coords,
+            )
+            g = out.relation.reshape(batch_size, sequence_length, -1)  # [B, T, 4]
+            # ν_t = g_t − g_{t−1}；首决策 ν≡0（无 g_prev，与闭环语义一致）。
+            nu = g - torch.cat((torch.zeros_like(g[:, :1]), g[:, :-1]), dim=1)
+            z_g, z_nu = relation_encoder(
+                g.reshape(batch_size * sequence_length, -1),
+                nu.reshape(batch_size * sequence_length, -1),
+            )
+            metric_tokens = torch.stack((z_g, z_nu), dim=1).reshape(
+                batch_size, sequence_length, 2, -1
+            )
+    return dense_evidence, metric_tokens
+
+
 def servo_correction_t0(
     model: VACompoundPolicy,
     servo: InteractionServo,
@@ -827,6 +1105,8 @@ def rollout_policy(
     tasks=None,
     servo: InteractionServo | None = None,
     servo_stats: dict | None = None,
+    dense_evidence: dict[int, Tensor] | None = None,
+    metric_tokens: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     if model.config.plan_resampler:
         # Plan-Cache 方案 B：首决策场景摘要（vision 全局均值）→ plan tokens，
@@ -884,8 +1164,18 @@ def rollout_policy(
         if servo_stats is not None:
             for key in ("stage", "innovation_flag", "beta", "hyp_entropy", "correction"):
                 servo_stats[key] = []
-    for time_index in range(batch["vision_tokens"].shape[1]):
+    for time_index in range(batch["actions"].shape[1]):
         semantic_context = None
+        mtvj_kwargs = {}
+        if dense_evidence is not None:
+            # MT-VJ（契约 §5）：dense evidence 只做 K/V（1152 不进 VA 自注意力），
+            # metric_tokens（冻结 RelationStateEncoder 输出）加入 action
+            # cross-attention；None 时该步与旧路径完全一致。
+            mtvj_kwargs["dense_evidence"] = {
+                layer: evidence[:, time_index] for layer, evidence in dense_evidence.items()
+            }
+            if metric_tokens is not None:
+                mtvj_kwargs["metric_tokens"] = metric_tokens[:, time_index]
         if model.config.local_slots:
             vision_in = model.build_local_vision(
                 batch["vision_tokens_st"][:, time_index],
@@ -896,6 +1186,12 @@ def rollout_policy(
                 # π0 式逐层 cross-attn：槽/关系 token（语言实例化语义上下文）
                 # 作为 flow head 的 cross-attn K/V，逐层注入。
                 semantic_context = vision_in  # [B, 25, vision_dim]
+        elif dense_evidence is not None:
+            # MT-VJ：VA 基础路径输入 = H11 池化 16 粗 token（设计 C_t=Pool16(H11)）
+            h11 = dense_evidence[11][:, time_index]  # [B, 1152, 768]
+            vision_in = h11.reshape(
+                h11.shape[0], 16, -1, h11.shape[-1]
+            ).mean(dim=2)  # [B, 16, 768]
         else:
             vision_in = batch["vision_tokens"][:, time_index]
         condition, visual_memory = model.encode_condition(
@@ -905,6 +1201,7 @@ def rollout_policy(
             language_cache=language_cache,
             visual_memory=visual_memory,
             return_visual_memory=True,
+            **mtvj_kwargs,
         )
         if model.config.c2_controller:
             # C²-VA Stage B：c_current = P(当前决策视觉均值)；解码
@@ -1557,6 +1854,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "互斥（§九：1152 不进 VA 自注意力）。",
     )
     parser.add_argument(
+        "--dense-readout-mtvj",
+        action="store_true",
+        help="MT-VJ（artifacts/mt_vj_contract.md §5/§6）：持久 dense action "
+        "readout——每决策把 4 帧窗在线编码为 {5,11} dense evidence（冻结 "
+        "V-JEPA forward_hierarchical_dense，fp16 本地加载）注入 VA 层 K/V "
+        "（config.dense_readout_mtvj=True；1152 只做 K/V，query 仅 action "
+        "tokens）。需要 --live-vjepa（LiveVJEPADataset 提供原始帧）或无 --data "
+        "的合成冒烟（synthetic frames）；与 --dense-readout/--perturb-data/"
+        "--e2e-data 互斥。",
+    )
+    parser.add_argument(
+        "--metric-visual-checkpoint",
+        type=Path,
+        default=None,
+        help="MT-VJ 阶段 V checkpoint（契约 §2：{metric_head, relation_encoder, "
+        "contract='mt_vj_metric_field_v1'}）：加载并冻结 LanguageMetricField + "
+        "RelationStateEncoder（eval/no_grad），每决策产出 metric_tokens "
+        "[B, 2, d_model]（g_t = head 输出 relation，ν_t = g_t − g_{t−1}）加入 "
+        "action cross-attention。需要 --dense-readout-mtvj。",
+    )
+    parser.add_argument(
         "--multi-mode",
         action="store_true",
         help="Step 1（C²-IRF v2 设计 §七 Step 1）：多模式读出——每角色 heatmap "
@@ -1957,6 +2275,36 @@ def validate_args(args: argparse.Namespace) -> None:
         if args.local_slots_direct288:
             raise ValueError(
                 "--multi-mode 与 --local-slots-direct288 互斥：direct288 无角色读出路径"
+            )
+    if getattr(args, "dense_readout_mtvj", False) or getattr(args, "metric_visual_checkpoint", None) is not None:
+        # MT-VJ（契约 §6）：在线 dense 编码需要原始帧（live 数据集或合成冒烟）。
+        if args.e2e_data:
+            raise ValueError(
+                "--dense-readout-mtvj/--metric-visual-checkpoint 不支持 --e2e-data"
+                "（MT-VJ 在线 dense 编码仅 live/合成冒烟路径）"
+            )
+        if args.data is not None and not args.live_vjepa:
+            # 2026-08-10：--dense-readout-mtvj + --data 走 LongTrajFramesDataset
+            # （windows_h48.pt + longtraj JPEG 帧在线解码，MT-VJ 主数据路径）。
+            print(
+                "--dense-readout-mtvj: --data 为 longtraj windows 文件，"
+                "帧由 LongTrajFramesDataset 从 JPEG 在线解码",
+                flush=True,
+            )
+        if args.metric_visual_checkpoint is not None and not args.dense_readout_mtvj:
+            raise ValueError(
+                "--metric-visual-checkpoint requires --dense-readout-mtvj"
+                "（metric_tokens 由 dense action readout 消费）"
+            )
+        if args.dense_readout:
+            raise ValueError(
+                "--dense-readout-mtvj 与 --dense-readout 互斥（Step 0 1152 槽读出 vs "
+                "MT-VJ dense evidence 注入，两套 dense 机制语义重叠）"
+            )
+        if args.perturb_data is not None:
+            raise ValueError(
+                "--dense-readout-mtvj 与 --perturb-data 互斥（混批行不对齐 "
+                "dense evidence/metric_tokens）"
             )
     if getattr(args, "servo_only", False):
         args.servo = True  # --servo-only 隐含启用 --servo（第一阶段冻结模式）
@@ -2413,6 +2761,7 @@ def main() -> None:
             role_query_tokens=args.role_query_tokens,
             dual_attention=args.dual_attention,
             flow_semantic=args.flow_semantic,
+            **_mtvj_config_kwargs(args),
         )
         if args.single_task:
             loader = DataLoader(
@@ -2467,7 +2816,20 @@ def main() -> None:
                         f"--dense-readout with --local-slots-data requires "
                         f"1152-token dense features, got {local_tokens.shape[-2]}"
                     )
-        if args.live_vjepa:
+        if args.dense_readout_mtvj and not args.live_vjepa:
+            # MT-VJ 主数据路径：longtraj windows + JPEG 帧在线解码（2026-08-10）
+            from va_compound.longtraj_frames import LongTrajFramesDataset
+
+            dataset = LongTrajFramesDataset(
+                args.data,
+                min_sequence_length=args.min_sequence_length,
+            )
+            print(
+                f"MT-VJ data: LongTrajFramesDataset（{len(dataset)} 样本，"
+                f"帧从 longtraj JPEG 在线解码）",
+                flush=True,
+            )
+        elif args.live_vjepa:
             # Stage B：在线 V-JEPA 编码（帧变体；vision_tokens 键被移除）。
             from va_compound.live_vjepa import LiveVJEPADataset
 
@@ -2506,6 +2868,7 @@ def main() -> None:
                 768 if args.live_vjepa
                 else int(local_tokens.shape[-1])
                 if local_tokens is not None  # ST288 路径无 vision_tokens 键（Codex P0-4）
+                else 768 if args.dense_readout_mtvj  # MT-VJ：在线 dense，H11 特征维 768
                 else int(dataset.payload[vision_key].shape[-1])
             ),
             action_horizon=int(dataset.payload["actions"].shape[-2]),
@@ -2540,6 +2903,7 @@ def main() -> None:
             dense_readout=args.dense_readout,
             multi_mode=args.multi_mode,
             local_slot_tokens=1152 if args.dense_readout else 288,
+            **_mtvj_config_kwargs(args),
         )
         if args.perturb_data is not None:
             # Step 2 微扰混合（设计 §六.1）：clean [B−m] + perturbed [m] → [B]。
@@ -2621,12 +2985,30 @@ def main() -> None:
                     f"{(per_sample < 1.0).float().mean().item() * 100:.1f}%）",
                     flush=True,
                 )
-                loader = DataLoader(
-                    dataset,
-                    batch_sampler=TaskWeightedSampler(per_sample, effective_batch, args.seed),
-                    num_workers=args.num_workers,
-                    persistent_workers=args.num_workers > 0,
-                )
+                if args.dense_readout_mtvj:
+                    # MT-VJ（LongTrajFramesDataset）：任务局部性采样，缓存命中
+                    # ~100%（Codex P1-13，纯随机加权实测 50s/step 不可行）。
+                    from va_compound.longtraj_frames import mtvj_collate
+                    sampler = TaskLocalityWeightedSampler(
+                        dataset.payload["instruction_id"], task_w,
+                        effective_batch, args.seed,
+                    )
+                    loader = DataLoader(
+                        dataset,
+                        batch_sampler=sampler,
+                        collate_fn=mtvj_collate,
+                        num_workers=args.num_workers,
+                        persistent_workers=args.num_workers > 0,
+                    )
+                else:
+                    loader = DataLoader(
+                        dataset,
+                        batch_sampler=TaskWeightedSampler(
+                            per_sample, effective_batch, args.seed
+                        ),
+                        num_workers=args.num_workers,
+                        persistent_workers=args.num_workers > 0,
+                    )
             else:
                 loader = DataLoader(
                     dataset,
@@ -2702,12 +3084,27 @@ def main() -> None:
             role_query_tokens=args.role_query_tokens,
             dual_attention=args.dual_attention,
             flow_semantic=args.flow_semantic,
+            **_mtvj_config_kwargs(args),
         )
         smoke_batch = synthetic_sequence(
             config,
             args.batch_size,
             args.sequence_length,
             device,
+            with_frames=args.dense_readout_mtvj,
+        )
+
+    # MT-VJ（契约 §6）：冻结 fp16 V-JEPA（dense evidence 只读）+ 冻结 metric
+    # head/relation encoder（eval/no_grad，均不进 optimizer）。两 flag 都未给时
+    # 以下对象全为 None，训练路径与旧版逐字一致。
+    mtvj_backbone = None
+    metric_head = None
+    relation_encoder = None
+    if args.dense_readout_mtvj:
+        mtvj_backbone = _maybe_build_mtvj_backbone(device)
+    if args.metric_visual_checkpoint is not None:
+        metric_head, relation_encoder = _load_mtvj_metric_checkpoint(
+            args.metric_visual_checkpoint, device, config
         )
 
     # Step 2：双新息中央凹交互伺服（C²-IRF v2 §七 Step 2；--servo-only 隐含
@@ -3017,6 +3414,8 @@ def main() -> None:
     if args.c2_controller:
         clean_iter = iter_forever(loader)
         rec_iter = iter_forever(recovery_loader)
+    mtvj_dense_evidence = None
+    mtvj_metric_tokens = None
     # --perturb-data 帧在线编码骨干（live 路径复用主骨干；feature 路径冻结 V-JEPA）。
     perturb_backbone = _maybe_build_perturb_backbone(
         args, device, vision_backbone, use_payload_vision
@@ -3048,6 +3447,28 @@ def main() -> None:
                 except StopIteration:
                     iterator = iter(loader)
                     batch = next(iterator)
+        if mtvj_backbone is not None:
+            # MT-VJ（契约 §6）：在线 dense 编码——frames（live 数据集或合成冒烟）
+            # → 冻结 V-JEPA forward_hierarchical_dense（fp16）→ {5,11} →
+            # dense_evidence；给了 checkpoint 时 metric head + relation encoder
+            # → metric_tokens。全程 no_grad（冻结只读）。本块不 pop frames
+            # （live 块随后 pop，避免 KeyError）。
+            frames_mtvj = batch.get("frames")
+            if frames_mtvj is None:
+                raise ValueError(
+                    "--dense-readout-mtvj 需要原始帧：batch 无 'frames' 键"
+                    "（--live-vjepa 数据集或合成冒烟提供）"
+                )
+            if isinstance(frames_mtvj, torch.Tensor):
+                frames_mtvj = frames_mtvj.cpu().numpy()
+            mtvj_dense_evidence, mtvj_metric_tokens = _mtvj_online_encode(
+                frames_mtvj,
+                mtvj_backbone,
+                metric_head,
+                relation_encoder,
+                batch,
+                device,
+            )
         if args.live_vjepa:
             # Stage B：在线 V-JEPA 编码（frames 仍为 CPU numpy；编码在 GPU 上，
             # 输出 [B, T, 288, D] 与 ST288 同构，替换进 batch）。
@@ -3218,6 +3639,8 @@ def main() -> None:
                     tasks=tasks,
                     servo=servo,
                     servo_stats=servo_stats,
+                    dense_evidence=mtvj_dense_evidence,
+                    metric_tokens=mtvj_metric_tokens,
                 )
                 if model.config.future_predict:
                     predicted_velocity, action_conditions, memories = rollout

@@ -8,8 +8,41 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from va_compound.local_control_slots import fourier_encode
+
 
 AttentionMode = Literal["bidir_va", "uni_a"]
+
+# MT-VJ 公共常量（artifacts/mt_vj_contract.md §公共常量，2026-08-10）：
+# dense evidence 投影维（768 → 192，带宽降 4 倍，0.42MiB/decision）。
+D_PROJ = 192
+# 坐标正弦嵌入维：fourier_encode(coords, num_bands=4) = 3 + 2*3*4 = 27。
+_COORD_DIM = 27
+
+
+def dense_coords(
+    n_tokens: int,
+    device: torch.device | str | None = None,
+    dtype: torch.dtype | None = None,
+) -> Tensor:
+    """[N, 3] 归一化 (t, y, x) 网格坐标（N = 2*grid²，t→y→x 序）。
+
+    与 live_vjepa._slot_coords / tests/test_dense_readout.build_dense_coords_smoke
+    同一生成公式；MT-VJ dense readout 用它构造坐标正弦嵌入（K_dense 加项）。
+    """
+    if n_tokens % 2:
+        raise ValueError(f"dense token 数必须为 2*grid²（2 时间片），got {n_tokens}")
+    grid = math.isqrt(n_tokens // 2)
+    if grid * grid != n_tokens // 2:
+        raise ValueError(f"dense token 数必须为 2*grid²，got {n_tokens}")
+    half = (grid - 1) / 2
+    rows = [
+        (t * 2.0 - 1.0, (y - half) / half, (x - half) / half)
+        for t in range(2)
+        for y in range(grid)
+        for x in range(grid)
+    ]
+    return torch.tensor(rows, dtype=dtype or torch.float32, device=device)
 
 
 @dataclass(frozen=True)
@@ -112,6 +145,12 @@ class VACompoundConfig:
     # 16 coarse + 12 modes + 3 relations = 31 tokens；vis 经零初始化投影注入。
     # 与 --dense-readout 兼容（1152 网格）；288 网格同样可用（消融）。
     multi_mode: bool = False
+    # MT-VJ Stage A dense action readout（2026-08-10 契约 §5）：每层
+    # VACouplingLayer 注入 dense K/V cross-attention（1152 patch 只做 K/V，
+    # query 仅 action tokens）+ metric relation tokens；W_o 严格零初始化 →
+    # 初始输出与无 dense 路径逐位一致。与 local_slots/dense_readout 正交：
+    # 直接消费 forward_hierarchical_dense 的 {5, 11} 证据，不经角色读出。
+    dense_readout_mtvj: bool = False
 
     def __post_init__(self) -> None:
         if self.hidden_dim % self.num_heads:
@@ -618,6 +657,107 @@ class FutureLatentPredictor(nn.Module):
         return (1.0 - (p * t).sum(-1)).mean()
 
 
+@dataclass(frozen=True)
+class DenseReadoutInput:
+    """MT-VJ 每决策 dense evidence（契约 §5）：策略级共享投影一次、逐层复用。
+
+    - ``d`` [B, N, D_PROJ]：proj(H11)；``g`` [B, N, D_PROJ]：proj(H5)；
+    - ``t`` [B, N, D_PROJ]：proj(ΔtH11)（H11 两时间片之差，按时间片复制回 N
+      与 D/G 对齐，t→y→x 序）；
+    - ``coord_raw`` [N, _COORD_DIM]：正弦坐标嵌入（K/V 两侧共用）；
+    - ``coord_k`` [N, hidden]：coord 嵌入投影——K_dense = W_K·D + coord_k；
+    - ``metric_tokens`` [B, 2, hidden] | None：RelationStateEncoder 的
+      (z_g, z_ν)，拼接到每层 dense K/V 后（query 仍只有 action tokens）。
+    """
+
+    d: Tensor
+    g: Tensor
+    t: Tensor
+    coord_raw: Tensor
+    coord_k: Tensor
+    metric_tokens: Tensor | None = None
+
+
+class DenseEvidenceProjector(nn.Module):
+    """MT-VJ dense evidence 共享投影（2026-08-10 契约 §5，策略级共享）。
+
+    D = proj_d(H11), G = proj_g(H5), T = proj_t(ΔtH11)：768 → D_PROJ=192 的
+    可训练投影（0.42MiB/decision vs 768D 1.69MiB，带宽降 4 倍）。ΔtH11 =
+    H11 两时间片（1152 = 2×576，t→y→x 序）逐 patch 之差，即时序创新项。
+    coord_k 把正弦坐标嵌入（[N, _COORD_DIM]）投影到 hidden 空间，作为
+    K_dense 的坐标加项（正弦、非参数；仅此小投影可训练）。
+
+    仅 ``dense_readout_mtvj=True`` 时构造。这里不做零初始化——只有每层的
+    W_o 输出投影严格零初始化（初始等价纪律）。
+    """
+
+    def __init__(self, vision_dim: int, hidden_dim: int) -> None:
+        super().__init__()
+        self.proj_d = nn.Linear(vision_dim, D_PROJ)
+        self.proj_g = nn.Linear(vision_dim, D_PROJ)
+        self.proj_t = nn.Linear(vision_dim, D_PROJ)
+        self.coord_k = nn.Linear(_COORD_DIM, hidden_dim)
+
+    def forward(
+        self,
+        dense_evidence: dict[int, Tensor],
+        metric_tokens: Tensor | None,
+    ) -> DenseReadoutInput:
+        dtype = self.proj_d.weight.dtype
+        h5 = dense_evidence[5]
+        h11 = dense_evidence[11]
+        if h5.ndim != 3 or h11.ndim != 3:
+            raise ValueError(
+                "dense_evidence[5]/[11] 必须为 [B, N, vision_dim] 3D 张量，"
+                f"got {tuple(h5.shape)} / {tuple(h11.shape)}"
+            )
+        if h5.shape[:2] != h11.shape[:2]:
+            raise ValueError(
+                "dense_evidence[5] 与 [11] 的 batch/token 数必须一致，"
+                f"got {tuple(h5.shape)} vs {tuple(h11.shape)}"
+            )
+        if h11.shape[-1] != self.proj_d.in_features:
+            raise ValueError(
+                f"dense_evidence[11] 最后一维必须等于 vision_dim="
+                f"{self.proj_d.in_features}，got {h11.shape[-1]}"
+            )
+        batch, n_tokens, _ = h11.shape
+        if n_tokens % 2:
+            raise ValueError(
+                f"dense token 数必须为偶数（2 时间片），got {n_tokens}"
+            )
+        if metric_tokens is not None and (
+            metric_tokens.ndim != 3
+            or metric_tokens.shape[0] != batch
+            or metric_tokens.shape[1] != 2
+            or metric_tokens.shape[2] != self.coord_k.out_features
+        ):
+            raise ValueError(
+                "metric_tokens 必须为 [batch, 2, hidden_dim]，"
+                f"got {tuple(metric_tokens.shape)}"
+            )
+        h5 = h5.to(dtype=dtype)
+        h11 = h11.to(dtype=dtype)
+        half = n_tokens // 2
+        d = self.proj_d(h11)  # [B, N, D_PROJ]
+        g = self.proj_g(h5)  # [B, N, D_PROJ]
+        t_diff = h11[:, half:] - h11[:, :half]  # ΔtH11 [B, N/2, vision]
+        t = torch.cat((self.proj_t(t_diff), self.proj_t(t_diff)), dim=1)  # [B, N, D_PROJ]
+        coords = dense_coords(n_tokens, device=h11.device).to(dtype=dtype)
+        coord_raw = fourier_encode(coords)  # [N, _COORD_DIM]
+        coord_k = self.coord_k(coord_raw)  # [N, hidden]
+        return DenseReadoutInput(
+            d=d,
+            g=g,
+            t=t,
+            coord_raw=coord_raw,
+            coord_k=coord_k,
+            metric_tokens=(
+                metric_tokens.to(dtype=dtype) if metric_tokens is not None else None
+            ),
+        )
+
+
 class VACouplingLayer(nn.Module):
     """Layer with visual/action streams, optionally task stream + extra K/V.
 
@@ -649,6 +789,7 @@ class VACouplingLayer(nn.Module):
         attention_variant: str = "flat",
         sequential: bool = False,
         dual_attention: bool = False,
+        dense_readout_mtvj: bool = False,
     ) -> None:
         super().__init__()
         self.sequential = sequential
@@ -712,6 +853,21 @@ class VACouplingLayer(nn.Module):
             nn.init.zeros_(self.sem_gate[-1].weight)
             nn.init.zeros_(self.sem_gate[-1].bias)
             self.sem_gate[-1].bias.data.fill_(-2.0)
+        # MT-VJ dense action readout（2026-08-10 契约 §5）：每层独立
+        # K/V/query 投影 + 严格零初始化的 W_o。D=proj(H11) 等共享投影由
+        # 策略级 DenseEvidenceProjector 完成一次，这里只做逐层投影与
+        # cross-attention。1152 永远只做 K/V，query 仅 action tokens。
+        self.dense_readout_mtvj = dense_readout_mtvj
+        if dense_readout_mtvj:
+            self.dense_q = nn.Linear(hidden_dim, hidden_dim)
+            self.dense_k = nn.Linear(D_PROJ, hidden_dim)
+            self.dense_v = nn.Linear(3 * D_PROJ + _COORD_DIM, hidden_dim)
+            self.dense_out = nn.Linear(hidden_dim, hidden_dim)
+            # W_o 严格零初始化：A_out = A_base + W_o·z ≡ A_base（初始等价）。
+            nn.init.zeros_(self.dense_out.weight)
+            nn.init.zeros_(self.dense_out.bias)
+            self.metric_k = nn.Linear(hidden_dim, hidden_dim)
+            self.metric_v = nn.Linear(hidden_dim, hidden_dim)
 
     @staticmethod
     def _make_ffn(hidden_dim: int, dropout: float) -> nn.Sequential:
@@ -729,6 +885,36 @@ class VACouplingLayer(nn.Module):
     def _from_heads(self, x: Tensor) -> Tensor:
         batch, _, tokens, _ = x.shape
         return x.transpose(1, 2).contiguous().view(batch, tokens, self.hidden_dim)
+
+    def _dense_update(
+        self, action_norm: Tensor, dense_input: DenseReadoutInput
+    ) -> Tensor:
+        """MT-VJ dense readout（契约 §5）：z = CrossAttn(A, K_dense, V_dense)。
+
+        K_dense = W_K·D + coord_emb；V_dense = W_V·[D, G, T, coord_emb]；
+        A_out = A_base + W_o·z（W_o 严格零初始化 → 初始输出与无 dense 路径
+        逐位一致）。1152 patch + 2 metric tokens 只出现在 K/V 侧，query 仅
+        action tokens（≤48），绝无 1152×1152 自注意力。``action_norm`` 是
+        本层输入 action 的 norm_a_attn 输出（与 base attention 同一 query）。
+        """
+        d, g, t = dense_input.d, dense_input.g, dense_input.t
+        coord_raw, coord_k = dense_input.coord_raw, dense_input.coord_k
+        k_dense = self.dense_k(d) + coord_k[None]  # [B, N, hidden]
+        v_dense = self.dense_v(
+            torch.cat((d, g, t, coord_raw[None].expand(d.shape[0], -1, -1)), dim=-1)
+        )
+        if dense_input.metric_tokens is not None:
+            metric = dense_input.metric_tokens.to(dtype=self.dense_q.weight.dtype)
+            k_dense = torch.cat((k_dense, self.metric_k(metric)), dim=1)
+            v_dense = torch.cat((v_dense, self.metric_v(metric)), dim=1)
+        q = self._to_heads(self.dense_q(action_norm))
+        k = self._to_heads(k_dense)
+        v = self._to_heads(v_dense)
+        scores = torch.matmul(q.float(), k.float().transpose(-1, -2)) * self.scale
+        weights = torch.softmax(scores, dim=-1).to(dtype=v.dtype)
+        weights = F.dropout(weights, p=self.dropout, training=self.training)
+        z = self._from_heads(torch.matmul(weights, v))
+        return self.dense_out(z)
 
     def project_language(self, hidden: Tensor) -> LayerLanguageCache:
         hidden = hidden.to(dtype=self.norm_l.weight.dtype)
@@ -766,6 +952,7 @@ class VACouplingLayer(nn.Module):
         task: Tensor | None = None,
         evidence: Tensor | None = None,
         state: Tensor | None = None,
+        dense_input: DenseReadoutInput | None = None,
     ) -> tuple[Tensor, Tensor, Tensor | None]:
         visual_norm = self.norm_v_attn(visual)
         action_norm = self.norm_a_attn(action)
@@ -906,6 +1093,9 @@ class VACouplingLayer(nn.Module):
             update_a = update_a + sem_update
         visual = visual + self.out_v(update_v)
         action = action + self.out_a(update_a)
+        if dense_input is not None:
+            # MT-VJ：A_out = A_base + W_o·z（W_o 零初始化 → 初始严格等价）。
+            action = action + self._dense_update(action_norm, dense_input)
         visual = visual + self.ffn_v(self.norm_v_ffn(visual))
         action = action + self.ffn_a(self.norm_a_ffn(action))
         task_out: Tensor | None = None
@@ -1052,6 +1242,7 @@ class VACouplingLayer(nn.Module):
         task: Tensor | None = None,
         evidence: Tensor | None = None,
         state: Tensor | None = None,
+        dense_input: DenseReadoutInput | None = None,
     ) -> tuple[Tensor, Tensor, Tensor | None]:
         """Sequential A->V/T->A coupling (2026-08-07 审阅落地④).
 
@@ -1108,6 +1299,11 @@ class VACouplingLayer(nn.Module):
             action_half, self.q_a, self.norm_a_attn, groups_3, language, language_mask
         )
         action_new = action_half + self.out_a(update_corr)
+        if dense_input is not None:
+            # MT-VJ：dense readout 注入 Pass 3（correction）的 action 输出。
+            action_new = action_new + self._dense_update(
+                self.norm_a_attn(action_half), dense_input
+            )
         action_new = action_new + self.ffn_a(self.norm_a_ffn(action_new))
         return visual_new, action_new, task_new
 
@@ -1553,9 +1749,19 @@ class VACompoundPolicy(nn.Module):
                         and (index + 1) % config.sequential_coupling == 0
                     )
                 ),
+                dense_readout_mtvj=config.dense_readout_mtvj,
             )
             for index in range(config.num_layers)
         )
+        # MT-VJ（2026-08-10 契约 §5）：dense evidence 共享投影（D/G/T：
+        # 768 → 192 + 坐标嵌入投影），每层 dense K/V 复用其输出。
+        if config.dense_readout_mtvj:
+            self.dense_evidence_proj = DenseEvidenceProjector(
+                vision_dim=config.vision_dim,
+                hidden_dim=config.hidden_dim,
+            )
+        else:
+            self.dense_evidence_proj = None
         if config.memory_split:
             self.evidence_init = nn.Parameter(
                 torch.empty(1, config.evidence_tokens, config.hidden_dim)
@@ -1758,6 +1964,8 @@ class VACompoundPolicy(nn.Module):
         language_cache: LanguageCache | None = None,
         visual_memory: VisualMemory | None = None,
         return_visual_memory: bool = False,
+        dense_evidence: dict[int, Tensor] | None = None,
+        metric_tokens: Tensor | None = None,
     ) -> Tensor | tuple[Tensor, VisualMemory]:
         if (language_hidden is None) == (language_cache is None):
             raise ValueError("provide exactly one of language_hidden or language_cache")
@@ -1810,6 +2018,15 @@ class VACompoundPolicy(nn.Module):
                 raise ValueError(
                     "language cache device/dtype must match the policy; call cache.to(device, dtype)"
                 )
+
+        # MT-VJ dense readout（契约 §5）：dense_evidence 非 None 时共享投影
+        # 一次，每层用各自 W_K/W_V 构建 dense K/V。None（False 或 True 但
+        # 未传）→ 与现有行为逐位一致。
+        dense_input = None
+        if self.config.dense_readout_mtvj and dense_evidence is not None:
+            if not (5 in dense_evidence and 11 in dense_evidence):
+                raise ValueError("dense_evidence 必须包含 key 5（H5）与 11（H11）")
+            dense_input = self.dense_evidence_proj(dense_evidence, metric_tokens)
 
         if visual_memory is not None:
             if self.config.memory_split:
@@ -1904,6 +2121,7 @@ class VACompoundPolicy(nn.Module):
                         evidence=evidence,
                         task=task_hat,
                         state=state[:, None],
+                        dense_input=dense_input,
                     )
                 else:
                     vision, action, task_hat = layer(
@@ -1914,6 +2132,7 @@ class VACompoundPolicy(nn.Module):
                         evidence=evidence,
                         task=task_hat,
                         state=state[:, None],
+                        dense_input=dense_input,
                     )
             # The VA layers propose a speculative task update; with EVSM it
             # goes to scratch (task_spec) and is only committed after evidence
@@ -1954,6 +2173,7 @@ class VACompoundPolicy(nn.Module):
                     layer_cache,
                     language_cache.attention_mask,
                     visual_memory=previous_visual,
+                    dense_input=dense_input,
                 )
             else:
                 vision, action, _ = layer(
@@ -1962,6 +2182,7 @@ class VACompoundPolicy(nn.Module):
                     layer_cache,
                     language_cache.attention_mask,
                     visual_memory=previous_visual,
+                    dense_input=dense_input,
                 )
             next_memory.append(vision)
         action_condition = self.action_norm(action)
@@ -2008,6 +2229,8 @@ class VACompoundPolicy(nn.Module):
         visual_memory: VisualMemory | None = None,
         return_visual_memory: bool = False,
         semantic_context: Tensor | None = None,
+        dense_evidence: dict[int, Tensor] | None = None,
+        metric_tokens: Tensor | None = None,
     ) -> Tensor | tuple[Tensor, VisualMemory]:
         encoded = self.encode_condition(
             vision_tokens,
@@ -2018,6 +2241,8 @@ class VACompoundPolicy(nn.Module):
             language_cache=language_cache,
             visual_memory=visual_memory,
             return_visual_memory=return_visual_memory,
+            dense_evidence=dense_evidence,
+            metric_tokens=metric_tokens,
         )
         if return_visual_memory:
             action_condition, next_memory = encoded

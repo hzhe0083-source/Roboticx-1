@@ -61,7 +61,7 @@ E6 已停（用户指示）。五个真资产确认保留。**不再跑 fovea/�
 6. **VA 回 8 层**（继承 stage B/E1 视觉侧权重，action query 重新初始化）
 7. 视觉路径回 **spatiotemporal 288 + coarse 池化**（槽/multi-mode/servo/dense 全不开）
 8. **lr 1e-4**（对齐 22% 基线配方，不是 E6 的 1e-5）
-9. 训练：batch 16 × 60k 步（~44 epoch），V-JEPA 冻结；flow 步数训练/部署统一 8-10（先 1h 验证 8 步无阶梯伪影）
+9. 训练：batch 16 × 80k 步（用户拍板：1.28M 样本接触 = Evo-1 1.07×；~21 epoch），V-JEPA 冻结；flow 步数训练/部署统一 8-10（先 1h 验证 8 步无阶梯伪影）
 10. 评估：`eval_metaworld.py` ACTION_HORIZON 从 checkpoint config 读；`--execute-steps 12`（flag 已有）
 11. **任务分层采样（用户指示，2026-08-09）**：DataLoader 按 instruction_id 加权——hard/very-hard 任务
     （抓取/插入/工具类）窗口过采样 2-3 倍、easy 任务（按钮/关门类）降采样。理由：难任务
@@ -106,7 +106,7 @@ E6 已停（用户指示）。五个真资产确认保留。**不再跑 fovea/�
 | 阶段 | 内容 | 时长 |
 |---|---|---|
 | 0 | E6 止损 | ✅ 已完成 |
-| 1 | E7 协议对齐 BC（H=48/VA8/lr1e-4/60k） | ~4-5 天 |
+| 1 | E7 协议对齐 BC（H=48/VA8/lr1e-4/80k=Evo-1 1.07×） | ~4-5 天 |
 | 2 | flow-noise PPO（MT10→MT50） | ~4-6 天 |
 | 3 | fork 评估 + 四件套 + 回灌 | ~1-2 天（并行） |
 | 总计 | | ~10-14 天到 70-85% |
@@ -149,7 +149,7 @@ P1 已修：executed=clip(a) 显式化（采集端）、任务级分层采样（
 
 ### E7 行动增量（按 Claude 建议）
 
-- E7 原样跑：ST288+H48 BC 60k；eval 记录 per-task 成功 + near-miss（末尾 success 帧距离）+ `--execute-steps` 8/16/48 消融
+- E7 原样跑：ST288+H48 BC 80k（Evo-1 1.07×）；eval 记录 per-task 成功 + near-miss（末尾 success 帧距离）+ `--execute-steps` 8/16/48 消融
 - RL 阶段：flow-noise PPO + **特权 critic**（24 维 state 只进 critic）
 - 并行臂（BC 出分后/空档）：精度任务子集（peg-insert-side/assembly/hand-insert ~15GB）H11 dense 探针，判据 oracle keypoint RMSE 对比容差带；阴性 → dense/foveal/C²-IRF 全线永久关闭，写成论文 finding
 - C²-IRF v2 最小核（r_t+DLS+W_o=0+两阶段冻结+oracle 辅助）排最后，预注册 kill 判据（混合熵/κ 遥测/微扰 eval 集）
@@ -178,3 +178,35 @@ B−A=视觉粒度；C−A=数据收益；(D−C)−(B−A)=dense 对恢复的�
 - E7 ≥45% 才进 RL；<45% 先 direct-head 诊断
 - RL 前 PPO 四硬门：E7 同构 PolicyRuntime、minibatch logp 顺序、真实 bootstrap/seed/500 步覆盖、KL/finite/memory/checkpoint 契约
 - servo/fovea 严格串行：几何 probe → frozen-base servo → zero-gain/gain-shuffle/wrong-role/open-loop 消融 → fovea（H2 adapter 已训练 + p95<25ms + 异步刷新 p95<50ms + flag 不饱和）
+
+---
+
+## 2026-08-10 补充：GPT Pro 最终判决（回应 Claude 评审，用户拍板方向）
+
+### 代码事实修正（已验证 eval_metaworld.py:1915）
+- 当前仓库 H=8 时代：`chunk[(step-chunk_start) % ACTION_HORIZON]`——execute_steps>8 会**循环播放**同一组 8 动作。Claude 建议的 k∈{8,16,48} 消融在 H=8 下无效。
+- **E7 用 H=48 后 {1,2,4,6,8,12} 全部合法**（<48 不循环）。正确消融集合 = {1,2,4,6,8}（对应 80/40/20/13.3/10Hz 决策频率）+ 12（H/4 receding）。
+
+### 三轴诊断（E7 出分后的第一优先级）
+- **A. Oracle-state action upper bound**：精密任务子集上同款动作头 + 完整环境状态训练——排除"数据/动作对齐/动作头"问题（oracle 也差=数据问题；oracle 好=感知问题；开环好闭环差=反馈频率问题）。
+- **B. Frozen visual relation probe**（独立诊断，不进 actor）：ST288 vs H11 dense(1152) vs H5+H11 vs foveal crop，标签=相对关系（eef-object、object-target、轴误差、插入深度），指标：2D pixel RMSE / 3D mm RMSE / PCK@2/5/10mm / episode-held-out / near-contact 子集。判据：ST288+H11<5mm→fovea 永久关闭；H11 明显优→dense reader 不 fovea；H11>8-10mm 且 crop<5mm→fovea 必要；crop 也差→V-JEPA 表征问题。
+- **C. Receding-horizon bandwidth**：同 checkpoint 跑 execute_steps∈{1,2,4,6,8}，记录 min/terminal object-target 距离、最后进展步、抓取后插入失败率。判据：k=2 vs k=6 成功率差 ≥10pp 或 near-miss 距离降 ≥30% → 反馈频率是主瓶颈。
+
+### 新主算法候选：Dense Action-Query Residual Readout
+coarse 路径不变（Pool16(H11) → VA）→ 每个 action query q_h cross-attn 直接读 1152 patch（8×1152，非 1152²）→ W_o=0 零初始化残差 ā_h = B_h + W_o z_h → 原 flow head，损失不变（L_FM+L_pair）。**不自称可解释几何**（无 role center/covariance/NULL/Jacobian 主张），不存在不可辨识问题。两阶段：D1 冻结 V-JEPA+VA+base flow 只训 query/cross-attn/W_o（程序化微扰+clean）；D2 解冻 VA+flow（V-JEPA 仍冻结）。
+
+### Oracle 标签定位（GPT Pro 修正 Claude）
+- 先做**诊断探针**（独立、不进 actor、不加 loss）——这是必须的。
+- 作为 actor 辅助头**不是免费**（privileged supervision 改变论文口径、需 with/without 消融）——暂不做。
+
+### C²-IRF 复活条件（三条件齐备才做 C²-IRF-lite）
+1. H11/crop probe 稳定达所需几何精度；2. dense residual reader 有闭环收益；3. 大规模 held-out 微扰集就绪。lite 版只留：单一 active relation + 单 relation state + bounded correction head + base 冻结 + W_o=0 + 数千条微扰。删：四假设/NULL/熵路由/双速率 fovea/learned phase/DLS/Broyden。**选择 A（oracle 监督 relation state，诚实报告）或 B（叫 latent correction state，不宣称物理意义）必须二选一。**
+
+### 微扰数据规模底线
+3 精密任务 × 2000-5000 起点 × 4-12 步恢复；train/eval 不同 seed；2/4/8/15mm 四档；记录各档恢复成功率。
+
+### 10 步实验序列（每步 kill 条件）
+1. E7 原样 → 2. execute_steps 消融（k 减小无收益则 kill）→ 3. oracle-state 上界 → 4. ST288 vs H11 probe（H11 无显著提升 kill dense 线）→ 5. Dense Action-Query Residual（hard precision <5pp kill）→ 6. H5 residual（<2pp kill）→ 7. foveal early-exit probe（RMSE 不优于 H11 kill）→ 8. privileged-critic PPO → 9. C²-IRF-lite（held-out 微扰无收益 kill）→ 10. readout adapter/last-1（泛化下降撤销）。
+
+### 存储口径
+全 MT49 sliding dense bank ~500GB 昂贵；3 精密任务子集 15-25GB 可做；probe 完全可接受。推荐：3 任务 H11 → probe → 阳性扩 hard-6 → actor 阳性再决定在线/全量。

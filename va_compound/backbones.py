@@ -1018,6 +1018,39 @@ class VJEPA21Backbone(nn.Module):
         position = {layer: index for index, layer in enumerate(ascending)}
         return [outs[position[layer]] for layer in layers]
 
+    def forward_hierarchical_dense(
+        self,
+        video: Tensor,
+        out_layers: Sequence[int] = (5, 11),
+    ) -> dict[int, Tensor]:
+        """MT-VJ §1：多层未池化 dense evidence（官方原生 out_layers 路径）。
+
+        ``video`` 输入契约与 ``_encode`` 同构：[B, W, 3, 384, 384]（W=4 帧窗，
+        偶数帧）。一次前向返回 ``{layer: [B, 1152, 768]}``——每层在对应 block
+        之后收集 ``norm(x)`` 并按 t→y→x 顺序扁平的全 2×24×24 patch token
+        （不池化），与 Step 0 dense 读出 / ``_dense_coords()`` 的顺序约定一致
+        （2 时间片 × 24×24 = 1152）。复用官方 forward 的 ``out_layers`` 支持
+        （``encode_multi``），缺省路径（``forward``/``_encode``）行为不变。
+        """
+        if isinstance(out_layers, (set, frozenset)):
+            layers = tuple(sorted(out_layers))  # 无序集合：规范为升序
+        else:
+            layers = tuple(out_layers)
+        h_grid, w_grid = self.patch_grid()
+        expected_tokens = (video.shape[1] // 2) * h_grid * w_grid
+        outs = self.encode_multi(video, out_layers=layers)
+        dense: dict[int, Tensor] = {}
+        for layer, raw in zip(layers, outs):
+            tokens = self._pool(raw, "dense")  # [B, t*h*w, D]（不池化扁平，t→y→x）
+            if tokens.shape[1] != expected_tokens:
+                raise ValueError(
+                    f"hierarchical dense output for layer {layer} has "
+                    f"{tokens.shape[1]} tokens, expected {expected_tokens} "
+                    f"(W={video.shape[1]} 帧窗 × {h_grid}×{w_grid} patch / 2 时间片)"
+                )
+            dense[layer] = tokens
+        return dense
+
     def _pool(self, tokens: Tensor, pooling: PoolingMode) -> Tensor:
         if pooling == "dense":
             # Step 0 dense readout：不池化，按 [t, h, w] 顺序扁平（2×24×24=1152），
