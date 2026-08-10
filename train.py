@@ -882,17 +882,29 @@ def _load_mtvj_metric_checkpoint(
 
     metric_head = LanguageMetricField(**ctor_kwargs(LanguageMetricField)).to(device)
     metric_head.load_state_dict(ckpt["metric_head"])
+    # metric tokens 输入改用 v4 实证定位 out.p（[B, R=4, 2] = 8 维）替代 loc-only
+    # 下未训练的 out.relation；RelationStateEncoder 以 state_dim=8 重建——旧权重是
+    # loc-only 随机初始化且从未训练（Codex v4 审查 P0-1），维度不匹配时直接丢弃。
     relation_encoder = RelationStateEncoder(
-        **ctor_kwargs(RelationStateEncoder)
+        state_dim=8,
+        d_model=int(ctor_config.get("d_model", 512)),
     ).to(device)
-    relation_encoder.load_state_dict(ckpt["relation_encoder"])
+    old_rel_sd = ckpt["relation_encoder"]
+    try:
+        relation_encoder.load_state_dict(old_rel_sd)
+    except RuntimeError as e:
+        print(
+            f"[mtvj] relation_encoder state_dim 不兼容，丢弃旧随机权重重建 "
+            f"（loc-only 下未训练，Codex P0-1）：{e}"
+        )
     for module in (metric_head, relation_encoder):
         module.eval()
         for parameter in module.parameters():
             parameter.requires_grad_(False)
     # metric_tokens [B, 2, d_model] 加入每层 action cross-attention（契约 §5）：
     # d_model 必须等于 VACompoundConfig.hidden_dim，启动即校验（fail-fast）。
-    state_dim = int(ctor_config.get("state_dim", 6)) if isinstance(ctor_config, dict) else 6
+    # 注意：metric tokens 输入已切换为 v4 定位 out.p（8 维），probe 用 state_dim=8。
+    state_dim = 8
     with torch.no_grad():
         try:
             probe_g, _ = relation_encoder(
@@ -1005,7 +1017,10 @@ def _mtvj_online_encode(
                 language_mask.repeat_interleave(sequence_length, dim=0),
                 coords,
             )
-            g = out.relation.reshape(batch_size, sequence_length, -1)  # [B, T, 4]
+            # metric tokens 输入 = v4 实证定位 out.p（[B*T, R=4, 2] → [B, T, 8]），
+            # 替代 loc-only 下未训练的 out.relation（Codex v4 审查 P0-1：随机 relation
+            # 注入 = 随机语义；13.45px 反事实验证过的定位才是有效度量证据）。
+            g = out.p.reshape(batch_size, sequence_length, -1)  # [B, T, 8]
             # ν_t = g_t − g_{t−1}；首决策 ν≡0（无 g_prev，与闭环语义一致）。
             nu = g - torch.cat((torch.zeros_like(g[:, :1]), g[:, :-1]), dim=1)
             z_g, z_nu = relation_encoder(

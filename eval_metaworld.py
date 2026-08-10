@@ -131,15 +131,21 @@ def _load_mtvj_metric_checkpoint(path: Path, device, config) -> tuple[nn.Module,
 
     metric_head = LanguageMetricField(**ctor_kwargs(LanguageMetricField)).to(device)
     metric_head.load_state_dict(ckpt["metric_head"])
+    # 与 train.py 一致：metric tokens 输入改用 v4 实证定位 out.p（8 维），
+    # RelationStateEncoder 以 state_dim=8 重建（loc-only 旧权重随机未训练，丢弃）。
     relation_encoder = RelationStateEncoder(
-        **ctor_kwargs(RelationStateEncoder)
+        state_dim=8,
+        d_model=int(ctor_config.get("d_model", 512)),
     ).to(device)
-    relation_encoder.load_state_dict(ckpt["relation_encoder"])
+    try:
+        relation_encoder.load_state_dict(ckpt["relation_encoder"])
+    except RuntimeError as e:
+        print(f"eval: relation_encoder state_dim 不兼容，丢弃旧随机权重重建：{e}")
     for module in (metric_head, relation_encoder):
         module.eval()
         for parameter in module.parameters():
             parameter.requires_grad_(False)
-    state_dim = int(ctor_config.get("state_dim", 4)) if isinstance(ctor_config, dict) else 4
+    state_dim = 8
     with torch.no_grad():
         probe_g, _ = relation_encoder(
             torch.zeros(1, state_dim, device=device),
@@ -187,7 +193,9 @@ def _mtvj_metric_tokens(
         language_mask.to(device=device),
         coords.to(device=device, dtype=head_dtype),
     )
-    g = out.relation.detach()[0]  # [4]（head 回归的 g_t）
+    # metric tokens 输入 = v4 实证定位 out.p（[B=1, R=4, 2] → [8]），替代 loc-only
+    # 下未训练的 out.relation（与 train.py _mtvj_online_encode 同构）。
+    g = out.p.detach()[0].reshape(-1)  # [8]（4 角色 × 2 归一化坐标）
     nu = torch.zeros_like(g) if g_prev is None else g - g_prev
     z_g, z_nu = relation_encoder(g[None], nu[None])
     metric_tokens = torch.stack((z_g, z_nu), dim=1)  # [1, 2, d_model]
