@@ -284,7 +284,7 @@ class TestLanguageMetricField:
         assert tuple(out.visibility.shape) == (2, N_ROLES)
         assert tuple(out.offset.shape) == (2, N_ROLES, 2)
         assert tuple(out.heatmap.shape) == (2, N_ROLES, GRID, GRID)
-        assert tuple(out.relation.shape) == (2, 4)
+        assert tuple(out.relation.shape) == (2, 6)  # 拍板 2A（2026-08-10）：[p_eef−p_obj(2), p_obj−p_target(2), axis_cos, depth_m]
         # 连续位置是图像坐标 0-1（y,x 序）；patch 中心 ± ½patch 偏移的浮点
         # 舍入用 1e-3 容差——坐标漏做 0-1 归一化会超出 ~0.5，必然触发。
         assert (out.p >= -1e-3).all(), "p 越界（< 0）"

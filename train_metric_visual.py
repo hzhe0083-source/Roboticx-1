@@ -91,6 +91,32 @@ def parse_args() -> argparse.Namespace:
         help="从 checkpoint 续训（自愈用：mujoco 渲染 GL 上下文长期运行失效 → "
         "看护检测卡死后 --resume 重启，2026-08-10）",
     )
+    # ---- v2（2026-08-10，三方评审后）----
+    parser.add_argument("--l2-norm", action="store_true",
+                        help="query/d11 逐行 L2 归一化 → cosine 分数")
+    parser.add_argument("--no-bias", action="store_true",
+                        help="冻结 spatial_bias（防边缘分布捷径，评审一致要求）")
+    parser.add_argument("--temp-init", type=float, default=10.0,
+                        help="可学习温度初值（l2_norm 时分数 = temp·cos）")
+    parser.add_argument("--sigma-px", type=float, default=2.0,
+                        help="高斯标签 σ（像素）；v2 建议 ≥3-4（σ=2 在 patch 交叉点 "
+                        "有 clamp 归一化伪影，target 只和 0.45）")
+    parser.add_argument("--loc-only", action="store_true",
+                        help="只训定位（CE+坐标），跳过 relation/vis/relation-encoder")
+    parser.add_argument("--offset-supervision", action="store_true",
+                        help="直接监督 GT patch 的 offset：δ* = p* − p_center（SmoothL1）")
+    parser.add_argument("--grad-accum", type=int, default=1,
+                        help="梯度累积步数（batch 4 太小时建议 ≥8）")
+    parser.add_argument("--fixed-data", type=str, default=None,
+                        help="tiny-set 模式：固定数据集 .pt（make_metric_batch 输出的 dict），"
+                        "特征一次性预计算，循环内只训 head（过拟合门）")
+    parser.add_argument("--mode-readout", action="store_true",
+                        help="v3 模式读出：NMS 全局峰 + 局部 5×5 soft-argmax + 峰 offset "
+                        "（探针实证：全网格期望读出在近乎全平的余弦面上 ≈ 均匀分布）")
+    parser.add_argument("--hinge-loss", action="store_true",
+                        help="v4 max-margin 目标替代 CE（探针实证：CE 在平坦余弦面上 "
+                        "收敛到边缘分布，hinge 2000 步达 8.5px）")
+    parser.add_argument("--hinge-margin", type=float, default=0.1)
     return parser.parse_args()
 
 
@@ -161,39 +187,74 @@ def gaussian_targets(
     return target / target.sum(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
 
 
-def compute_losses(out, keypoints, visibility, relation) -> tuple[torch.Tensor, dict]:
-    """CE(heatmap, Gaussian) + Huber(p̂,p*) + λg·Huber(ĝ,g*) + BCE(visibility)。
-
-    位置类损失按可见度掩码（分母 clamp 防除零）。返回总 loss 与各分量。
-    """
+def compute_losses(out, keypoints, visibility, relation, sigma_px: float = HEATMAP_SIGMA_PX,
+                   loc_only: bool = False, offset_supervision: bool = False,
+                   hinge: bool = False, hinge_margin: float = 0.1) -> tuple[torch.Tensor, dict]:
+    """v4（2026-08-10，探针实证）：``hinge`` 用 max-margin 目标替代 CE——
+    max(s_GT) 必须超过 max(其余 patch) 至少 ``hinge_margin``。CE 在近乎全平的
+    余弦面上梯度 ≈ mean(全图特征) − f_target，被静态背景主导 → 收敛到边缘
+    分布（探针：三种读出 × 两种初始化全部 49-58px）；hinge 梯度 = −f_target +
+    f_best_other 逐样本相干，2000 步即达 8.5px（scripts/diag_trained_linear_probe.py
+    与 hinge 探针实证）。其余组件同前：CE/Huber 位置/offset 按可见度掩码。"""
     device = keypoints.device
-    targets = gaussian_targets(keypoints)
     vis = visibility  # [B, R] float
     n_vis = vis.sum().clamp_min(1.0)
+    grid = HEATMAP_GRID
+    yi = torch.clamp(torch.floor(keypoints[..., 0] * grid).long(), 0, grid - 1)
+    xi = torch.clamp(torch.floor(keypoints[..., 1] * grid).long(), 0, grid - 1)
+    idx = yi * grid + xi  # [B, R]（片内位置；两片坐标相同）
 
-    # CE（log P，数值稳定：logsumexp 形式，不经概率钳制）
-    ce_per = -(targets * out.log_heatmap).sum(dim=(-2, -1))  # [B, R]
-    loss_ce = (ce_per * vis).sum() / n_vis
+    parts: dict[str, float] = {}
+    if hinge:
+        s = out.scores  # [B, R, 1152]
+        s_gt = torch.maximum(
+            s.gather(-1, idx.unsqueeze(-1)).squeeze(-1),
+            s.gather(-1, (idx + grid * grid).unsqueeze(-1)).squeeze(-1),
+        )  # [B, R]
+        mask_excl = torch.ones_like(s, dtype=torch.bool)
+        mask_excl.scatter_(-1, idx.unsqueeze(-1), False)
+        mask_excl.scatter_(-1, (idx + grid * grid).unsqueeze(-1), False)
+        s_other = s.masked_fill(~mask_excl, -1e9).max(dim=-1).values  # [B, R]
+        h = F.relu(hinge_margin - (s_gt - s_other))
+        loss_hinge = (h * vis).sum() / n_vis
+        parts["hinge"] = loss_hinge.item()
+        loss_cls = loss_hinge
+    else:
+        targets = gaussian_targets(keypoints, sigma_px=sigma_px)
+        ce_per = -(targets * out.log_heatmap).sum(dim=(-2, -1))  # [B, R]
+        loss_cls = (ce_per * vis).sum() / n_vis
+        parts["ce"] = loss_cls.item()
 
     # Huber 位置（归一化图像坐标 → 像素乘 384 在 RMSE 中体现）
     pos_per = F.smooth_l1_loss(out.p, keypoints, reduction="none").sum(dim=-1)  # [B, R]
     loss_pos = (pos_per * vis).sum() / n_vis
+    parts["pos"] = loss_pos.item()
 
-    # Huber 关系（g* 世界坐标，米）
-    loss_rel = F.smooth_l1_loss(out.relation, relation, reduction="mean")
+    # v2：GT patch 的直接 offset 监督（δ* = p* − p_center，归一化坐标）
+    loss_offset = torch.zeros((), device=device)
+    if offset_supervision:
+        gt_center = torch.stack(((yi + 0.5) / grid, (xi + 0.5) / grid), dim=-1)
+        delta_star = keypoints - gt_center  # [B, R, 2]
+        off = out.offset_full[:, :, : grid * grid]  # [B, R, 576, 2]（t=0 片）
+        idx4 = idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, 2)
+        off_gt = off.gather(dim=2, index=idx4).squeeze(2)  # [B, R, 2]
+        loss_offset = (
+            F.smooth_l1_loss(off_gt, delta_star, reduction="none").sum(dim=-1) * vis
+        ).sum() / n_vis
+        parts["offset"] = loss_offset.item()
 
-    # BCE 可见度
-    loss_vis = F.binary_cross_entropy_with_logits(
-        out.visibility_logits, vis, reduction="mean"
-    )
-
-    total = loss_ce + loss_pos + RELATION_LAMBDA * loss_rel + loss_vis
-    return total, {
-        "ce": loss_ce.item(),
-        "pos": loss_pos.item(),
-        "rel": loss_rel.item(),
-        "vis": loss_vis.item(),
-    }
+    if not loc_only:
+        # Huber 关系（g* 世界坐标，米）
+        loss_rel = F.smooth_l1_loss(out.relation, relation, reduction="mean")
+        # BCE 可见度
+        loss_vis = F.binary_cross_entropy_with_logits(
+            out.visibility_logits, vis, reduction="mean"
+        )
+        total = loss_cls + loss_pos + RELATION_LAMBDA * loss_rel + loss_vis
+        parts.update({"rel": loss_rel.item(), "vis": loss_vis.item()})
+    else:
+        total = loss_cls + loss_pos + loss_offset
+    return total, parts
 
 
 def verify_labels(tasks: list[str], rng: np.random.Generator) -> None:
@@ -290,15 +351,26 @@ def main() -> None:
         text_backbone, [ENV_TO_TASK[t] for t in tasks]
     )
 
-    # ---- 模型（仅 metric head 可训练） ----
-    metric_head = LanguageMetricField().to(device)
+    # ---- 模型（v2：loc_only 只训 metric head；relation encoder 恒创建以保契约） ----
+    metric_head = LanguageMetricField(
+        l2_norm=args.l2_norm,
+        learnable_temp=args.l2_norm,
+        temp_init=args.temp_init,
+        freeze_bias=args.no_bias,
+        mode_readout=args.mode_readout,
+    ).to(device)
     # 拍板 3A（2026-08-10）：阶段 V 一起训练 RelationStateEncoder——metric tokens
-    # 应为监督学习的关系编码（Codex P1-3），而非随机线性映射。
+    # 应为监督学习的关系编码（Codex P1-3），而非随机线性映射。loc_only 时仅
+    # 随机初始化保存（checkpoint 契约 §2 要求该键），不进优化器。
     relation_encoder = RelationStateEncoder(state_dim=6).to(device)
-    relation_encoder.train()
-    optimizer = torch.optim.Adam(
-        [*metric_head.parameters(), *relation_encoder.parameters()], lr=args.lr
-    )
+    optimizer_params = list(metric_head.parameters())
+    if args.loc_only:
+        relation_encoder.eval()
+        print("train: loc-only 模式——relation/vis 损失跳过，relation encoder 仅随机保存", flush=True)
+    else:
+        relation_encoder.train()
+        optimizer_params += list(relation_encoder.parameters())
+    optimizer = torch.optim.Adam(optimizer_params, lr=args.lr)
     n_params = sum(p.numel() for p in metric_head.parameters())
     print(f"train: device={device} tasks={tasks} steps={args.steps} "
           f"batch_size={args.batch_size} lr={args.lr} metric_head_params={n_params / 1e6:.2f}M")
@@ -318,8 +390,9 @@ def main() -> None:
         # 2026-08-10 自愈：从 checkpoint 续训（mujoco 渲染 GL 上下文长期运行
         # 后失效 → fallback 软件渲染极慢 → 看护检测卡死自动 --resume 重启）
         ck = torch.load(args.resume, map_location="cpu", weights_only=True)
-        metric_head.load_state_dict(ck["metric_head"])
-        relation_encoder.load_state_dict(ck["relation_encoder"])
+        metric_head.load_state_dict(ck["metric_head"], strict=False)  # v2 新参数保持初始化
+        if relation_encoder is not None:
+            relation_encoder.load_state_dict(ck["relation_encoder"])
         start_step = int(ck.get("config", {}).get("steps_done", 0))
         print(f"train: resume from {args.resume}（steps_done={start_step}）", flush=True)
 
@@ -343,41 +416,82 @@ def main() -> None:
                 "relation_encoder_trained": True,  # 拍板 3A（2026-08-10）：阶段 V 联合训练
                 "state_dim": 6,  # relation 状态维（拍板 2A；train.py 探针读取）
                 "language_cache_available": text_backbone is not None,
+                # v2（2026-08-10）：重建 ctor 用（train.py _load_mtvj_metric_checkpoint
+                # 按签名过滤注入；缺省字段旧 checkpoint 加载不受影响）
+                "l2_norm": args.l2_norm,
+                "learnable_temp": args.l2_norm,
+                "temp_init": args.temp_init,
+                "freeze_bias": args.no_bias,
+                "sigma_px": args.sigma_px,
+                "mode_readout": args.mode_readout,
+                "hinge_loss": args.hinge_loss,
+                "hinge_margin": args.hinge_margin,
             },
             "metric_head": metric_head.state_dict(),
             "relation_encoder": relation_encoder.state_dict(),
             "contract": CONTRACT,
         }
 
-    for step in range(start_step, args.steps):
-        task = tasks[int(rng.integers(0, len(tasks)))]
-        batch = make_metric_batch(task, rng, args.batch_size)
-
-        video = preprocess_frames(batch["frames"], device)  # [B,4,3,384,384]
+    # ---- 数据源（v2）：tiny 固定集（特征一次性预计算，head-only）或仿真流 ----
+    fixed = None
+    if args.fixed_data:
+        fixed = torch.load(args.fixed_data, map_location="cpu", weights_only=False)
+        n_fixed = len(fixed["frames"])
+        video = preprocess_frames(np.asarray(fixed["frames"]), device)
         with torch.no_grad():
-            h5, h11 = vision_backbone.encode_multi(video, out_layers=(5, 11))
-            lang_hidden, lang_mask = gather_language(language_cache, batch["language_text"], device)
+            h5_f, h11_f = vision_backbone.encode_multi(video, out_layers=(5, 11))
+        del video
+        lang_cache_f, _ = build_language_cache(
+            text_backbone, [str(t) for t in fixed["language_text"]]
+        )
+        kp_f = torch.from_numpy(np.asarray(fixed["keypoints"])).to(device)
+        vis_f = torch.from_numpy(np.asarray(fixed["visibility"])).to(device)
+        rel_f = torch.from_numpy(np.asarray(fixed["relation"])).to(device)
+        print(f"train: tiny 固定集 {n_fixed} 样本，特征预计算完成（head-only）", flush=True)
+
+    for step in range(start_step, args.steps):
+        if fixed is not None:
+            idx = torch.randperm(n_fixed, device=device)[: args.batch_size]
+            h5, h11 = h5_f[idx], h11_f[idx]
+            texts = [str(fixed["language_text"][int(i)]) for i in idx.cpu()]
+            lang_hidden, lang_mask = gather_language(lang_cache_f, texts, device)
+            keypoints, visibility, relation = kp_f[idx], vis_f[idx], rel_f[idx]
+        else:
+            task = tasks[int(rng.integers(0, len(tasks)))]
+            batch = make_metric_batch(task, rng, args.batch_size)
+            video = preprocess_frames(batch["frames"], device)  # [B,4,3,384,384]
+            with torch.no_grad():
+                h5, h11 = vision_backbone.encode_multi(video, out_layers=(5, 11))
+                lang_hidden, lang_mask = gather_language(
+                    language_cache, batch["language_text"], device
+                )
+            keypoints = torch.from_numpy(batch["keypoints"]).to(device)
+            visibility = torch.from_numpy(batch["visibility"]).to(device)
+            relation = torch.from_numpy(batch["relation"]).to(device)
 
         out = metric_head(h5, h11, lang_hidden, lang_mask, coords)
-        keypoints = torch.from_numpy(batch["keypoints"]).to(device)
-        visibility = torch.from_numpy(batch["visibility"]).to(device)
-        relation = torch.from_numpy(batch["relation"]).to(device)
-
-        loss, parts = compute_losses(out, keypoints, visibility, relation)
-        # 拍板 3A（2026-08-10）：relation encoder 重建监督——z_g 须保留 g_t 信息
-        # （Codex P1-3；ν 分支无历史依赖，留阶段 A 监督）。
-        g_true = relation
-        nu_zero = torch.zeros_like(g_true)
-        z_g, _ = relation_encoder(g_true, nu_zero)
-        g_recon = relation_encoder.recon(z_g)
-        loss_recon = F.mse_loss(g_recon, g_true)
-        loss = loss + REL_RECON_LAMBDA * loss_recon
+        loss, parts = compute_losses(
+            out, keypoints, visibility, relation,
+            sigma_px=args.sigma_px, loc_only=args.loc_only,
+            offset_supervision=args.offset_supervision,
+            hinge=args.hinge_loss, hinge_margin=args.hinge_margin,
+        )
+        if not args.loc_only and relation_encoder is not None:
+            # 拍板 3A（2026-08-10）：relation encoder 重建监督——z_g 须保留 g_t 信息
+            # （Codex P1-3；ν 分支无历史依赖，留阶段 A 监督）。
+            g_true = relation
+            nu_zero = torch.zeros_like(g_true)
+            z_g, _ = relation_encoder(g_true, nu_zero)
+            g_recon = relation_encoder.recon(z_g)
+            loss = loss + REL_RECON_LAMBDA * F.mse_loss(g_recon, g_true)
+        loss = loss / max(args.grad_accum, 1)
         if not math.isfinite(loss.item()):
             raise RuntimeError(f"loss 非有限值 @ step {step}: {loss.item()}")
 
-        optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        optimizer.step()
+        if (step + 1) % max(args.grad_accum, 1) == 0:
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
         # train RMSE（px）：可见角色的位置误差 ×384
         err_px = (out.p.detach() - keypoints) * IMAGE_SIZE  # [B, R, 2]
@@ -387,10 +501,13 @@ def main() -> None:
 
         if (step + 1) % args.log_every == 0 or step == args.steps - 1:
             rmse = math.sqrt(rmse_sum / max(rmse_count, 1))
+            parts_str = " ".join(f"{k} {v:.4f}" for k, v in parts.items())
+            temp_str = ""
+            if args.l2_norm and hasattr(metric_head, "temperature"):
+                temp_str = f" temp={float(metric_head.temperature.detach()):.2f}"
             print(
                 f"step {step + 1}/{args.steps} loss {loss.item():.4f} "
-                f"(ce {parts['ce']:.4f} pos {parts['pos']:.4f} "
-                f"rel {parts['rel']:.4f} vis {parts['vis']:.4f}) "
+                f"({parts_str}){temp_str} "
                 f"train RMSE {rmse:.2f} px  vis_mean {float(visibility.mean()):.2f}",
                 flush=True,
             )

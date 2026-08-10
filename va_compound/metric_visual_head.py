@@ -45,6 +45,8 @@ class MetricFieldOutput:
                        # （Codex P0-5 拍板 2026-08-10：统一 6 维，支持显式轴向/深度主张）
     visibility_logits: Tensor  # [B, N_ROLES] BCE 用 logits（诊断/训练，附加字段）
     log_heatmap: Tensor  # [B, N_ROLES, 24, 24] log P（数值稳定，CE 监督用；附加字段）
+    offset_full: Tensor | None = None  # [B, N_ROLES, 1152, 2] 逐 patch offset（直接监督用）
+    scores: Tensor | None = None  # [B, N_ROLES, 1152] 原始分数（hinge 监督用；附加字段）
 
 
 def _normalize_coords(coords: Tensor) -> Tensor:
@@ -68,13 +70,27 @@ class LanguageMetricField(nn.Module):
     """
 
     def __init__(self, lang_dim: int = 2048, h_dim: int = H_DIM,
-                 d_proj: int = D_PROJ, n_roles: int = N_ROLES) -> None:
+                 d_proj: int = D_PROJ, n_roles: int = N_ROLES,
+                 l2_norm: bool = False, learnable_temp: bool = False,
+                 temp_init: float = 10.0, freeze_bias: bool = False,
+                 mode_readout: bool = False) -> None:
+        """v3（2026-08-10，探针实证后）：``mode_readout`` 用模式读出替代全网格
+        期望读出——heatmap（片求和）全局峰 + 局部 5×5 soft-argmax（+峰 patch
+        的 offset）。实测 V-JEPA h11 余弦面近乎全平（576 片中 575 片相似度
+        >0.5×max），全网格期望 ≈ 均匀分布 → 预测钉死网格质心（40-80px）；
+        argmax / 模式读出在同一查询下即达 8-10px（scripts/diag_probe_oracle.py
+        与 diag_trained_linear_probe.py 实证）。v1 默认参数行为逐字节不变。"""
         super().__init__()
         self.lang_dim = lang_dim
         self.h_dim = h_dim
         self.d_proj = d_proj
         self.n_roles = n_roles
         self.grid = HEATMAP_GRID
+        self.l2_norm = l2_norm
+        self.learnable_temp = learnable_temp
+        self.freeze_bias = freeze_bias
+        self.temp_init = temp_init
+        self.mode_readout = mode_readout
 
         # 语言 → 角色查询：语言 token 掩码均值池 → 每角色一个 d_proj 查询。
         self.lang_pool = nn.Linear(lang_dim, n_roles * d_proj)
@@ -103,6 +119,11 @@ class LanguageMetricField(nn.Module):
         )
         # 初始等价：softmax 前分数由空间偏置决定（0），保证训练前 p̂ ≈ 网格中心。
         self._init_weights()
+        if self.learnable_temp:
+            # 可学习温度：s = temp·cos(q,d)（l2_norm 时）或 temp·(q·d/√d)（纯 v1）
+            self.temperature = nn.Parameter(torch.tensor(float(temp_init)))
+        if self.freeze_bias:
+            self.spatial_bias.requires_grad_(False)
 
     def _init_weights(self) -> None:
         for module in self.modules():
@@ -138,9 +159,19 @@ class LanguageMetricField(nn.Module):
         d11 = self.w_k11(h11)  # [B, 1152, d]
         d5 = self.w_k5(h5)     # [B, 1152, d]
 
-        # ---- 分数 s_{r,n} = q_r·D_n/√d + b_r(t,y,x)（√d 缩放稳定 softmax） ----
-        scale = 1.0 / math.sqrt(self.d_proj)
-        scores = torch.einsum("brd,bnd->brn", query, d11) * scale  # [B, r, 1152]
+        # ---- 分数 s_{r,n}（v1: q·d/√d；v2: L2 归一化 + 温度 → cosine 相似度）----
+        if self.l2_norm:
+            qn = query / query.norm(dim=-1, keepdim=True).clamp_min(1e-9)
+            dn = d11 / d11.norm(dim=-1, keepdim=True).clamp_min(1e-9)
+            temp = (
+                self.temperature
+                if self.learnable_temp
+                else torch.tensor(self.temp_init, dtype=dtype, device=h11.device)
+            )
+            scores = torch.einsum("brd,bnd->brn", qn, dn) * temp  # [B, r, 1152]
+        else:
+            scale = 1.0 / math.sqrt(self.d_proj)
+            scores = torch.einsum("brd,bnd->brn", query, d11) * scale  # [B, r, 1152]
         bias = self.spatial_bias.reshape(self.n_roles, -1)  # [r, 1152]
         scores = scores + bias.unsqueeze(0)
 
@@ -161,9 +192,6 @@ class LanguageMetricField(nn.Module):
 
         # ---- softmax 概率（含 t 轴）→ 位置 + heatmap + log-heatmap ----
         probs = F.softmax(scores, dim=-1)  # [B, r, 1152]
-        patch_center = coords[:, 1:]       # [1152, 2]（0-1，y,x）
-        expected = patch_center.unsqueeze(0).unsqueeze(0) + offsets  # [B, r, 1152, 2]
-        p_hat = (probs.unsqueeze(-1) * expected).sum(dim=2)  # [B, r, 2]
         scores_grid = scores.view(batch, self.n_roles, 2, self.grid, self.grid)
         heatmap = probs.view(batch, self.n_roles, 2, self.grid, self.grid).sum(dim=2)
         # log P(y,x) = logsumexp_t(s) − log Z：数值稳定，CE 监督用（不经概率钳制，
@@ -171,6 +199,48 @@ class LanguageMetricField(nn.Module):
         log_heatmap = torch.logsumexp(scores_grid, dim=2) - torch.logsumexp(
             scores.view(batch, self.n_roles, -1), dim=-1, keepdim=True
         ).unsqueeze(-1)  # [B, r, 24, 24]
+
+        if self.mode_readout:
+            # ---- v3 模式读出（探针实证，2026-08-10）：片求和 heatmap 全局峰 +
+            # 局部 5×5 soft-argmax + 峰 patch 的 offset。全网格期望读出在近乎
+            # 全平的余弦面上 ≈ 均匀分布 → 钉死网格质心（40-80px）；模式读出
+            # 同一查询即达 8-10px。 ----
+            hm = heatmap  # [B, r, 24, 24]
+            flat_hm = hm.view(batch, self.n_roles, -1)
+            peak_idx = flat_hm.argmax(dim=-1)  # [B, r]
+            py = peak_idx // self.grid
+            px = peak_idx % self.grid
+            dy = torch.arange(-2, 3, device=hm.device, dtype=torch.long)
+            dx = torch.arange(-2, 3, device=hm.device, dtype=torch.long)
+            # 5×5 窗口（边界 clamp；多峰 NMS/top-2 留后续）
+            yy = (py.unsqueeze(-1).unsqueeze(-1) + dy.view(1, 1, 5, 1)).clamp(0, self.grid - 1)
+            xx = (px.unsqueeze(-1).unsqueeze(-1) + dx.view(1, 1, 1, 5)).clamp(0, self.grid - 1)
+            yyb = yy.expand(-1, -1, 5, 5)
+            xxb = xx.expand(-1, -1, 5, 5)
+            # 扁平索引一次 gather（两次 gather 会作用在中间 5×5 结果上越界）
+            win_idx = (yyb * self.grid + xxb).view(batch, self.n_roles, -1)  # [B, r, 25]
+            w = flat_hm.gather(-1, win_idx).view(batch, self.n_roles, 5, 5)  # [B, r, 5, 5]
+            w = w / w.sum(dim=(-2, -1), keepdim=True).clamp_min(1e-9)
+            cy = (yyb.float() + 0.5) / self.grid
+            cx = (xxb.float() + 0.5) / self.grid
+            p_mode = torch.stack(
+                ((w * cy).sum(dim=(-2, -1)), (w * cx).sum(dim=(-2, -1))), dim=-1
+            )  # [B, r, 2]（y,x 0-1）
+            # 峰 patch 的 offset（取概率更高的时间片；两片坐标相同）
+            ps_flat = probs.view(batch, self.n_roles, 2, self.grid * self.grid)
+            idx2 = (py * self.grid + px).unsqueeze(-1)  # [B, r, 1]
+            p0 = ps_flat[:, :, 0].gather(-1, idx2).squeeze(-1)
+            p1 = ps_flat[:, :, 1].gather(-1, idx2).squeeze(-1)
+            slice_sel = (p1 > p0).long()  # [B, r]
+            off_idx = slice_sel * (self.grid * self.grid) + peak_idx
+            off_peak = offsets.gather(
+                2, off_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, 2)
+            ).squeeze(2)  # [B, r, 2]
+            p_hat = p_mode + off_peak
+        else:
+            patch_center = coords[:, 1:]       # [1152, 2]（0-1，y,x）
+            expected = patch_center.unsqueeze(0).unsqueeze(0) + offsets  # [B, r, 1152, 2]
+            p_hat = (probs.unsqueeze(-1) * expected).sum(dim=2)  # [B, r, 2]
 
         # ---- 可见度 + 关系 ----
         attn_feat = (probs.unsqueeze(-1) * d11.unsqueeze(1)).sum(dim=2)  # [B, r, d] ΣπD
@@ -191,6 +261,8 @@ class LanguageMetricField(nn.Module):
             relation=relation,
             visibility_logits=vis_logits,
             log_heatmap=log_heatmap,
+            offset_full=offsets,  # [B, r, 1152, 2]（v2 直接监督：δ* = p* − p_center）
+            scores=scores,  # [B, r, 1152]（v4 hinge 监督）
         )
 
 
