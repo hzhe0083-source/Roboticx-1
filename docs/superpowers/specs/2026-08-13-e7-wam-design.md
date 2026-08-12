@@ -3,7 +3,7 @@
 - 日期：2026-08-13
 - 分支：`wam-e7`（base = `main@709d6d0`，工作树干净，无未提交补丁）
 - 状态：设计定稿，待用户 review 后进入实施计划
-- 决策记录：排期=双轨并行；L_consistency=Codex 方案 E（首轮占位）；分支=wam-e7；取舍=甲+甲+甲（独立模块+2处钩子 / 精简 cache / 4门里程碑）
+- 决策记录：排期=双轨并行；L_consistency=Codex 方案 E（首轮占位）；分支=wam-e7；取舍=甲+甲+甲（独立模块+2处钩子 / 精简 cache / 4门里程碑）；**WAM-VA 耦合=逐层旁路耦合（方案 C）**
 
 ## 1. 目标与不变式
 
@@ -46,19 +46,26 @@ v_action = v_base + α · Δv_WAM        （α=0 或 wam=off → 纯旧路径）
     （H11 最后时间片 24×24 网格 → 4×4 空间池化 = 16）
   - 3 × 2 个未来几何 token（每跨度：`g_future = p×visibility` 与
     `ν = g_future − g_current`）
-- 只读条件：当前 VA action condition（[B,48,512]）、当前 16 个空间 token、
-  当前几何 token；动作 token 与未来场景 token 之间双向注意力。
+- **逐层旁路耦合（方案 C）**：WAM 第 i 层与 VA 第 i 层对齐，读该层 VA 记忆
+  快照（`VisualMemory.layers[i]`，只读 K/V）+ 当前 16 个空间 token + 当前
+  几何 token；层内动作残差 token 与未来场景 token 双向注意力。VA 层不感知
+  WAM 存在，WAM 不反向写入任何 VA 状态。
+- 只读条件汇总：当前 VA action condition（[B,48,512]）、每层 VA 记忆快照、
+  当前 16 个空间 token、当前几何 token。
 - 输出：场景速度（V-JEPA/几何 token 自身去噪速度）+ 动作残差速度。
   **动作残差输出层零初始化，场景输出层正常初始化**。
 - 想象结果不写入 VisualMemory，仅用于本次动作联合生成与诊断。
 
-### 3.2 挂载点（仅 2 处小钩子，`wam_joint=False` 时零改动）
+### 3.2 挂载点（只读小钩子，`wam_joint=False` 时零改动）
 
-1. `VACompoundPolicy.encode_condition`：收集当前空间/几何 token 与
-   action condition，传入 WAM。
+1. `VACompoundPolicy.encode_condition`：把每层 VA 记忆快照
+   （`VisualMemory.layers[i]`）、当前空间/几何 token、action condition 传入
+   WAM（N+1 处只读输入，N = VA 层数）。
 2. `train.py rollout_policy` / 评测侧：速度合成
    `v = v_base + α·Δv_WAM`；训练时 WAM 场景 token 与动作残差 token 参与
    各自的 flow-matching 目标。
+3. 推理延迟预算：每层旁路 K/V 投影为轻量线性层，总开销控制在原版 1.5× 内
+   （M4 实测验证）。
 
 ### 3.3 旧模块保护
 
