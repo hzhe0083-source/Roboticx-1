@@ -153,6 +153,47 @@ def _make_wam_residual_fn(wam, memory, spatial16, geo8, wam_alpha):
     return fn
 
 
+def _resolve_wam(ckpt: dict, args, config, device: torch.device):
+    """E7 WAM M0 Task 4：--wam auto|on|off 决议（返回 wam 或 None）。
+
+    auto = checkpoint 追加键 wam_model 存在则启用；on = 必须有 WAM 权重，
+    否则明确报错退出（拒绝旧 checkpoint 静默回退）；off = 永不启用。
+    --wam off 或 --wam-alpha 0 直接短路返回 None：不建 WAM、不建
+    wam_residual_fn 闭包、不传 wam_residual_fn（旧版「建闭包乘零」仍会
+    每决策步白跑一次 wam.forward，且轨迹与旧版非逐位一致）。wam=None 时
+    两个 decode 钩子均走旧版路径，行为逐位一致。
+    """
+    if args.wam == "off" or float(args.wam_alpha) == 0.0:
+        return None
+    wam_state = ckpt.get("wam_model")
+    if wam_state is None:
+        if args.wam == "on":
+            sys.exit(
+                "--wam on: checkpoint has no WAM weights (old checkpoint); "
+                "use auto/off"
+            )
+        return None
+    # Task 1（va_compound/wam.py）为并行交付：延迟导入，wam 不可用时
+    # 不触碰该模块（import eval_metaworld 始终干净）。
+    from va_compound.wam import JointWorldActionFlow, WAMConfig
+
+    wam_cfg = WAMConfig(
+        action_horizon=int(getattr(config, "action_horizon", ACTION_HORIZON)),
+        action_dim=int(getattr(config, "action_dim", 4)),
+        hidden_dim=int(getattr(config, "hidden_dim", 512)),
+    )
+    wam = JointWorldActionFlow(wam_cfg)
+    wam.load_state_dict(wam_state)
+    wam.to(device).eval()
+    print(
+        f"eval: WAM enabled from checkpoint wam_model "
+        f"(action_horizon={wam_cfg.action_horizon}, "
+        f"action_dim={wam_cfg.action_dim}, "
+        f"hidden_dim={wam_cfg.hidden_dim}, alpha={args.wam_alpha})"
+    )
+    return wam
+
+
 def select_eval_tasks(
     all_tasks: list[str], task_ids: str | None, max_tasks: int
 ) -> list[tuple[int, str]]:
@@ -1744,38 +1785,11 @@ def main() -> None:
     )
     print(f"eval: action_horizon={ACTION_HORIZON} (from checkpoint config), "
           f"flow_steps={flow_steps} (from checkpoint contract)")
-    # E7 WAM M0 Task 4：--wam auto|on|off 决议。auto = checkpoint 追加键 wam_model
-    # 存在则启用；on = 必须有 WAM 权重，否则明确报错退出（拒绝旧 checkpoint 静默
-    # 回退）；off = 永不启用。wam_model 为追加键，旧 checkpoint 无此键时 wam=None，
-    # 后续决策循环行为与旧版逐位一致。
-    wam = None
-    wam_state = ckpt.get("wam_model")
-    if wam_state is not None:
-        if args.wam == "off":
-            wam = None
-        else:
-            # Task 1（va_compound/wam.py）为并行交付：延迟导入，wam 不可用时
-            # 不触碰该模块（import eval_metaworld 始终干净）。
-            from va_compound.wam import JointWorldActionFlow, WAMConfig
-
-            wam_cfg = WAMConfig(
-                action_horizon=int(getattr(config, "action_horizon", ACTION_HORIZON)),
-                action_dim=int(getattr(config, "action_dim", 4)),
-                hidden_dim=int(getattr(config, "hidden_dim", 512)),
-            )
-            wam = JointWorldActionFlow(wam_cfg)
-            wam.load_state_dict(wam_state)
-            wam.to(device).eval()
-            print(
-                f"eval: WAM enabled from checkpoint wam_model "
-                f"(action_horizon={wam_cfg.action_horizon}, "
-                f"action_dim={wam_cfg.action_dim}, "
-                f"hidden_dim={wam_cfg.hidden_dim}, alpha={args.wam_alpha})"
-            )
-    elif args.wam == "on":
-        sys.exit(
-            "--wam on: checkpoint has no WAM weights (old checkpoint); use auto/off"
-        )
+    # E7 WAM M0 Task 4：--wam auto|on|off 决议（见 _resolve_wam）。off 或
+    # alpha=0 短路返回 None：不建 WAM、不建 wam_residual_fn 闭包，两个 decode
+    # 钩子均不传 wam_residual_fn。wam_model 为追加键，旧 checkpoint 无此键时
+    # wam=None，后续决策循环行为与旧版逐位一致。
+    wam = _resolve_wam(ckpt, args, config, device)
     # spatial-pooling ckpt 评估：vision_pooling 存在 training_contract 而非 config。
     vision_pooling = str(
         (ckpt.get("training_contract", {}) or {}).get("vision_pooling", "flat")
@@ -2424,6 +2438,8 @@ def main() -> None:
                                 # E7 WAM M0 Task 4：servo 分支无 dense_evidence /
                                 # metric head 决策点读数，场景输入零张量（与 M0
                                 # 动作残差通路约定一致）。
+                                # M0 约定：servo 路径无 dense metric 上下文，WAM
+                                # 仅动作残差通路；E7 验收走普通分支。
                                 decode_kwargs["wam_residual_fn"] = _make_wam_residual_fn(
                                     wam,
                                     memory,

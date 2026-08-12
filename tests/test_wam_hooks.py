@@ -131,3 +131,70 @@ def test_wam_joint_mutex() -> None:
     args.future_predict = True
     with pytest.raises(ValueError, match="mutually exclusive"):
         validate_args(args)
+
+
+def test_pooling_implementations_equivalent() -> None:
+    """eval 的 _wam_spatial16_from_h11（avg_pool2d）与 wam_cache 的
+    wam_last_slice_pool（view+mean 块均值）语义必须一致：同一 [B,1152,768]
+    输入的 6×6 块均值 → [B,16,768]（E7 审查：池化双实现等价）。"""
+    try:
+        from va_compound.wam_cache import wam_last_slice_pool
+    except ImportError:
+        pytest.skip("dependency not yet implemented: va_compound.wam_cache")
+    try:
+        from eval_metaworld import _wam_spatial16_from_h11
+    except ImportError:
+        pytest.skip("dependency not yet implemented: eval_metaworld")
+    torch.manual_seed(20260812)
+    h11 = torch.randn(2, 1152, 768)
+    torch.testing.assert_close(
+        _wam_spatial16_from_h11(h11),
+        wam_last_slice_pool(h11),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
+def test_wam_forward_not_called_when_disabled(monkeypatch) -> None:
+    """--wam off / --wam-alpha 0 时 eval 决议短路：wam=None → 两个 decode
+    钩子不建 wam_residual_fn 闭包、wam.forward 永不被调（计数 stub 验证）。
+
+    train 侧 rollout 钩子（train.py 的 rollout_policy）无 args 上下文且
+    整体构造过重，不在本测试覆盖——train 侧由 fix-C agent 覆盖。
+    """
+    if VACompoundConfig is None:
+        pytest.skip("dependency not yet implemented: va_compound.model")
+    try:
+        import eval_metaworld
+        from eval_metaworld import _resolve_wam
+    except ImportError:
+        pytest.skip("dependency not yet implemented: eval_metaworld")
+    from types import SimpleNamespace
+
+    calls = {"n": 0}
+
+    def residual_stub(*_a, **_k):
+        calls["n"] += 1
+        raise AssertionError("wam 禁用时不得创建 wam_residual_fn 闭包")
+
+    monkeypatch.setattr(eval_metaworld, "_make_wam_residual_fn", residual_stub)
+
+    config = _tiny_config(VACompoundConfig)
+    for wam_flag, alpha in (("off", 1.0), ("auto", 0.0), ("on", 0.0)):
+        args = SimpleNamespace(wam=wam_flag, wam_alpha=alpha)
+        wam = _resolve_wam({}, args, config, torch.device("cpu"))
+        assert wam is None, f"--wam {wam_flag} / alpha {alpha} 必须短路为 None"
+        # 决议 None 后两个 decode 钩子站点的契约：不建闭包、不传 wam_residual_fn。
+        decode_kwargs = {}
+        if wam is not None:
+            decode_kwargs["wam_residual_fn"] = residual_stub()
+        assert "wam_residual_fn" not in decode_kwargs
+
+    # auto + 旧 checkpoint（无 wam_model 键）→ None，行为与旧版逐位一致。
+    args = SimpleNamespace(wam="auto", wam_alpha=1.0)
+    assert _resolve_wam({}, args, config, torch.device("cpu")) is None
+    # on + 旧 checkpoint → 明确报错退出（拒绝静默回退）。
+    args = SimpleNamespace(wam="on", wam_alpha=1.0)
+    with pytest.raises(SystemExit):
+        _resolve_wam({}, args, config, torch.device("cpu"))
+    assert calls["n"] == 0
