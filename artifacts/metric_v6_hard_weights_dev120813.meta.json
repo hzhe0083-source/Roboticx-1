@@ -1,0 +1,356 @@
+{
+  "contract": "mt_vj_visual_hard_weights_v1",
+  "formula": "clip(1 + I(task_rmse>15) + I(worst_role_rmse>30) + I(task_pck10<0.30) + I(visibility_brier>0.05), 1, 4)",
+  "evaluation": "/home/ryan/Documents/robot/ORA0/artifacts/metric_v5_10k_newcontract_dev_seed120813_b4.json",
+  "evaluation_sha256": "2b7d7d8654b7ba5dce4b8aaf776209d53aefbc3869b1c4869dbf553aa6990179",
+  "evaluation_seed": 120813,
+  "evaluation_batch_size": 4,
+  "evaluation_samples_per_task": 50,
+  "weights_sha256": "08eaa007bddd8364312d4e9c814b6ed97dca37d715b02dcd2f82a4c75c094ad7",
+  "weight_sum": 98,
+  "diagnostics": {
+    "assembly-v3": {
+      "weight": 1,
+      "task_rmse_px": 9.566380566500678,
+      "worst_role_rmse_px": 14.415410885384365,
+      "task_pck10": 0.6994818652849741,
+      "visibility_brier": 0.008936844896403623
+    },
+    "basketball-v3": {
+      "weight": 2,
+      "task_rmse_px": 11.914180181425733,
+      "worst_role_rmse_px": 13.31055201097836,
+      "task_pck10": 0.25824175824175827,
+      "visibility_brier": 0.027674966897259692
+    },
+    "bin-picking-v3": {
+      "weight": 1,
+      "task_rmse_px": 13.440754599310782,
+      "worst_role_rmse_px": 16.70921682836087,
+      "task_pck10": 0.3675675675675676,
+      "visibility_brier": 0.02536903057706178
+    },
+    "box-close-v3": {
+      "weight": 2,
+      "task_rmse_px": 12.939125707868277,
+      "worst_role_rmse_px": 13.733936040559938,
+      "task_pck10": 0.2393617021276596,
+      "visibility_brier": 0.04676967046493001
+    },
+    "button-press-topdown-v3": {
+      "weight": 3,
+      "task_rmse_px": 16.387364724681813,
+      "worst_role_rmse_px": 20.99599930848346,
+      "task_pck10": 0.28402366863905326,
+      "visibility_brier": 0.04353597725732536
+    },
+    "button-press-topdown-wall-v3": {
+      "weight": 3,
+      "task_rmse_px": 17.67992490574542,
+      "worst_role_rmse_px": 21.434094260708978,
+      "task_pck10": 0.26011560693641617,
+      "visibility_brier": 0.0310459021957082
+    },
+    "button-press-v3": {
+      "weight": 2,
+      "task_rmse_px": 14.112611933813907,
+      "worst_role_rmse_px": 16.02608895141578,
+      "task_pck10": 0.1977401129943503,
+      "visibility_brier": 0.037506331445998596
+    },
+    "button-press-wall-v3": {
+      "weight": 2,
+      "task_rmse_px": 13.963377126671423,
+      "worst_role_rmse_px": 16.186972275740665,
+      "task_pck10": 0.22598870056497175,
+      "visibility_brier": 0.03152618895776755
+    },
+    "coffee-button-v3": {
+      "weight": 4,
+      "task_rmse_px": 16.957349696225002,
+      "worst_role_rmse_px": 23.294851543812058,
+      "task_pck10": 0.2222222222222222,
+      "visibility_brier": 0.07311928763564779
+    },
+    "coffee-pull-v3": {
+      "weight": 1,
+      "task_rmse_px": 11.283925007517754,
+      "worst_role_rmse_px": 12.779638795684079,
+      "task_pck10": 0.455026455026455,
+      "visibility_brier": 0.025525811264550207
+    },
+    "coffee-push-v3": {
+      "weight": 1,
+      "task_rmse_px": 10.43056297653841,
+      "worst_role_rmse_px": 12.02358403534217,
+      "task_pck10": 0.5567010309278351,
+      "visibility_brier": 0.018400893585450433
+    },
+    "dial-turn-v3": {
+      "weight": 4,
+      "task_rmse_px": 29.402141258116433,
+      "worst_role_rmse_px": 55.185698290866156,
+      "task_pck10": 0.5303030303030303,
+      "visibility_brier": 0.22865232550074488
+    },
+    "disassemble-v3": {
+      "weight": 1,
+      "task_rmse_px": 8.605649456181466,
+      "worst_role_rmse_px": 11.588754559429582,
+      "task_pck10": 0.7291666666666666,
+      "visibility_brier": 0.027378193764999618
+    },
+    "door-close-v3": {
+      "weight": 1,
+      "task_rmse_px": 11.011691661943635,
+      "worst_role_rmse_px": 12.827163469517393,
+      "task_pck10": 0.5487179487179488,
+      "visibility_brier": 0.01897596432003008
+    },
+    "door-lock-v3": {
+      "weight": 3,
+      "task_rmse_px": 16.796873244948465,
+      "worst_role_rmse_px": 58.51070514851289,
+      "task_pck10": 0.3333333333333333,
+      "visibility_brier": 0.017020291651728765
+    },
+    "door-open-v3": {
+      "weight": 1,
+      "task_rmse_px": 14.25485523534302,
+      "worst_role_rmse_px": 19.25864141870711,
+      "task_pck10": 0.32989690721649484,
+      "visibility_brier": 0.023930440875908357
+    },
+    "door-unlock-v3": {
+      "weight": 4,
+      "task_rmse_px": 18.58126283138988,
+      "worst_role_rmse_px": 45.03421514139925,
+      "task_pck10": 0.3018867924528302,
+      "visibility_brier": 0.0673573028582604
+    },
+    "hand-insert-v3": {
+      "weight": 2,
+      "task_rmse_px": 13.526611865493535,
+      "worst_role_rmse_px": 15.304559438431152,
+      "task_pck10": 0.2710843373493976,
+      "visibility_brier": 0.02433041580505927
+    },
+    "drawer-close-v3": {
+      "weight": 4,
+      "task_rmse_px": 87.94013802182883,
+      "worst_role_rmse_px": 143.71255911029837,
+      "task_pck10": 0.20958083832335328,
+      "visibility_brier": 0.4887673928166534
+    },
+    "drawer-open-v3": {
+      "weight": 3,
+      "task_rmse_px": 19.516066015908446,
+      "worst_role_rmse_px": 29.04244717187242,
+      "task_pck10": 0.203125,
+      "visibility_brier": 0.02590153402536091
+    },
+    "faucet-open-v3": {
+      "weight": 4,
+      "task_rmse_px": 21.71672540277526,
+      "worst_role_rmse_px": 31.383144445673985,
+      "task_pck10": 0.25,
+      "visibility_brier": 0.16727297468846344
+    },
+    "faucet-close-v3": {
+      "weight": 4,
+      "task_rmse_px": 27.423995775174003,
+      "worst_role_rmse_px": 51.74070573248947,
+      "task_pck10": 0.4438202247191011,
+      "visibility_brier": 0.09582431393392378
+    },
+    "hammer-v3": {
+      "weight": 1,
+      "task_rmse_px": 14.635628582683704,
+      "worst_role_rmse_px": 18.695107290027888,
+      "task_pck10": 0.3163265306122449,
+      "visibility_brier": 0.01258749372248836
+    },
+    "handle-press-side-v3": {
+      "weight": 1,
+      "task_rmse_px": 9.065811293422708,
+      "worst_role_rmse_px": 9.819144272682399,
+      "task_pck10": 0.6951871657754011,
+      "visibility_brier": 0.0104080679696221
+    },
+    "handle-press-v3": {
+      "weight": 2,
+      "task_rmse_px": 14.545141925601804,
+      "worst_role_rmse_px": 17.19868256755502,
+      "task_pck10": 0.20855614973262032,
+      "visibility_brier": 0.018054559293843257
+    },
+    "handle-pull-side-v3": {
+      "weight": 2,
+      "task_rmse_px": 14.888224972117381,
+      "worst_role_rmse_px": 23.563369129452372,
+      "task_pck10": 0.3370165745856354,
+      "visibility_brier": 0.06873395645704557
+    },
+    "handle-pull-v3": {
+      "weight": 2,
+      "task_rmse_px": 12.880533360740154,
+      "worst_role_rmse_px": 16.476315338148016,
+      "task_pck10": 0.2727272727272727,
+      "visibility_brier": 0.026697161514347156
+    },
+    "lever-pull-v3": {
+      "weight": 2,
+      "task_rmse_px": 14.63831234413496,
+      "worst_role_rmse_px": 18.115748875871056,
+      "task_pck10": 0.2677595628415301,
+      "visibility_brier": 0.04526556974083815
+    },
+    "pick-place-wall-v3": {
+      "weight": 2,
+      "task_rmse_px": 12.748461805726317,
+      "worst_role_rmse_px": 14.434879900204098,
+      "task_pck10": 0.27472527472527475,
+      "visibility_brier": 0.014805687932367077
+    },
+    "pick-out-of-hole-v3": {
+      "weight": 1,
+      "task_rmse_px": 10.514720776847685,
+      "worst_role_rmse_px": 16.2056392463426,
+      "task_pck10": 0.6505376344086021,
+      "visibility_brier": 0.028086892068586337
+    },
+    "pick-place-v3": {
+      "weight": 1,
+      "task_rmse_px": 12.543378541715342,
+      "worst_role_rmse_px": 14.193023815815128,
+      "task_pck10": 0.3783783783783784,
+      "visibility_brier": 0.02454305378353814
+    },
+    "plate-slide-v3": {
+      "weight": 1,
+      "task_rmse_px": 11.401692105430367,
+      "worst_role_rmse_px": 13.07421756019448,
+      "task_pck10": 0.46808510638297873,
+      "visibility_brier": 0.0403362187236687
+    },
+    "plate-slide-side-v3": {
+      "weight": 1,
+      "task_rmse_px": 10.538454404151969,
+      "worst_role_rmse_px": 13.144215332720773,
+      "task_pck10": 0.5625,
+      "visibility_brier": 0.024426989304275382
+    },
+    "plate-slide-back-v3": {
+      "weight": 2,
+      "task_rmse_px": 12.946765248511856,
+      "worst_role_rmse_px": 14.349089792197237,
+      "task_pck10": 0.2849462365591398,
+      "visibility_brier": 0.04062949889158871
+    },
+    "plate-slide-back-side-v3": {
+      "weight": 1,
+      "task_rmse_px": 10.814201228030788,
+      "worst_role_rmse_px": 13.46789414407724,
+      "task_pck10": 0.5625,
+      "visibility_brier": 0.01619866909034568
+    },
+    "peg-insert-side-v3": {
+      "weight": 1,
+      "task_rmse_px": 9.394318041528864,
+      "worst_role_rmse_px": 9.500473225989115,
+      "task_pck10": 0.6598639455782312,
+      "visibility_brier": 0.007436552477586211
+    },
+    "peg-unplug-side-v3": {
+      "weight": 2,
+      "task_rmse_px": 9.127160877555959,
+      "worst_role_rmse_px": 9.971387465267988,
+      "task_pck10": 0.7678571428571429,
+      "visibility_brier": 0.23302701629137026
+    },
+    "soccer-v3": {
+      "weight": 1,
+      "task_rmse_px": 12.124933123895326,
+      "worst_role_rmse_px": 14.258945871275106,
+      "task_pck10": 0.3723404255319149,
+      "visibility_brier": 0.020758484512366965
+    },
+    "stick-push-v3": {
+      "weight": 4,
+      "task_rmse_px": 105.71908598445418,
+      "worst_role_rmse_px": 199.21159969136718,
+      "task_pck10": 0.21666666666666667,
+      "visibility_brier": 0.27889671931672194
+    },
+    "stick-pull-v3": {
+      "weight": 3,
+      "task_rmse_px": 24.3906487640441,
+      "worst_role_rmse_px": 41.890168263703565,
+      "task_pck10": 0.32386363636363635,
+      "visibility_brier": 0.04294056362176585
+    },
+    "push-v3": {
+      "weight": 1,
+      "task_rmse_px": 13.626572501853778,
+      "worst_role_rmse_px": 16.616022545215284,
+      "task_pck10": 0.4,
+      "visibility_brier": 0.02343853931491079
+    },
+    "push-wall-v3": {
+      "weight": 2,
+      "task_rmse_px": 12.51630204527664,
+      "worst_role_rmse_px": 13.756166159993805,
+      "task_pck10": 0.2857142857142857,
+      "visibility_brier": 0.048884413119816145
+    },
+    "reach-v3": {
+      "weight": 1,
+      "task_rmse_px": 10.498822081188717,
+      "worst_role_rmse_px": 11.309351307481785,
+      "task_pck10": 0.46111111111111114,
+      "visibility_brier": 0.02804073268959512
+    },
+    "reach-wall-v3": {
+      "weight": 1,
+      "task_rmse_px": 10.246684269865241,
+      "worst_role_rmse_px": 11.87774800256818,
+      "task_pck10": 0.5290697674418605,
+      "visibility_brier": 0.047320942095365394
+    },
+    "shelf-place-v3": {
+      "weight": 2,
+      "task_rmse_px": 11.321892150049248,
+      "worst_role_rmse_px": 11.97294763642849,
+      "task_pck10": 0.2777777777777778,
+      "visibility_brier": 0.01360001053951294
+    },
+    "sweep-into-v3": {
+      "weight": 1,
+      "task_rmse_px": 12.505653621946367,
+      "worst_role_rmse_px": 14.480762071865431,
+      "task_pck10": 0.3404255319148936,
+      "visibility_brier": 0.0190950879879435
+    },
+    "sweep-v3": {
+      "weight": 1,
+      "task_rmse_px": 11.460713996579315,
+      "worst_role_rmse_px": 15.255776865833123,
+      "task_pck10": 0.5595854922279793,
+      "visibility_brier": 0.003605036654003694
+    },
+    "window-open-v3": {
+      "weight": 3,
+      "task_rmse_px": 16.879402677107638,
+      "worst_role_rmse_px": 20.28293647337952,
+      "task_pck10": 0.2692307692307692,
+      "visibility_brier": 0.046738540403961554
+    },
+    "window-close-v3": {
+      "weight": 3,
+      "task_rmse_px": 15.228660719055856,
+      "worst_role_rmse_px": 24.378103374684546,
+      "task_pck10": 0.3743016759776536,
+      "visibility_brier": 0.0747450778096772
+    }
+  }
+}

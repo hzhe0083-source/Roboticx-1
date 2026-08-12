@@ -22,6 +22,7 @@ import gc
 import io
 import sys
 import time
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -41,15 +42,307 @@ VISION_STRIDE = 2
 
 REF = ROOT / "data" / "metaworld_fullframe_executed.pt"
 ST_NPY_DIR = Path("/media/ryan/robot-data")
+LEGACY_PERTURB_SETTLE_STEPS = 12
 
 
-def win_out(horizon: int) -> Path:
-    return ROOT / "data" / f"metaworld_longtraj_windows_h{horizon}.pt"
+def win_out(horizon: int, task: str | None = None) -> Path:
+    suffix = "" if task is None else f"_{task}"
+    return ROOT / "data" / f"metaworld_longtraj_windows_h{horizon}{suffix}.pt"
 
 
-def st_paths(horizon: int) -> tuple[Path, Path]:
-    return (ST_NPY_DIR / f"longtraj_st288_h{horizon}.npy",
-            ST_NPY_DIR / f"longtraj_st288_h{horizon}_meta.pt")
+def st_paths(horizon: int, task: str | None = None) -> tuple[Path, Path]:
+    suffix = "" if task is None else f"_{task}"
+    return (ST_NPY_DIR / f"longtraj_st288_h{horizon}{suffix}.npy",
+            ST_NPY_DIR / f"longtraj_st288_h{horizon}{suffix}_meta.pt")
+
+
+def _frame_ref_key(path: Path) -> str:
+    """Key accepted by LongTrajFramesDataset's existing filename resolver."""
+    prefix = "metaworld_longtraj_"
+    if not path.name.startswith(prefix) or path.suffix != ".pt":
+        raise ValueError(
+            f"longtraj source must be named {prefix}<source>.pt, got {path.name}"
+        )
+    return path.stem[len(prefix):]
+
+
+def _save_new(payload: dict, path: Path, *, overwrite: bool = False) -> None:
+    """Atomic save; refuse accidental replacement unless explicitly requested."""
+    if path.exists() and not overwrite:
+        raise FileExistsError(
+            f"refusing to overwrite existing dataset: {path}; choose --output or pass --overwrite"
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    if tmp.exists():
+        raise FileExistsError(f"stale temporary output exists: {tmp}")
+    torch.save(payload, tmp)
+    tmp.replace(path)
+
+
+_WARNED_LEGACY: set[tuple[str, str]] = set()
+
+
+def _legacy_issue(message: str, policy: str, category: str) -> None:
+    # ``infer`` is a repair mode, so anything it cannot infer uniquely is an
+    # error.  Only the compatibility ``warn`` mode is allowed to continue.
+    if policy in {"error", "infer"}:
+        raise ValueError(message)
+    source_file = message.split(":episode[", 1)[0]
+    key = (source_file, category)
+    if key in _WARNED_LEGACY:
+        return
+    _WARNED_LEGACY.add(key)
+    warnings.warn(message, RuntimeWarning, stacklevel=3)
+
+
+def _true_runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    """Return maximal ``True`` intervals as half-open ``[start, end)`` runs."""
+    padded = np.pad(np.asarray(mask, dtype=np.int8), (1, 1))
+    edges = np.flatnonzero(np.diff(padded))
+    return [(int(start), int(end)) for start, end in edges.reshape(-1, 2)]
+
+
+def _infer_legacy_v1_semantics(ep: dict, source: str) -> dict[str, object]:
+    """Recover the task-agnostic timeline contract of the original collector.
+
+    The v1 collector inserted one *exact* 12-action all-zero settle block after
+    a random pre-success perturbation, but ``success_frame`` remained on the
+    outer policy-step timeline.  Consequently every stored action after that
+    block is shifted by 12.  Inference deliberately fails if the stored episode
+    does not identify that event uniquely; silently guessing would corrupt H48
+    supervision again.
+    """
+    forbidden = [
+        key for key in (
+            "first_success", "settle_mask", "recovery_mask",
+            "perturb_start", "perturb_end", "perturb_event",
+        )
+        if key in ep
+    ]
+    if forbidden:
+        raise ValueError(
+            f"{source}: --legacy-policy infer expects the original v1 schema, "
+            f"but partial timeline annotations are present: {forbidden}"
+        )
+    if "success_frame" not in ep:
+        raise ValueError(
+            f"{source}: --legacy-policy infer requires legacy success_frame"
+        )
+    raw_success = ep["success_frame"]
+    if isinstance(raw_success, (bool, np.bool_)) or not isinstance(
+        raw_success, (int, np.integer)
+    ):
+        raise ValueError(
+            f"{source}: legacy success_frame must be an integer, got {raw_success!r}"
+        )
+
+    actions = np.asarray(ep["actions"])
+    n = len(actions)
+    if actions.shape != (n, 4):
+        raise ValueError(
+            f"{source}: legacy actions must have shape ({n},4), got {actions.shape}"
+        )
+    if not np.isfinite(actions).all():
+        raise ValueError(f"{source}: legacy actions contain NaN/Inf")
+    raw_success = int(raw_success)
+    if not 0 <= raw_success < n:
+        raise ValueError(
+            f"{source}: legacy success_frame={raw_success} outside [0,{n})"
+        )
+    perturbed_value = ep.get("perturbed")
+    if not isinstance(perturbed_value, (bool, np.bool_)):
+        raise ValueError(
+            f"{source}: --legacy-policy infer requires scalar bool perturbed"
+        )
+    perturbed = bool(perturbed_value)
+
+    zero_runs = _true_runs(np.equal(actions, 0).all(axis=1))
+    candidates = [
+        (start, end)
+        for start, end in zero_runs
+        if end - start == LEGACY_PERTURB_SETTLE_STEPS
+        and 0 < start <= raw_success
+        and end < n
+    ]
+    if not perturbed:
+        if candidates:
+            raise ValueError(
+                f"{source}: perturbed=False conflicts with pre-success exact "
+                f"{LEGACY_PERTURB_SETTLE_STEPS}-zero-action block(s) {candidates}"
+            )
+        return {
+            "first_success": raw_success,
+            "settle": np.zeros(n, dtype=bool),
+            "recovery": np.zeros(n, dtype=bool),
+            "perturb_start": None,
+            "perturb_end": None,
+        }
+
+    if len(candidates) != 1:
+        run_summary = [(start, end, end - start) for start, end in zero_runs]
+        raise ValueError(
+            f"{source}: perturbed legacy episode must contain exactly one maximal "
+            f"pre-success {LEGACY_PERTURB_SETTLE_STEPS}-action all-zero settle "
+            f"block; candidates={candidates}, all_zero_runs={run_summary}"
+        )
+    perturb_start, perturb_end = candidates[0]
+    first_success = raw_success + LEGACY_PERTURB_SETTLE_STEPS
+    if not perturb_end <= first_success < n:
+        raise ValueError(
+            f"{source}: inferred first_success={first_success} is inconsistent "
+            f"with perturb=[{perturb_start},{perturb_end}) and length={n}"
+        )
+    settle = np.zeros(n, dtype=bool)
+    settle[perturb_start:perturb_end] = True
+    recovery = np.zeros(n, dtype=bool)
+    recovery[perturb_start:first_success + 1] = True
+    return {
+        "first_success": first_success,
+        "settle": settle,
+        "recovery": recovery,
+        "perturb_start": perturb_start,
+        "perturb_end": perturb_end,
+    }
+
+
+def resolve_episode_semantics(ep: dict, source: str,
+                              legacy_policy: str = "warn") -> dict[str, object]:
+    """Resolve v2 masks and metric state, with explicit v1 fallback.
+
+    Returned masks use the stored pre-observation/action timeline. ``valid`` is
+    suitable for direct horizon supervision: actions must have been executed,
+    have a valid aligned frame, not be settle actions, and occur no later than
+    the first successful action.
+    """
+    n = len(ep["actions"])
+    lengths = {"frames": len(ep["frames"]), "states": len(ep["states"])}
+    if any(length != n for length in lengths.values()):
+        raise ValueError(f"{source}: timeline length mismatch actions={n}, {lengths}")
+
+    if legacy_policy not in {"warn", "error", "infer"}:
+        raise ValueError(f"unknown legacy_policy={legacy_policy!r}")
+    is_v2 = "action_supervision_valid" in ep and "action_executed" in ep
+    inferred: dict[str, object] | None = None
+    if not is_v2:
+        if legacy_policy == "infer":
+            inferred = _infer_legacy_v1_semantics(ep, source)
+        else:
+            _legacy_issue(
+                f"{source}: legacy episode has no v2 execution/validity contract; "
+                "post-success actions can be masked, but historical perturb-settle "
+                "positions are unknowable",
+                legacy_policy,
+                "contract",
+            )
+
+    def bool_array(key: str, default: np.ndarray) -> np.ndarray:
+        value = np.asarray(ep.get(key, default), dtype=bool).copy()
+        if value.shape != (n,):
+            raise ValueError(f"{source}: {key} must have shape ({n},), got {value.shape}")
+        return value
+
+    frame_valid = bool_array("frame_valid", np.ones(n, dtype=bool))
+    executed = bool_array("action_executed", np.ones(n, dtype=bool))
+    inferred_settle = (
+        np.asarray(inferred["settle"], dtype=bool)
+        if inferred is not None else np.zeros(n, dtype=bool)
+    )
+    settle = bool_array("settle_mask", inferred_settle)
+    if (inferred is None and "settle_mask" not in ep
+            and bool(ep.get("perturbed", False))):
+        _legacy_issue(
+            f"{source}: perturbed legacy episode lacks perturb_start/end; "
+            "settle targets cannot be identified safely",
+            legacy_policy,
+            "settle",
+        )
+    supplied_valid = ep.get("action_supervision_valid", ep.get("action_valid"))
+    valid = bool_array(
+        "action_supervision_valid",
+        np.ones(n, dtype=bool) if supplied_valid is None else np.asarray(supplied_valid),
+    )
+    first_success = (
+        inferred["first_success"]
+        if inferred is not None
+        else ep.get("first_success", ep.get("success_frame"))
+    )
+    if first_success is None:
+        _legacy_issue(
+            f"{source}: no first_success/success_frame; post-success masking is impossible",
+            legacy_policy,
+            "success",
+        )
+    else:
+        first_success = int(first_success)
+        if not 0 <= first_success < n:
+            raise ValueError(f"{source}: first_success={first_success} outside [0,{n})")
+        valid[first_success + 1:] = False
+    valid &= frame_valid & executed & ~settle
+
+    inferred_recovery = (
+        np.asarray(inferred["recovery"], dtype=bool)
+        if inferred is not None else np.zeros(n, dtype=bool)
+    )
+    recovery = bool_array("recovery_mask", inferred_recovery)
+    event = ep.get("perturb_event") or {}
+    perturb_start = (
+        inferred["perturb_start"]
+        if inferred is not None else ep.get("perturb_start", event.get("start"))
+    )
+    perturb_end = (
+        inferred["perturb_end"]
+        if inferred is not None else ep.get("perturb_end", event.get("end"))
+    )
+    if "recovery_mask" not in ep and perturb_start is not None:
+        start = int(perturb_start)
+        end = first_success + 1 if first_success is not None else n
+        if not 0 <= start <= end <= n:
+            raise ValueError(f"{source}: invalid inferred recovery interval [{start},{end})")
+        recovery[start:end] = True
+    if perturb_start is not None:
+        perturb_start = int(perturb_start)
+        if perturb_end is None:
+            raise ValueError(
+                f"{source}: perturb_start is present but perturb_end is missing"
+            )
+        perturb_end = int(perturb_end)
+        if not 0 <= perturb_start <= perturb_end <= n:
+            raise ValueError(
+                f"{source}: invalid perturb interval [{perturb_start},{perturb_end})"
+            )
+
+    metric = ep.get("metric_state")
+    if metric is None and "lock_pos" in ep and "lock_target" in ep:
+        metric = np.concatenate(
+            [np.asarray(ep["lock_pos"]), np.asarray(ep["lock_target"])], axis=-1
+        )
+    if metric is None:
+        metric_state = np.zeros((n, 6), dtype=np.float32)
+        metric_valid = np.zeros(n, dtype=bool)
+    else:
+        metric_state = np.asarray(metric, dtype=np.float32).copy()
+        if metric_state.shape != (n, 6):
+            raise ValueError(
+                f"{source}: metric_state must have shape ({n},6), got {metric_state.shape}"
+            )
+        metric_valid = bool_array(
+            "metric_state_valid", np.isfinite(metric_state).all(axis=-1)
+        )
+        metric_valid &= np.isfinite(metric_state).all(axis=-1)
+        metric_state = np.nan_to_num(metric_state, copy=False)
+
+    return {
+        "valid": valid,
+        "recovery": recovery,
+        "frame_valid": frame_valid,
+        "metric_state": metric_state,
+        "metric_valid": metric_valid,
+        "first_success": first_success,
+        "perturb_start": perturb_start,
+        "perturb_end": perturb_end,
+        "legacy_inferred": inferred is not None,
+    }
 
 # MT1 环境名 → lerobot 任务文本（与 REF.metadata.tasks 对齐，2026-08-09 全量核对）
 ENV_TO_TASK = {
@@ -115,46 +408,118 @@ def clip_frame_indices(decision: int, video_start_frame: int = 0,
     return np.clip(decision + off * stride, video_start_frame, None)
 
 
-def phase1(horizon: int) -> None:
-    """窗口切片（动作/状态/prev/帧索引），无 GPU。horizon=action chunk 长度。"""
-    ref = torch.load(REF, map_location="cpu", weights_only=True)
+def phase1(horizon: int, *, task: str | None = None,
+           input_paths: list[Path] | None = None,
+           output_path: Path | None = None,
+           ref_path: Path = REF,
+           legacy_policy: str = "warn",
+           overwrite: bool = False) -> Path:
+    """窗口切片（动作/状态/prev/帧索引），无 GPU。horizon=action chunk 长度。
+
+    Passing ``task`` selects only that task and defaults to a task-suffixed new
+    output, so a door-lock repair cannot replace the all-task H48 dataset.
+    ``input_paths`` can select a clean collector file explicitly.
+    """
+    ref = torch.load(ref_path, map_location="cpu", weights_only=True)
     aq01, aq99 = ref["normalization"]["action_q01"], ref["normalization"]["action_q99"]
     sq01, sq99 = ref["normalization"]["state_q01"], ref["normalization"]["state_q99"]
     norm = dict(ref["normalization"])
-    out_path = win_out(horizon)
+    out_path = Path(output_path) if output_path is not None else win_out(horizon, task)
+
+    if "language_hidden" not in ref or "language_mask" not in ref:
+        raise ValueError(
+            f"{ref_path}: missing language_hidden/language_mask; output would not be trainable"
+        )
+    n_tasks = len(ref["metadata"]["tasks"])
+    task_language: list[torch.Tensor] = []
+    task_language_mask: list[torch.Tensor] = []
+    for tid in range(n_tasks):
+        rows = (ref["instruction_id"] == tid).nonzero(as_tuple=False)
+        if not len(rows):
+            raise ValueError(f"{ref_path}: no language cache row for instruction_id={tid}")
+        row = int(rows[0, 0])
+        task_language.append(ref["language_hidden"][row])
+        task_language_mask.append(ref["language_mask"][row])
+    task_language_t = torch.stack(task_language)
+    task_language_mask_t = torch.stack(task_language_mask)
 
     def robust(x, lo, hi):
         lo_n, hi_n = lo.numpy(), hi.numpy()
         return np.clip(2 * (x - lo_n) / (hi_n - lo_n) - 1, -1, 1)
 
-    files = sorted(
-        p for p in ROOT.glob("data/metaworld_longtraj_*.pt")
-        if not p.name.startswith("metaworld_longtraj_windows")
-    )  # 排除 phase1 自身输出（windows 文件无 task 键）
+    if input_paths:
+        files = [Path(path) for path in input_paths]
+    elif task is not None:
+        files = [ROOT / "data" / f"metaworld_longtraj_{task}.pt"]
+    else:
+        # Canonical all-task build only. Variant clean/recovery sources must be
+        # selected explicitly with --input so they cannot silently duplicate a task.
+        files = sorted(
+            path for name in ENV_TO_TASK
+            if (path := ROOT / "data" / f"metaworld_longtraj_{name}.pt").is_file()
+        )
+    missing_files = [str(path) for path in files if not path.is_file()]
+    if missing_files:
+        raise FileNotFoundError(f"longtraj input files not found: {missing_files}")
     print(f"phase1(h={horizon}): {len(files)} task files")
     W = []
+    episodes_seen = 0
+    dropped_empty = 0
+    legacy_episodes_inferred = 0
+    legacy_perturb_events_inferred = 0
     for fi, path in enumerate(files):
         data = torch.load(path, map_location="cpu", weights_only=False)
+        if "task" not in data or "episodes" not in data:
+            raise ValueError(f"{path}: not a longtraj task payload")
+        if task is not None and data["task"] != task:
+            raise ValueError(
+                f"{path}: contains task={data['task']!r}, requested task={task!r}"
+            )
         task_text = ENV_TO_TASK.get(data["task"])
         if task_text is None:
-            continue
+            raise ValueError(f"{path}: unknown task {data['task']!r}")
         try:
             tid = ref["metadata"]["tasks"].index(task_text)
-        except ValueError:
-            continue
+        except ValueError as exc:
+            raise ValueError(f"{path}: task text absent from reference: {task_text!r}") from exc
+        source_key = _frame_ref_key(path)
         for ei, ep in enumerate(data["episodes"]):
+            episodes_seen += 1
             frames_jpeg = ep["frames"]      # list[bytes]
             actions = ep["actions"]         # [T,4]
             states = ep["states"]           # [T,4]
             T = len(frames_jpeg)
+            semantics = resolve_episode_semantics(
+                ep, f"{path.name}:episode[{ei}]", legacy_policy
+            )
+            if semantics["legacy_inferred"]:
+                legacy_episodes_inferred += 1
+                legacy_perturb_events_inferred += int(
+                    semantics["perturb_start"] is not None
+                )
             last_start = T - 1 - ((SEQUENCE_LENGTH - 1) * CONTROL_STRIDE + (horizon - 1))
             if last_start < 0:
                 continue
             for s in range(0, last_start + 1, CONTROL_STRIDE):
-                acts = np.stack([
-                    actions[s + t * CONTROL_STRIDE + h]
-                    for t in range(SEQUENCE_LENGTH) for h in range(horizon)
-                ]).reshape(SEQUENCE_LENGTH, horizon, 4)
+                target_idx = np.asarray([
+                    [s + t * CONTROL_STRIDE + h for h in range(horizon)]
+                    for t in range(SEQUENCE_LENGTH)
+                ], dtype=np.int64)
+                action_valid_mask = semantics["valid"][target_idx]
+                decision_idx = s + np.arange(SEQUENCE_LENGTH) * CONTROL_STRIDE
+                # A pre-perturb observation cannot predict which random
+                # perturb/recovery branch will occur later in its H-step target.
+                # Keep recovery supervision once the perturb is observable.
+                if semantics["perturb_start"] is not None:
+                    unseen_recovery = (
+                        semantics["recovery"][target_idx]
+                        & (decision_idx[:, None] < semantics["perturb_start"])
+                    )
+                    action_valid_mask &= ~unseen_recovery
+                if not bool(action_valid_mask.any()):
+                    dropped_empty += 1
+                    continue
+                acts = np.asarray(actions)[target_idx]
                 prev = np.stack([
                     np.zeros(4, dtype=np.float32)
                     if s + t * CONTROL_STRIDE == 0
@@ -176,41 +541,100 @@ def phase1(horizon: int) -> None:
                     "proprio": robust(proprio, sq01, sq99).astype(np.float32),
                     "task_id": tid,
                     "ep_id": fi * 10000 + ei,
-                    "task_file": data["task"],
+                    # Existing LongTrajFramesDataset resolves this as
+                    # data/metaworld_longtraj_{source_key}.pt. A clean source
+                    # therefore remains distinct without a loader change.
+                    "task_file": source_key,
                     "ep_idx": ei,
                     "frame_idx": frame_idx.tolist(),
+                    "action_valid_mask": action_valid_mask,
+                    "recovery_mask": semantics["recovery"][target_idx],
+                    "decision_recovery": semantics["recovery"][decision_idx],
+                    "metric_state": semantics["metric_state"][decision_idx],
+                    "metric_state_valid": semantics["metric_valid"][decision_idx],
+                    "first_success": semantics["first_success"],
                 })
     n = len(W)
+    if n == 0:
+        raise ValueError("phase1 produced zero windows with valid action supervision")
     print(f"phase1(h={horizon}): {n} windows, tasks={len(set(w['task_id'] for w in W))}")
+    instruction_id = torch.tensor([w["task_id"] for w in W], dtype=torch.long)
     payload = {
         "actions": torch.from_numpy(np.stack([w["actions"] for w in W])),
         "previous_action": torch.from_numpy(np.stack([w["prev"] for w in W])),
         "proprio": torch.from_numpy(np.stack([w["proprio"] for w in W])),
-        "instruction_id": torch.tensor([w["task_id"] for w in W], dtype=torch.long),
+        "instruction_id": instruction_id,
         "episode_id": torch.tensor([w["ep_id"] for w in W], dtype=torch.long),
         "pair_id": torch.arange(n, dtype=torch.long),
         "frame_refs": [(w["task_file"], w["ep_idx"], w["frame_idx"]) for w in W],
+        "action_valid_mask": torch.from_numpy(
+            np.stack([w["action_valid_mask"] for w in W])
+        ),
+        "recovery_mask": torch.from_numpy(np.stack([w["recovery_mask"] for w in W])),
+        "decision_recovery": torch.from_numpy(
+            np.stack([w["decision_recovery"] for w in W])
+        ),
+        "door_metric_state": torch.from_numpy(
+            np.stack([w["metric_state"] for w in W]).astype(np.float32)
+        ),
+        "door_metric_state_valid": torch.from_numpy(
+            np.stack([w["metric_state_valid"] for w in W])
+        ),
+        "first_success": torch.tensor(
+            [-1 if w["first_success"] is None else w["first_success"] for w in W],
+            dtype=torch.long,
+        ),
+        # Broadcast the frozen per-task Qwen cache now; no follow-up mutation by
+        # add_language_cache_to_longtraj.py is required.
+        "language_hidden": task_language_t[instruction_id],
+        "language_mask": task_language_mask_t[instruction_id],
         "normalization": norm,
         "metadata": {
-            "contract": "language_conditioned_mt50_longtraj",
+            "contract": "language_conditioned_mt50_longtraj_v2",
+            "contract_version": 2,
             "tasks": ref["metadata"]["tasks"],
             "fps": FPS, "control_stride": CONTROL_STRIDE,
             "action_horizon": horizon,
             "action_contract": "executed-clip-fullframe",
-            "n_trajectories": len(files),
+            "observation_action_alignment": "frame/state[i] is pre-action; action[i] executed once",
+            "action_valid_mask": (
+                "[N,T,H], excludes settle, actions after first_success, and recovery "
+                "targets not yet observable at the decision"
+            ),
+            "recovery_mask": "[N,T,H], perturb_start through first_success inclusive",
+            "frame_ref_contract": "data/metaworld_longtraj_{frame_refs[i][0]}.pt",
+            "source_files": [str(path.resolve()) for path in files],
+            "n_source_files": len(files),
+            "n_trajectories": episodes_seen,
+            "dropped_all_invalid_windows": dropped_empty,
+            "legacy_policy": legacy_policy,
+            "legacy_episodes_inferred": legacy_episodes_inferred,
+            "legacy_perturb_events_inferred": legacy_perturb_events_inferred,
         },
     }
-    torch.save(payload, out_path)
+    _save_new(payload, out_path, overwrite=overwrite)
     print(f"[out] {out_path}: {n} windows")
+    return out_path
 
 
-def phase2(device: str, horizon: int) -> None:
+def phase2(device: str, horizon: int, *, task: str | None = None,
+           windows_path: Path | None = None,
+           st_npy_path: Path | None = None,
+           st_meta_path: Path | None = None,
+           overwrite: bool = False) -> None:
     """按帧索引解压窗口帧 → 冻结原始 V-JEPA 编码 → ST288 memmap。"""
     from prepare_pnpw_features import VJEPA21Backbone
     from va_compound.live_vjepa import _slot_coords
 
-    win_path = win_out(horizon)
-    st_npy, st_meta = st_paths(horizon)
+    win_path = Path(windows_path) if windows_path is not None else win_out(horizon, task)
+    default_npy, default_meta = st_paths(horizon, task)
+    st_npy = Path(st_npy_path) if st_npy_path is not None else default_npy
+    st_meta = Path(st_meta_path) if st_meta_path is not None else default_meta
+    existing = [str(path) for path in (st_npy, st_meta) if path.exists()]
+    if existing and not overwrite:
+        raise FileExistsError(
+            f"refusing to overwrite phase2 outputs: {existing}; choose new paths or pass --overwrite"
+        )
     win = torch.load(win_path, map_location="cpu", weights_only=False)
     refs = win["frame_refs"]
     n = len(refs)
@@ -334,8 +758,46 @@ if __name__ == "__main__":
     ap.add_argument("--phase", choices=("1", "2"), default="1")
     ap.add_argument("--horizon", type=int, default=8,
                     help="action chunk 长度（E7 用 48；文件名/特征路径按 horizon 区分）")
+    ap.add_argument("--task", choices=tuple(ENV_TO_TASK),
+                    help="仅构建一个任务；默认输出任务后缀文件，不覆盖全任务文件")
+    ap.add_argument("--input", type=Path, action="append",
+                    help="phase1 精确源文件，可重复；clean door-lock 应显式指定")
+    ap.add_argument(
+        "--ref",
+        type=Path,
+        default=REF,
+        help="phase1 的 normalization + per-task language cache 来源；可直接使用"
+        "现有 windows_h48.pt，避免再次加载更大的 fullframe reference",
+    )
+    ap.add_argument("--output", type=Path, help="phase1 输出 windows 文件")
+    ap.add_argument("--windows", type=Path, help="phase2 输入 windows 文件")
+    ap.add_argument("--st-npy", type=Path, help="phase2 特征 memmap 输出")
+    ap.add_argument("--st-meta", type=Path, help="phase2 metadata 输出")
+    ap.add_argument(
+        "--legacy-policy", choices=("warn", "error", "infer"), default="warn",
+        help=("旧数据策略：warn 保持兼容性警告；error 拒绝；infer 严格识别旧采集器"
+              "唯一的12步零动作扰动块并修正 success/mask（歧义时失败）"),
+    )
+    ap.add_argument("--overwrite", action="store_true",
+                    help="显式允许覆盖输出（默认拒绝）")
     args = ap.parse_args()
     if args.phase == "1":
-        phase1(args.horizon)
+        phase1(
+            args.horizon,
+            task=args.task,
+            input_paths=args.input,
+            output_path=args.output,
+            ref_path=args.ref,
+            legacy_policy=args.legacy_policy,
+            overwrite=args.overwrite,
+        )
     else:
-        phase2(args.device, args.horizon)
+        phase2(
+            args.device,
+            args.horizon,
+            task=args.task,
+            windows_path=args.windows,
+            st_npy_path=args.st_npy,
+            st_meta_path=args.st_meta,
+            overwrite=args.overwrite,
+        )

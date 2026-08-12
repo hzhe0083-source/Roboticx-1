@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import os
 from pathlib import Path
 from typing import Any, Callable
@@ -36,6 +37,7 @@ _ALIGN_ACTS: list | None = None
 from va_compound.backbones import (
     QwenSemanticBackbone,
     VJEPA21Backbone,
+    pool_mtvj_coarse_tokens,
 )
 from va_compound.model import (
     ControllerParams,
@@ -54,9 +56,138 @@ from va_compound.local_control_slots import (
     MultiModeReadout,
     build_va_vision_input,
 )
+from va_compound.metric_roi import (
+    load_metric_roi_checkpoint,
+    metric_head_state_sha256,
+    prepare_metric_roi_video,
+    refine_metric_roi_positions,
+)
 
 IMAGE_MEAN = torch.tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1)
 IMAGE_STD = torch.tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1)
+
+MTVJ_METRIC_HEAD_CONFIG_KEYS = (
+    "lang_dim",
+    "h_dim",
+    "d_proj",
+    "n_roles",
+    "l2_norm",
+    "learnable_temp",
+    "temp_init",
+    "freeze_bias",
+    "mode_readout",
+)
+_MTVJ_METRIC_HEAD_CONFIG_DEFAULTS = {
+    "lang_dim": 2048,
+    "h_dim": 768,
+    "d_proj": 192,
+    "n_roles": 4,
+    "l2_norm": False,
+    "learnable_temp": False,
+    "temp_init": 10.0,
+    "freeze_bias": False,
+    "mode_readout": False,
+}
+MTVJ_METRIC_STATE_SOURCE = "p_times_visibility_flat"
+MTVJ_METRIC_CONTRACT_VERSION = 3
+MTVJ_LEGACY_METRIC_STATE_SOURCE = "p_flat"
+MTVJ_LEGACY_METRIC_CONTRACT_VERSION = 2
+
+
+def _mtvj_metric_positions(
+    out, source: str = MTVJ_METRIC_STATE_SOURCE
+) -> torch.Tensor:
+    """Train/eval-identical state selector, including faithful v2 baselines."""
+    p = out.p
+    if p.ndim != 3 or p.shape[-2:] != (4, 2):
+        raise ValueError(f"MT-VJ out.p must be [N, 4, 2], got {tuple(p.shape)}")
+    if source == MTVJ_LEGACY_METRIC_STATE_SOURCE:
+        return p.reshape(p.shape[0], 8)
+    if source != MTVJ_METRIC_STATE_SOURCE:
+        raise ValueError(f"unknown MT-VJ metric state source: {source!r}")
+    visibility = out.visibility
+    if visibility.shape != p.shape[:-1]:
+        raise ValueError(
+            "MT-VJ out.visibility must match out.p roles: "
+            f"{tuple(visibility.shape)} != {tuple(p.shape[:-1])}"
+        )
+    return (p * visibility.unsqueeze(-1)).reshape(p.shape[0], 8)
+
+
+_mtvj_visibility_gated_positions = _mtvj_metric_positions
+
+
+def select_eval_tasks(
+    all_tasks: list[str], task_ids: str | None, max_tasks: int
+) -> list[tuple[int, str]]:
+    """Select tasks while preserving their global metadata IDs."""
+    if task_ids is not None:
+        indices = [int(token) for token in task_ids.split(",")]
+    else:
+        indices = list(range(min(max_tasks, len(all_tasks))))
+    for index in indices:
+        if index < 0 or index >= len(all_tasks):
+            raise ValueError(
+                f"--task-ids index {index} out of range 0..{len(all_tasks) - 1}"
+            )
+    return [(index, all_tasks[index]) for index in indices]
+
+
+def evaluation_episode_seed(global_task_id: int, trial: int) -> int:
+    """Stable seed independent of task subset/order."""
+    return 1000 * int(global_task_id) + int(trial)
+
+
+def _canonical_mtvj_metric_head_config(
+    config: dict | None,
+    *,
+    require_complete: bool = False,
+) -> dict:
+    raw = dict(config or {})
+    if require_complete:
+        missing = sorted(set(MTVJ_METRIC_HEAD_CONFIG_KEYS) - set(raw))
+        if missing:
+            raise ValueError(
+                "主 checkpoint 缺少完整 mtvj_metric_head_config："
+                f"missing={missing}"
+            )
+    values = {
+        key: raw.get(key, default)
+        for key, default in _MTVJ_METRIC_HEAD_CONFIG_DEFAULTS.items()
+    }
+    for key in ("lang_dim", "h_dim", "d_proj", "n_roles"):
+        values[key] = int(values[key])
+    for key in (
+        "l2_norm",
+        "learnable_temp",
+        "freeze_bias",
+        "mode_readout",
+    ):
+        values[key] = bool(values[key])
+    values["temp_init"] = float(values["temp_init"])
+    return values
+
+
+def _mtvj_metric_checkpoint_identity(path: Path, checkpoint: dict) -> dict:
+    resolved = path.expanduser().resolve(strict=True)
+    digest = hashlib.sha256()
+    with resolved.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return {
+        "path": str(resolved),
+        "sha256": digest.hexdigest(),
+        "size_bytes": int(resolved.stat().st_size),
+        "contract": checkpoint.get("contract"),
+    }
+
+
+def _mtvj_metric_identity_mismatches(saved: dict, current: dict) -> dict:
+    return {
+        key: (saved.get(key), current.get(key))
+        for key in ("sha256", "size_bytes", "contract")
+        if saved.get(key) != current.get(key)
+    }
 
 try:
     from va_compound.live_vjepa import _dense_coords, _slot_coords as _stage_coords
@@ -91,7 +222,16 @@ def _apply_local_vision(model, tokens, language_cache):
     return model.build_local_vision(tokens, coords, role_queries)
 
 
-def _load_mtvj_metric_checkpoint(path: Path, device, config) -> tuple[nn.Module, nn.Module]:
+def _load_mtvj_metric_checkpoint(
+    path: Path,
+    device,
+    config,
+    policy_relation_state: dict[str, torch.Tensor] | None = None,
+    policy_metric_state: dict[str, torch.Tensor] | None = None,
+    policy_metric_config: dict | None = None,
+    policy_metric_identity: dict | None = None,
+    policy_training_contract: dict[str, Any] | None = None,
+) -> tuple[nn.Module, nn.Module]:
     """MT-VJ（契约 §2/§7）：加载并冻结 LanguageMetricField + RelationStateEncoder。
 
     与 train.py ``_load_mtvj_metric_checkpoint`` 同构：checkpoint 契约
@@ -101,15 +241,46 @@ def _load_mtvj_metric_checkpoint(path: Path, device, config) -> tuple[nn.Module,
     闭环 no_grad 只读）；启动即校验 relation encoder d_model == hidden_dim
     （metric_tokens 加入每层 action cross-attention 需同维，fail-fast）。
     """
-    import inspect
-
     from va_compound.metric_visual_head import (
         LanguageMetricField,
         RelationStateEncoder,
     )
 
+    policy_contract = policy_training_contract or {}
+    if policy_contract.get("metric_head_checkpointed") is True:
+        missing_main = [
+            key
+            for key, value in (
+                ("mtvj_metric_head", policy_metric_state),
+                ("mtvj_metric_head_config", policy_metric_config),
+                ("mtvj_metric_checkpoint_identity", policy_metric_identity),
+            )
+            if value is None
+        ]
+        if missing_main:
+            raise ValueError(
+                "主 checkpoint 声明 metric_head_checkpointed=True，"
+                f"但缺少 {missing_main}；拒绝静默回退外部旧 metric head"
+            )
+    if policy_metric_state is not None and (
+        policy_metric_config is None or policy_metric_identity is None
+    ):
+        raise ValueError(
+            "主 checkpoint 含 mtvj_metric_head，但缺少完整构造配置或外部来源指纹"
+        )
+    if policy_metric_config is not None and policy_metric_state is None:
+        raise ValueError(
+            "主 checkpoint 含 mtvj_metric_head_config 但缺少 mtvj_metric_head"
+        )
     ckpt = torch.load(path, map_location="cpu", weights_only=True)
-    for key in ("metric_head", "relation_encoder"):
+    # 外部 checkpoint 始终提供模块构造 config；其权重仅用于旧 policy 的
+    # 单向迁移。新 policy 已随主 checkpoint 保存精确 runtime 权重。
+    required_external_states = []
+    if policy_metric_state is None:
+        required_external_states.append("metric_head")
+    if policy_relation_state is None:
+        required_external_states.append("relation_encoder")
+    for key in required_external_states:
         if key not in ckpt:
             raise ValueError(
                 f"--metric-visual-checkpoint {path} 缺少键 {key!r}（契约 §2）"
@@ -120,27 +291,139 @@ def _load_mtvj_metric_checkpoint(path: Path, device, config) -> tuple[nn.Module,
             f"--metric-visual-checkpoint contract={contract!r} != "
             f"'mt_vj_metric_field_v1'（阶段 V checkpoint 不匹配）"
         )
-    ctor_config = ckpt.get("config") or {}
+    external_ctor_config = _canonical_mtvj_metric_head_config(ckpt.get("config"))
+    current_identity = _mtvj_metric_checkpoint_identity(path, ckpt)
+    if policy_metric_state is not None:
+        ctor_config = _canonical_mtvj_metric_head_config(
+            policy_metric_config,
+            require_complete=True,
+        )
+        config_mismatch = (
+            {"checkpoint": ctor_config, "external": external_ctor_config}
+            if ctor_config != external_ctor_config
+            else None
+        )
+        identity_mismatch = _mtvj_metric_identity_mismatches(
+            policy_metric_identity or {}, current_identity
+        )
+        if config_mismatch or identity_mismatch:
+            raise ValueError(
+                "评测使用的 MT-VJ 外部 checkpoint 与训练保存时不一致："
+                f"constructor={config_mismatch}, fingerprint={identity_mismatch}"
+            )
+        metric_state = policy_metric_state
+        metric_source = "main policy checkpoint"
+        constructor_source = "main policy checkpoint"
+    else:
+        ctor_config = external_ctor_config
+        metric_state = ckpt["metric_head"]
+        metric_source = "external metric checkpoint (legacy migration)"
+        constructor_source = str(path)
 
-    def ctor_kwargs(cls) -> dict:
-        return {
-            key: value
-            for key, value in ctor_config.items()
-            if key in inspect.signature(cls.__init__).parameters and key != "self"
+    def strict_load_state(
+        module: nn.Module,
+        state: dict[str, torch.Tensor],
+        *,
+        module_name: str,
+        source: str,
+    ) -> None:
+        expected = module.state_dict()
+        missing = sorted(set(expected) - set(state))
+        unexpected = sorted(set(state) - set(expected))
+        bad_shapes = {
+            key: (tuple(state[key].shape), tuple(expected[key].shape))
+            for key in set(expected) & set(state)
+            if tuple(state[key].shape) != tuple(expected[key].shape)
         }
+        if missing or unexpected or bad_shapes:
+            raise ValueError(
+                f"MT-VJ {module_name} 与保存的构造配置不兼容；"
+                f"source={source}, missing={missing[:8]}, "
+                f"unexpected={unexpected[:8]}, shape_mismatch={bad_shapes}"
+            )
+        module.load_state_dict(state, strict=True)
 
-    metric_head = LanguageMetricField(**ctor_kwargs(LanguageMetricField)).to(device)
-    metric_head.load_state_dict(ckpt["metric_head"])
-    # 与 train.py 一致：metric tokens 输入改用 v4 实证定位 out.p（8 维），
-    # RelationStateEncoder 以 state_dim=8 重建（loc-only 旧权重随机未训练，丢弃）。
+    metric_head = LanguageMetricField(**ctor_config).to(device)
+    strict_load_state(
+        metric_head,
+        metric_state,
+        module_name="metric head",
+        source=metric_source,
+    )
+    # metric tokens 输入使用 visibility-gated out.p（8D）。主 policy checkpoint 中的
+    # projection 优先；只有形状兼容时才允许回退到外部 metric checkpoint。
+    # 禁止评测时随机重建，否则训练和考试会读取两套不同的 token 语义。
+    has_relation_contract = any(
+        key in policy_contract
+        for key in (
+            "metric_tokens_enabled",
+            "metric_state_source",
+            "metric_state_dim",
+            "metric_d_model",
+            "metric_contract_version",
+        )
+    )
+    runtime_metric_source = policy_contract.get(
+        "metric_state_source", MTVJ_LEGACY_METRIC_STATE_SOURCE
+    )
+    runtime_metric_version = int(
+        policy_contract.get(
+            "metric_contract_version", MTVJ_LEGACY_METRIC_CONTRACT_VERSION
+        )
+    )
+    if policy_relation_state is not None and has_relation_contract:
+        common_expected = {
+            "metric_tokens_enabled": True,
+            "metric_state_dim": 8,
+            "metric_d_model": config.hidden_dim,
+        }
+        mismatched = {
+            key: (policy_contract.get(key), expected)
+            for key, expected in common_expected.items()
+            if policy_contract.get(key) != expected
+        }
+        allowed_runtime = {
+            (MTVJ_LEGACY_METRIC_STATE_SOURCE, MTVJ_LEGACY_METRIC_CONTRACT_VERSION),
+            (MTVJ_METRIC_STATE_SOURCE, MTVJ_METRIC_CONTRACT_VERSION),
+        }
+        if mismatched or (runtime_metric_source, runtime_metric_version) not in allowed_runtime:
+            raise ValueError(
+                "主 checkpoint 的 MT-VJ metric 契约不兼容："
+                f"fields={mismatched}, source/version="
+                f"{runtime_metric_source!r}/{runtime_metric_version}"
+            )
+    metric_head._mtvj_metric_state_source = runtime_metric_source
+    metric_head._mtvj_metric_contract_version = runtime_metric_version
+    metric_head._mtvj_current_external_checkpoint_identity = dict(current_identity)
     relation_encoder = RelationStateEncoder(
         state_dim=8,
-        d_model=int(ctor_config.get("d_model", 512)),
+        d_model=(
+            config.hidden_dim
+            if policy_relation_state is not None
+            else int((ckpt.get("config") or {}).get("d_model", 512))
+        ),
     ).to(device)
+    relation_source = (
+        "main policy checkpoint"
+        if policy_relation_state is not None
+        else "external metric checkpoint (legacy migration)"
+    )
     try:
-        relation_encoder.load_state_dict(ckpt["relation_encoder"])
-    except RuntimeError as e:
-        print(f"eval: relation_encoder state_dim 不兼容，丢弃旧随机权重重建：{e}")
+        strict_load_state(
+            relation_encoder,
+            policy_relation_state
+            if policy_relation_state is not None
+            else ckpt["relation_encoder"],
+            module_name="relation encoder",
+            source=relation_source,
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "MT-VJ relation encoder 与当前 8D out.p 契约不兼容。"
+            "评测不能随机重建；请使用包含 mtvj_relation_encoder 的主 checkpoint，"
+            "或移除 --metric-visual-checkpoint 运行明确的 dense-only benchmark。"
+            f"详情：{exc}"
+        ) from exc
     for module in (metric_head, relation_encoder):
         module.eval()
         for parameter in module.parameters():
@@ -162,7 +445,8 @@ def _load_mtvj_metric_checkpoint(path: Path, device, config) -> tuple[nn.Module,
         f"（params={sum(p.numel() for p in metric_head.parameters()):,}）"
         "+ relation encoder "
         f"（params={sum(p.numel() for p in relation_encoder.parameters()):,}）"
-        f" from {path}"
+        f" from {relation_source}; metric head from {metric_source}; "
+        f"constructor config from {constructor_source}"
     )
     return metric_head, relation_encoder
 
@@ -176,12 +460,15 @@ def _mtvj_metric_tokens(
     coords: torch.Tensor,
     g_prev: torch.Tensor | None,
     device,
+    *,
+    roi_head: nn.Module | None = None,
+    roi_backbone: nn.Module | None = None,
+    roi_video: torch.Tensor | None = None,
+    roi_alpha: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """单决策 metric_tokens（与 train.py ``_mtvj_online_encode`` 的 metric 分支同构）。
 
-    - g_t = metric head 回归的 relation [4]（阶段 V 监督自模拟器 eef/object/
-      target 世界坐标：eef 来自仿真环境状态；闭环中 head 直接从视觉 evidence
-      回归同一量，无需额外 proprio 输入——与训练逐位同构）；
+    - g_t = ``out.p * out.visibility`` 展平的8维门控图像坐标；
     - ν_t = g_t − g_{t−1}（首决策 ν≡0，与训练 T 序列首决策一致）；
     - z_g, z_nu = RelationStateEncoder(g, ν) → metric_tokens [B=1, 2, d_model]。
     """
@@ -193,9 +480,29 @@ def _mtvj_metric_tokens(
         language_mask.to(device=device),
         coords.to(device=device, dtype=head_dtype),
     )
-    # metric tokens 输入 = v4 实证定位 out.p（[B=1, R=4, 2] → [8]），替代 loc-only
-    # 下未训练的 out.relation（与 train.py _mtvj_online_encode 同构）。
-    g = out.p.detach()[0].reshape(-1)  # [8]（4 角色 × 2 归一化坐标）
+    if roi_head is not None and roi_alpha != 0.0:
+        if roi_backbone is None or roi_video is None:
+            raise ValueError("MT-VJ ROI runtime requires raw video and frozen backbone")
+        out.p, out.visibility = refine_metric_roi_positions(
+            out.p,
+            out.visibility,
+            roi_video,
+            roi_backbone,
+            roi_head,
+            language_hidden.to(device=device),
+            language_mask.to(device=device),
+            coords,
+            alpha=roi_alpha,
+        )
+    # 与 train.py _mtvj_online_encode 完全同构：不可见角色坐标归零。
+    g = _mtvj_metric_positions(
+        out,
+        getattr(
+            metric_head,
+            "_mtvj_metric_state_source",
+            MTVJ_LEGACY_METRIC_STATE_SOURCE,
+        ),
+    ).detach()[0]
     nu = torch.zeros_like(g) if g_prev is None else g - g_prev
     z_g, z_nu = relation_encoder(g[None], nu[None])
     metric_tokens = torch.stack((z_g, z_nu), dim=1)  # [1, 2, d_model]
@@ -234,9 +541,27 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="MT-VJ metric 视觉预训练 checkpoint（契约 §2：config/metric_head/"
         "relation_encoder/contract='mt_vj_metric_field_v1'）。提供时每决策点经 "
-        "LanguageMetricField（g_t = head 回归 relation）+ RelationStateEncoder "
+        "LanguageMetricField（g_t = out.p 四角色坐标展平）+ RelationStateEncoder "
         "（ν_t = g_t − g_{t−1}）生成 metric_tokens 注入模型；缺省 None（回退 "
         "metric_tokens=None，与训练无 metric head 分支一致）",
+    )
+    parser.add_argument(
+        "--mtvj-dense-only-ablation",
+        action="store_true",
+        help="显式关闭 checkpoint 期待的 MT-VJ metric tokens，只评测 dense H5/H11 "
+        "action readout 消融；普通 benchmark 禁止静默关闭 metric 路径。",
+    )
+    parser.add_argument(
+        "--mtvj-roi-checkpoint",
+        type=Path,
+        default=None,
+        help="可选 MT-VJ 原图 ROI 精修 checkpoint；默认关闭。",
+    )
+    parser.add_argument(
+        "--mtvj-roi-alpha",
+        type=float,
+        default=None,
+        help="ROI 有界残差融合系数 [0,1]；启用 ROI checkpoint 时必须显式给出。",
     )
     parser.add_argument("--trials-per-task", type=int, default=10)
     parser.add_argument("--max-tasks", type=int, default=49)
@@ -1307,6 +1632,56 @@ def main() -> None:
     device = torch.device(args.device)
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     config = VACompoundConfig(**ckpt["config"])
+    policy_contract = ckpt.get("training_contract", {}) or {}
+    checkpoint_uses_mtvj = bool(getattr(config, "dense_readout_mtvj", False))
+    if checkpoint_uses_mtvj and not args.dense_readout_mtvj:
+        args.dense_readout_mtvj = True
+        print(
+            "eval: checkpoint config.dense_readout_mtvj=True；自动启用同构 MT-VJ "
+            "H5/H11 dense 路径",
+            flush=True,
+        )
+    metric_expected = bool(policy_contract.get("metric_tokens_enabled", False))
+    roi_expected = policy_contract.get("mtvj_roi_enabled") is True
+    if args.mtvj_roi_checkpoint is None:
+        if args.mtvj_roi_alpha is not None:
+            raise ValueError("--mtvj-roi-alpha requires --mtvj-roi-checkpoint")
+        if roi_expected:
+            raise ValueError(
+                "checkpoint requires --mtvj-roi-checkpoint; refusing to silently "
+                "disable the trained ROI runtime"
+            )
+    else:
+        if (
+            args.mtvj_roi_alpha is None
+            or not np.isfinite(args.mtvj_roi_alpha)
+            or not 0.0 <= args.mtvj_roi_alpha <= 1.0
+        ):
+            raise ValueError(
+                "--mtvj-roi-checkpoint requires finite --mtvj-roi-alpha in [0,1]"
+            )
+        if args.metric_visual_checkpoint is None:
+            raise ValueError(
+                "--mtvj-roi-checkpoint requires --metric-visual-checkpoint"
+            )
+        if roi_expected:
+            saved_alpha = policy_contract.get("mtvj_roi_alpha")
+            if saved_alpha is None or float(saved_alpha) != float(args.mtvj_roi_alpha):
+                raise ValueError(
+                    "--mtvj-roi-alpha must exactly match the policy checkpoint: "
+                    f"policy={saved_alpha!r}, runtime={args.mtvj_roi_alpha!r}"
+                )
+    if args.mtvj_dense_only_ablation and not args.dense_readout_mtvj:
+        raise ValueError("--mtvj-dense-only-ablation requires an MT-VJ checkpoint/path")
+    if (
+        metric_expected
+        and args.metric_visual_checkpoint is None
+        and not args.mtvj_dense_only_ablation
+    ):
+        raise ValueError(
+            "checkpoint 训练时启用了 MT-VJ metric tokens；评测必须提供 "
+            "--metric-visual-checkpoint，或显式指定 --mtvj-dense-only-ablation"
+        )
     # 2026-08-09：ACTION_HORIZON 从 checkpoint config 读（E7 H=48），不再硬编码 8。
     global ACTION_HORIZON
     ACTION_HORIZON = int(getattr(config, "action_horizon", 8))
@@ -1477,6 +1852,7 @@ def main() -> None:
     mtvj_backbone = None
     metric_head = None
     relation_encoder = None
+    roi_head = None
     coords_mtvj = None
     if args.dense_readout_mtvj:
         mtvj_backbone = VJEPA21Backbone.from_pretrained(
@@ -1496,9 +1872,45 @@ def main() -> None:
                     "metric 路径需要 va_compound.live_vjepa._dense_coords"
                 )
             metric_head, relation_encoder = _load_mtvj_metric_checkpoint(
-                args.metric_visual_checkpoint, device, config
+                args.metric_visual_checkpoint,
+                device,
+                config,
+                policy_relation_state=ckpt.get("mtvj_relation_encoder"),
+                policy_metric_state=ckpt.get("mtvj_metric_head"),
+                policy_metric_config=ckpt.get("mtvj_metric_head_config"),
+                policy_metric_identity=ckpt.get(
+                    "mtvj_metric_checkpoint_identity"
+                ),
+                policy_training_contract=ckpt.get("training_contract", {}) or {},
             )
             coords_mtvj = torch.from_numpy(_dense_coords())
+            if args.mtvj_roi_checkpoint is not None:
+                coarse_identity = getattr(
+                    metric_head, "_mtvj_current_external_checkpoint_identity", None
+                )
+                if not isinstance(coarse_identity, dict):
+                    raise ValueError("MT-VJ metric head lacks its external coarse identity")
+                roi_head = load_metric_roi_checkpoint(
+                    args.mtvj_roi_checkpoint,
+                    device,
+                    coarse_identity=coarse_identity,
+                    coarse_head_state_sha256=metric_head_state_sha256(metric_head),
+                    policy_state=ckpt.get("mtvj_roi_head"),
+                    policy_config=ckpt.get("mtvj_roi_config"),
+                    policy_identity=ckpt.get("mtvj_roi_checkpoint_identity"),
+                    policy_training_contract=policy_contract,
+                )
+                print(
+                    "eval: frozen MT-VJ ROI head loaded "
+                    f"(alpha={args.mtvj_roi_alpha}, "
+                    f"params={sum(p.numel() for p in roi_head.parameters()):,})",
+                    flush=True,
+                )
+        else:
+            print(
+                "eval: MT-VJ dense-only benchmark（metric tokens disabled"
+                f"{'；这是主模型的显式消融' if args.mtvj_dense_only_ablation else ''}）"
+            )
     if args.c2_recovery_eval is not None:
         if not config.c2_controller:
             raise ValueError("--c2-recovery-eval requires a c2 checkpoint")
@@ -1535,16 +1947,11 @@ def main() -> None:
         compiler.eval()
         print("eval: semantic_compiler loaded from checkpoint")
     all_tasks = features["metadata"]["tasks"]
-    if args.task_ids is not None:
-        task_indices = [int(token) for token in args.task_ids.split(",")]
-        for index in task_indices:
-            if index < 0 or index >= len(all_tasks):
-                raise ValueError(f"--task-ids index {index} out of range 0..{len(all_tasks) - 1}")
-        tasks = [all_tasks[index] for index in task_indices]
-    else:
-        tasks = all_tasks[: args.max_tasks]
-    if not tasks:
+    selected_tasks = select_eval_tasks(all_tasks, args.task_ids, args.max_tasks)
+    if not selected_tasks:
         raise ValueError("no tasks selected for evaluation")
+    task_indices = [index for index, _ in selected_tasks]
+    tasks = [text for _, text in selected_tasks]
     if isinstance(text_backbone, QwenSemanticBackbone):
         # P0-3：semantic adapter ckpt——语言 hidden 用 fused 嵌入
         # （prior + g ⊙ (adapted − prior)），不是裸冻结先验。
@@ -1593,7 +2000,7 @@ def main() -> None:
     descriptions_to_env = {v: k for k, v in mw_config["TASK_DESCRIPTIONS"].items()}
 
     per_task = {}
-    for task_index, task_text in enumerate(tasks):
+    for local_task_index, (global_task_index, task_text) in enumerate(selected_tasks):
         env_name = descriptions_to_env.get(task_text)
         if env_name is None:
             print(f"task {task_text[:40]}: SKIP (no env_name mapping)")
@@ -1607,7 +2014,15 @@ def main() -> None:
         env._freeze_rand_vec = False
         wins = 0
         for trial in range(args.trials_per_task):
-            obs, _ = env.reset(seed=1000 * task_index + trial)  # 固定种子（口径要求）
+            episode_seed = evaluation_episode_seed(global_task_index, trial)
+            # MetaWorld v3 的 reset_model 在部分版本仍读全局 NumPy RNG；
+            # 仅传 env.reset(seed=...) 不足以固定任务布局。显式同步后，基线与
+            # 候选的同一 trial 才是真正同初态配对。
+            np.random.seed(episode_seed)
+            obs, _ = env.reset(seed=episode_seed)  # 固定环境种子（口径要求）
+            # 每个 trial 独立重置 flow 噪声：否则某模型提前成功会
+            # 少消耗随机数，使后续 trial 与基线失去配对可比性。
+            torch.manual_seed(1_000_000 + episode_seed)
             if args.align_init:
                 # 对齐数据首帧（物体+target），把闭环拉回训练分布
                 from mw_expert_replay import align_objects, load_episode_rows, load_episodes
@@ -1625,7 +2040,7 @@ def main() -> None:
                     if args.debug_first_action:
                         global _ALIGN_ACTS
                         feat = torch.load(args.features, map_location="cpu", weights_only=True)
-                        tid = tasks.index(task_text)
+                        tid = global_task_index
                         idx = int((feat["instruction_id"] == tid).nonzero()[0][0])
                         _ALIGN_ACTS = feat["actions"][idx].numpy()
             frame_buffer = []
@@ -1700,7 +2115,7 @@ def main() -> None:
                                 # servo 路径：一次 reader 调用（带 prev_mu 跟踪先验）
                                 # 同时产出 MultiModeReadout 与 31-token 视觉流。
                                 readout, vision_in = _servo_vision(
-                                    model, tokens, task_caches[task_index],
+                                    model, tokens, task_caches[local_task_index],
                                     dense_coords_arr, prev_mu=servo_runtime.prev_mu,
                                 )
                                 if args.fovea:
@@ -1720,14 +2135,14 @@ def main() -> None:
                                     ).detach().cpu().float()
                             else:
                                 vision_in = _apply_local_vision(
-                                    model, tokens, task_caches[task_index]
+                                    model, tokens, task_caches[local_task_index]
                                 )
                             c_current = model.control_projector(tokens)
                             cond, memory = model.encode_condition(
                                 vision_in,
                                 proprio[0],
                                 previous[0],
-                                language_cache=task_caches[task_index],
+                                language_cache=task_caches[local_task_index],
                                 visual_memory=memory,
                                 return_visual_memory=True,
                             )
@@ -1776,7 +2191,7 @@ def main() -> None:
                                             else None
                                         )
                                         readout, _ = _servo_vision(
-                                            model, tokens, task_caches[task_index],
+                                            model, tokens, task_caches[local_task_index],
                                             dense_coords_arr, prev_mu=prev_crop,
                                         )
                                         readout = MultiModeReadout(
@@ -1795,7 +2210,7 @@ def main() -> None:
                                             clip.unsqueeze(0), pooling=vision_pooling
                                         )
                                         readout, _ = _servo_vision(
-                                            model, tokens, task_caches[task_index],
+                                            model, tokens, task_caches[local_task_index],
                                             dense_coords_arr,
                                             prev_mu=servo_runtime.prev_mu,
                                         )
@@ -1805,7 +2220,7 @@ def main() -> None:
                                 correction, innovation_flag = servo_runtime.correct(
                                     readout,
                                     state_norm[:4],
-                                    task_caches[task_index].role_queries.mean(dim=1),
+                                    task_caches[local_task_index].role_queries.mean(dim=1),
                                     a_prev=None if servo_first else last_norm,
                                 )
                                 nominal = c2_params.nominal[0, c2_token].cpu().numpy()
@@ -1881,13 +2296,13 @@ def main() -> None:
                         with torch.inference_mode():
                             tokens = vision_backbone(clip.unsqueeze(0), pooling=vision_pooling)
                             readout, vision_in = _servo_vision(
-                                model, tokens, task_caches[task_index],
+                                model, tokens, task_caches[local_task_index],
                                 dense_coords_arr, prev_mu=servo_runtime.prev_mu,
                             )
                             # servo 语言条件：role queries 均值（与 train.py
                             # servo_correction_t0 同一构造）。
                             servo_lang_cond = (
-                                task_caches[task_index].role_queries.mean(dim=1)
+                                task_caches[local_task_index].role_queries.mean(dim=1)
                             )
                             if args.fovea:
                                 # ROI 在渲染像素空间（480×480）；同一仿射应用于
@@ -1908,7 +2323,7 @@ def main() -> None:
                                 vision_in,
                                 proprio[0],
                                 previous[0],
-                                language_cache=task_caches[task_index],
+                                language_cache=task_caches[local_task_index],
                                 visual_memory=memory,
                                 return_visual_memory=True,
                             )
@@ -1952,7 +2367,7 @@ def main() -> None:
                                         else None
                                     )
                                     readout, _ = _servo_vision(
-                                        model, tokens, task_caches[task_index],
+                                        model, tokens, task_caches[local_task_index],
                                         dense_coords_arr, prev_mu=prev_crop,
                                     )
                                     readout = MultiModeReadout(
@@ -1974,7 +2389,7 @@ def main() -> None:
                                         feedback_clip.unsqueeze(0), pooling=vision_pooling
                                     )
                                     readout, _ = _servo_vision(
-                                        model, tokens, task_caches[task_index],
+                                        model, tokens, task_caches[local_task_index],
                                         dense_coords_arr,
                                         prev_mu=servo_runtime.prev_mu,
                                     )
@@ -2016,13 +2431,13 @@ def main() -> None:
                     if has_plan and plan_refresh_due(decision_count, args.plan_refresh):
                         # Plan-Cache：用当前窗口场景（vision 全局均值）重建该任务缓存
                         scene_summary = tokens.mean(dim=1)  # [1, vision_dim]
-                        task_caches[task_index] = build_plan_language_cache(
+                        task_caches[local_task_index] = build_plan_language_cache(
                             model,
-                            hidden[task_index : task_index + 1].to(device),
-                            mask[task_index : task_index + 1].to(device),
+                            hidden[local_task_index : local_task_index + 1].to(device),
+                            mask[local_task_index : local_task_index + 1].to(device),
                             scene_summary,
                             instruction=(
-                                tasks[task_index]
+                                tasks[local_task_index]
                                 if config.scene_teacher or compiler is not None
                                 else None
                             ),
@@ -2061,7 +2476,7 @@ def main() -> None:
                     )[None, None]
                     with torch.inference_mode():
                         vision_in = _apply_local_vision(
-                            model, tokens, task_caches[task_index]
+                            model, tokens, task_caches[local_task_index]
                         )
                         dense_kwargs = {}
                         if args.dense_readout_mtvj:
@@ -2070,7 +2485,7 @@ def main() -> None:
                             # [d-6, d-4, d-2, d] → 冻结 V-JEPA 多层未池化
                             # evidence {5, 11}（fp32 交付，与训练一致）；
                             # metric head（若 checkpoint 提供）→ metric_tokens
-                            # （g_t = head 回归 relation，ν_t = g_t − g_{t−1}）。
+                            # （g_t = out.p 四角色坐标展平，ν_t = g_t − g_{t−1}）。
                             dense_evidence = mtvj_backbone.forward_hierarchical_dense(
                                 clip.unsqueeze(0)
                             )
@@ -2078,17 +2493,41 @@ def main() -> None:
                                 layer: ev.float()
                                 for layer, ev in dense_evidence.items()
                             }
+                            if not model.config.local_slots:
+                                # Exact train/eval base-vision contract:
+                                # Pool16(H11), not final-layer flat64 tokens.
+                                vision_in = pool_mtvj_coarse_tokens(
+                                    dense_evidence[11]
+                                )
                             metric_tokens = None
                             if metric_head is not None:
+                                roi_video = None
+                                if roi_head is not None and args.mtvj_roi_alpha != 0.0:
+                                    raw_window = np.stack(frames, axis=0)[
+                                        None, None
+                                    ]
+                                    roi_video = prepare_metric_roi_video(
+                                        raw_window,
+                                        device,
+                                        image_size=None,
+                                    )
                                 metric_tokens, metric_g_prev = _mtvj_metric_tokens(
                                     metric_head,
                                     relation_encoder,
                                     dense_evidence,
-                                    hidden[task_index : task_index + 1],
-                                    mask[task_index : task_index + 1],
+                                    hidden[local_task_index : local_task_index + 1],
+                                    mask[local_task_index : local_task_index + 1],
                                     coords_mtvj,
                                     metric_g_prev,
                                     device,
+                                    roi_head=roi_head,
+                                    roi_backbone=mtvj_backbone,
+                                    roi_video=roi_video,
+                                    roi_alpha=(
+                                        float(args.mtvj_roi_alpha)
+                                        if roi_head is not None
+                                        else 0.0
+                                    ),
                                 )
                             dense_kwargs = {
                                 "dense_evidence": dense_evidence,
@@ -2098,7 +2537,7 @@ def main() -> None:
                             vision_in,
                             proprio[0],
                             previous[0],
-                            language_cache=task_caches[task_index],
+                            language_cache=task_caches[local_task_index],
                             visual_memory=memory,
                             return_visual_memory=True,
                             **dense_kwargs,
@@ -2151,6 +2590,10 @@ def main() -> None:
                 if terminated or truncated:
                     break
             wins += int(success)
+            print(
+                f"trial task={global_task_index} trial={trial} seed={episode_seed} "
+                f"success={int(success)}"
+            )
         per_task[task_text[:40]] = wins
         print(f"task {task_text[:40]}: {wins}/{args.trials_per_task}")
         env.close()

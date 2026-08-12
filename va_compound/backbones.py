@@ -142,6 +142,32 @@ def pool_flat_tokens(tokens: Tensor, max_tokens: int) -> Tensor:
     return tokens
 
 
+MTVJ_COARSE_TOKENS = 16
+
+
+def pool_mtvj_coarse_tokens(tokens: Tensor) -> Tensor:
+    """Pool flattened MT-VJ H11 evidence into the policy's 16 coarse tokens.
+
+    Training historically used 16 contiguous, equally sized bins over the
+    flattened ``[t, y, x]`` token sequence.  Keeping this as one shared helper
+    prevents closed-loop evaluation from silently using the regular V-JEPA
+    final-layer/64-token input instead.
+    """
+    if tokens.ndim != 3:
+        raise ValueError("MT-VJ H11 tokens must have shape [batch, tokens, dim]")
+    if tokens.shape[1] % MTVJ_COARSE_TOKENS != 0:
+        raise ValueError(
+            "MT-VJ H11 token count must be divisible by "
+            f"{MTVJ_COARSE_TOKENS}, got {tokens.shape[1]}"
+        )
+    return tokens.reshape(
+        tokens.shape[0],
+        MTVJ_COARSE_TOKENS,
+        -1,
+        tokens.shape[-1],
+    ).mean(dim=2)
+
+
 def _square_grid_size(max_tokens: int) -> int:
     size = isqrt(max_tokens)
     if size * size != max_tokens:

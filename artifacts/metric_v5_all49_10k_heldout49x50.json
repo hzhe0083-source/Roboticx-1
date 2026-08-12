@@ -1,0 +1,6513 @@
+{
+  "contract": "mt_vj_metric_field_v1",
+  "checkpoint": "/home/ryan/Documents/robot/ORA0/checkpoints/metric_field_v5_all49_10k.pt",
+  "checkpoint_steps_done": 10000,
+  "task": "all49",
+  "tasks": [
+    "assembly-v3",
+    "basketball-v3",
+    "bin-picking-v3",
+    "box-close-v3",
+    "button-press-topdown-v3",
+    "button-press-topdown-wall-v3",
+    "button-press-v3",
+    "button-press-wall-v3",
+    "coffee-button-v3",
+    "coffee-pull-v3",
+    "coffee-push-v3",
+    "dial-turn-v3",
+    "disassemble-v3",
+    "door-close-v3",
+    "door-lock-v3",
+    "door-open-v3",
+    "door-unlock-v3",
+    "hand-insert-v3",
+    "drawer-close-v3",
+    "drawer-open-v3",
+    "faucet-open-v3",
+    "faucet-close-v3",
+    "hammer-v3",
+    "handle-press-side-v3",
+    "handle-press-v3",
+    "handle-pull-side-v3",
+    "handle-pull-v3",
+    "lever-pull-v3",
+    "pick-place-wall-v3",
+    "pick-out-of-hole-v3",
+    "pick-place-v3",
+    "plate-slide-v3",
+    "plate-slide-side-v3",
+    "plate-slide-back-v3",
+    "plate-slide-back-side-v3",
+    "peg-insert-side-v3",
+    "peg-unplug-side-v3",
+    "soccer-v3",
+    "stick-push-v3",
+    "stick-pull-v3",
+    "push-v3",
+    "push-wall-v3",
+    "reach-v3",
+    "reach-wall-v3",
+    "shelf-place-v3",
+    "sweep-into-v3",
+    "sweep-v3",
+    "window-open-v3",
+    "window-close-v3"
+  ],
+  "samples_per_task": 50,
+  "samples": 2450,
+  "seed": 120813,
+  "device": "cuda",
+  "metrics": {
+    "localization": {
+      "roles": {
+        "tool": {
+          "visible_count": 2223,
+          "rmse_px": 10.039522353460846,
+          "median_px": 9.66610115944283,
+          "pck@5px": 0.008097165991902834,
+          "pck@10px": 0.5708502024291497
+        },
+        "object": {
+          "visible_count": 2157,
+          "rmse_px": 14.858725142147811,
+          "median_px": 11.874666994847805,
+          "pck@5px": 0.07324988409828466,
+          "pck@10px": 0.32962447844228093
+        },
+        "target": {
+          "visible_count": 1963,
+          "rmse_px": 17.077311995200404,
+          "median_px": 11.631457751218008,
+          "pck@5px": 0.049923586347427405,
+          "pck@10px": 0.31482424859908303
+        },
+        "interface": {
+          "visible_count": 2122,
+          "rmse_px": 17.554204576082686,
+          "median_px": 11.968263953308044,
+          "pck@5px": 0.06644674835061264,
+          "pck@10px": 0.3176248821866164
+        }
+      },
+      "aggregate": {
+        "visible_count": 8465,
+        "rmse_px": 15.086519487833018,
+        "median_px": 10.921101658582282,
+        "pck@5px": 0.0490253987005316,
+        "pck@10px": 0.3865327820437094
+      }
+    },
+    "visibility": {
+      "roles": {
+        "tool": {
+          "count": 2450,
+          "accuracy": 0.9444897959183673,
+          "balanced_accuracy": 0.7558167416734539,
+          "visible_recall": 0.98740440845704,
+          "hidden_recall": 0.5242290748898678,
+          "brier": 0.040715558675799936
+        },
+        "object": {
+          "count": 2450,
+          "accuracy": 0.9359183673469388,
+          "balanced_accuracy": 0.8883981196232285,
+          "visible_recall": 0.9508576726935558,
+          "hidden_recall": 0.825938566552901,
+          "brier": 0.04364421391307035
+        },
+        "target": {
+          "count": 2450,
+          "accuracy": 0.9322448979591836,
+          "balanced_accuracy": 0.878203646306778,
+          "visible_recall": 0.9679062659195109,
+          "hidden_recall": 0.7885010266940452,
+          "brier": 0.04958596814495966
+        },
+        "interface": {
+          "count": 2450,
+          "accuracy": 0.9375510204081633,
+          "balanced_accuracy": 0.9059547481667087,
+          "visible_recall": 0.9491046182846371,
+          "hidden_recall": 0.8628048780487805,
+          "brier": 0.04223901831701001
+        }
+      },
+      "aggregate": {
+        "count": 9800,
+        "accuracy": 0.9375510204081633,
+        "balanced_accuracy": 0.8670033692379504,
+        "visible_recall": 0.9639692852923804,
+        "hidden_recall": 0.7700374531835206,
+        "brier": 0.044046189762709985
+      }
+    },
+    "gated_state": {
+      "roles": {
+        "tool": {
+          "visible_count": 2450,
+          "rmse_px": 54.924954892371886,
+          "median_px": 10.93115348773005,
+          "pck@5px": 0.003673469387755102,
+          "pck@10px": 0.36122448979591837
+        },
+        "object": {
+          "visible_count": 2450,
+          "rmse_px": 51.06259484107187,
+          "median_px": 14.5195638504477,
+          "pck@5px": 0.0473469387755102,
+          "pck@10px": 0.21551020408163266
+        },
+        "target": {
+          "visible_count": 2450,
+          "rmse_px": 53.57799530285986,
+          "median_px": 13.200670853046216,
+          "pck@5px": 0.07306122448979592,
+          "pck@10px": 0.2510204081632653
+        },
+        "interface": {
+          "visible_count": 2450,
+          "rmse_px": 50.91953296105073,
+          "median_px": 14.086477314612518,
+          "pck@5px": 0.06285714285714286,
+          "pck@10px": 0.24040816326530612
+        }
+      },
+      "aggregate": {
+        "visible_count": 9800,
+        "rmse_px": 52.64869342984057,
+        "median_px": 12.868648959628077,
+        "pck@5px": 0.04673469387755102,
+        "pck@10px": 0.2670408163265306
+      }
+    },
+    "pair_visibility_coverage": {
+      "tool_object": 0.796734693877551,
+      "interface_target": 0.713469387755102,
+      "any_actionable_pair": 0.8706122448979592
+    }
+  },
+  "per_task": {
+    "assembly-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 46,
+            "rmse_px": 10.032157536470507,
+            "median_px": 9.57912648885961,
+            "pck@5px": 0.0,
+            "pck@10px": 0.5869565217391305
+          },
+          "object": {
+            "visible_count": 49,
+            "rmse_px": 5.228854599794803,
+            "median_px": 4.523039101933077,
+            "pck@5px": 0.5918367346938775,
+            "pck@10px": 1.0
+          },
+          "target": {
+            "visible_count": 49,
+            "rmse_px": 13.945226787752837,
+            "median_px": 13.500774444859402,
+            "pck@5px": 0.04081632653061224,
+            "pck@10px": 0.2653061224489796
+          },
+          "interface": {
+            "visible_count": 49,
+            "rmse_px": 5.317417688623771,
+            "median_px": 4.874237543766956,
+            "pck@5px": 0.5102040816326531,
+            "pck@10px": 1.0
+          }
+        },
+        "aggregate": {
+          "visible_count": 193,
+          "rmse_px": 9.353120721110065,
+          "median_px": 7.817344231381371,
+          "pck@5px": 0.29015544041450775,
+          "pck@10px": 0.7150259067357513
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.94,
+            "balanced_accuracy": 0.625,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.25,
+            "brier": 0.033637685476159564
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": 1.0,
+            "visible_recall": 1.0,
+            "hidden_recall": 1.0,
+            "brier": 0.004418729888923156
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.96,
+            "balanced_accuracy": 0.9795918367346939,
+            "visible_recall": 0.9591836734693877,
+            "hidden_recall": 1.0,
+            "brier": 0.014845770865082675
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": 1.0,
+            "visible_recall": 1.0,
+            "hidden_recall": 1.0,
+            "brier": 0.004704073039713155
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.975,
+          "balanced_accuracy": 0.7805329385640266,
+          "visible_recall": 0.9896373056994818,
+          "hidden_recall": 0.5714285714285714,
+          "brier": 0.014401564817469636
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 47.26033271925675,
+            "median_px": 10.12427602450137,
+            "pck@5px": 0.0,
+            "pck@10px": 0.48
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 14.449725400969006,
+            "median_px": 4.586679452280209,
+            "pck@5px": 0.56,
+            "pck@10px": 0.96
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 32.017641939190504,
+            "median_px": 16.56682191897618,
+            "pck@5px": 0.04,
+            "pck@10px": 0.12
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 14.938034893502547,
+            "median_px": 4.974959190213312,
+            "pck@5px": 0.5,
+            "pck@10px": 0.96
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 30.37518680898921,
+          "median_px": 8.326818903034367,
+          "pck@5px": 0.275,
+          "pck@10px": 0.63
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.9,
+        "interface_target": 0.96,
+        "any_actionable_pair": 0.98
+      }
+    },
+    "basketball-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 49,
+            "rmse_px": 10.168974093506593,
+            "median_px": 9.579996553707248,
+            "pck@5px": 0.02040816326530612,
+            "pck@10px": 0.5918367346938775
+          },
+          "object": {
+            "visible_count": 46,
+            "rmse_px": 11.01386545216574,
+            "median_px": 11.15650845977029,
+            "pck@5px": 0.06521739130434782,
+            "pck@10px": 0.2826086956521739
+          },
+          "target": {
+            "visible_count": 38,
+            "rmse_px": 13.16233365525974,
+            "median_px": 12.330920091307561,
+            "pck@5px": 0.0,
+            "pck@10px": 0.05263157894736842
+          },
+          "interface": {
+            "visible_count": 46,
+            "rmse_px": 11.179066165038668,
+            "median_px": 11.489698064619674,
+            "pck@5px": 0.06521739130434782,
+            "pck@10px": 0.2826086956521739
+          }
+        },
+        "aggregate": {
+          "visible_count": 179,
+          "rmse_px": 11.33026582181617,
+          "median_px": 11.28047048317264,
+          "pck@5px": 0.03910614525139665,
+          "pck@10px": 0.31843575418994413
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.96,
+            "balanced_accuracy": 0.4897959183673469,
+            "visible_recall": 0.9795918367346939,
+            "hidden_recall": 0.0,
+            "brier": 0.018710934975357335
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.875,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.75,
+            "brier": 0.012263639203959724
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.96,
+            "balanced_accuracy": 0.9166666666666667,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.8333333333333334,
+            "brier": 0.037708083346979664
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.875,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.75,
+            "brier": 0.010827013816183041
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.97,
+          "balanced_accuracy": 0.8781590848629954,
+          "visible_recall": 0.994413407821229,
+          "hidden_recall": 0.7619047619047619,
+          "brier": 0.019877417835619943
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 40.69913454957427,
+            "median_px": 10.530418211389838,
+            "pck@5px": 0.02,
+            "pck@10px": 0.42
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 25.76655150698755,
+            "median_px": 11.395688491800701,
+            "pck@5px": 0.06,
+            "pck@10px": 0.24
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 50.48017510795328,
+            "median_px": 14.294704629151452,
+            "pck@5px": 0.0,
+            "pck@10px": 0.08
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 24.56363959382269,
+            "median_px": 11.620639337534458,
+            "pck@5px": 0.06,
+            "pck@10px": 0.24
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 36.986332606354175,
+          "median_px": 11.886753401199625,
+          "pck@5px": 0.035,
+          "pck@10px": 0.245
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.9,
+        "interface_target": 0.72,
+        "any_actionable_pair": 0.92
+      }
+    },
+    "bin-picking-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 41,
+            "rmse_px": 9.59034286914842,
+            "median_px": 9.702121453401878,
+            "pck@5px": 0.0,
+            "pck@10px": 0.6829268292682927
+          },
+          "object": {
+            "visible_count": 46,
+            "rmse_px": 19.74470910359572,
+            "median_px": 16.075441709514006,
+            "pck@5px": 0.0,
+            "pck@10px": 0.06521739130434782
+          },
+          "target": {
+            "visible_count": 48,
+            "rmse_px": 9.788335701836736,
+            "median_px": 9.784414752701434,
+            "pck@5px": 0.041666666666666664,
+            "pck@10px": 0.5208333333333334
+          },
+          "interface": {
+            "visible_count": 46,
+            "rmse_px": 16.69079427209906,
+            "median_px": 15.959152362808954,
+            "pck@5px": 0.0,
+            "pck@10px": 0.13043478260869565
+          }
+        },
+        "aggregate": {
+          "visible_count": 181,
+          "rmse_px": 14.701068746827694,
+          "median_px": 10.877615398712269,
+          "pck@5px": 0.011049723756906077,
+          "pck@10px": 0.3425414364640884
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.94,
+            "balanced_accuracy": 0.8766937669376693,
+            "visible_recall": 0.975609756097561,
+            "hidden_recall": 0.7777777777777778,
+            "brier": 0.045710051673135424
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.9,
+            "balanced_accuracy": 0.4891304347826087,
+            "visible_recall": 0.9782608695652174,
+            "hidden_recall": 0.0,
+            "brier": 0.07586010381591266
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.96,
+            "balanced_accuracy": 0.5,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.0,
+            "brier": 0.03329729307545378
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 0.9,
+            "balanced_accuracy": 0.4891304347826087,
+            "visible_recall": 0.9782608695652174,
+            "hidden_recall": 0.0,
+            "brier": 0.07030722267389374
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.925,
+          "balanced_accuracy": 0.6759232334981099,
+          "visible_recall": 0.9834254143646409,
+          "hidden_recall": 0.3684210526315789,
+          "brier": 0.0562936678095989
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 64.20226466497853,
+            "median_px": 10.139512948105235,
+            "pck@5px": 0.0,
+            "pck@10px": 0.42
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 69.55370031029203,
+            "median_px": 20.286520125837907,
+            "pck@5px": 0.0,
+            "pck@10px": 0.0
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 38.364294760117765,
+            "median_px": 11.249026562294464,
+            "pck@5px": 0.0,
+            "pck@10px": 0.36
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 66.52821603151872,
+            "median_px": 21.419172638919903,
+            "pck@5px": 0.0,
+            "pck@10px": 0.0
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 60.94561234359593,
+          "median_px": 16.476606914659804,
+          "pck@5px": 0.0,
+          "pck@10px": 0.195
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.74,
+        "interface_target": 0.88,
+        "any_actionable_pair": 0.92
+      }
+    },
+    "box-close-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 48,
+            "rmse_px": 10.482863305073066,
+            "median_px": 10.327643903782786,
+            "pck@5px": 0.0,
+            "pck@10px": 0.4375
+          },
+          "object": {
+            "visible_count": 47,
+            "rmse_px": 20.761249122686817,
+            "median_px": 13.617957285487243,
+            "pck@5px": 0.0,
+            "pck@10px": 0.06382978723404255
+          },
+          "target": {
+            "visible_count": 48,
+            "rmse_px": 13.68007173726259,
+            "median_px": 13.295048772161138,
+            "pck@5px": 0.0,
+            "pck@10px": 0.14583333333333334
+          },
+          "interface": {
+            "visible_count": 47,
+            "rmse_px": 13.193822393414186,
+            "median_px": 13.57320220737798,
+            "pck@5px": 0.02127659574468085,
+            "pck@10px": 0.06382978723404255
+          }
+        },
+        "aggregate": {
+          "visible_count": 190,
+          "rmse_px": 14.990816697594587,
+          "median_px": 12.680321984375684,
+          "pck@5px": 0.005263157894736842,
+          "pck@10px": 0.17894736842105263
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.94,
+            "balanced_accuracy": 0.4895833333333333,
+            "visible_recall": 0.9791666666666666,
+            "hidden_recall": 0.0,
+            "brier": 0.044356516868112233
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.9,
+            "balanced_accuracy": 0.6347517730496454,
+            "visible_recall": 0.9361702127659575,
+            "hidden_recall": 0.3333333333333333,
+            "brier": 0.052749533975670976
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.96,
+            "balanced_accuracy": 0.9791666666666667,
+            "visible_recall": 0.9583333333333334,
+            "hidden_recall": 1.0,
+            "brier": 0.02571082737045647
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 0.9,
+            "balanced_accuracy": 0.6347517730496454,
+            "visible_recall": 0.9361702127659575,
+            "hidden_recall": 0.3333333333333333,
+            "brier": 0.05040547022243588
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.925,
+          "balanced_accuracy": 0.6763157894736842,
+          "visible_recall": 0.9526315789473684,
+          "hidden_recall": 0.4,
+          "brier": 0.04330558710916889
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 62.1150910547023,
+            "median_px": 11.41015093339714,
+            "pck@5px": 0.0,
+            "pck@10px": 0.36
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 57.03481552326223,
+            "median_px": 20.943299162466566,
+            "pck@5px": 0.0,
+            "pck@10px": 0.0
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 37.59902557283715,
+            "median_px": 14.441548857793137,
+            "pck@5px": 0.0,
+            "pck@10px": 0.1
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 56.287424928635495,
+            "median_px": 21.113928161438366,
+            "pck@5px": 0.0,
+            "pck@10px": 0.0
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 54.067586518241576,
+          "median_px": 17.186282483019294,
+          "pck@5px": 0.0,
+          "pck@10px": 0.115
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.9,
+        "interface_target": 0.92,
+        "any_actionable_pair": 0.94
+      }
+    },
+    "button-press-topdown-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 48,
+            "rmse_px": 9.79200473467711,
+            "median_px": 9.533614837772388,
+            "pck@5px": 0.0,
+            "pck@10px": 0.6458333333333334
+          },
+          "object": {
+            "visible_count": 39,
+            "rmse_px": 24.456838892216016,
+            "median_px": 21.050868534414565,
+            "pck@5px": 0.0,
+            "pck@10px": 0.0
+          },
+          "target": {
+            "visible_count": 37,
+            "rmse_px": 11.350704336143712,
+            "median_px": 11.884188371356883,
+            "pck@5px": 0.05405405405405406,
+            "pck@10px": 0.3783783783783784
+          },
+          "interface": {
+            "visible_count": 39,
+            "rmse_px": 24.084718597267667,
+            "median_px": 21.806501575532792,
+            "pck@5px": 0.0,
+            "pck@10px": 0.0
+          }
+        },
+        "aggregate": {
+          "visible_count": 163,
+          "rmse_px": 18.42238570824689,
+          "median_px": 14.4793494553989,
+          "pck@5px": 0.012269938650306749,
+          "pck@10px": 0.27607361963190186
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.96,
+            "balanced_accuracy": 0.7395833333333333,
+            "visible_recall": 0.9791666666666666,
+            "hidden_recall": 0.5,
+            "brier": 0.020987897654365657
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.9871794871794872,
+            "visible_recall": 0.9743589743589743,
+            "hidden_recall": 1.0,
+            "brier": 0.03167128464715665
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.9615384615384616,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.9230769230769231,
+            "brier": 0.03179368821192959
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.9871794871794872,
+            "visible_recall": 0.9743589743589743,
+            "hidden_recall": 1.0,
+            "brier": 0.03314005206513939
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.975,
+          "balanced_accuracy": 0.9637705189852429,
+          "visible_recall": 0.9815950920245399,
+          "hidden_recall": 0.9459459459459459,
+          "brier": 0.02939823064464782
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 42.415971911663206,
+            "median_px": 10.956807286157353,
+            "pck@5px": 0.0,
+            "pck@10px": 0.36
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 53.18998163616686,
+            "median_px": 23.123588645434776,
+            "pck@5px": 0.02,
+            "pck@10px": 0.06
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 44.29430142213305,
+            "median_px": 13.518414376312702,
+            "pck@5px": 0.0,
+            "pck@10px": 0.16
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 54.57186193659372,
+            "median_px": 23.059252137012386,
+            "pck@5px": 0.02,
+            "pck@10px": 0.06
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 48.909002426363685,
+          "median_px": 20.058638508833738,
+          "pck@5px": 0.01,
+          "pck@10px": 0.16
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.74,
+        "interface_target": 0.72,
+        "any_actionable_pair": 0.78
+      }
+    },
+    "button-press-topdown-wall-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 45,
+            "rmse_px": 9.647473485249447,
+            "median_px": 9.459503901336697,
+            "pck@5px": 0.044444444444444446,
+            "pck@10px": 0.6222222222222222
+          },
+          "object": {
+            "visible_count": 36,
+            "rmse_px": 20.906411142163737,
+            "median_px": 20.33377377178408,
+            "pck@5px": 0.0,
+            "pck@10px": 0.0
+          },
+          "target": {
+            "visible_count": 40,
+            "rmse_px": 12.761028737866429,
+            "median_px": 11.120874914257644,
+            "pck@5px": 0.025,
+            "pck@10px": 0.4
+          },
+          "interface": {
+            "visible_count": 36,
+            "rmse_px": 21.396260941564385,
+            "median_px": 21.040218862467324,
+            "pck@5px": 0.0,
+            "pck@10px": 0.0
+          }
+        },
+        "aggregate": {
+          "visible_count": 157,
+          "rmse_px": 16.533633163258763,
+          "median_px": 13.602510741744945,
+          "pck@5px": 0.01910828025477707,
+          "pck@10px": 0.2802547770700637
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.92,
+            "balanced_accuracy": 0.6888888888888889,
+            "visible_recall": 0.9777777777777777,
+            "hidden_recall": 0.4,
+            "brier": 0.03735799926677743
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.86,
+            "balanced_accuracy": 0.8154761904761905,
+            "visible_recall": 0.9166666666666666,
+            "hidden_recall": 0.7142857142857143,
+            "brier": 0.061608099175747603
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.9,
+            "balanced_accuracy": 0.8625,
+            "visible_recall": 0.925,
+            "hidden_recall": 0.8,
+            "brier": 0.07010793179609155
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 0.92,
+            "balanced_accuracy": 0.9226190476190477,
+            "visible_recall": 0.9166666666666666,
+            "hidden_recall": 0.9285714285714286,
+            "brier": 0.05531122458238747
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.9,
+          "balanced_accuracy": 0.8518737964745964,
+          "visible_recall": 0.9363057324840764,
+          "hidden_recall": 0.7674418604651163,
+          "brier": 0.05609631370525101
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 51.38948777637662,
+            "median_px": 11.297474421299267,
+            "pck@5px": 0.0,
+            "pck@10px": 0.32
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 67.70939152887878,
+            "median_px": 23.511654152233316,
+            "pck@5px": 0.0,
+            "pck@10px": 0.02
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 69.60151499634686,
+            "median_px": 12.983808268159084,
+            "pck@5px": 0.02,
+            "pck@10px": 0.26
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 66.2197364371214,
+            "median_px": 23.773363232680353,
+            "pck@5px": 0.0,
+            "pck@10px": 0.04
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 64.138259913093,
+          "median_px": 21.611697718124944,
+          "pck@5px": 0.005,
+          "pck@10px": 0.16
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.62,
+        "interface_target": 0.68,
+        "any_actionable_pair": 0.72
+      }
+    },
+    "button-press-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 44,
+            "rmse_px": 10.523873257642078,
+            "median_px": 10.112542458686292,
+            "pck@5px": 0.0,
+            "pck@10px": 0.4772727272727273
+          },
+          "object": {
+            "visible_count": 45,
+            "rmse_px": 16.47611259553386,
+            "median_px": 16.427506585162767,
+            "pck@5px": 0.0,
+            "pck@10px": 0.044444444444444446
+          },
+          "target": {
+            "visible_count": 45,
+            "rmse_px": 12.464932499912068,
+            "median_px": 11.672390870935205,
+            "pck@5px": 0.022222222222222223,
+            "pck@10px": 0.4666666666666667
+          },
+          "interface": {
+            "visible_count": 45,
+            "rmse_px": 18.39381348357664,
+            "median_px": 16.495484510953695,
+            "pck@5px": 0.0,
+            "pck@10px": 0.022222222222222223
+          }
+        },
+        "aggregate": {
+          "visible_count": 179,
+          "rmse_px": 14.818397537769311,
+          "median_px": 13.166692914122615,
+          "pck@5px": 0.00558659217877095,
+          "pck@10px": 0.25139664804469275
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.92,
+            "balanced_accuracy": 0.6666666666666666,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.3333333333333333,
+            "brier": 0.05057222414092239
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.92,
+            "balanced_accuracy": 0.8666666666666667,
+            "visible_recall": 0.9333333333333333,
+            "hidden_recall": 0.8,
+            "brier": 0.06213943097755775
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.9,
+            "balanced_accuracy": 0.8555555555555556,
+            "visible_recall": 0.9111111111111111,
+            "hidden_recall": 0.8,
+            "brier": 0.049841549560088405
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 0.92,
+            "balanced_accuracy": 0.8666666666666667,
+            "visible_recall": 0.9333333333333333,
+            "hidden_recall": 0.8,
+            "brier": 0.06185844396095062
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.915,
+          "balanced_accuracy": 0.8054003724394785,
+          "visible_recall": 0.9441340782122905,
+          "hidden_recall": 0.6666666666666666,
+          "brier": 0.056102912159879795
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 62.2034972811442,
+            "median_px": 13.00818576071067,
+            "pck@5px": 0.0,
+            "pck@10px": 0.24
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 62.17880725416879,
+            "median_px": 17.527620497573043,
+            "pck@5px": 0.0,
+            "pck@10px": 0.02
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 53.94907264553332,
+            "median_px": 15.39018491895246,
+            "pck@5px": 0.0,
+            "pck@10px": 0.12
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 61.961987841445385,
+            "median_px": 17.693267655578683,
+            "pck@5px": 0.0,
+            "pck@10px": 0.0
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 60.177382632789964,
+          "median_px": 16.567838457747683,
+          "pck@5px": 0.0,
+          "pck@10px": 0.095
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.78,
+        "interface_target": 0.82,
+        "any_actionable_pair": 0.9
+      }
+    },
+    "button-press-wall-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 40,
+            "rmse_px": 11.281463997576637,
+            "median_px": 10.65415988791062,
+            "pck@5px": 0.025,
+            "pck@10px": 0.375
+          },
+          "object": {
+            "visible_count": 45,
+            "rmse_px": 15.924657563377922,
+            "median_px": 16.0089521495882,
+            "pck@5px": 0.022222222222222223,
+            "pck@10px": 0.06666666666666667
+          },
+          "target": {
+            "visible_count": 41,
+            "rmse_px": 12.585293346545528,
+            "median_px": 12.24334716442269,
+            "pck@5px": 0.04878048780487805,
+            "pck@10px": 0.3170731707317073
+          },
+          "interface": {
+            "visible_count": 45,
+            "rmse_px": 16.294503650392315,
+            "median_px": 16.359511414753253,
+            "pck@5px": 0.022222222222222223,
+            "pck@10px": 0.022222222222222223
+          }
+        },
+        "aggregate": {
+          "visible_count": 171,
+          "rmse_px": 14.295253720590333,
+          "median_px": 13.776707346532884,
+          "pck@5px": 0.029239766081871343,
+          "pck@10px": 0.1871345029239766
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.84,
+            "balanced_accuracy": 0.6,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.2,
+            "brier": 0.12469985394188282
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.94,
+            "balanced_accuracy": 0.9666666666666667,
+            "visible_recall": 0.9333333333333333,
+            "hidden_recall": 1.0,
+            "brier": 0.025770548802473526
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.9,
+            "balanced_accuracy": 0.7655826558265583,
+            "visible_recall": 0.975609756097561,
+            "hidden_recall": 0.5555555555555556,
+            "brier": 0.0760699254888694
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 0.94,
+            "balanced_accuracy": 0.9666666666666667,
+            "visible_recall": 0.9333333333333333,
+            "hidden_recall": 1.0,
+            "brier": 0.02999419687297184
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.905,
+          "balanced_accuracy": 0.772635612018552,
+          "visible_recall": 0.9590643274853801,
+          "hidden_recall": 0.5862068965517241,
+          "brier": 0.06413363127654939
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 81.62266429587629,
+            "median_px": 19.141284747250644,
+            "pck@5px": 0.0,
+            "pck@10px": 0.08
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 43.416244676552836,
+            "median_px": 18.506099308238014,
+            "pck@5px": 0.02,
+            "pck@10px": 0.04
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 65.1750238006274,
+            "median_px": 13.830504919208316,
+            "pck@5px": 0.02,
+            "pck@10px": 0.2
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 46.6008702582718,
+            "median_px": 18.992902583711682,
+            "pck@5px": 0.02,
+            "pck@10px": 0.04
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 61.169139410351875,
+          "median_px": 17.919364244648744,
+          "pck@5px": 0.015,
+          "pck@10px": 0.09
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.74,
+        "interface_target": 0.8,
+        "any_actionable_pair": 0.88
+      }
+    },
+    "coffee-button-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 49,
+            "rmse_px": 10.385930561909534,
+            "median_px": 9.980070556774582,
+            "pck@5px": 0.0,
+            "pck@10px": 0.5102040816326531
+          },
+          "object": {
+            "visible_count": 35,
+            "rmse_px": 17.351790895697434,
+            "median_px": 15.531270762644247,
+            "pck@5px": 0.0,
+            "pck@10px": 0.05714285714285714
+          },
+          "target": {
+            "visible_count": 35,
+            "rmse_px": 18.494892891271697,
+            "median_px": 16.465238318661005,
+            "pck@5px": 0.0,
+            "pck@10px": 0.02857142857142857
+          },
+          "interface": {
+            "visible_count": 35,
+            "rmse_px": 17.044392186185615,
+            "median_px": 15.233838443888486,
+            "pck@5px": 0.0,
+            "pck@10px": 0.0
+          }
+        },
+        "aggregate": {
+          "visible_count": 154,
+          "rmse_px": 15.700836619542219,
+          "median_px": 14.62012649301306,
+          "pck@5px": 0.0,
+          "pck@10px": 0.18181818181818182
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.5,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.0,
+            "brier": 0.01397568691958
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.96,
+            "balanced_accuracy": 0.9714285714285714,
+            "visible_recall": 0.9428571428571428,
+            "hidden_recall": 1.0,
+            "brier": 0.04824795428177337
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.94,
+            "balanced_accuracy": 0.9190476190476191,
+            "visible_recall": 0.9714285714285714,
+            "hidden_recall": 0.8666666666666667,
+            "brier": 0.05939296718526875
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 0.96,
+            "balanced_accuracy": 0.9714285714285714,
+            "visible_recall": 0.9428571428571428,
+            "hidden_recall": 1.0,
+            "brier": 0.04844662605934427
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.96,
+          "balanced_accuracy": 0.9511575381140599,
+          "visible_recall": 0.9675324675324676,
+          "hidden_recall": 0.9347826086956522,
+          "brier": 0.042515808611491596
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 37.090836461494234,
+            "median_px": 12.965437784669213,
+            "pck@5px": 0.0,
+            "pck@10px": 0.24
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 65.85101626682686,
+            "median_px": 22.15096743367441,
+            "pck@5px": 0.02,
+            "pck@10px": 0.02
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 67.01823449889389,
+            "median_px": 24.97934831129048,
+            "pck@5px": 0.0,
+            "pck@10px": 0.04
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 66.08950725370096,
+            "median_px": 20.55117358272085,
+            "pck@5px": 0.02,
+            "pck@10px": 0.06
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 60.35593015017855,
+          "median_px": 20.191739475658594,
+          "pck@5px": 0.01,
+          "pck@10px": 0.09
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.68,
+        "interface_target": 0.68,
+        "any_actionable_pair": 0.7
+      }
+    },
+    "coffee-pull-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 48,
+            "rmse_px": 10.763951633711466,
+            "median_px": 10.484408196157457,
+            "pck@5px": 0.0,
+            "pck@10px": 0.375
+          },
+          "object": {
+            "visible_count": 49,
+            "rmse_px": 11.370135430706469,
+            "median_px": 10.546804311684312,
+            "pck@5px": 0.0,
+            "pck@10px": 0.3673469387755102
+          },
+          "target": {
+            "visible_count": 49,
+            "rmse_px": 13.5803488991214,
+            "median_px": 12.483957541960908,
+            "pck@5px": 0.0,
+            "pck@10px": 0.2653061224489796
+          },
+          "interface": {
+            "visible_count": 49,
+            "rmse_px": 11.23226685765321,
+            "median_px": 10.532946421143691,
+            "pck@5px": 0.0,
+            "pck@10px": 0.3673469387755102
+          }
+        },
+        "aggregate": {
+          "visible_count": 195,
+          "rmse_px": 11.792005438105997,
+          "median_px": 10.781335294164379,
+          "pck@5px": 0.0,
+          "pck@10px": 0.3435897435897436
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.75,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.5,
+            "brier": 0.014970797911006884
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.9897959183673469,
+            "visible_recall": 0.9795918367346939,
+            "hidden_recall": 1.0,
+            "brier": 0.012990477702705769
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.5,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.0,
+            "brier": 0.01338254890779112
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.9897959183673469,
+            "visible_recall": 0.9795918367346939,
+            "hidden_recall": 1.0,
+            "brier": 0.012989747052815232
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.98,
+          "balanced_accuracy": 0.7948717948717949,
+          "visible_recall": 0.9897435897435898,
+          "hidden_recall": 0.6,
+          "brier": 0.013583392893579752
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 35.8631721514374,
+            "median_px": 11.417291288884732,
+            "pck@5px": 0.0,
+            "pck@10px": 0.22
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 26.96718336753741,
+            "median_px": 11.800854779308526,
+            "pck@5px": 0.0,
+            "pck@10px": 0.28
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 27.754599291208592,
+            "median_px": 13.53613855378706,
+            "pck@5px": 0.0,
+            "pck@10px": 0.24
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 26.719150383218203,
+            "median_px": 11.611745606852168,
+            "pck@5px": 0.0,
+            "pck@10px": 0.28
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 29.57036892971834,
+          "median_px": 11.899119223631992,
+          "pck@5px": 0.0,
+          "pck@10px": 0.255
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.94,
+        "interface_target": 0.96,
+        "any_actionable_pair": 0.98
+      }
+    },
+    "coffee-push-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 44,
+            "rmse_px": 10.723756201474698,
+            "median_px": 10.502340777678508,
+            "pck@5px": 0.0,
+            "pck@10px": 0.4090909090909091
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 9.4432476493239,
+            "median_px": 9.172982019214707,
+            "pck@5px": 0.0,
+            "pck@10px": 0.72
+          },
+          "target": {
+            "visible_count": 49,
+            "rmse_px": 10.33014269023693,
+            "median_px": 10.182208693462199,
+            "pck@5px": 0.10204081632653061,
+            "pck@10px": 0.4897959183673469
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 9.226992383573785,
+            "median_px": 9.170775665161305,
+            "pck@5px": 0.0,
+            "pck@10px": 0.78
+          }
+        },
+        "aggregate": {
+          "visible_count": 193,
+          "rmse_px": 9.923137236270591,
+          "median_px": 9.45800999698536,
+          "pck@5px": 0.025906735751295335,
+          "pck@10px": 0.6062176165803109
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.92,
+            "balanced_accuracy": 0.6666666666666666,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.3333333333333333,
+            "brier": 0.04522078059710918
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": null,
+            "visible_recall": 1.0,
+            "hidden_recall": null,
+            "brier": 0.0002613192326197833
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.5,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.0,
+            "brier": 0.015481316485868746
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": null,
+            "visible_recall": 1.0,
+            "hidden_recall": null,
+            "brier": 0.0003067541763781634
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.975,
+          "balanced_accuracy": 0.6428571428571428,
+          "visible_recall": 1.0,
+          "hidden_recall": 0.2857142857142857,
+          "brier": 0.015317542622993967
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 61.69461897441801,
+            "median_px": 11.513761252548104,
+            "pck@5px": 0.0,
+            "pck@10px": 0.2
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 11.438083610690956,
+            "median_px": 10.037410651420918,
+            "pck@5px": 0.0,
+            "pck@10px": 0.5
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 28.154850175306365,
+            "median_px": 10.684879753905559,
+            "pck@5px": 0.1,
+            "pck@10px": 0.4
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 11.264759253064287,
+            "median_px": 9.778257179012975,
+            "pck@5px": 0.0,
+            "pck@10px": 0.6
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 34.84482083648596,
+          "median_px": 10.426551899285457,
+          "pck@5px": 0.025,
+          "pck@10px": 0.425
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.88,
+        "interface_target": 0.98,
+        "any_actionable_pair": 1.0
+      }
+    },
+    "dial-turn-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 47,
+            "rmse_px": 10.1106216292823,
+            "median_px": 10.035208303362289,
+            "pck@5px": 0.0,
+            "pck@10px": 0.48936170212765956
+          },
+          "object": {
+            "visible_count": 30,
+            "rmse_px": 14.699874848335988,
+            "median_px": 8.47919363629371,
+            "pck@5px": 0.2,
+            "pck@10px": 0.6
+          },
+          "target": {
+            "visible_count": 24,
+            "rmse_px": 20.405549898362803,
+            "median_px": 11.915031888507407,
+            "pck@5px": 0.041666666666666664,
+            "pck@10px": 0.375
+          },
+          "interface": {
+            "visible_count": 30,
+            "rmse_px": 46.6526431404811,
+            "median_px": 7.446936612566638,
+            "pck@5px": 0.23333333333333334,
+            "pck@10px": 0.6
+          }
+        },
+        "aggregate": {
+          "visible_count": 131,
+          "rmse_px": 25.70747027401969,
+          "median_px": 9.75790672983925,
+          "pck@5px": 0.10687022900763359,
+          "pck@10px": 0.5190839694656488
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.94,
+            "balanced_accuracy": 0.6560283687943262,
+            "visible_recall": 0.9787234042553191,
+            "hidden_recall": 0.3333333333333333,
+            "brier": 0.025822426374548277
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.4,
+            "balanced_accuracy": 0.5,
+            "visible_recall": 0.0,
+            "hidden_recall": 1.0,
+            "brier": 0.3227701010645322
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.68,
+            "balanced_accuracy": 0.6730769230769231,
+            "visible_recall": 0.5,
+            "hidden_recall": 0.8461538461538461,
+            "brier": 0.22546587645802205
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 0.4,
+            "balanced_accuracy": 0.5,
+            "visible_recall": 0.0,
+            "hidden_recall": 1.0,
+            "brier": 0.33129738231908257
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.605,
+          "balanced_accuracy": 0.6778957849319615,
+          "visible_recall": 0.44274809160305345,
+          "hidden_recall": 0.9130434782608695,
+          "brier": 0.22633894655404624
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 47.825661102574955,
+            "median_px": 11.047005876165127,
+            "pck@5px": 0.0,
+            "pck@10px": 0.32
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 118.57390977061462,
+            "median_px": 130.38505498329494,
+            "pck@5px": 0.0,
+            "pck@10px": 0.0
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 107.32513265675381,
+            "median_px": 101.1393171230032,
+            "pck@5px": 0.0,
+            "pck@10px": 0.0
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 122.0460641907573,
+            "median_px": 134.0418641573562,
+            "pck@5px": 0.0,
+            "pck@10px": 0.0
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 103.39365529667725,
+          "median_px": 77.97461215617693,
+          "pck@5px": 0.0,
+          "pck@10px": 0.08
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.56,
+        "interface_target": 0.28,
+        "any_actionable_pair": 0.6
+      }
+    },
+    "disassemble-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 47,
+            "rmse_px": 9.983913482403304,
+            "median_px": 9.807105975766596,
+            "pck@5px": 0.0,
+            "pck@10px": 0.5531914893617021
+          },
+          "object": {
+            "visible_count": 48,
+            "rmse_px": 7.942859609926836,
+            "median_px": 5.932857450138298,
+            "pck@5px": 0.3541666666666667,
+            "pck@10px": 0.8541666666666666
+          },
+          "target": {
+            "visible_count": 0,
+            "rmse_px": null,
+            "median_px": null,
+            "pck@5px": null,
+            "pck@10px": null
+          },
+          "interface": {
+            "visible_count": 48,
+            "rmse_px": 8.325364924549516,
+            "median_px": 6.467650262979637,
+            "pck@5px": 0.20833333333333334,
+            "pck@10px": 0.8541666666666666
+          }
+        },
+        "aggregate": {
+          "visible_count": 143,
+          "rmse_px": 8.78656213016227,
+          "median_px": 7.256845921629072,
+          "pck@5px": 0.1888111888111888,
+          "pck@10px": 0.7552447552447552
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.96,
+            "balanced_accuracy": 0.6666666666666666,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.3333333333333333,
+            "brier": 0.03462382273190194
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.96,
+            "balanced_accuracy": 0.7395833333333333,
+            "visible_recall": 0.9791666666666666,
+            "hidden_recall": 0.5,
+            "brier": 0.023222236708581433
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": null,
+            "visible_recall": null,
+            "hidden_recall": 1.0,
+            "brier": 0.0007793046459616404
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 0.96,
+            "balanced_accuracy": 0.7395833333333333,
+            "visible_recall": 0.9791666666666666,
+            "hidden_recall": 0.5,
+            "brier": 0.023530200098366708
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.97,
+          "balanced_accuracy": 0.9579192737087474,
+          "visible_recall": 0.986013986013986,
+          "hidden_recall": 0.9298245614035088,
+          "brier": 0.02053889104620293
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 50.62719733982689,
+            "median_px": 10.549179956502666,
+            "pck@5px": 0.0,
+            "pck@10px": 0.4
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 31.33497688159198,
+            "median_px": 6.152837463063093,
+            "pck@5px": 0.32,
+            "pck@10px": 0.74
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 6.627043252765364,
+            "median_px": 6.175769524148642,
+            "pck@5px": 0.32,
+            "pck@10px": 0.94
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 31.612308177595704,
+            "median_px": 6.7847026369642895,
+            "pck@5px": 0.18,
+            "pck@10px": 0.74
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 33.868309735078995,
+          "median_px": 7.1829503879533725,
+          "pck@5px": 0.205,
+          "pck@10px": 0.705
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.9,
+        "interface_target": 0.0,
+        "any_actionable_pair": 0.9
+      }
+    },
+    "door-close-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 41,
+            "rmse_px": 11.365658128875769,
+            "median_px": 10.320492526361981,
+            "pck@5px": 0.0,
+            "pck@10px": 0.3902439024390244
+          },
+          "object": {
+            "visible_count": 49,
+            "rmse_px": 25.467829554055786,
+            "median_px": 11.89746468984003,
+            "pck@5px": 0.061224489795918366,
+            "pck@10px": 0.24489795918367346
+          },
+          "target": {
+            "visible_count": 49,
+            "rmse_px": 7.345354522860856,
+            "median_px": 6.904058609508478,
+            "pck@5px": 0.24489795918367346,
+            "pck@10px": 0.8775510204081632
+          },
+          "interface": {
+            "visible_count": 49,
+            "rmse_px": 13.207383851461353,
+            "median_px": 12.220714820732924,
+            "pck@5px": 0.02040816326530612,
+            "pck@10px": 0.24489795918367346
+          }
+        },
+        "aggregate": {
+          "visible_count": 188,
+          "rmse_px": 16.023467527611082,
+          "median_px": 10.418910848082591,
+          "pck@5px": 0.0851063829787234,
+          "pck@10px": 0.44148936170212766
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.86,
+            "balanced_accuracy": 0.7411924119241193,
+            "visible_recall": 0.926829268292683,
+            "hidden_recall": 0.5555555555555556,
+            "brier": 0.08382864091919483
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.5,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.0,
+            "brier": 0.022788480551679983
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.5,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.0,
+            "brier": 0.017757853657661613
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.5,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.0,
+            "brier": 0.02414662553599463
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.95,
+          "balanced_accuracy": 0.700354609929078,
+          "visible_recall": 0.9840425531914894,
+          "hidden_recall": 0.4166666666666667,
+          "brier": 0.03713040016613276
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 76.4767264576451,
+            "median_px": 20.122298365865745,
+            "pck@5px": 0.0,
+            "pck@10px": 0.12
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 40.069460596894366,
+            "median_px": 13.214350717515783,
+            "pck@5px": 0.04,
+            "pck@10px": 0.22
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 22.677207466377325,
+            "median_px": 7.020711404751991,
+            "pck@5px": 0.16,
+            "pck@10px": 0.84
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 34.76417457888035,
+            "median_px": 13.557586376825824,
+            "pck@5px": 0.0,
+            "pck@10px": 0.22
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 47.898473187638075,
+          "median_px": 12.088606646738892,
+          "pck@5px": 0.05,
+          "pck@10px": 0.35
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.8,
+        "interface_target": 0.98,
+        "any_actionable_pair": 0.98
+      }
+    },
+    "door-lock-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 45,
+            "rmse_px": 10.397938872971919,
+            "median_px": 10.048012532136946,
+            "pck@5px": 0.0,
+            "pck@10px": 0.4888888888888889
+          },
+          "object": {
+            "visible_count": 46,
+            "rmse_px": 12.987971626053493,
+            "median_px": 12.159222104437923,
+            "pck@5px": 0.043478260869565216,
+            "pck@10px": 0.41304347826086957
+          },
+          "target": {
+            "visible_count": 0,
+            "rmse_px": null,
+            "median_px": null,
+            "pck@5px": null,
+            "pck@10px": null
+          },
+          "interface": {
+            "visible_count": 46,
+            "rmse_px": 16.210565586670374,
+            "median_px": 13.09423718343799,
+            "pck@5px": 0.043478260869565216,
+            "pck@10px": 0.2391304347826087
+          }
+        },
+        "aggregate": {
+          "visible_count": 137,
+          "rmse_px": 13.430786015941326,
+          "median_px": 10.889619772306546,
+          "pck@5px": 0.029197080291970802,
+          "pck@10px": 0.3795620437956204
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.92,
+            "balanced_accuracy": 0.6,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.2,
+            "brier": 0.05613505249081079
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.875,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.75,
+            "brier": 0.016382873967963677
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": null,
+            "visible_recall": null,
+            "hidden_recall": 1.0,
+            "brier": 0.0001936505012949675
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.875,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.75,
+            "brier": 0.016263119870085777
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.97,
+          "balanced_accuracy": 0.9523809523809523,
+          "visible_recall": 1.0,
+          "hidden_recall": 0.9047619047619048,
+          "brier": 0.022243674207538807
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 61.601143307547396,
+            "median_px": 11.941171176021644,
+            "pck@5px": 0.0,
+            "pck@10px": 0.2
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 33.33287325522238,
+            "median_px": 14.005768006850332,
+            "pck@5px": 0.04,
+            "pck@10px": 0.24
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 3.688171103564307,
+            "median_px": 3.6408941865658258,
+            "pck@5px": 0.96,
+            "pck@10px": 1.0
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 34.90200568584171,
+            "median_px": 15.002135927537836,
+            "pck@5px": 0.02,
+            "pck@10px": 0.14
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 39.17120722938407,
+          "median_px": 11.197011661343199,
+          "pck@5px": 0.255,
+          "pck@10px": 0.395
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.84,
+        "interface_target": 0.0,
+        "any_actionable_pair": 0.84
+      }
+    },
+    "door-open-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 45,
+            "rmse_px": 10.425507883682268,
+            "median_px": 9.506315995682716,
+            "pck@5px": 0.044444444444444446,
+            "pck@10px": 0.6222222222222222
+          },
+          "object": {
+            "visible_count": 49,
+            "rmse_px": 12.307567574826786,
+            "median_px": 11.588167910136418,
+            "pck@5px": 0.02040816326530612,
+            "pck@10px": 0.2857142857142857
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 15.401172757889249,
+            "median_px": 14.406509089295792,
+            "pck@5px": 0.0,
+            "pck@10px": 0.06
+          },
+          "interface": {
+            "visible_count": 49,
+            "rmse_px": 12.517188169125568,
+            "median_px": 12.011527984944427,
+            "pck@5px": 0.0,
+            "pck@10px": 0.22448979591836735
+          }
+        },
+        "aggregate": {
+          "visible_count": 193,
+          "rmse_px": 12.846355003817163,
+          "median_px": 12.011527984944427,
+          "pck@5px": 0.015544041450777202,
+          "pck@10px": 0.29015544041450775
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.92,
+            "balanced_accuracy": 0.6888888888888889,
+            "visible_recall": 0.9777777777777777,
+            "hidden_recall": 0.4,
+            "brier": 0.074345332847907
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.5,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.0,
+            "brier": 0.017633206878373144
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": null,
+            "visible_recall": 1.0,
+            "hidden_recall": null,
+            "brier": 0.000267116934560363
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.5,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.0,
+            "brier": 0.017591497262013006
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.97,
+          "balanced_accuracy": 0.6402664692820133,
+          "visible_recall": 0.9948186528497409,
+          "hidden_recall": 0.2857142857142857,
+          "brier": 0.027459288480713377
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 67.77272581474048,
+            "median_px": 14.539605435053542,
+            "pck@5px": 0.0,
+            "pck@10px": 0.16
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 27.544943762933112,
+            "median_px": 12.558110200741726,
+            "pck@5px": 0.02,
+            "pck@10px": 0.24
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 17.12637627184922,
+            "median_px": 14.864058096151346,
+            "pck@5px": 0.0,
+            "pck@10px": 0.04
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 27.529974743433257,
+            "median_px": 13.293457343513882,
+            "pck@5px": 0.0,
+            "pck@10px": 0.18
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 40.00961935848106,
+          "median_px": 14.108551011102449,
+          "pck@5px": 0.005,
+          "pck@10px": 0.155
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.88,
+        "interface_target": 0.98,
+        "any_actionable_pair": 0.98
+      }
+    },
+    "door-unlock-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 43,
+            "rmse_px": 9.923207563436419,
+            "median_px": 9.517682172724257,
+            "pck@5px": 0.023255813953488372,
+            "pck@10px": 0.5813953488372093
+          },
+          "object": {
+            "visible_count": 42,
+            "rmse_px": 15.04837077243513,
+            "median_px": 11.590563639067685,
+            "pck@5px": 0.07142857142857142,
+            "pck@10px": 0.40476190476190477
+          },
+          "target": {
+            "visible_count": 20,
+            "rmse_px": 22.01581423549291,
+            "median_px": 16.124041119781857,
+            "pck@5px": 0.05,
+            "pck@10px": 0.1
+          },
+          "interface": {
+            "visible_count": 42,
+            "rmse_px": 17.86949916328433,
+            "median_px": 12.912781034677698,
+            "pck@5px": 0.09523809523809523,
+            "pck@10px": 0.30952380952380953
+          }
+        },
+        "aggregate": {
+          "visible_count": 147,
+          "rmse_px": 15.833009749184415,
+          "median_px": 11.442543654554344,
+          "pck@5px": 0.061224489795918366,
+          "pck@10px": 0.3877551020408163
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.9883720930232558,
+            "visible_recall": 0.9767441860465116,
+            "hidden_recall": 1.0,
+            "brier": 0.03347557900709162
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.96,
+            "balanced_accuracy": 0.875,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.75,
+            "brier": 0.03578112149489409
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.6,
+            "balanced_accuracy": 0.5,
+            "visible_recall": 0.0,
+            "hidden_recall": 1.0,
+            "brier": 0.2949374221896584
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 0.96,
+            "balanced_accuracy": 0.875,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.75,
+            "brier": 0.03675138337083443
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.875,
+          "balanced_accuracy": 0.8908355795148248,
+          "visible_recall": 0.8571428571428571,
+          "hidden_recall": 0.9245283018867925,
+          "brier": 0.10023637651561965
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 54.11147441273081,
+            "median_px": 13.474190064661103,
+            "pck@5px": 0.02,
+            "pck@10px": 0.28
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 46.33218639662881,
+            "median_px": 17.171918343832587,
+            "pck@5px": 0.06,
+            "pck@10px": 0.14
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 128.19701299566103,
+            "median_px": 37.49303877300812,
+            "pck@5px": 0.0,
+            "pck@10px": 0.0
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 48.11493607051644,
+            "median_px": 18.73775118508188,
+            "pck@5px": 0.06,
+            "pck@10px": 0.14
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 77.1755213352834,
+          "median_px": 22.31835913058105,
+          "pck@5px": 0.035,
+          "pck@10px": 0.14
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.7,
+        "interface_target": 0.4,
+        "any_actionable_pair": 0.74
+      }
+    },
+    "hand-insert-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 46,
+            "rmse_px": 9.858915401836823,
+            "median_px": 9.508424346896039,
+            "pck@5px": 0.0,
+            "pck@10px": 0.6521739130434783
+          },
+          "object": {
+            "visible_count": 45,
+            "rmse_px": 15.150081261649344,
+            "median_px": 14.464601343287866,
+            "pck@5px": 0.0,
+            "pck@10px": 0.13333333333333333
+          },
+          "target": {
+            "visible_count": 16,
+            "rmse_px": 11.036711332157513,
+            "median_px": 11.005135379420492,
+            "pck@5px": 0.125,
+            "pck@10px": 0.25
+          },
+          "interface": {
+            "visible_count": 45,
+            "rmse_px": 15.239250540423553,
+            "median_px": 14.54920991259466,
+            "pck@5px": 0.0,
+            "pck@10px": 0.1111111111111111
+          }
+        },
+        "aggregate": {
+          "visible_count": 152,
+          "rmse_px": 13.376936434581179,
+          "median_px": 12.691360228019654,
+          "pck@5px": 0.013157894736842105,
+          "pck@10px": 0.29605263157894735
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.96,
+            "balanced_accuracy": 0.75,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.5,
+            "brier": 0.02532906682607662
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.9888888888888889,
+            "visible_recall": 0.9777777777777777,
+            "hidden_recall": 1.0,
+            "brier": 0.010259004124778157
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.8,
+            "balanced_accuracy": 0.8529411764705883,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.7058823529411765,
+            "brier": 0.14753186648954578
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.9888888888888889,
+            "visible_recall": 0.9777777777777777,
+            "hidden_recall": 1.0,
+            "brier": 0.010279129674186205
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.93,
+          "balanced_accuracy": 0.868421052631579,
+          "visible_recall": 0.9868421052631579,
+          "hidden_recall": 0.75,
+          "brier": 0.04834976677864669
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 48.19482192122484,
+            "median_px": 9.961741215071271,
+            "pck@5px": 0.0,
+            "pck@10px": 0.54
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 26.83139485000329,
+            "median_px": 14.886388703080629,
+            "pck@5px": 0.0,
+            "pck@10px": 0.12
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 77.07832010939907,
+            "median_px": 16.141900951615245,
+            "pck@5px": 0.02,
+            "pck@10px": 0.12
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 26.916422410943536,
+            "median_px": 14.936444570309467,
+            "pck@5px": 0.0,
+            "pck@10px": 0.12
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 49.26516476148917,
+          "median_px": 13.72176816867896,
+          "pck@5px": 0.005,
+          "pck@10px": 0.225
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.82,
+        "interface_target": 0.26,
+        "any_actionable_pair": 0.82
+      }
+    },
+    "drawer-close-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 46,
+            "rmse_px": 10.921144359674255,
+            "median_px": 10.377772053265343,
+            "pck@5px": 0.0,
+            "pck@10px": 0.41304347826086957
+          },
+          "object": {
+            "visible_count": 0,
+            "rmse_px": null,
+            "median_px": null,
+            "pck@5px": null,
+            "pck@10px": null
+          },
+          "target": {
+            "visible_count": 38,
+            "rmse_px": 14.166227926462856,
+            "median_px": 12.871404890155489,
+            "pck@5px": 0.05263157894736842,
+            "pck@10px": 0.3684210526315789
+          },
+          "interface": {
+            "visible_count": 0,
+            "rmse_px": null,
+            "median_px": null,
+            "pck@5px": null,
+            "pck@10px": null
+          }
+        },
+        "aggregate": {
+          "visible_count": 84,
+          "rmse_px": 12.493998868501455,
+          "median_px": 10.755923926535127,
+          "pck@5px": 0.023809523809523808,
+          "pck@10px": 0.39285714285714285
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.96,
+            "balanced_accuracy": 0.75,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.5,
+            "brier": 0.028144650405694756
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": null,
+            "visible_recall": null,
+            "hidden_recall": 1.0,
+            "brier": 0.0024396479186734174
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.82,
+            "balanced_accuracy": 0.6535087719298246,
+            "visible_recall": 0.9736842105263158,
+            "hidden_recall": 0.3333333333333333,
+            "brier": 0.14530635559814375
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": null,
+            "visible_recall": null,
+            "hidden_recall": 1.0,
+            "brier": 0.0009090914477069862
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.945,
+          "balanced_accuracy": 0.950944170771757,
+          "visible_recall": 0.9880952380952381,
+          "hidden_recall": 0.9137931034482759,
+          "brier": 0.04419993634255473
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 44.101972058609235,
+            "median_px": 11.874298217419925,
+            "pck@5px": 0.0,
+            "pck@10px": 0.26
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 11.744621410082878,
+            "median_px": 9.230844250427634,
+            "pck@5px": 0.12,
+            "pck@10px": 0.58
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 89.09971091280718,
+            "median_px": 43.23266554294772,
+            "pck@5px": 0.0,
+            "pck@10px": 0.04
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 7.49316062483713,
+            "median_px": 6.247485820909734,
+            "pck@5px": 0.34,
+            "pck@10px": 0.76
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 50.1941879414837,
+          "median_px": 11.162526128771688,
+          "pck@5px": 0.115,
+          "pck@10px": 0.41
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.0,
+        "interface_target": 0.0,
+        "any_actionable_pair": 0.0
+      }
+    },
+    "drawer-open-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 42,
+            "rmse_px": 10.504891681366912,
+            "median_px": 10.427206368841848,
+            "pck@5px": 0.0,
+            "pck@10px": 0.4523809523809524
+          },
+          "object": {
+            "visible_count": 43,
+            "rmse_px": 17.880115704792324,
+            "median_px": 16.513882348488533,
+            "pck@5px": 0.0,
+            "pck@10px": 0.06976744186046512
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 13.719357818364736,
+            "median_px": 12.588276505972395,
+            "pck@5px": 0.0,
+            "pck@10px": 0.06
+          },
+          "interface": {
+            "visible_count": 43,
+            "rmse_px": 17.070956892835408,
+            "median_px": 15.562989058495166,
+            "pck@5px": 0.0,
+            "pck@10px": 0.09302325581395349
+          }
+        },
+        "aggregate": {
+          "visible_count": 178,
+          "rmse_px": 15.05119484787987,
+          "median_px": 13.413046038459926,
+          "pck@5px": 0.0,
+          "pck@10px": 0.16292134831460675
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.92,
+            "balanced_accuracy": 0.8005952380952381,
+            "visible_recall": 0.9761904761904762,
+            "hidden_recall": 0.625,
+            "brier": 0.06650259780751683
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.86,
+            "balanced_accuracy": 0.5,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.0,
+            "brier": 0.13305831677036303
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": null,
+            "visible_recall": 1.0,
+            "hidden_recall": null,
+            "brier": 3.711756319674464e-05
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 0.86,
+            "balanced_accuracy": 0.5,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.0,
+            "brier": 0.1301741931084846
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.91,
+          "balanced_accuracy": 0.6108273748723186,
+          "visible_recall": 0.9943820224719101,
+          "hidden_recall": 0.22727272727272727,
+          "brier": 0.0824430563123903
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 70.98527252742565,
+            "median_px": 11.093192558018078,
+            "pck@5px": 0.0,
+            "pck@10px": 0.36
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 85.7066291638887,
+            "median_px": 30.097133876713084,
+            "pck@5px": 0.0,
+            "pck@10px": 0.0
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 14.23055730526698,
+            "median_px": 12.900283260936408,
+            "pck@5px": 0.0,
+            "pck@10px": 0.04
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 84.33421131927585,
+            "median_px": 27.11931781407109,
+            "pck@5px": 0.0,
+            "pck@10px": 0.0
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 70.17710302957083,
+          "median_px": 19.651257117517986,
+          "pck@5px": 0.0,
+          "pck@10px": 0.1
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.7,
+        "interface_target": 0.86,
+        "any_actionable_pair": 0.86
+      }
+    },
+    "faucet-open-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 46,
+            "rmse_px": 10.39938626020997,
+            "median_px": 10.211645791171879,
+            "pck@5px": 0.0,
+            "pck@10px": 0.45652173913043476
+          },
+          "object": {
+            "visible_count": 38,
+            "rmse_px": 17.04173581946956,
+            "median_px": 15.78250673892658,
+            "pck@5px": 0.0,
+            "pck@10px": 0.07894736842105263
+          },
+          "target": {
+            "visible_count": 48,
+            "rmse_px": 21.221887327889757,
+            "median_px": 13.32897443616709,
+            "pck@5px": 0.020833333333333332,
+            "pck@10px": 0.1875
+          },
+          "interface": {
+            "visible_count": 38,
+            "rmse_px": 22.175022128830854,
+            "median_px": 16.58681189788681,
+            "pck@5px": 0.0,
+            "pck@10px": 0.07894736842105263
+          }
+        },
+        "aggregate": {
+          "visible_count": 170,
+          "rmse_px": 18.200557649721624,
+          "median_px": 13.576938492126459,
+          "pck@5px": 0.0058823529411764705,
+          "pck@10px": 0.21176470588235294
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.94,
+            "balanced_accuracy": 0.625,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.25,
+            "brier": 0.03169960031235945
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.54,
+            "balanced_accuracy": 0.6973684210526316,
+            "visible_recall": 0.39473684210526316,
+            "hidden_recall": 1.0,
+            "brier": 0.2906252959380817
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.96,
+            "balanced_accuracy": 0.5,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.0,
+            "brier": 0.03276236023646653
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 0.5,
+            "balanced_accuracy": 0.6710526315789473,
+            "visible_recall": 0.34210526315789475,
+            "hidden_recall": 1.0,
+            "brier": 0.30122204492900556
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.735,
+          "balanced_accuracy": 0.7754901960784314,
+          "visible_recall": 0.7176470588235294,
+          "hidden_recall": 0.8333333333333334,
+          "brier": 0.16407732535397831
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 49.64503886534812,
+            "median_px": 10.781615346510065,
+            "pck@5px": 0.0,
+            "pck@10px": 0.3
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 135.05457571396707,
+            "median_px": 120.09635316684952,
+            "pck@5px": 0.0,
+            "pck@10px": 0.0
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 48.54981379054377,
+            "median_px": 21.83768676149888,
+            "pck@5px": 0.0,
+            "pck@10px": 0.06
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 137.67881715653692,
+            "median_px": 125.66480357040477,
+            "pck@5px": 0.0,
+            "pck@10px": 0.0
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 102.4901329615944,
+          "median_px": 39.48121602776219,
+          "pck@5px": 0.0,
+          "pck@10px": 0.09
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.68,
+        "interface_target": 0.72,
+        "any_actionable_pair": 0.76
+      }
+    },
+    "faucet-close-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 42,
+            "rmse_px": 10.37548285377595,
+            "median_px": 10.241956150693632,
+            "pck@5px": 0.0,
+            "pck@10px": 0.40476190476190477
+          },
+          "object": {
+            "visible_count": 46,
+            "rmse_px": 14.939834471881868,
+            "median_px": 14.334982915005192,
+            "pck@5px": 0.15217391304347827,
+            "pck@10px": 0.30434782608695654
+          },
+          "target": {
+            "visible_count": 41,
+            "rmse_px": 62.35744027569017,
+            "median_px": 63.05670879340995,
+            "pck@5px": 0.0,
+            "pck@10px": 0.07317073170731707
+          },
+          "interface": {
+            "visible_count": 46,
+            "rmse_px": 17.906705122425155,
+            "median_px": 14.930522091889841,
+            "pck@5px": 0.15217391304347827,
+            "pck@10px": 0.2608695652173913
+          }
+        },
+        "aggregate": {
+          "visible_count": 175,
+          "rmse_px": 32.860295962837746,
+          "median_px": 13.574263687966875,
+          "pck@5px": 0.08,
+          "pck@10px": 0.26285714285714284
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.9,
+            "balanced_accuracy": 0.6875,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.375,
+            "brier": 0.09071012907611116
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.86,
+            "balanced_accuracy": 0.8097826086956521,
+            "visible_recall": 0.8695652173913043,
+            "hidden_recall": 0.75,
+            "brier": 0.10576541591495603
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.86,
+            "balanced_accuracy": 0.6544715447154471,
+            "visible_recall": 0.975609756097561,
+            "hidden_recall": 0.3333333333333333,
+            "brier": 0.09006727258403638
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 0.82,
+            "balanced_accuracy": 0.7880434782608696,
+            "visible_recall": 0.8260869565217391,
+            "hidden_recall": 0.75,
+            "brier": 0.10750469039215256
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.86,
+          "balanced_accuracy": 0.6971428571428571,
+          "visible_recall": 0.9142857142857143,
+          "hidden_recall": 0.48,
+          "brier": 0.09851187699181402
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 75.62536984433876,
+            "median_px": 11.612400941412602,
+            "pck@5px": 0.0,
+            "pck@10px": 0.24
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 77.63494907156519,
+            "median_px": 33.338982777357714,
+            "pck@5px": 0.0,
+            "pck@10px": 0.02
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 92.63485765097764,
+            "median_px": 94.19837253634249,
+            "pck@5px": 0.0,
+            "pck@10px": 0.0
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 79.0563861564866,
+            "median_px": 34.536802538054935,
+            "pck@5px": 0.0,
+            "pck@10px": 0.0
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 81.51305252163294,
+          "median_px": 33.19960213706099,
+          "pck@5px": 0.0,
+          "pck@10px": 0.065
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.76,
+        "interface_target": 0.8,
+        "any_actionable_pair": 0.92
+      }
+    },
+    "hammer-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 46,
+            "rmse_px": 10.149754236237545,
+            "median_px": 9.757221052710523,
+            "pck@5px": 0.0,
+            "pck@10px": 0.5652173913043478
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 17.3354809356402,
+            "median_px": 17.286334982034802,
+            "pck@5px": 0.0,
+            "pck@10px": 0.02
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 9.658760490556316,
+            "median_px": 9.211529057806331,
+            "pck@5px": 0.08,
+            "pck@10px": 0.64
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 20.082354016227796,
+            "median_px": 12.885125561490014,
+            "pck@5px": 0.02,
+            "pck@10px": 0.12
+          }
+        },
+        "aggregate": {
+          "visible_count": 196,
+          "rmse_px": 15.083843959482264,
+          "median_px": 11.640429915224667,
+          "pck@5px": 0.025510204081632654,
+          "pck@10px": 0.33163265306122447
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.875,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.75,
+            "brier": 0.022414263706391456
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": null,
+            "visible_recall": 1.0,
+            "hidden_recall": null,
+            "brier": 1.4197984803843156e-07
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": null,
+            "visible_recall": 1.0,
+            "hidden_recall": null,
+            "brier": 0.00041611615561272687
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": null,
+            "visible_recall": 1.0,
+            "hidden_recall": null,
+            "brier": 4.412252001493755e-05
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.995,
+          "balanced_accuracy": 0.875,
+          "visible_recall": 1.0,
+          "hidden_recall": 0.75,
+          "brier": 0.00571866109046679
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 44.96142782594533,
+            "median_px": 11.206885398140333,
+            "pck@5px": 0.0,
+            "pck@10px": 0.36
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 17.40272784828883,
+            "median_px": 17.371073230381747,
+            "pck@5px": 0.0,
+            "pck@10px": 0.02
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 10.891907164034652,
+            "median_px": 10.091506302956063,
+            "pck@5px": 0.04,
+            "pck@10px": 0.48
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 20.31176937040326,
+            "median_px": 13.067888401670974,
+            "pck@5px": 0.02,
+            "pck@10px": 0.12
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 26.718844217778678,
+          "median_px": 12.917824504139205,
+          "pck@5px": 0.015,
+          "pck@10px": 0.245
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.92,
+        "interface_target": 1.0,
+        "any_actionable_pair": 1.0
+      }
+    },
+    "handle-press-side-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 44,
+            "rmse_px": 9.379663962512526,
+            "median_px": 9.388903856312606,
+            "pck@5px": 0.0,
+            "pck@10px": 0.7272727272727273
+          },
+          "object": {
+            "visible_count": 43,
+            "rmse_px": 8.903480111120647,
+            "median_px": 7.624740220682137,
+            "pck@5px": 0.16279069767441862,
+            "pck@10px": 0.7674418604651163
+          },
+          "target": {
+            "visible_count": 44,
+            "rmse_px": 7.945729147414455,
+            "median_px": 6.765787773117353,
+            "pck@5px": 0.20454545454545456,
+            "pck@10px": 0.8181818181818182
+          },
+          "interface": {
+            "visible_count": 43,
+            "rmse_px": 9.233639394857518,
+            "median_px": 8.007222756813004,
+            "pck@5px": 0.13953488372093023,
+            "pck@10px": 0.7209302325581395
+          }
+        },
+        "aggregate": {
+          "visible_count": 174,
+          "rmse_px": 8.881026361452477,
+          "median_px": 8.115692471044818,
+          "pck@5px": 0.12643678160919541,
+          "pck@10px": 0.7586206896551724
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.92,
+            "balanced_accuracy": 0.6666666666666666,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.3333333333333333,
+            "brier": 0.05547092609119339
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.94,
+            "balanced_accuracy": 0.7857142857142857,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.5714285714285714,
+            "brier": 0.04210134456768884
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.94,
+            "balanced_accuracy": 0.75,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.5,
+            "brier": 0.03445740214299219
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 0.94,
+            "balanced_accuracy": 0.7857142857142857,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.5714285714285714,
+            "brier": 0.038681525163226496
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.935,
+          "balanced_accuracy": 0.75,
+          "visible_recall": 1.0,
+          "hidden_recall": 0.5,
+          "brier": 0.04267779949127523
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 62.85918520244912,
+            "median_px": 10.60288374889089,
+            "pck@5px": 0.0,
+            "pck@10px": 0.46
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 51.437263530399534,
+            "median_px": 9.834591417327355,
+            "pck@5px": 0.04,
+            "pck@10px": 0.5
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 45.261492824627126,
+            "median_px": 8.989120666836705,
+            "pck@5px": 0.14,
+            "pck@10px": 0.56
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 49.449188586251886,
+            "median_px": 10.46586678951271,
+            "pck@5px": 0.04,
+            "pck@10px": 0.44
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 52.65665729127715,
+          "median_px": 10.103221783226665,
+          "pck@5px": 0.055,
+          "pck@10px": 0.49
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.74,
+        "interface_target": 0.84,
+        "any_actionable_pair": 0.86
+      }
+    },
+    "handle-press-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 47,
+            "rmse_px": 9.039506723647603,
+            "median_px": 8.380752608403737,
+            "pck@5px": 0.0,
+            "pck@10px": 0.7659574468085106
+          },
+          "object": {
+            "visible_count": 45,
+            "rmse_px": 17.05087505585579,
+            "median_px": 16.63307149013632,
+            "pck@5px": 0.0,
+            "pck@10px": 0.0
+          },
+          "target": {
+            "visible_count": 46,
+            "rmse_px": 14.02144599873989,
+            "median_px": 13.798346267107142,
+            "pck@5px": 0.0,
+            "pck@10px": 0.10869565217391304
+          },
+          "interface": {
+            "visible_count": 45,
+            "rmse_px": 17.634419184191238,
+            "median_px": 17.413295734338558,
+            "pck@5px": 0.0,
+            "pck@10px": 0.0
+          }
+        },
+        "aggregate": {
+          "visible_count": 183,
+          "rmse_px": 14.77719189480676,
+          "median_px": 14.514705497123725,
+          "pck@5px": 0.0,
+          "pck@10px": 0.22404371584699453
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.96,
+            "balanced_accuracy": 0.6666666666666666,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.3333333333333333,
+            "brier": 0.024819544411026583
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.96,
+            "balanced_accuracy": 0.8,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.6,
+            "brier": 0.039826698252034026
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.94,
+            "balanced_accuracy": 0.625,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.25,
+            "brier": 0.050129500320941885
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 0.96,
+            "balanced_accuracy": 0.8,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.6,
+            "brier": 0.03936950851803213
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.955,
+          "balanced_accuracy": 0.7352941176470589,
+          "visible_recall": 1.0,
+          "hidden_recall": 0.47058823529411764,
+          "brier": 0.038536312875508655
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 40.414801512091465,
+            "median_px": 9.41957022366276,
+            "pck@5px": 0.0,
+            "pck@10px": 0.56
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 45.54377226515941,
+            "median_px": 18.075399923349785,
+            "pck@5px": 0.0,
+            "pck@10px": 0.0
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 52.84211156887644,
+            "median_px": 15.21009031235695,
+            "pck@5px": 0.0,
+            "pck@10px": 0.04
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 45.400387183512755,
+            "median_px": 18.845462715399428,
+            "pck@5px": 0.0,
+            "pck@10px": 0.0
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 46.26303947232853,
+          "median_px": 16.65951445602772,
+          "pck@5px": 0.0,
+          "pck@10px": 0.15
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.84,
+        "interface_target": 0.88,
+        "any_actionable_pair": 0.9
+      }
+    },
+    "handle-pull-side-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 45,
+            "rmse_px": 8.899280418528996,
+            "median_px": 9.007507601070829,
+            "pck@5px": 0.0,
+            "pck@10px": 0.8666666666666667
+          },
+          "object": {
+            "visible_count": 47,
+            "rmse_px": 10.542345373000474,
+            "median_px": 9.938626648065178,
+            "pck@5px": 0.0425531914893617,
+            "pck@10px": 0.5106382978723404
+          },
+          "target": {
+            "visible_count": 44,
+            "rmse_px": 29.746314832812942,
+            "median_px": 16.8751242804876,
+            "pck@5px": 0.0,
+            "pck@10px": 0.0
+          },
+          "interface": {
+            "visible_count": 47,
+            "rmse_px": 10.37514915342138,
+            "median_px": 10.126323685092196,
+            "pck@5px": 0.06382978723404255,
+            "pck@10px": 0.44680851063829785
+          }
+        },
+        "aggregate": {
+          "visible_count": 183,
+          "rmse_px": 16.982771801706487,
+          "median_px": 10.155501010574396,
+          "pck@5px": 0.0273224043715847,
+          "pck@10px": 0.45901639344262296
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.96,
+            "balanced_accuracy": 0.8888888888888888,
+            "visible_recall": 0.9777777777777777,
+            "hidden_recall": 0.8,
+            "brier": 0.0358357455690806
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.9893617021276595,
+            "visible_recall": 0.9787234042553191,
+            "hidden_recall": 1.0,
+            "brier": 0.02097397502078855
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.94,
+            "balanced_accuracy": 0.75,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.5,
+            "brier": 0.04168652251038432
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 0.96,
+            "balanced_accuracy": 0.8226950354609929,
+            "visible_recall": 0.9787234042553191,
+            "hidden_recall": 0.6666666666666666,
+            "brier": 0.020919846168309345
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.96,
+          "balanced_accuracy": 0.8447444551591128,
+          "visible_recall": 0.9836065573770492,
+          "hidden_recall": 0.7058823529411765,
+          "brier": 0.029854022317140707
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 53.57731667445267,
+            "median_px": 10.083070225183334,
+            "pck@5px": 0.0,
+            "pck@10px": 0.48
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 38.92175677337581,
+            "median_px": 12.5542468033866,
+            "pck@5px": 0.0,
+            "pck@10px": 0.3
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 63.060119706686045,
+            "median_px": 30.064731993328035,
+            "pck@5px": 0.0,
+            "pck@10px": 0.0
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 38.894873747415055,
+            "median_px": 11.401823329475608,
+            "pck@5px": 0.02,
+            "pck@10px": 0.32
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 49.68606925892141,
+          "median_px": 14.58549630999931,
+          "pck@5px": 0.005,
+          "pck@10px": 0.275
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.84,
+        "interface_target": 0.88,
+        "any_actionable_pair": 0.94
+      }
+    },
+    "handle-pull-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 46,
+            "rmse_px": 9.16328401517104,
+            "median_px": 9.182896970773925,
+            "pck@5px": 0.021739130434782608,
+            "pck@10px": 0.782608695652174
+          },
+          "object": {
+            "visible_count": 48,
+            "rmse_px": 12.735478435863094,
+            "median_px": 12.282177069514017,
+            "pck@5px": 0.020833333333333332,
+            "pck@10px": 0.20833333333333334
+          },
+          "target": {
+            "visible_count": 47,
+            "rmse_px": 22.545195101328453,
+            "median_px": 17.465442425319587,
+            "pck@5px": 0.02127659574468085,
+            "pck@10px": 0.06382978723404255
+          },
+          "interface": {
+            "visible_count": 48,
+            "rmse_px": 13.437721849461552,
+            "median_px": 13.093917442560505,
+            "pck@5px": 0.0,
+            "pck@10px": 0.1875
+          }
+        },
+        "aggregate": {
+          "visible_count": 189,
+          "rmse_px": 15.293351714337787,
+          "median_px": 12.247166936215274,
+          "pck@5px": 0.015873015873015872,
+          "pck@10px": 0.30687830687830686
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.92,
+            "balanced_accuracy": 0.6141304347826086,
+            "visible_recall": 0.9782608695652174,
+            "hidden_recall": 0.25,
+            "brier": 0.05733314324273646
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": 1.0,
+            "visible_recall": 1.0,
+            "hidden_recall": 1.0,
+            "brier": 0.004486548071084701
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.94,
+            "balanced_accuracy": 0.6560283687943262,
+            "visible_recall": 0.9787234042553191,
+            "hidden_recall": 0.3333333333333333,
+            "brier": 0.035896428541835765
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": 1.0,
+            "visible_recall": 1.0,
+            "hidden_recall": 1.0,
+            "brier": 0.0041624089868185134
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.965,
+          "balanced_accuracy": 0.7674362674362674,
+          "visible_recall": 0.9894179894179894,
+          "hidden_recall": 0.5454545454545454,
+          "brier": 0.02546963221061886
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 61.98551298725902,
+            "median_px": 9.891051364523985,
+            "pck@5px": 0.0,
+            "pck@10px": 0.52
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 19.809129006269348,
+            "median_px": 12.690392550761338,
+            "pck@5px": 0.02,
+            "pck@10px": 0.18
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 51.9011096058629,
+            "median_px": 19.32806120514536,
+            "pck@5px": 0.0,
+            "pck@10px": 0.04
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 19.783613158552487,
+            "median_px": 13.514235216485107,
+            "pck@5px": 0.0,
+            "pck@10px": 0.16
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 42.777686766022434,
+          "median_px": 13.445142319931794,
+          "pck@5px": 0.005,
+          "pck@10px": 0.225
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.88,
+        "interface_target": 0.92,
+        "any_actionable_pair": 0.96
+      }
+    },
+    "lever-pull-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 41,
+            "rmse_px": 9.297706181676473,
+            "median_px": 9.080376137937385,
+            "pck@5px": 0.04878048780487805,
+            "pck@10px": 0.6341463414634146
+          },
+          "object": {
+            "visible_count": 48,
+            "rmse_px": 18.283031748888224,
+            "median_px": 13.337653130164838,
+            "pck@5px": 0.0625,
+            "pck@10px": 0.2916666666666667
+          },
+          "target": {
+            "visible_count": 49,
+            "rmse_px": 21.97143548490907,
+            "median_px": 11.746188603127703,
+            "pck@5px": 0.0,
+            "pck@10px": 0.061224489795918366
+          },
+          "interface": {
+            "visible_count": 48,
+            "rmse_px": 18.18760514052444,
+            "median_px": 13.276158309368096,
+            "pck@5px": 0.0625,
+            "pck@10px": 0.2708333333333333
+          }
+        },
+        "aggregate": {
+          "visible_count": 186,
+          "rmse_px": 17.828573011807624,
+          "median_px": 11.646576091564775,
+          "pck@5px": 0.043010752688172046,
+          "pck@10px": 0.3010752688172043
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.88,
+            "balanced_accuracy": 0.7533875338753387,
+            "visible_recall": 0.9512195121951219,
+            "hidden_recall": 0.5555555555555556,
+            "brier": 0.08577877429445037
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.9,
+            "balanced_accuracy": 0.46875,
+            "visible_recall": 0.9375,
+            "hidden_recall": 0.0,
+            "brier": 0.04940505024845738
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": 1.0,
+            "visible_recall": 1.0,
+            "hidden_recall": 1.0,
+            "brier": 0.0034377543401330267
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 0.9,
+            "balanced_accuracy": 0.46875,
+            "visible_recall": 0.9375,
+            "hidden_recall": 0.0,
+            "brier": 0.05178686296035421
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.92,
+          "balanced_accuracy": 0.6927803379416283,
+          "visible_recall": 0.956989247311828,
+          "hidden_recall": 0.42857142857142855,
+          "brier": 0.047602110460848744
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 76.81881208634843,
+            "median_px": 16.003382857488045,
+            "pck@5px": 0.0,
+            "pck@10px": 0.14
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 54.6048176997144,
+            "median_px": 17.14560521824045,
+            "pck@5px": 0.02,
+            "pck@10px": 0.14
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 28.886264340058762,
+            "median_px": 12.71014754666556,
+            "pck@5px": 0.0,
+            "pck@10px": 0.02
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 55.42132166791399,
+            "median_px": 17.302475596378112,
+            "pck@5px": 0.02,
+            "pck@10px": 0.16
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 56.54368923522522,
+          "median_px": 14.853104024631332,
+          "pck@5px": 0.01,
+          "pck@10px": 0.115
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.78,
+        "interface_target": 0.94,
+        "any_actionable_pair": 0.96
+      }
+    },
+    "pick-place-wall-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 46,
+            "rmse_px": 9.670414822227912,
+            "median_px": 9.547643722838936,
+            "pck@5px": 0.0,
+            "pck@10px": 0.6086956521739131
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 13.597186289978993,
+            "median_px": 12.626866436507557,
+            "pck@5px": 0.04,
+            "pck@10px": 0.12
+          },
+          "target": {
+            "visible_count": 42,
+            "rmse_px": 11.698669828333461,
+            "median_px": 11.072551104940706,
+            "pck@5px": 0.047619047619047616,
+            "pck@10px": 0.30952380952380953
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 13.62575944625631,
+            "median_px": 12.73432422200062,
+            "pck@5px": 0.0,
+            "pck@10px": 0.06
+          }
+        },
+        "aggregate": {
+          "visible_count": 188,
+          "rmse_px": 12.329063355595757,
+          "median_px": 11.422781627985191,
+          "pck@5px": 0.02127659574468085,
+          "pck@10px": 0.26595744680851063
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.96,
+            "balanced_accuracy": 0.8641304347826086,
+            "visible_recall": 0.9782608695652174,
+            "hidden_recall": 0.75,
+            "brier": 0.030559220761673042
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": null,
+            "visible_recall": 1.0,
+            "hidden_recall": null,
+            "brier": 5.618526920642353e-05
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.94,
+            "balanced_accuracy": 0.9136904761904762,
+            "visible_recall": 0.9523809523809523,
+            "hidden_recall": 0.875,
+            "brier": 0.042609836715745926
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": null,
+            "visible_recall": 1.0,
+            "hidden_recall": null,
+            "brier": 0.00011631352043316668
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.975,
+          "balanced_accuracy": 0.9086879432624113,
+          "visible_recall": 0.9840425531914894,
+          "hidden_recall": 0.8333333333333334,
+          "brier": 0.01833538906676464
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 51.775107978998285,
+            "median_px": 10.300992422037703,
+            "pck@5px": 0.0,
+            "pck@10px": 0.44
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 14.157399521679599,
+            "median_px": 12.644320924047298,
+            "pck@5px": 0.04,
+            "pck@10px": 0.12
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 49.69618646624432,
+            "median_px": 11.350320149861803,
+            "pck@5px": 0.04,
+            "pck@10px": 0.26
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 14.415604635698896,
+            "median_px": 12.798310977665857,
+            "pck@5px": 0.0,
+            "pck@10px": 0.06
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 37.27805780131891,
+          "median_px": 11.653688676713703,
+          "pck@5px": 0.02,
+          "pck@10px": 0.22
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.92,
+        "interface_target": 0.84,
+        "any_actionable_pair": 1.0
+      }
+    },
+    "pick-out-of-hole-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 49,
+            "rmse_px": 9.317835023317047,
+            "median_px": 9.0815201427454,
+            "pck@5px": 0.0,
+            "pck@10px": 0.6938775510204082
+          },
+          "object": {
+            "visible_count": 47,
+            "rmse_px": 7.874138744763204,
+            "median_px": 6.203831243046247,
+            "pck@5px": 0.3191489361702128,
+            "pck@10px": 0.8297872340425532
+          },
+          "target": {
+            "visible_count": 43,
+            "rmse_px": 18.04121059861467,
+            "median_px": 13.579687983469054,
+            "pck@5px": 0.0,
+            "pck@10px": 0.06976744186046512
+          },
+          "interface": {
+            "visible_count": 47,
+            "rmse_px": 7.741881552820168,
+            "median_px": 6.280573615221762,
+            "pck@5px": 0.3404255319148936,
+            "pck@10px": 0.8723404255319149
+          }
+        },
+        "aggregate": {
+          "visible_count": 186,
+          "rmse_px": 11.354803501406796,
+          "median_px": 9.014764810661195,
+          "pck@5px": 0.16666666666666666,
+          "pck@10px": 0.6290322580645161
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": 1.0,
+            "visible_recall": 1.0,
+            "hidden_recall": 1.0,
+            "brier": 0.0050442931026889685
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.9893617021276595,
+            "visible_recall": 0.9787234042553191,
+            "hidden_recall": 1.0,
+            "brier": 0.0208148838971267
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.94,
+            "balanced_accuracy": 0.7857142857142857,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.5714285714285714,
+            "brier": 0.044246002139291536
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.9893617021276595,
+            "visible_recall": 0.9787234042553191,
+            "hidden_recall": 1.0,
+            "brier": 0.02238605466982321
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.975,
+          "balanced_accuracy": 0.8874807987711213,
+          "visible_recall": 0.989247311827957,
+          "hidden_recall": 0.7857142857142857,
+          "brier": 0.0231228084522326
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 23.641496054697527,
+            "median_px": 9.270987022058229,
+            "pck@5px": 0.0,
+            "pck@10px": 0.64
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 32.48552885081119,
+            "median_px": 7.923342603185765,
+            "pck@5px": 0.22,
+            "pck@10px": 0.64
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 48.97713851995406,
+            "median_px": 14.725043147889092,
+            "pck@5px": 0.0,
+            "pck@10px": 0.06
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 33.62284402200238,
+            "median_px": 7.905401978495714,
+            "pck@5px": 0.2,
+            "pck@10px": 0.64
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 35.85904926985598,
+          "median_px": 10.018771080268746,
+          "pck@5px": 0.105,
+          "pck@10px": 0.495
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.92,
+        "interface_target": 0.82,
+        "any_actionable_pair": 0.94
+      }
+    },
+    "pick-place-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 47,
+            "rmse_px": 9.520860147674009,
+            "median_px": 9.36587570235648,
+            "pck@5px": 0.0,
+            "pck@10px": 0.6808510638297872
+          },
+          "object": {
+            "visible_count": 49,
+            "rmse_px": 11.08979028628873,
+            "median_px": 11.063622164419495,
+            "pck@5px": 0.04081632653061224,
+            "pck@10px": 0.22448979591836735
+          },
+          "target": {
+            "visible_count": 40,
+            "rmse_px": 12.033412483841472,
+            "median_px": 11.386802475201549,
+            "pck@5px": 0.05,
+            "pck@10px": 0.35
+          },
+          "interface": {
+            "visible_count": 49,
+            "rmse_px": 11.121361266078717,
+            "median_px": 11.27265217591989,
+            "pck@5px": 0.061224489795918366,
+            "pck@10px": 0.22448979591836735
+          }
+        },
+        "aggregate": {
+          "visible_count": 185,
+          "rmse_px": 10.939454339174874,
+          "median_px": 10.681498061825602,
+          "pck@5px": 0.03783783783783784,
+          "pck@10px": 0.3675675675675676
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": 1.0,
+            "visible_recall": 1.0,
+            "hidden_recall": 1.0,
+            "brier": 0.004904840284580096
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": 1.0,
+            "visible_recall": 1.0,
+            "hidden_recall": 1.0,
+            "brier": 0.003401814608519197
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.9875,
+            "visible_recall": 0.975,
+            "hidden_recall": 1.0,
+            "brier": 0.023556389782322436
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": 1.0,
+            "visible_recall": 1.0,
+            "hidden_recall": 1.0,
+            "brier": 0.00482670262981099
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.995,
+          "balanced_accuracy": 0.9972972972972973,
+          "visible_recall": 0.9945945945945946,
+          "hidden_recall": 1.0,
+          "brier": 0.00917243682630818
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 21.915372496057504,
+            "median_px": 9.593543627730934,
+            "pck@5px": 0.0,
+            "pck@10px": 0.54
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 17.448072080414637,
+            "median_px": 11.145233662765492,
+            "pck@5px": 0.04,
+            "pck@10px": 0.2
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 40.278772894811695,
+            "median_px": 12.595591689471755,
+            "pck@5px": 0.02,
+            "pck@10px": 0.28
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 19.3154101248462,
+            "median_px": 11.285658248322129,
+            "pck@5px": 0.04,
+            "pck@10px": 0.22
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 26.363722163074424,
+          "median_px": 10.996028613395195,
+          "pck@5px": 0.025,
+          "pck@10px": 0.31
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.92,
+        "interface_target": 0.78,
+        "any_actionable_pair": 0.98
+      }
+    },
+    "plate-slide-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 49,
+            "rmse_px": 10.482192677078453,
+            "median_px": 10.358255584448383,
+            "pck@5px": 0.02040816326530612,
+            "pck@10px": 0.40816326530612246
+          },
+          "object": {
+            "visible_count": 45,
+            "rmse_px": 14.067227318821304,
+            "median_px": 12.132300410395892,
+            "pck@5px": 0.0,
+            "pck@10px": 0.2222222222222222
+          },
+          "target": {
+            "visible_count": 46,
+            "rmse_px": 8.762265372952694,
+            "median_px": 7.894194239389431,
+            "pck@5px": 0.10869565217391304,
+            "pck@10px": 0.7608695652173914
+          },
+          "interface": {
+            "visible_count": 45,
+            "rmse_px": 13.452450222248817,
+            "median_px": 12.154359906658017,
+            "pck@5px": 0.022222222222222223,
+            "pck@10px": 0.2
+          }
+        },
+        "aggregate": {
+          "visible_count": 185,
+          "rmse_px": 11.846811844372839,
+          "median_px": 10.61572555957647,
+          "pck@5px": 0.03783783783783784,
+          "pck@10px": 0.4
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.5,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.0,
+            "brier": 0.016628053574263717
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.94,
+            "balanced_accuracy": 0.7,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.4,
+            "brier": 0.044087117431207225
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.92,
+            "balanced_accuracy": 0.5,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.0,
+            "brier": 0.06233636935275605
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 0.94,
+            "balanced_accuracy": 0.7,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.4,
+            "brier": 0.040673017976767645
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.945,
+          "balanced_accuracy": 0.6333333333333333,
+          "visible_recall": 1.0,
+          "hidden_recall": 0.26666666666666666,
+          "brier": 0.040931139583748666
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 37.65571759114372,
+            "median_px": 10.60984581881485,
+            "pck@5px": 0.02,
+            "pck@10px": 0.36
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 45.865914076400664,
+            "median_px": 15.599276097819766,
+            "pck@5px": 0.02,
+            "pck@10px": 0.1
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 54.83979776757121,
+            "median_px": 9.227349060684208,
+            "pck@5px": 0.1,
+            "pck@10px": 0.58
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 43.402559688627655,
+            "median_px": 15.032493686810287,
+            "pck@5px": 0.02,
+            "pck@10px": 0.1
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 45.86071507314494,
+          "median_px": 12.24759220680043,
+          "pck@5px": 0.04,
+          "pck@10px": 0.285
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.88,
+        "interface_target": 0.86,
+        "any_actionable_pair": 0.9
+      }
+    },
+    "plate-slide-side-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 44,
+            "rmse_px": 9.119436786552036,
+            "median_px": 8.751941982736863,
+            "pck@5px": 0.0,
+            "pck@10px": 0.7045454545454546
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 9.49579815204238,
+            "median_px": 10.141783270443096,
+            "pck@5px": 0.28,
+            "pck@10px": 0.44
+          },
+          "target": {
+            "visible_count": 45,
+            "rmse_px": 14.220490976027692,
+            "median_px": 12.40845461548535,
+            "pck@5px": 0.13333333333333333,
+            "pck@10px": 0.28888888888888886
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 9.63350339524217,
+            "median_px": 10.29791884513351,
+            "pck@5px": 0.24,
+            "pck@10px": 0.48
+          }
+        },
+        "aggregate": {
+          "visible_count": 189,
+          "rmse_px": 10.766388141727369,
+          "median_px": 10.12956595040476,
+          "pck@5px": 0.1693121693121693,
+          "pck@10px": 0.47619047619047616
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.88,
+            "balanced_accuracy": 0.7159090909090908,
+            "visible_recall": 0.9318181818181818,
+            "hidden_recall": 0.5,
+            "brier": 0.07661573385046468
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": null,
+            "visible_recall": 1.0,
+            "hidden_recall": null,
+            "brier": 0.004589687905435298
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.9,
+            "balanced_accuracy": 0.5,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.0,
+            "brier": 0.09464483370499352
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": null,
+            "visible_recall": 1.0,
+            "hidden_recall": null,
+            "brier": 0.004946821260498737
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.945,
+          "balanced_accuracy": 0.6284271284271283,
+          "visible_recall": 0.9841269841269841,
+          "hidden_recall": 0.2727272727272727,
+          "brier": 0.045199269180348056
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 78.21039071675634,
+            "median_px": 10.857806605022848,
+            "pck@5px": 0.0,
+            "pck@10px": 0.36
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 18.959164594319578,
+            "median_px": 11.301381386262618,
+            "pck@5px": 0.14,
+            "pck@10px": 0.34
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 82.81571559763275,
+            "median_px": 14.334807112058579,
+            "pck@5px": 0.08,
+            "pck@10px": 0.24
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 19.558497081057105,
+            "median_px": 11.24826552172674,
+            "pck@5px": 0.12,
+            "pck@10px": 0.34
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 58.56042327417019,
+          "median_px": 11.568897581630134,
+          "pck@5px": 0.085,
+          "pck@10px": 0.32
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.88,
+        "interface_target": 0.9,
+        "any_actionable_pair": 0.98
+      }
+    },
+    "plate-slide-back-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 47,
+            "rmse_px": 10.108811801929004,
+            "median_px": 10.1453841997925,
+            "pck@5px": 0.02127659574468085,
+            "pck@10px": 0.40425531914893614
+          },
+          "object": {
+            "visible_count": 43,
+            "rmse_px": 16.169482320082206,
+            "median_px": 12.90772813783652,
+            "pck@5px": 0.0,
+            "pck@10px": 0.32558139534883723
+          },
+          "target": {
+            "visible_count": 49,
+            "rmse_px": 14.045211071051993,
+            "median_px": 12.428681590549825,
+            "pck@5px": 0.0,
+            "pck@10px": 0.32653061224489793
+          },
+          "interface": {
+            "visible_count": 43,
+            "rmse_px": 15.142984691080226,
+            "median_px": 12.64859277444629,
+            "pck@5px": 0.023255813953488372,
+            "pck@10px": 0.32558139534883723
+          }
+        },
+        "aggregate": {
+          "visible_count": 182,
+          "rmse_px": 13.980312198285993,
+          "median_px": 11.30247299938998,
+          "pck@5px": 0.01098901098901099,
+          "pck@10px": 0.34615384615384615
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.96,
+            "balanced_accuracy": 0.8226950354609929,
+            "visible_recall": 0.9787234042553191,
+            "hidden_recall": 0.6666666666666666,
+            "brier": 0.022749641940378998
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.86,
+            "balanced_accuracy": 0.6794019933554817,
+            "visible_recall": 0.9302325581395349,
+            "hidden_recall": 0.42857142857142855,
+            "brier": 0.08501491430701744
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": 1.0,
+            "visible_recall": 1.0,
+            "hidden_recall": 1.0,
+            "brier": 0.004130803327388879
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 0.86,
+            "balanced_accuracy": 0.6794019933554817,
+            "visible_recall": 0.9302325581395349,
+            "hidden_recall": 0.42857142857142855,
+            "brier": 0.08554564752106138
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.92,
+          "balanced_accuracy": 0.7307692307692308,
+          "visible_recall": 0.9615384615384616,
+          "hidden_recall": 0.5,
+          "brier": 0.04936025177396168
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 43.79341040851678,
+            "median_px": 11.15022020175085,
+            "pck@5px": 0.02,
+            "pck@10px": 0.34
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 65.35849513327004,
+            "median_px": 17.75592524262354,
+            "pck@5px": 0.0,
+            "pck@10px": 0.12
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 20.116197045306777,
+            "median_px": 12.510152082681932,
+            "pck@5px": 0.0,
+            "pck@10px": 0.32
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 65.69702121920386,
+            "median_px": 17.615969033856118,
+            "pck@5px": 0.0,
+            "pck@10px": 0.12
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 52.22632397061994,
+          "median_px": 13.980498110917926,
+          "pck@5px": 0.005,
+          "pck@10px": 0.225
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.8,
+        "interface_target": 0.86,
+        "any_actionable_pair": 0.86
+      }
+    },
+    "plate-slide-back-side-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 48,
+            "rmse_px": 9.095946344253447,
+            "median_px": 8.81092829199023,
+            "pck@5px": 0.020833333333333332,
+            "pck@10px": 0.6666666666666666
+          },
+          "object": {
+            "visible_count": 47,
+            "rmse_px": 9.256443132645975,
+            "median_px": 9.681518081175852,
+            "pck@5px": 0.14893617021276595,
+            "pck@10px": 0.5957446808510638
+          },
+          "target": {
+            "visible_count": 49,
+            "rmse_px": 11.423973788128519,
+            "median_px": 10.979549351098157,
+            "pck@5px": 0.04081632653061224,
+            "pck@10px": 0.32653061224489793
+          },
+          "interface": {
+            "visible_count": 47,
+            "rmse_px": 9.30507987521326,
+            "median_px": 9.595505988807584,
+            "pck@5px": 0.14893617021276595,
+            "pck@10px": 0.574468085106383
+          }
+        },
+        "aggregate": {
+          "visible_count": 191,
+          "rmse_px": 9.831753500883211,
+          "median_px": 9.78033003102845,
+          "pck@5px": 0.08900523560209424,
+          "pck@10px": 0.5392670157068062
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.96,
+            "balanced_accuracy": 0.5,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.0,
+            "brier": 0.029922389025674435
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": 1.0,
+            "visible_recall": 1.0,
+            "hidden_recall": 1.0,
+            "brier": 0.010748908102606638
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.5,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.0,
+            "brier": 0.018149532576839746
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": 1.0,
+            "visible_recall": 1.0,
+            "hidden_recall": 1.0,
+            "brier": 0.009535170268082855
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.985,
+          "balanced_accuracy": 0.8333333333333333,
+          "visible_recall": 1.0,
+          "hidden_recall": 0.6666666666666666,
+          "brier": 0.017088999993300918
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 46.566298406893594,
+            "median_px": 9.645318610442496,
+            "pck@5px": 0.02,
+            "pck@10px": 0.56
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 25.477221604516927,
+            "median_px": 11.051025856401601,
+            "pck@5px": 0.08,
+            "pck@10px": 0.3
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 27.27407903919903,
+            "median_px": 11.167951878842153,
+            "pck@5px": 0.04,
+            "pck@10px": 0.3
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 24.104018405913603,
+            "median_px": 11.019372226875001,
+            "pck@5px": 0.06,
+            "pck@10px": 0.38
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 32.18069319776465,
+          "median_px": 10.680938412317241,
+          "pck@5px": 0.05,
+          "pck@10px": 0.385
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.9,
+        "interface_target": 0.92,
+        "any_actionable_pair": 0.94
+      }
+    },
+    "peg-insert-side-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 49,
+            "rmse_px": 9.452291320637675,
+            "median_px": 9.220611583746198,
+            "pck@5px": 0.02040816326530612,
+            "pck@10px": 0.6530612244897959
+          },
+          "object": {
+            "visible_count": 48,
+            "rmse_px": 8.927949166228531,
+            "median_px": 8.857830135926076,
+            "pck@5px": 0.0,
+            "pck@10px": 0.7083333333333334
+          },
+          "target": {
+            "visible_count": 0,
+            "rmse_px": null,
+            "median_px": null,
+            "pck@5px": null,
+            "pck@10px": null
+          },
+          "interface": {
+            "visible_count": 48,
+            "rmse_px": 8.967644958183557,
+            "median_px": 8.913279084012553,
+            "pck@5px": 0.020833333333333332,
+            "pck@10px": 0.7083333333333334
+          }
+        },
+        "aggregate": {
+          "visible_count": 145,
+          "rmse_px": 9.121417579263504,
+          "median_px": 8.998382696969678,
+          "pck@5px": 0.013793103448275862,
+          "pck@10px": 0.6896551724137931
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": 1.0,
+            "visible_recall": 1.0,
+            "hidden_recall": 1.0,
+            "brier": 0.006002260362704561
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.75,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.5,
+            "brier": 0.01686112163465113
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": null,
+            "visible_recall": null,
+            "hidden_recall": 1.0,
+            "brier": 1.636361722199411e-05
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.75,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.5,
+            "brier": 0.01752059683787664
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.99,
+          "balanced_accuracy": 0.9818181818181818,
+          "visible_recall": 1.0,
+          "hidden_recall": 0.9636363636363636,
+          "brier": 0.01010008561311358
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 25.97424236281878,
+            "median_px": 9.570974735440036,
+            "pck@5px": 0.02,
+            "pck@10px": 0.58
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 24.996538441374938,
+            "median_px": 9.706186377520329,
+            "pck@5px": 0.0,
+            "pck@10px": 0.6
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 1.1943540112316715,
+            "median_px": 1.1546964105197481,
+            "pck@5px": 1.0,
+            "pck@10px": 1.0
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 25.14491373705391,
+            "median_px": 9.361864529526805,
+            "pck@5px": 0.0,
+            "pck@10px": 0.62
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 21.983979216247526,
+          "median_px": 8.96592960460346,
+          "pck@5px": 0.255,
+          "pck@10px": 0.7
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.94,
+        "interface_target": 0.0,
+        "any_actionable_pair": 0.94
+      }
+    },
+    "peg-unplug-side-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 45,
+            "rmse_px": 9.478859901289738,
+            "median_px": 8.35152076577169,
+            "pck@5px": 0.044444444444444446,
+            "pck@10px": 0.6222222222222222
+          },
+          "object": {
+            "visible_count": 17,
+            "rmse_px": 8.012219856490592,
+            "median_px": 8.169793027693487,
+            "pck@5px": 0.11764705882352941,
+            "pck@10px": 0.8823529411764706
+          },
+          "target": {
+            "visible_count": 43,
+            "rmse_px": 14.387062122085736,
+            "median_px": 6.023379717132774,
+            "pck@5px": 0.4186046511627907,
+            "pck@10px": 0.7674418604651163
+          },
+          "interface": {
+            "visible_count": 17,
+            "rmse_px": 8.144679132336599,
+            "median_px": 8.455068477344561,
+            "pck@5px": 0.17647058823529413,
+            "pck@10px": 0.8823529411764706
+          }
+        },
+        "aggregate": {
+          "visible_count": 122,
+          "rmse_px": 11.148290747594451,
+          "median_px": 7.934235204867453,
+          "pck@5px": 0.20491803278688525,
+          "pck@10px": 0.7459016393442623
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.92,
+            "balanced_accuracy": 0.7777777777777778,
+            "visible_recall": 0.9555555555555556,
+            "hidden_recall": 0.6,
+            "brier": 0.06290431757760868
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.76,
+            "balanced_accuracy": 0.6470588235294118,
+            "visible_recall": 0.29411764705882354,
+            "hidden_recall": 1.0,
+            "brier": 0.16548666508714163
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.9285714285714286,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.8571428571428571,
+            "brier": 0.028474903842649595
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 0.78,
+            "balanced_accuracy": 0.6764705882352942,
+            "visible_recall": 0.35294117647058826,
+            "hidden_recall": 1.0,
+            "brier": 0.16637390426015788
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.86,
+          "balanced_accuracy": 0.8783102143757882,
+          "visible_recall": 0.7950819672131147,
+          "hidden_recall": 0.9615384615384616,
+          "brier": 0.10580994769188942
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 67.00755015367592,
+            "median_px": 9.10913387291049,
+            "pck@5px": 0.04,
+            "pck@10px": 0.54
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 102.40250869479233,
+            "median_px": 42.0566399473292,
+            "pck@5px": 0.0,
+            "pck@10px": 0.04
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 40.203338011314635,
+            "median_px": 9.597127248609153,
+            "pck@5px": 0.32,
+            "pck@10px": 0.5
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 102.79335912974774,
+            "median_px": 40.90107117817718,
+            "pck@5px": 0.0,
+            "pck@10px": 0.06
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 82.40004343599239,
+          "median_px": 23.29627029525475,
+          "pck@5px": 0.09,
+          "pck@10px": 0.285
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.3,
+        "interface_target": 0.32,
+        "any_actionable_pair": 0.34
+      }
+    },
+    "soccer-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 46,
+            "rmse_px": 10.056790773104016,
+            "median_px": 10.042438114211926,
+            "pck@5px": 0.021739130434782608,
+            "pck@10px": 0.4782608695652174
+          },
+          "object": {
+            "visible_count": 49,
+            "rmse_px": 13.313362259551173,
+            "median_px": 12.468635260108982,
+            "pck@5px": 0.10204081632653061,
+            "pck@10px": 0.1836734693877551
+          },
+          "target": {
+            "visible_count": 48,
+            "rmse_px": 9.66051015247086,
+            "median_px": 8.98756989837285,
+            "pck@5px": 0.0625,
+            "pck@10px": 0.625
+          },
+          "interface": {
+            "visible_count": 49,
+            "rmse_px": 13.282373176392216,
+            "median_px": 12.734810807367502,
+            "pck@5px": 0.061224489795918366,
+            "pck@10px": 0.16326530612244897
+          }
+        },
+        "aggregate": {
+          "visible_count": 192,
+          "rmse_px": 11.739734726531092,
+          "median_px": 11.064292972111595,
+          "pck@5px": 0.0625,
+          "pck@10px": 0.359375
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.92,
+            "balanced_accuracy": 0.5,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.0,
+            "brier": 0.05348415937751099
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": 1.0,
+            "visible_recall": 1.0,
+            "hidden_recall": 1.0,
+            "brier": 0.0010564966059902936
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.96,
+            "balanced_accuracy": 0.7395833333333333,
+            "visible_recall": 0.9791666666666666,
+            "hidden_recall": 0.5,
+            "brier": 0.020643469901374337
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": 1.0,
+            "visible_recall": 1.0,
+            "hidden_recall": 1.0,
+            "brier": 0.0014709427542885756
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.97,
+          "balanced_accuracy": 0.6848958333333333,
+          "visible_recall": 0.9947916666666666,
+          "hidden_recall": 0.375,
+          "brier": 0.01916376715979105
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 64.26789068871713,
+            "median_px": 11.471836188545545,
+            "pck@5px": 0.02,
+            "pck@10px": 0.3
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 15.448446976832212,
+            "median_px": 13.06734753493216,
+            "pck@5px": 0.06,
+            "pck@10px": 0.12
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 32.628129846576755,
+            "median_px": 9.435637489745329,
+            "pck@5px": 0.0,
+            "pck@10px": 0.54
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 16.046155467798524,
+            "median_px": 13.249255703313512,
+            "pck@5px": 0.04,
+            "pck@10px": 0.12
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 37.71965750823675,
+          "median_px": 12.036863163908398,
+          "pck@5px": 0.03,
+          "pck@10px": 0.27
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.9,
+        "interface_target": 0.96,
+        "any_actionable_pair": 0.98
+      }
+    },
+    "stick-push-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 42,
+            "rmse_px": 9.643656733748927,
+            "median_px": 9.335247074425128,
+            "pck@5px": 0.0,
+            "pck@10px": 0.6904761904761905
+          },
+          "object": {
+            "visible_count": 43,
+            "rmse_px": 13.040439207635375,
+            "median_px": 11.993540978861533,
+            "pck@5px": 0.0,
+            "pck@10px": 0.11627906976744186
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 11.566820927771067,
+            "median_px": 11.860516387598938,
+            "pck@5px": 0.02,
+            "pck@10px": 0.26
+          },
+          "interface": {
+            "visible_count": 0,
+            "rmse_px": null,
+            "median_px": null,
+            "pck@5px": null,
+            "pck@10px": null
+          }
+        },
+        "aggregate": {
+          "visible_count": 135,
+          "rmse_px": 11.517411460204775,
+          "median_px": 10.96401960718783,
+          "pck@5px": 0.007407407407407408,
+          "pck@10px": 0.34814814814814815
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.92,
+            "balanced_accuracy": 0.8511904761904762,
+            "visible_recall": 0.9523809523809523,
+            "hidden_recall": 0.75,
+            "brier": 0.040191662184445164
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.96,
+            "balanced_accuracy": 0.9169435215946844,
+            "visible_recall": 0.9767441860465116,
+            "hidden_recall": 0.8571428571428571,
+            "brier": 0.03783146241304727
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": null,
+            "visible_recall": 1.0,
+            "hidden_recall": null,
+            "brier": 5.275529332493534e-07
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": null,
+            "visible_recall": null,
+            "hidden_recall": 1.0,
+            "brier": 6.095366356630389e-06
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.97,
+          "balanced_accuracy": 0.9658119658119658,
+          "visible_recall": 0.9777777777777777,
+          "hidden_recall": 0.9538461538461539,
+          "brier": 0.01950743687919558
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 46.15376571031684,
+            "median_px": 11.527823303325738,
+            "pck@5px": 0.0,
+            "pck@10px": 0.28
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 48.46529710094814,
+            "median_px": 15.09578587749543,
+            "pck@5px": 0.0,
+            "pck@10px": 0.0
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 11.595789235940202,
+            "median_px": 11.862983082918284,
+            "pck@5px": 0.02,
+            "pck@10px": 0.26
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 0.7629438905681363,
+            "median_px": 0.717559078581402,
+            "pck@5px": 1.0,
+            "pck@10px": 1.0
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 33.96358168579432,
+          "median_px": 11.359290421465747,
+          "pck@5px": 0.255,
+          "pck@10px": 0.385
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.72,
+        "interface_target": 0.0,
+        "any_actionable_pair": 0.72
+      }
+    },
+    "stick-pull-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 40,
+            "rmse_px": 10.030611917959886,
+            "median_px": 9.66274012121309,
+            "pck@5px": 0.0,
+            "pck@10px": 0.6
+          },
+          "object": {
+            "visible_count": 42,
+            "rmse_px": 13.99561446041102,
+            "median_px": 13.180628384689037,
+            "pck@5px": 0.0,
+            "pck@10px": 0.09523809523809523
+          },
+          "target": {
+            "visible_count": 48,
+            "rmse_px": 11.206560628238272,
+            "median_px": 11.027379115025425,
+            "pck@5px": 0.0,
+            "pck@10px": 0.10416666666666667
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 47.64060452907684,
+            "median_px": 14.556016502541745,
+            "pck@5px": 0.02,
+            "pck@10px": 0.12
+          }
+        },
+        "aggregate": {
+          "visible_count": 180,
+          "rmse_px": 27.05559158468001,
+          "median_px": 11.720619319445637,
+          "pck@5px": 0.005555555555555556,
+          "pck@10px": 0.21666666666666667
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.96,
+            "balanced_accuracy": 0.9,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.8,
+            "brier": 0.05698688296719062
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.94,
+            "balanced_accuracy": 0.8630952380952381,
+            "visible_recall": 0.9761904761904762,
+            "hidden_recall": 0.75,
+            "brier": 0.03839403827594906
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.96,
+            "balanced_accuracy": 0.5,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.0,
+            "brier": 0.03170296706986228
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": null,
+            "visible_recall": 1.0,
+            "hidden_recall": null,
+            "brier": 6.903175966421315e-05
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.965,
+          "balanced_accuracy": 0.8472222222222222,
+          "visible_recall": 0.9944444444444445,
+          "hidden_recall": 0.7,
+          "brier": 0.031788230018166545
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 65.80925898428312,
+            "median_px": 13.865948937005768,
+            "pck@5px": 0.0,
+            "pck@10px": 0.22
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 48.15447701880868,
+            "median_px": 15.504920289027565,
+            "pck@5px": 0.0,
+            "pck@10px": 0.04
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 35.03388818768118,
+            "median_px": 11.217049278825098,
+            "pck@5px": 0.0,
+            "pck@10px": 0.1
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 48.120090586248345,
+            "median_px": 14.738935857154129,
+            "pck@5px": 0.02,
+            "pck@10px": 0.12
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 50.479274619865315,
+          "median_px": 12.993430926086464,
+          "pck@5px": 0.005,
+          "pck@10px": 0.12
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.68,
+        "interface_target": 0.96,
+        "any_actionable_pair": 1.0
+      }
+    },
+    "push-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 45,
+            "rmse_px": 9.518064775109124,
+            "median_px": 9.397420531311864,
+            "pck@5px": 0.0,
+            "pck@10px": 0.6444444444444445
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 13.475741276625223,
+            "median_px": 12.673845695983424,
+            "pck@5px": 0.06,
+            "pck@10px": 0.14
+          },
+          "target": {
+            "visible_count": 48,
+            "rmse_px": 11.330947025094803,
+            "median_px": 10.92422865924995,
+            "pck@5px": 0.0,
+            "pck@10px": 0.25
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 13.073358510692719,
+            "median_px": 12.499303638457203,
+            "pck@5px": 0.04,
+            "pck@10px": 0.14
+          }
+        },
+        "aggregate": {
+          "visible_count": 193,
+          "rmse_px": 12.0157199832857,
+          "median_px": 11.20290358114212,
+          "pck@5px": 0.025906735751295335,
+          "pck@10px": 0.2849740932642487
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.9,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.8,
+            "brier": 0.029084225071249338
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.96,
+            "balanced_accuracy": null,
+            "visible_recall": 0.96,
+            "hidden_recall": null,
+            "brier": 0.01797962661447494
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.9895833333333333,
+            "visible_recall": 0.9791666666666666,
+            "hidden_recall": 1.0,
+            "brier": 0.011634499588016007
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 0.96,
+            "balanced_accuracy": null,
+            "visible_recall": 0.96,
+            "hidden_recall": null,
+            "brier": 0.02087439013445783
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.97,
+          "balanced_accuracy": 0.9156180606957809,
+          "visible_recall": 0.9740932642487047,
+          "hidden_recall": 0.8571428571428571,
+          "brier": 0.019893185352049526
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 47.32684362372792,
+            "median_px": 9.94155804996441,
+            "pck@5px": 0.0,
+            "pck@10px": 0.5
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 33.9970479128036,
+            "median_px": 13.263967909935008,
+            "pck@5px": 0.04,
+            "pck@10px": 0.12
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 25.463854737306406,
+            "median_px": 11.331248797987133,
+            "pck@5px": 0.0,
+            "pck@10px": 0.2
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 35.94904452739268,
+            "median_px": 12.6759092970562,
+            "pck@5px": 0.04,
+            "pck@10px": 0.12
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 36.525234751762255,
+          "median_px": 11.479103675867417,
+          "pck@5px": 0.02,
+          "pck@10px": 0.235
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.9,
+        "interface_target": 0.96,
+        "any_actionable_pair": 1.0
+      }
+    },
+    "push-wall-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 47,
+            "rmse_px": 9.883759733956676,
+            "median_px": 9.624539624546005,
+            "pck@5px": 0.0,
+            "pck@10px": 0.5531914893617021
+          },
+          "object": {
+            "visible_count": 47,
+            "rmse_px": 15.060969288114858,
+            "median_px": 13.095843558960588,
+            "pck@5px": 0.02127659574468085,
+            "pck@10px": 0.06382978723404255
+          },
+          "target": {
+            "visible_count": 15,
+            "rmse_px": 10.483348316763584,
+            "median_px": 10.62815037421976,
+            "pck@5px": 0.13333333333333333,
+            "pck@10px": 0.3333333333333333
+          },
+          "interface": {
+            "visible_count": 47,
+            "rmse_px": 14.635008027220694,
+            "median_px": 13.440924942057483,
+            "pck@5px": 0.02127659574468085,
+            "pck@10px": 0.06382978723404255
+          }
+        },
+        "aggregate": {
+          "visible_count": 156,
+          "rmse_px": 13.147984662913089,
+          "median_px": 11.928927778198162,
+          "pck@5px": 0.02564102564102564,
+          "pck@10px": 0.23717948717948717
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.96,
+            "balanced_accuracy": 0.6666666666666666,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.3333333333333333,
+            "brier": 0.03598164678021142
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": 1.0,
+            "visible_recall": 1.0,
+            "hidden_recall": 1.0,
+            "brier": 0.004121088037679286
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.72,
+            "balanced_accuracy": 0.7428571428571429,
+            "visible_recall": 0.8,
+            "hidden_recall": 0.6857142857142857,
+            "brier": 0.20909839047031759
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": 1.0,
+            "visible_recall": 1.0,
+            "hidden_recall": 1.0,
+            "brier": 0.0033469509660931517
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.92,
+          "balanced_accuracy": 0.8426573426573427,
+          "visible_recall": 0.9807692307692307,
+          "hidden_recall": 0.7045454545454546,
+          "brier": 0.06313701906357537
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 51.77752261289341,
+            "median_px": 10.411239403802137,
+            "pck@5px": 0.0,
+            "pck@10px": 0.44
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 20.545082719215735,
+            "median_px": 13.885520064985794,
+            "pck@5px": 0.02,
+            "pck@10px": 0.04
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 94.26954283662182,
+            "median_px": 63.19198555183152,
+            "pck@5px": 0.06,
+            "pck@10px": 0.14
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 19.22766895552265,
+            "median_px": 13.859911910378703,
+            "pck@5px": 0.02,
+            "pck@10px": 0.04
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 55.586559148675846,
+          "median_px": 13.531206386799928,
+          "pck@5px": 0.025,
+          "pck@10px": 0.165
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.88,
+        "interface_target": 0.28,
+        "any_actionable_pair": 0.9
+      }
+    },
+    "reach-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 46,
+            "rmse_px": 9.370418721671628,
+            "median_px": 8.949445551752742,
+            "pck@5px": 0.0,
+            "pck@10px": 0.717391304347826
+          },
+          "object": {
+            "visible_count": 46,
+            "rmse_px": 8.922266842154698,
+            "median_px": 8.649983273686702,
+            "pck@5px": 0.021739130434782608,
+            "pck@10px": 0.7608695652173914
+          },
+          "target": {
+            "visible_count": 45,
+            "rmse_px": 11.821233745505419,
+            "median_px": 11.272352875680024,
+            "pck@5px": 0.022222222222222223,
+            "pck@10px": 0.2
+          },
+          "interface": {
+            "visible_count": 46,
+            "rmse_px": 27.67209099897405,
+            "median_px": 9.0233999909229,
+            "pck@5px": 0.021739130434782608,
+            "pck@10px": 0.717391304347826
+          }
+        },
+        "aggregate": {
+          "visible_count": 183,
+          "rmse_px": 16.39897976290331,
+          "median_px": 9.216295671733425,
+          "pck@5px": 0.01639344262295082,
+          "pck@10px": 0.6010928961748634
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.875,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.75,
+            "brier": 0.012122501500824657
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.875,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.75,
+            "brier": 0.019168307294285362
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.94,
+            "balanced_accuracy": 0.7,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.4,
+            "brier": 0.022066214464221426
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.875,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.75,
+            "brier": 0.019076939518439816
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.97,
+          "balanced_accuracy": 0.8235294117647058,
+          "visible_recall": 1.0,
+          "hidden_recall": 0.6470588235294118,
+          "brier": 0.018108490694442817
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 32.16773428109135,
+            "median_px": 9.671565736421636,
+            "pck@5px": 0.0,
+            "pck@10px": 0.56
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 39.93737751573897,
+            "median_px": 9.33983123243949,
+            "pck@5px": 0.02,
+            "pck@10px": 0.62
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 34.273925035493676,
+            "median_px": 11.750259254992905,
+            "pck@5px": 0.0,
+            "pck@10px": 0.16
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 46.91709056309566,
+            "median_px": 9.596850591800703,
+            "pck@5px": 0.0,
+            "pck@10px": 0.58
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 38.748137296707284,
+          "median_px": 10.234121332580514,
+          "pck@5px": 0.005,
+          "pck@10px": 0.48
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.92,
+        "interface_target": 0.82,
+        "any_actionable_pair": 0.92
+      }
+    },
+    "reach-wall-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 46,
+            "rmse_px": 9.844799516085217,
+            "median_px": 9.730919098896178,
+            "pck@5px": 0.0,
+            "pck@10px": 0.6086956521739131
+          },
+          "object": {
+            "visible_count": 46,
+            "rmse_px": 27.826467043968186,
+            "median_px": 8.91860794063029,
+            "pck@5px": 0.13043478260869565,
+            "pck@10px": 0.6956521739130435
+          },
+          "target": {
+            "visible_count": 42,
+            "rmse_px": 11.47162299033364,
+            "median_px": 11.076315977181507,
+            "pck@5px": 0.047619047619047616,
+            "pck@10px": 0.3333333333333333
+          },
+          "interface": {
+            "visible_count": 46,
+            "rmse_px": 27.950001125461355,
+            "median_px": 9.306534630292685,
+            "pck@5px": 0.10869565217391304,
+            "pck@10px": 0.5869565217391305
+          }
+        },
+        "aggregate": {
+          "visible_count": 180,
+          "rmse_px": 21.28368277235642,
+          "median_px": 9.673099647054741,
+          "pck@5px": 0.07222222222222222,
+          "pck@10px": 0.5611111111111111
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": 1.0,
+            "visible_recall": 1.0,
+            "hidden_recall": 1.0,
+            "brier": 0.004875716785297729
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.875,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.75,
+            "brier": 0.01536521497918708
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.96,
+            "balanced_accuracy": 0.875,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.75,
+            "brier": 0.01513059715671153
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.875,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.75,
+            "brier": 0.016872797067490702
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.98,
+          "balanced_accuracy": 0.9,
+          "visible_recall": 1.0,
+          "hidden_recall": 0.8,
+          "brier": 0.01306108149717176
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 22.47116144217481,
+            "median_px": 10.498908448564885,
+            "pck@5px": 0.0,
+            "pck@10px": 0.42
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 44.0966301831085,
+            "median_px": 10.08233293899531,
+            "pck@5px": 0.08,
+            "pck@10px": 0.48
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 30.360813431804296,
+            "median_px": 11.769937626760285,
+            "pck@5px": 0.04,
+            "pck@10px": 0.28
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 45.60158502672757,
+            "median_px": 10.375407118518226,
+            "pck@5px": 0.06,
+            "pck@10px": 0.44
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 36.91459548490547,
+          "median_px": 10.691818303745443,
+          "pck@5px": 0.045,
+          "pck@10px": 0.405
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.92,
+        "interface_target": 0.76,
+        "any_actionable_pair": 0.92
+      }
+    },
+    "shelf-place-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 44,
+            "rmse_px": 11.000262152361596,
+            "median_px": 10.440977076797836,
+            "pck@5px": 0.0,
+            "pck@10px": 0.45454545454545453
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 11.138830213709497,
+            "median_px": 11.074617660385838,
+            "pck@5px": 0.08,
+            "pck@10px": 0.3
+          },
+          "target": {
+            "visible_count": 33,
+            "rmse_px": 11.689726131832206,
+            "median_px": 11.384231964093384,
+            "pck@5px": 0.0,
+            "pck@10px": 0.21212121212121213
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 11.21718420228595,
+            "median_px": 11.180390679214685,
+            "pck@5px": 0.04,
+            "pck@10px": 0.3
+          }
+        },
+        "aggregate": {
+          "visible_count": 177,
+          "rmse_px": 11.231672269006614,
+          "median_px": 11.121305882711324,
+          "pck@5px": 0.03389830508474576,
+          "pck@10px": 0.3220338983050847
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.92,
+            "balanced_accuracy": 0.6666666666666666,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.3333333333333333,
+            "brier": 0.06773627044595139
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": null,
+            "visible_recall": 1.0,
+            "hidden_recall": null,
+            "brier": 0.00018626404117348726
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.94,
+            "balanced_accuracy": 0.9402852049910874,
+            "visible_recall": 0.9393939393939394,
+            "hidden_recall": 0.9411764705882353,
+            "brier": 0.038970425981781284
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": null,
+            "visible_recall": 1.0,
+            "hidden_recall": null,
+            "brier": 0.00033098167624899587
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.965,
+          "balanced_accuracy": 0.8856546303119627,
+          "visible_recall": 0.9887005649717514,
+          "hidden_recall": 0.782608695652174,
+          "brier": 0.02680598553628879
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 65.4805519124813,
+            "median_px": 13.201215592605843,
+            "pck@5px": 0.0,
+            "pck@10px": 0.14
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 12.567534646925678,
+            "median_px": 11.20031158545288,
+            "pck@5px": 0.08,
+            "pck@10px": 0.28
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 55.87486094183812,
+            "median_px": 12.960837925483409,
+            "pck@5px": 0.0,
+            "pck@10px": 0.06
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 13.201562669461655,
+            "median_px": 11.38444628291402,
+            "pck@5px": 0.04,
+            "pck@10px": 0.28
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 43.994110253675736,
+          "median_px": 11.933997797205286,
+          "pck@5px": 0.03,
+          "pck@10px": 0.19
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.88,
+        "interface_target": 0.66,
+        "any_actionable_pair": 0.94
+      }
+    },
+    "sweep-into-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 44,
+            "rmse_px": 9.554293658640274,
+            "median_px": 9.441185513929792,
+            "pck@5px": 0.0,
+            "pck@10px": 0.6363636363636364
+          },
+          "object": {
+            "visible_count": 49,
+            "rmse_px": 14.400184652654081,
+            "median_px": 13.985679583740895,
+            "pck@5px": 0.0,
+            "pck@10px": 0.10204081632653061
+          },
+          "target": {
+            "visible_count": 48,
+            "rmse_px": 12.192390048901634,
+            "median_px": 11.254028630121075,
+            "pck@5px": 0.020833333333333332,
+            "pck@10px": 0.2708333333333333
+          },
+          "interface": {
+            "visible_count": 49,
+            "rmse_px": 14.389912565410608,
+            "median_px": 14.36467731014638,
+            "pck@5px": 0.0,
+            "pck@10px": 0.12244897959183673
+          }
+        },
+        "aggregate": {
+          "visible_count": 190,
+          "rmse_px": 12.867592787751772,
+          "median_px": 12.163980020002178,
+          "pck@5px": 0.005263157894736842,
+          "pck@10px": 0.2736842105263158
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.92,
+            "balanced_accuracy": 0.8106060606060606,
+            "visible_recall": 0.9545454545454546,
+            "hidden_recall": 0.6666666666666666,
+            "brier": 0.04025767754135044
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.9897959183673469,
+            "visible_recall": 0.9795918367346939,
+            "hidden_recall": 1.0,
+            "brier": 0.014552552779197843
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.75,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.5,
+            "brier": 0.013206352670816556
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 0.98,
+            "balanced_accuracy": 0.9897959183673469,
+            "visible_recall": 0.9795918367346939,
+            "hidden_recall": 1.0,
+            "brier": 0.014776975361278435
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.965,
+          "balanced_accuracy": 0.8394736842105264,
+          "visible_recall": 0.9789473684210527,
+          "hidden_recall": 0.7,
+          "brier": 0.02069838958816082
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 60.56574324980745,
+            "median_px": 10.11797715750965,
+            "pck@5px": 0.0,
+            "pck@10px": 0.48
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 31.58662067141107,
+            "median_px": 14.329607942309767,
+            "pck@5px": 0.0,
+            "pck@10px": 0.1
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 27.94848805120424,
+            "median_px": 11.921015530989346,
+            "pck@5px": 0.02,
+            "pck@10px": 0.22
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 31.94580662087807,
+            "median_px": 14.571759598686295,
+            "pck@5px": 0.0,
+            "pck@10px": 0.1
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 40.2106217492594,
+          "median_px": 13.00771186524792,
+          "pck@5px": 0.005,
+          "pck@10px": 0.225
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.86,
+        "interface_target": 0.94,
+        "any_actionable_pair": 0.98
+      }
+    },
+    "sweep-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 45,
+            "rmse_px": 9.68663969871723,
+            "median_px": 9.117381897073495,
+            "pck@5px": 0.0,
+            "pck@10px": 0.6444444444444445
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 9.808088808405834,
+            "median_px": 9.450821706889345,
+            "pck@5px": 0.06,
+            "pck@10px": 0.58
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 16.57206550154648,
+            "median_px": 12.047128107814032,
+            "pck@5px": 0.0,
+            "pck@10px": 0.3
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 9.900604974187019,
+            "median_px": 9.769611357514425,
+            "pck@5px": 0.06,
+            "pck@10px": 0.54
+          }
+        },
+        "aggregate": {
+          "visible_count": 195,
+          "rmse_px": 11.911014399560619,
+          "median_px": 9.975153369290988,
+          "pck@5px": 0.03076923076923077,
+          "pck@10px": 0.5128205128205128
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.92,
+            "balanced_accuracy": 0.6888888888888889,
+            "visible_recall": 0.9777777777777777,
+            "hidden_recall": 0.4,
+            "brier": 0.06600376407960766
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": null,
+            "visible_recall": 1.0,
+            "hidden_recall": null,
+            "brier": 0.00715485008323192
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": null,
+            "visible_recall": 1.0,
+            "hidden_recall": null,
+            "brier": 1.0703857575578013e-06
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": null,
+            "visible_recall": 1.0,
+            "hidden_recall": null,
+            "brier": 0.005941187380950339
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.98,
+          "balanced_accuracy": 0.6974358974358974,
+          "visible_recall": 0.9948717948717949,
+          "hidden_recall": 0.4,
+          "brier": 0.01977521798238687
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 71.31775327171351,
+            "median_px": 10.23871092161172,
+            "pck@5px": 0.0,
+            "pck@10px": 0.46
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 21.94217999075985,
+            "median_px": 10.01308940584103,
+            "pck@5px": 0.06,
+            "pck@10px": 0.5
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 16.546433136596647,
+            "median_px": 11.996420594389651,
+            "pck@5px": 0.0,
+            "pck@10px": 0.3
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 20.585704283194538,
+            "median_px": 10.171648051543707,
+            "pck@5px": 0.06,
+            "pck@10px": 0.48
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 39.576624618740865,
+          "median_px": 10.413647981770877,
+          "pck@5px": 0.03,
+          "pck@10px": 0.435
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.9,
+        "interface_target": 1.0,
+        "any_actionable_pair": 1.0
+      }
+    },
+    "window-open-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 46,
+            "rmse_px": 11.253458023543274,
+            "median_px": 10.223482559160189,
+            "pck@5px": 0.021739130434782608,
+            "pck@10px": 0.45652173913043476
+          },
+          "object": {
+            "visible_count": 43,
+            "rmse_px": 18.517697755808893,
+            "median_px": 18.310046036130363,
+            "pck@5px": 0.0,
+            "pck@10px": 0.023255813953488372
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 18.091225519520968,
+            "median_px": 10.273184175212325,
+            "pck@5px": 0.06,
+            "pck@10px": 0.44
+          },
+          "interface": {
+            "visible_count": 43,
+            "rmse_px": 19.674432343518035,
+            "median_px": 19.288412292247813,
+            "pck@5px": 0.0,
+            "pck@10px": 0.0
+          }
+        },
+        "aggregate": {
+          "visible_count": 182,
+          "rmse_px": 17.157892911502675,
+          "median_px": 13.419404178362385,
+          "pck@5px": 0.02197802197802198,
+          "pck@10px": 0.24175824175824176
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 1.0,
+            "balanced_accuracy": 1.0,
+            "visible_recall": 1.0,
+            "hidden_recall": 1.0,
+            "brier": 0.015638749261624625
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.9,
+            "balanced_accuracy": 0.7026578073089701,
+            "visible_recall": 0.9767441860465116,
+            "hidden_recall": 0.42857142857142855,
+            "brier": 0.057354653378002635
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.94,
+            "balanced_accuracy": null,
+            "visible_recall": 0.94,
+            "hidden_recall": null,
+            "brier": 0.04313176966174547
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 0.92,
+            "balanced_accuracy": 0.7740863787375415,
+            "visible_recall": 0.9767441860465116,
+            "hidden_recall": 0.5714285714285714,
+            "brier": 0.05626077342352321
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.94,
+          "balanced_accuracy": 0.7918192918192919,
+          "visible_recall": 0.9725274725274725,
+          "hidden_recall": 0.6111111111111112,
+          "brier": 0.04309648643122399
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 40.46444274739124,
+            "median_px": 12.663596684921545,
+            "pck@5px": 0.0,
+            "pck@10px": 0.24
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 55.21553279613086,
+            "median_px": 21.417882388422314,
+            "pck@5px": 0.0,
+            "pck@10px": 0.0
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 42.52309753908572,
+            "median_px": 16.013167030097797,
+            "pck@5px": 0.0,
+            "pck@10px": 0.18
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 54.39444827416309,
+            "median_px": 23.21242794439352,
+            "pck@5px": 0.0,
+            "pck@10px": 0.0
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 48.61351668051466,
+          "median_px": 19.821539902030608,
+          "pck@5px": 0.0,
+          "pck@10px": 0.105
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.78,
+        "interface_target": 0.86,
+        "any_actionable_pair": 0.86
+      }
+    },
+    "window-close-v3": {
+      "localization": {
+        "roles": {
+          "tool": {
+            "visible_count": 47,
+            "rmse_px": 11.465977557938304,
+            "median_px": 10.532087024855667,
+            "pck@5px": 0.0,
+            "pck@10px": 0.46808510638297873
+          },
+          "object": {
+            "visible_count": 42,
+            "rmse_px": 10.009757860788966,
+            "median_px": 8.199262003956928,
+            "pck@5px": 0.19047619047619047,
+            "pck@10px": 0.6904761904761905
+          },
+          "target": {
+            "visible_count": 34,
+            "rmse_px": 19.479601309487453,
+            "median_px": 11.871143176108967,
+            "pck@5px": 0.058823529411764705,
+            "pck@10px": 0.35294117647058826
+          },
+          "interface": {
+            "visible_count": 42,
+            "rmse_px": 10.851154624481474,
+            "median_px": 9.236346756656669,
+            "pck@5px": 0.11904761904761904,
+            "pck@10px": 0.5714285714285714
+          }
+        },
+        "aggregate": {
+          "visible_count": 165,
+          "rmse_px": 13.081119776634141,
+          "median_px": 9.809577550804988,
+          "pck@5px": 0.09090909090909091,
+          "pck@10px": 0.5272727272727272
+        }
+      },
+      "visibility": {
+        "roles": {
+          "tool": {
+            "count": 50,
+            "accuracy": 0.96,
+            "balanced_accuracy": 0.6666666666666666,
+            "visible_recall": 1.0,
+            "hidden_recall": 0.3333333333333333,
+            "brier": 0.03489864310039458
+          },
+          "object": {
+            "count": 50,
+            "accuracy": 0.94,
+            "balanced_accuracy": 0.9136904761904762,
+            "visible_recall": 0.9523809523809523,
+            "hidden_recall": 0.875,
+            "brier": 0.048840047818037115
+          },
+          "target": {
+            "count": 50,
+            "accuracy": 0.78,
+            "balanced_accuracy": 0.6893382352941176,
+            "visible_recall": 0.9411764705882353,
+            "hidden_recall": 0.4375,
+            "brier": 0.15719929597594814
+          },
+          "interface": {
+            "count": 50,
+            "accuracy": 0.92,
+            "balanced_accuracy": 0.9017857142857143,
+            "visible_recall": 0.9285714285714286,
+            "hidden_recall": 0.875,
+            "brier": 0.04583614633330501
+          }
+        },
+        "aggregate": {
+          "count": 200,
+          "accuracy": 0.9,
+          "balanced_accuracy": 0.793073593073593,
+          "visible_recall": 0.9575757575757575,
+          "hidden_recall": 0.6285714285714286,
+          "brier": 0.0716935333069212
+        }
+      },
+      "gated_state": {
+        "roles": {
+          "tool": {
+            "visible_count": 50,
+            "rmse_px": 50.48253053935182,
+            "median_px": 12.721029842928747,
+            "pck@5px": 0.0,
+            "pck@10px": 0.26
+          },
+          "object": {
+            "visible_count": 50,
+            "rmse_px": 51.268336694025216,
+            "median_px": 13.819797242332623,
+            "pck@5px": 0.06,
+            "pck@10px": 0.22
+          },
+          "target": {
+            "visible_count": 50,
+            "rmse_px": 93.33925092311492,
+            "median_px": 51.94340870217754,
+            "pck@5px": 0.02,
+            "pck@10px": 0.02
+          },
+          "interface": {
+            "visible_count": 50,
+            "rmse_px": 49.8917708985254,
+            "median_px": 14.580093099756455,
+            "pck@5px": 0.04,
+            "pck@10px": 0.18
+          }
+        },
+        "aggregate": {
+          "visible_count": 200,
+          "rmse_px": 63.98893029913001,
+          "median_px": 17.264962901006538,
+          "pck@5px": 0.03,
+          "pck@10px": 0.17
+        }
+      },
+      "pair_visibility_coverage": {
+        "tool_object": 0.78,
+        "interface_target": 0.6,
+        "any_actionable_pair": 0.82
+      }
+    }
+  }
+}

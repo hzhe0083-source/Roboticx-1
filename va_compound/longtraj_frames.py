@@ -81,6 +81,11 @@ class LongTrajFramesDataset:
         cached = self._decoded.get(task_file)
         if cached is not None:
             return cached
+        # 先释放旧任务解码缓存再解码新任务：避免「旧缓存 + 新任务全帧解码」双驻留
+        # 峰值（大任务 peg-unplug-side 15000 帧 ≈ 10GB，叠加旧缓存可触顶 OOM）。
+        while len(self._decoded) >= self.decode_cache_tasks:
+            oldest = next(iter(self._decoded))
+            del self._decoded[oldest]
         data = self._load_task(task_file)
         # 多线程解码（PIL JPEG 解码在 C 层释放 GIL，8 线程 ~8 倍加速）；
         # 存 480 原尺寸（resize 交给 GPU 预处理，phase2 同款，避免 CPU bicubic）。

@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 from collections.abc import Iterator
+import hashlib
+import json
 import math
 from pathlib import Path
 import random
@@ -14,9 +16,143 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, Sampler
 
 from va_compound import VACompoundConfig, VACompoundPolicy
-from va_compound.backbones import pool_flat_tokens
+from va_compound.backbones import pool_flat_tokens, pool_mtvj_coarse_tokens
+from va_compound.metric_roi import (
+    METRIC_ROI_CONTRACT_VERSION,
+    load_metric_roi_checkpoint,
+    metric_head_state_sha256,
+    prepare_metric_roi_video,
+    refine_metric_roi_positions,
+)
 from va_compound.servo import InteractionServo
 from scripts.mt50_difficulty import task_weights_for
+
+
+ACTION_MASK_KEYS = ("action_valid_mask", "horizon_mask")
+
+MTVJ_METRIC_HEAD_CONFIG_KEYS = (
+    "lang_dim",
+    "h_dim",
+    "d_proj",
+    "n_roles",
+    "l2_norm",
+    "learnable_temp",
+    "temp_init",
+    "freeze_bias",
+    "mode_readout",
+)
+_MTVJ_METRIC_HEAD_CONFIG_DEFAULTS = {
+    "lang_dim": 2048,
+    "h_dim": 768,
+    "d_proj": 192,
+    "n_roles": 4,
+    "l2_norm": False,
+    "learnable_temp": False,
+    "temp_init": 10.0,
+    "freeze_bias": False,
+    "mode_readout": False,
+}
+
+# The action-policy relation encoder keeps its historical 8-D input shape, but
+# all new all-task migrations use visibility-gated coordinates.  Keeping these
+# names/version explicit prevents an old p-only checkpoint from being evaluated
+# under the new semantics by accident.
+MTVJ_METRIC_STATE_SOURCE = "p_times_visibility_flat"
+MTVJ_METRIC_CONTRACT_VERSION = 3
+MTVJ_LEGACY_METRIC_STATE_SOURCE = "p_flat"
+MTVJ_LEGACY_METRIC_CONTRACT_VERSION = 2
+
+
+def _mtvj_metric_positions(out, source: str = MTVJ_METRIC_STATE_SOURCE) -> Tensor:
+    """Return the declared 8-D state; v2 stays reproducible, v3 gates visibility."""
+    p = out.p
+    if p.ndim != 3 or p.shape[-2:] != (4, 2):
+        raise ValueError(f"MT-VJ out.p must be [N, 4, 2], got {tuple(p.shape)}")
+    if source == MTVJ_LEGACY_METRIC_STATE_SOURCE:
+        return p.reshape(p.shape[0], 8)
+    if source != MTVJ_METRIC_STATE_SOURCE:
+        raise ValueError(f"unknown MT-VJ metric state source: {source!r}")
+    visibility = out.visibility
+    if visibility.shape != p.shape[:-1]:
+        raise ValueError(
+            "MT-VJ out.visibility must match out.p roles: "
+            f"{tuple(visibility.shape)} != {tuple(p.shape[:-1])}"
+        )
+    return (p * visibility.unsqueeze(-1)).reshape(p.shape[0], 8)
+
+
+_mtvj_visibility_gated_positions = _mtvj_metric_positions
+
+
+def _canonical_mtvj_metric_head_config(
+    config: dict | None,
+    *,
+    require_complete: bool = False,
+) -> dict:
+    """Return the complete, weights-only-safe LanguageMetricField ctor contract."""
+    raw = dict(config or {})
+    if require_complete:
+        missing = sorted(set(MTVJ_METRIC_HEAD_CONFIG_KEYS) - set(raw))
+        if missing:
+            raise ValueError(
+                "主 checkpoint 缺少完整 mtvj_metric_head_config："
+                f"missing={missing}"
+            )
+    values = {
+        key: raw.get(key, default)
+        for key, default in _MTVJ_METRIC_HEAD_CONFIG_DEFAULTS.items()
+    }
+    for key in ("lang_dim", "h_dim", "d_proj", "n_roles"):
+        values[key] = int(values[key])
+    for key in (
+        "l2_norm",
+        "learnable_temp",
+        "freeze_bias",
+        "mode_readout",
+    ):
+        values[key] = bool(values[key])
+    values["temp_init"] = float(values["temp_init"])
+    return values
+
+
+def _mtvj_metric_head_constructor_config(metric_head: nn.Module) -> dict:
+    """Read every constructor semantic from a live LanguageMetricField."""
+    missing = [
+        key for key in MTVJ_METRIC_HEAD_CONFIG_KEYS if not hasattr(metric_head, key)
+    ]
+    if missing:
+        raise ValueError(
+            "metric head 无法保存完整构造契约："
+            f"missing attributes={missing}"
+        )
+    return _canonical_mtvj_metric_head_config(
+        {key: getattr(metric_head, key) for key in MTVJ_METRIC_HEAD_CONFIG_KEYS},
+        require_complete=True,
+    )
+
+
+def _mtvj_metric_checkpoint_identity(path: Path, checkpoint: dict) -> dict:
+    """Fingerprint the immutable external metric checkpoint used for migration."""
+    resolved = path.expanduser().resolve(strict=True)
+    digest = hashlib.sha256()
+    with resolved.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return {
+        "path": str(resolved),
+        "sha256": digest.hexdigest(),
+        "size_bytes": int(resolved.stat().st_size),
+        "contract": checkpoint.get("contract"),
+    }
+
+
+def _mtvj_metric_identity_mismatches(saved: dict, current: dict) -> dict:
+    """Compare semantic identity fields; a copied identical file remains valid."""
+    return {
+        key: (saved.get(key), current.get(key))
+        for key in ("sha256", "size_bytes", "contract")
+        if saved.get(key) != current.get(key)
+    }
 
 
 def build_pair_groups(
@@ -257,6 +393,9 @@ class FeatureDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, Tensor]:
         item = {key: self.payload[key][index] for key in self.REQUIRED if key in self.payload}
+        for key in ACTION_MASK_KEYS:
+            if key in self.payload:
+                item[key] = self.payload[key][index]
         if self.local_tokens is not None:
             vision = self.local_tokens[index]  # [4, 288, 768] ST288（与 vision_tokens_st 同源）
             item["vision_tokens"] = vision
@@ -386,7 +525,7 @@ class E2EDataset(Dataset):
     def __getitem__(self, index: int) -> dict:
         payload = self.payload
         has_pairs = "pair_id" in payload and "instruction_id" in payload
-        return {
+        item = {
             "video_frames": payload["video_frames"][index],
             "instruction": payload["instructions"][index],
             "proprio": payload["proprio"][index],
@@ -396,6 +535,10 @@ class E2EDataset(Dataset):
             "pair_id": int(payload["pair_id"][index]) if has_pairs else index,
             "instruction_id": int(payload["instruction_id"][index]) if has_pairs else 0,
         }
+        for key in ACTION_MASK_KEYS:
+            if key in payload:
+                item[key] = payload[key][index]
+        return item
 
 
 class IndexedDataset(Dataset):
@@ -493,47 +636,691 @@ class TaskWeightedSampler(Sampler[list[int]]):
 
 
 class TaskLocalityWeightedSampler(Sampler[list[int]]):
-    """难度分层 + 任务局部性采样（MT-VJ 专用，Codex P1-13，2026-08-10）。
+    """有限、可恢复的任务局部性采样器，且在任务块内按 episode 均衡。
 
-    问题：LongTrajFramesDataset 按需加载任务文件（~300MB），纯随机加权采样
-    缓存命中率极低（实测 3148ms/样本 → 80k 步 ≈ 1119 小时，不可行）。
-
-    方案：先按任务权重（task_w/row_count，任务级分层语义不变）有放回地
-    抽任务序列，每个任务块内随机打乱该任务的窗口——同一任务 batch 连续，
-    dataset 缓存命中率 ~100%（每任务每 epoch 仅 1 次文件加载）。
+    每个 epoch 严格产生 ``N // batch_size`` 个 batch；每个抽样块含至多
+    ``block_batches`` 个同任务 batch（为保持真实权重，相邻同任务块可连续），
+    在 JPEG 解码局部性与跨任务曝光之间取折中。
+    块内轮询 episode，不再让长轨迹因滑窗更多而被额外过采样。
+    ``__iter__`` 不自行推进 cursor；只有优化器更新成功后由主循环调用
+    :meth:`advance`，使 checkpoint 能精确指向“已完成更新”的下一批。
     """
 
-    def __init__(self, instruction_id: Tensor, task_weights: Tensor,
-                 batch_size: int, seed: int = 0) -> None:
+    def __init__(
+        self,
+        instruction_id: Tensor,
+        episode_id: Tensor,
+        task_weights: Tensor,
+        batch_size: int,
+        seed: int = 0,
+        block_batches: int = 16,
+        sampling_mode: str = "weighted",
+    ) -> None:
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
-        self.task_ids = instruction_id.tolist()
-        self.task_w = task_weights.to(torch.float64)  # per-task（已除 row_count）
+        if block_batches < 1:
+            raise ValueError("block_batches must be positive")
+        if instruction_id.ndim != 1 or episode_id.ndim != 1:
+            raise ValueError("instruction_id/episode_id must be 1-D")
+        if instruction_id.shape != episode_id.shape or instruction_id.numel() == 0:
+            raise ValueError("instruction_id/episode_id must have the same non-zero length")
+        if task_weights.ndim != 1:
+            raise ValueError("task_weights must be 1-D")
+        if sampling_mode not in {"weighted", "balanced"}:
+            raise ValueError("sampling_mode must be 'weighted' or 'balanced'")
+        self.task_ids = [int(value) for value in instruction_id.tolist()]
+        self.episode_ids = [int(value) for value in episode_id.tolist()]
+        self.task_w = task_weights.to(torch.float64)
         self.batch_size = int(batch_size)
         self.seed = int(seed)
+        self.block_batches = int(block_batches)
+        self.sampling_mode = sampling_mode
         self.epoch = 0
-        self.by_task: dict[int, list[int]] = {}
-        for i, t in enumerate(self.task_ids):
-            self.by_task.setdefault(int(t), []).append(i)
-        self.tasks = sorted(self.by_task)
-        # 任务序列权重 = task_w（train.py 已做 task_w/row_count 归一化）
+        self.batch_cursor = 0
+        self.by_task_episode: dict[int, dict[int, list[int]]] = {}
+        for index, (task, episode) in enumerate(zip(self.task_ids, self.episode_ids, strict=True)):
+            self.by_task_episode.setdefault(task, {}).setdefault(episode, []).append(index)
+        self.tasks = sorted(self.by_task_episode)
+        if self.tasks[-1] >= len(self.task_w) or bool((self.task_w[self.tasks] <= 0).any()):
+            raise ValueError("task_weights must contain a positive entry for every task id")
+        if self.sampling_mode == "balanced":
+            active_weights = self.task_w[self.tasks]
+            if not bool(torch.all(active_weights == active_weights[0])):
+                raise ValueError("balanced sampling requires equal active task weights")
         self.task_probs = torch.stack([self.task_w[t] for t in self.tasks])
         self.task_probs = self.task_probs / self.task_probs.sum().clamp_min(1e-12)
         self._n = len(self.task_ids)
+        digest_input = torch.stack(
+            (instruction_id.to(torch.int64), episode_id.to(torch.int64)), dim=1
+        ).cpu().contiguous().numpy().tobytes()
+        self.dataset_fingerprint = hashlib.sha256(digest_input).hexdigest()
+        self.dataset_content_identity: dict | None = None
+
+    def bind_dataset_content_identity(self, identity: dict) -> None:
+        """Cache the expensive payload identity and bind sampler state to it."""
+        normalized = _normalize_contract_value(identity)
+        encoded = json.dumps(
+            normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("utf-8")
+        self.dataset_content_identity = normalized
+        self.dataset_fingerprint = hashlib.sha256(encoded).hexdigest()
 
     def __len__(self) -> int:
         return max(1, self._n // self.batch_size)
 
-    def __iter__(self) -> Iterator[list[int]]:
+    def _choose_task(self, rng: random.Random, previous: int | None) -> int:
+        if len(self.tasks) == 1:
+            return self.tasks[0]
+        # Do not forbid the previous task outright: with only two tasks that
+        # collapses every requested weighting to forced 1:1 alternation. The
+        # run-length cap is already enforced by one fixed-size block per draw;
+        # adjacent same-task draws simply remain two independently balanced
+        # blocks and preserve the requested long-run task probability.
+        del previous
+        return int(
+            rng.choices(
+                self.tasks,
+                weights=[float(self.task_w[task]) for task in self.tasks],
+                k=1,
+            )[0]
+        )
+
+    def _build_epoch(self) -> list[list[int]]:
         rng = random.Random(self.seed + self.epoch)
-        self.epoch += 1
-        task_seq = rng.choices(self.tasks, weights=self.task_probs.tolist(),
-                               k=len(self.task_ids))
-        indices: list[int] = []
-        for t in task_seq:
-            indices.extend(rng.sample(self.by_task[t], len(self.by_task[t])))
-        for start in range(0, len(indices) - self.batch_size + 1, self.batch_size):
-            yield indices[start:start + self.batch_size]
+        # 每个 (task, episode) 维护独立无放回队列；耗尽才重洗。
+        queues: dict[tuple[int, int], list[int]] = {}
+        offsets: dict[tuple[int, int], int] = {}
+        for task, episodes in self.by_task_episode.items():
+            for episode, rows in episodes.items():
+                queue = list(rows)
+                rng.shuffle(queue)
+                queues[(task, episode)] = queue
+                offsets[(task, episode)] = 0
+
+        def take_rows(task: int, count: int) -> list[int]:
+            episodes = list(self.by_task_episode[task])
+            selected: list[int] = []
+            while len(selected) < count:
+                rng.shuffle(episodes)
+                for episode in episodes:
+                    key = (task, episode)
+                    queue = queues[key]
+                    offset = offsets[key]
+                    if offset >= len(queue):
+                        rng.shuffle(queue)
+                        offset = 0
+                    selected.append(queue[offset])
+                    offsets[key] = offset + 1
+                    if len(selected) == count:
+                        break
+            return selected
+
+        batches: list[list[int]] = []
+        if self.sampling_mode == "balanced":
+            # Exact per-task exposure in every epoch.  For 59,557 rows,
+            # batch=16 and 49 tasks this gives 47 tasks x 76 batches and
+            # 2 tasks x 75 batches; which tasks receive the shorter quota is
+            # deterministically reshuffled from seed + epoch.
+            task_order = list(self.tasks)
+            rng.shuffle(task_order)
+            base, remainder = divmod(len(self), len(task_order))
+            quotas = {
+                task: base + int(rank < remainder)
+                for rank, task in enumerate(task_order)
+            }
+            blocks: list[tuple[int, int]] = []
+            for task in task_order:
+                remaining = quotas[task]
+                while remaining:
+                    size = min(self.block_batches, remaining)
+                    blocks.append((task, size))
+                    remaining -= size
+            rng.shuffle(blocks)
+            for task, n_batches in blocks:
+                rows = take_rows(task, n_batches * self.batch_size)
+                batches.extend(
+                    rows[start : start + self.batch_size]
+                    for start in range(0, len(rows), self.batch_size)
+                )
+        else:
+            previous_task: int | None = None
+            while len(batches) < len(self):
+                task = self._choose_task(rng, previous_task)
+                n_batches = min(self.block_batches, len(self) - len(batches))
+                rows = take_rows(task, n_batches * self.batch_size)
+                batches.extend(
+                    rows[start : start + self.batch_size]
+                    for start in range(0, len(rows), self.batch_size)
+                )
+                previous_task = task
+        return batches
+
+    def __iter__(self) -> Iterator[list[int]]:
+        schedule = self._build_epoch()
+        yield from schedule[self.batch_cursor :]
+
+    def advance(self, batches: int = 1) -> None:
+        if batches < 0:
+            raise ValueError("batches must be non-negative")
+        total = self.batch_cursor + int(batches)
+        self.epoch += total // len(self)
+        self.batch_cursor = total % len(self)
+
+    def state_dict(self) -> dict:
+        return {
+            "sampler_contract_version": 3,
+            "epoch": self.epoch,
+            "batch_cursor": self.batch_cursor,
+            "seed": self.seed,
+            "batch_size": self.batch_size,
+            "block_batches": self.block_batches,
+            "sampling_mode": self.sampling_mode,
+            "dataset_fingerprint": self.dataset_fingerprint,
+            "active_tasks": self.tasks,
+            "task_weights": [float(self.task_w[task]) for task in self.tasks],
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        expected = {
+            "sampler_contract_version": 3,
+            "seed": self.seed,
+            "batch_size": self.batch_size,
+            "block_batches": self.block_batches,
+            "sampling_mode": self.sampling_mode,
+            "dataset_fingerprint": self.dataset_fingerprint,
+            "active_tasks": self.tasks,
+            "task_weights": [float(self.task_w[task]) for task in self.tasks],
+        }
+        for key, value in expected.items():
+            if state.get(key) != value:
+                raise ValueError(
+                    f"sampler state mismatch on {key}: {state.get(key)!r} != {value!r}"
+                )
+        epoch = int(state.get("epoch", -1))
+        cursor = int(state.get("batch_cursor", -1))
+        if epoch < 0 or not 0 <= cursor < len(self):
+            raise ValueError(f"invalid sampler epoch/cursor: {epoch}/{cursor}")
+        self.epoch = epoch
+        self.batch_cursor = cursor
+
+
+EXACT_RESUME_VERSION = 2
+EXACT_RUN_CONTRACT_VERSION = 1
+
+# These only control how long/where the already-defined run is executed. They
+# cannot change the next stochastic optimizer update and therefore are allowed
+# to differ when an exact run is continued.
+_EXACT_RUN_OPERATIONAL_ARGS = {
+    "steps",
+    "save",
+    "save_every",
+    "resume",
+    "resume_exact",
+    # Content/config identity is recorded separately, so an identical external
+    # metric checkpoint copied to another filename is still the same input.
+    "metric_visual_checkpoint",
+    "mtvj_roi_checkpoint",
+    # One-shot initialization migration.  The resulting head constructor,
+    # weights and content identity are checkpointed, so replaying this flag is
+    # neither necessary nor allowed during an exact continuation.
+    "replace_mtvj_metric_head_from_external",
+    "data",
+}
+
+
+def _normalize_contract_value(value):
+    """Convert runtime objects into deterministic weights-only-safe values."""
+    if isinstance(value, Path):
+        return str(value.expanduser().resolve(strict=False))
+    if isinstance(value, dict):
+        return {
+            str(key): _normalize_contract_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_normalize_contract_value(item) for item in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, (torch.dtype, torch.device)):
+        return str(value)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise TypeError(
+        f"unsupported exact-run contract value {type(value).__name__}: {value!r}"
+    )
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _sampled_file_identity(path: Path) -> dict:
+    """Cheap identity for referenced JPEG containers, honestly marked sampled.
+
+    The windows payload itself gets a full SHA-256.  Its referenced longtraj
+    containers can total tens of GiB, so we combine exact stat metadata with
+    deterministic beginning/middle/end samples instead of pretending to have
+    hashed every JPEG byte.
+    """
+    resolved = path.expanduser().resolve(strict=True)
+    stat = resolved.stat()
+    block_bytes = 256 * 1024
+    if stat.st_size <= 3 * block_bytes:
+        offsets = [0]
+    else:
+        offsets = [0, max(0, (stat.st_size - block_bytes) // 2), stat.st_size - block_bytes]
+    digest = hashlib.sha256()
+    with resolved.open("rb") as stream:
+        for offset in offsets:
+            stream.seek(offset)
+            block = stream.read(block_bytes)
+            digest.update(int(offset).to_bytes(8, "little", signed=False))
+            digest.update(block)
+    return {
+        "path": str(resolved),
+        "size_bytes": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+        "sampled_sha256": digest.hexdigest(),
+        "sample_offsets": offsets,
+        "sample_bytes": block_bytes,
+    }
+
+
+def _payload_schema(payload: dict) -> dict:
+    """Record the explicit tensor/content schema protected by the file hash."""
+    tensors = {}
+    non_tensors = {}
+    for key, value in sorted(payload.items()):
+        if isinstance(value, Tensor):
+            tensors[key] = {
+                "shape": list(value.shape),
+                "dtype": str(value.dtype),
+                "numel": int(value.numel()),
+            }
+        elif key == "metadata" and isinstance(value, dict):
+            # Metadata is small and changes data semantics (task names, strides,
+            # horizon); store it explicitly as well as protecting it by SHA-256.
+            non_tensors[key] = _normalize_contract_value(value)
+        elif isinstance(value, (list, tuple)):
+            non_tensors[key] = {
+                "container": type(value).__name__,
+                "length": len(value),
+            }
+        else:
+            non_tensors[key] = {"type": type(value).__name__}
+    return {"tensors": tensors, "non_tensors": non_tensors}
+
+
+def build_dataset_content_identity(
+    path: str | Path,
+    payload: dict,
+    *,
+    longtraj_dir: str | Path | None = None,
+) -> dict:
+    """Strong identity for the MT-VJ windows payload, computed once per run.
+
+    ``full_file_sha256`` covers actions, masks, frame references, language and
+    metadata in the actual serialized payload—not only sampler task/episode IDs.
+    Referenced longtraj JPEG containers use a clearly labelled sampled identity
+    plus exact path/stat metadata to keep startup bounded.
+    """
+    resolved = Path(path).expanduser().resolve(strict=True)
+    before = resolved.stat()
+    digest = _sha256_file(resolved)
+    after = resolved.stat()
+    before_key = (before.st_size, before.st_mtime_ns)
+    after_key = (after.st_size, after.st_mtime_ns)
+    if before_key != after_key:
+        raise RuntimeError(f"dataset changed while fingerprinting: {resolved}")
+
+    sources = []
+    refs = payload.get("frame_refs")
+    if isinstance(refs, (list, tuple)) and refs:
+        root = (
+            Path(longtraj_dir).expanduser().resolve(strict=False)
+            if longtraj_dir is not None
+            else resolved.parent
+        )
+        task_files = sorted({str(ref[0]) for ref in refs})
+        for task_file in task_files:
+            raw = Path(task_file)
+            if raw.is_absolute():
+                source = raw
+            elif raw.suffix == ".pt" and (root / raw).exists():
+                source = root / raw
+            else:
+                source = root / f"metaworld_longtraj_{task_file}.pt"
+            if source.exists():
+                sources.append(_sampled_file_identity(source))
+            else:
+                sources.append(
+                    {
+                        "path": str(source.resolve(strict=False)),
+                        "missing": True,
+                    }
+                )
+
+    return {
+        "identity_algorithm": "full_payload_sha256+referenced_source_sample_v1",
+        "resolved_path": str(resolved),
+        "size_bytes": int(after.st_size),
+        "mtime_ns": int(after.st_mtime_ns),
+        "full_file_sha256": digest,
+        "payload_schema": _payload_schema(payload),
+        "referenced_sources": sources,
+    }
+
+
+def _optimizer_contract(optimizer: torch.optim.Optimizer) -> dict:
+    kind = "sam_adamw" if isinstance(optimizer, SAM) else "adamw"
+    groups = []
+    for group in optimizer.param_groups:
+        parameters = list(group["params"])
+        groups.append(
+            {
+                "lr": float(group["lr"]),
+                "weight_decay": float(group.get("weight_decay", 0.0)),
+                "betas": list(group.get("betas", ())),
+                "eps": float(group.get("eps", 0.0)),
+                "amsgrad": bool(group.get("amsgrad", False)),
+                "rho": float(group.get("rho", 0.0)),
+                "parameter_count": len(parameters),
+                "parameter_numel": int(sum(parameter.numel() for parameter in parameters)),
+                "parameter_signature": [
+                    {
+                        "shape": list(parameter.shape),
+                        "dtype": str(parameter.dtype),
+                        "requires_grad": bool(parameter.requires_grad),
+                    }
+                    for parameter in parameters
+                ],
+            }
+        )
+    return {"kind": kind, "groups": groups}
+
+
+def build_exact_run_contract(
+    args: argparse.Namespace,
+    config,
+    optimizer: torch.optim.Optimizer,
+    sampler: TaskLocalityWeightedSampler | None,
+    metric_head: nn.Module | None = None,
+    roi_head: nn.Module | None = None,
+) -> dict:
+    """Freeze every current MT-VJ CLI/data/objective semantic for exact resume."""
+    argument_semantics = {
+        key: _normalize_contract_value(value)
+        for key, value in sorted(vars(args).items())
+        if key not in _EXACT_RUN_OPERATIONAL_ARGS
+    }
+    metric_config = (
+        _mtvj_metric_head_constructor_config(metric_head)
+        if metric_head is not None
+        else None
+    )
+    metric_identity = (
+        getattr(metric_head, "_mtvj_external_checkpoint_identity", None)
+        if metric_head is not None
+        else None
+    )
+    if isinstance(metric_identity, dict):
+        # Identity is content-based; path spelling is not a model semantic.
+        metric_identity = {
+            key: metric_identity.get(key)
+            for key in ("sha256", "size_bytes", "contract")
+        }
+    roi_identity = (
+        getattr(roi_head, "_mtvj_roi_checkpoint_identity", None)
+        if roi_head is not None
+        else None
+    )
+    if isinstance(roi_identity, dict):
+        roi_identity = {
+            key: roi_identity.get(key)
+            for key in ("sha256", "size_bytes", "contract")
+        }
+    return _normalize_contract_value(
+        {
+            "contract_version": EXACT_RUN_CONTRACT_VERSION,
+            "data_identity": getattr(sampler, "dataset_content_identity", None),
+            "arguments": argument_semantics,
+            "model_config": dict(getattr(config, "__dict__", {})),
+            "optimizer": _optimizer_contract(optimizer),
+            "mtvj": {
+                "metric_head_config": metric_config,
+                "metric_checkpoint_identity": metric_identity,
+                "metric_head_joint_trained": bool(
+                    getattr(args, "mtvj_train_metric_head", False)
+                ),
+                "relation_joint_trained": bool(
+                    getattr(args, "mtvj_train_relation", False)
+                ),
+                "metric_state_source": getattr(
+                    metric_head, "_mtvj_metric_state_source", None
+                ),
+                "metric_contract_version": getattr(
+                    metric_head, "_mtvj_metric_contract_version", None
+                ),
+                "roi_config": getattr(roi_head, "_mtvj_roi_config", None),
+                "roi_checkpoint_identity": roi_identity,
+            },
+        }
+    )
+
+
+def exact_run_contract_mismatches(saved: dict, current: dict) -> list[tuple[str, object, object]]:
+    """Return deterministic leaf-level differences for a clear failure message."""
+    mismatches: list[tuple[str, object, object]] = []
+    missing = "<missing>"
+
+    def compare(left, right, path: str) -> None:
+        if isinstance(left, dict) and isinstance(right, dict):
+            for key in sorted(set(left) | set(right)):
+                child = f"{path}.{key}" if path else str(key)
+                if key not in left:
+                    mismatches.append((child, missing, right[key]))
+                elif key not in right:
+                    mismatches.append((child, left[key], missing))
+                else:
+                    compare(left[key], right[key], child)
+            return
+        if isinstance(left, list) and isinstance(right, list):
+            if len(left) != len(right):
+                mismatches.append((f"{path}.length", len(left), len(right)))
+                return
+            for index, (left_item, right_item) in enumerate(zip(left, right, strict=True)):
+                compare(left_item, right_item, f"{path}[{index}]")
+            return
+        if type(left) is not type(right) or left != right:
+            mismatches.append((path, left, right))
+
+    compare(_normalize_contract_value(saved), _normalize_contract_value(current), "")
+    return mismatches
+
+
+def validate_exact_run_contract(saved: dict | None, current: dict) -> None:
+    if saved is None:
+        raise ValueError(
+            "--resume-exact checkpoint is missing exact_run_contract; "
+            "use --resume for legacy weights-only loading"
+        )
+    mismatches = exact_run_contract_mismatches(saved, current)
+    if mismatches:
+        details = "; ".join(
+            f"{path}: checkpoint={left!r}, runtime={right!r}"
+            for path, left, right in mismatches[:12]
+        )
+        if len(mismatches) > 12:
+            details += f"; ... and {len(mismatches) - 12} more"
+        raise ValueError(f"--resume-exact exact_run_contract mismatch: {details}")
+
+
+def capture_rng_state(*, include_cuda: bool = True) -> dict:
+    """Capture global RNGs using only weights-only-safe primitives/tensors."""
+    numpy_state = np.random.get_state()
+    return {
+        "python": random.getstate(),
+        "numpy": {
+            "bit_generator": numpy_state[0],
+            "state": torch.from_numpy(numpy_state[1].copy()),
+            "position": int(numpy_state[2]),
+            "has_gauss": int(numpy_state[3]),
+            "cached_gaussian": float(numpy_state[4]),
+        },
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": (
+            torch.cuda.get_rng_state_all()
+            if include_cuda and torch.cuda.is_available()
+            else []
+        ),
+    }
+
+
+def restore_rng_state(state: dict) -> None:
+    """Restore RNGs captured by :func:`capture_rng_state`."""
+    required = {"python", "numpy", "torch_cpu", "torch_cuda"}
+    missing = required - set(state)
+    if missing:
+        raise ValueError(f"exact resume RNG state missing keys: {sorted(missing)}")
+    random.setstate(state["python"])
+    numpy_state = state["numpy"]
+    np.random.set_state(
+        (
+            numpy_state["bit_generator"],
+            numpy_state["state"].cpu().numpy().copy(),
+            int(numpy_state["position"]),
+            int(numpy_state["has_gauss"]),
+            float(numpy_state["cached_gaussian"]),
+        )
+    )
+    torch.set_rng_state(state["torch_cpu"].cpu())
+    cuda_states = state["torch_cuda"]
+    if cuda_states:
+        if not torch.cuda.is_available():
+            raise ValueError("exact resume checkpoint contains CUDA RNG but CUDA is unavailable")
+        if len(cuda_states) != torch.cuda.device_count():
+            raise ValueError(
+                "exact resume CUDA device count mismatch: "
+                f"checkpoint={len(cuda_states)} runtime={torch.cuda.device_count()}"
+            )
+        torch.cuda.set_rng_state_all([value.cpu() for value in cuda_states])
+
+
+def exact_optimizer_state_dict(optimizer: torch.optim.Optimizer) -> dict:
+    """Serialize AdamW, including SAM's real base optimizer state."""
+    if isinstance(optimizer, SAM):
+        if not isinstance(optimizer.base_optimizer, torch.optim.AdamW):
+            raise TypeError("--resume-exact only supports SAM with an AdamW base optimizer")
+        if any("e_w" in value for value in optimizer.state.values()):
+            raise RuntimeError("cannot checkpoint exact state between SAM first_step/second_step")
+        return {
+            "kind": "sam_adamw",
+            "state_dict": optimizer.base_optimizer.state_dict(),
+            "rho": [float(group["rho"]) for group in optimizer.param_groups],
+        }
+    if not isinstance(optimizer, torch.optim.AdamW):
+        raise TypeError("--resume-exact currently supports AdamW (or SAM over AdamW) only")
+    return {"kind": "adamw", "state_dict": optimizer.state_dict()}
+
+
+def restore_exact_optimizer_state(
+    optimizer: torch.optim.Optimizer,
+    saved: dict,
+) -> None:
+    """Strictly restore an optimizer produced by :func:`exact_optimizer_state_dict`."""
+    expected_kind = "sam_adamw" if isinstance(optimizer, SAM) else "adamw"
+    if saved.get("kind") != expected_kind:
+        raise ValueError(
+            "exact resume optimizer mismatch: "
+            f"checkpoint={saved.get('kind')!r} runtime={expected_kind!r}"
+        )
+    if isinstance(optimizer, SAM):
+        saved_rho = [float(value) for value in saved.get("rho", [])]
+        runtime_rho = [float(group["rho"]) for group in optimizer.param_groups]
+        if saved_rho != runtime_rho:
+            raise ValueError(
+                f"exact resume SAM rho mismatch: {saved_rho!r} != {runtime_rho!r}"
+            )
+        optimizer.base_optimizer.load_state_dict(saved["state_dict"])
+        optimizer.param_groups = optimizer.base_optimizer.param_groups
+    else:
+        if not isinstance(optimizer, torch.optim.AdamW):
+            raise TypeError("--resume-exact currently supports AdamW only")
+        optimizer.load_state_dict(saved["state_dict"])
+
+
+def build_exact_resume_state(
+    optimizer: torch.optim.Optimizer,
+    global_step: int,
+    sampler: TaskLocalityWeightedSampler | None,
+    exact_run_contract: dict,
+) -> dict:
+    """Build the training-state portion of an exact-resumable checkpoint."""
+    if global_step < 0:
+        raise ValueError("global_step must be non-negative")
+    uses_cuda = any(
+        parameter.is_cuda
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    )
+    return {
+        "exact_resume_version": EXACT_RESUME_VERSION,
+        "global_step": int(global_step),
+        "optimizer_state": exact_optimizer_state_dict(optimizer),
+        "sampler_state": sampler.state_dict() if sampler is not None else None,
+        "rng_state": capture_rng_state(include_cuda=uses_cuda),
+        "exact_run_contract": _normalize_contract_value(exact_run_contract),
+    }
+
+
+def restore_exact_resume_state(
+    checkpoint: dict,
+    optimizer: torch.optim.Optimizer,
+    sampler: TaskLocalityWeightedSampler | None,
+    *,
+    runtime_exact_run_contract: dict | None = None,
+    restore_rng: bool = True,
+) -> int:
+    """Restore optimizer/sampler and optionally RNG; return completed updates."""
+    required = {
+        "exact_resume_version",
+        "global_step",
+        "optimizer_state",
+        "sampler_state",
+        "rng_state",
+        "exact_run_contract",
+    }
+    missing = required - set(checkpoint)
+    if missing:
+        raise ValueError(
+            "--resume-exact requires a new exact checkpoint; missing keys: "
+            f"{sorted(missing)}. Use --resume for legacy weights-only loading."
+        )
+    if checkpoint["exact_resume_version"] != EXACT_RESUME_VERSION:
+        raise ValueError(
+            "unsupported exact resume version: "
+            f"{checkpoint['exact_resume_version']} != {EXACT_RESUME_VERSION}"
+        )
+    if runtime_exact_run_contract is not None:
+        # Contract comparison intentionally precedes every mutable restore below.
+        validate_exact_run_contract(
+            checkpoint["exact_run_contract"], runtime_exact_run_contract
+        )
+    saved_sampler = checkpoint["sampler_state"]
+    if sampler is None or saved_sampler is None:
+        raise ValueError("--resume-exact requires TaskLocalityWeightedSampler state")
+    restore_exact_optimizer_state(optimizer, checkpoint["optimizer_state"])
+    sampler.load_state_dict(saved_sampler)
+    global_step = int(checkpoint["global_step"])
+    if global_step < 0:
+        raise ValueError(f"invalid exact checkpoint global_step: {global_step}")
+    if restore_rng:
+        restore_rng_state(checkpoint["rng_state"])
+    return global_step
 
 
 def synthetic_sequence(
@@ -616,6 +1403,140 @@ def move_batch(batch: dict[str, Tensor], device: torch.device) -> dict[str, Tens
         key: value.to(device) if isinstance(value, Tensor) else value
         for key, value in batch.items()
     }
+
+
+def _enable_optional_action_masks(dataset: Dataset) -> None:
+    """Expose optional action masks through all dataset adapters.
+
+    ``LongTrajFramesDataset`` and ``LiveVJEPADataset`` build their item dicts from
+    a ``REQUIRED`` tuple.  Keep those classes backward compatible and extend the
+    tuple only for payloads that actually contain a mask.
+    """
+    payload = getattr(dataset, "payload", None)
+    if not isinstance(payload, dict):
+        return
+    present = tuple(key for key in ACTION_MASK_KEYS if key in payload)
+    if not present:
+        return
+    length = len(dataset)
+    for key in present:
+        value = payload[key]
+        if not isinstance(value, Tensor) or value.ndim == 0 or value.shape[0] != length:
+            raise ValueError(
+                f"{key} must be a tensor with first dimension equal to dataset length {length}"
+            )
+    source = getattr(dataset, "_inner", dataset)
+    required = getattr(source, "REQUIRED", None)
+    if required is not None:
+        source.REQUIRED = tuple(dict.fromkeys((*required, *present)))
+    print(f"action masks enabled: {', '.join(present)}", flush=True)
+
+
+def _expand_action_mask(mask: Tensor, reference: Tensor, name: str) -> Tensor:
+    """Broadcast a common action/horizon mask shape to ``[B,T,H,A]``."""
+    if reference.ndim != 4:
+        raise ValueError("flow tensors must have shape [batch, sequence, horizon, action_dim]")
+    batch, sequence, horizon, action_dim = reference.shape
+    shape = tuple(mask.shape)
+    if shape == tuple(reference.shape):
+        expanded = mask
+    elif shape == (batch, sequence, horizon):
+        expanded = mask.unsqueeze(-1)
+    elif shape == (batch, sequence):
+        expanded = mask[:, :, None, None]
+    elif shape == (batch, horizon):
+        expanded = mask[:, None, :, None]
+    elif shape == (sequence, horizon):
+        expanded = mask[None, :, :, None]
+    elif shape == (horizon,):
+        expanded = mask[None, None, :, None]
+    else:
+        raise ValueError(
+            f"{name} shape {shape} cannot broadcast to flow tensor "
+            f"{(batch, sequence, horizon, action_dim)}"
+        )
+    expanded = expanded.to(device=reference.device, dtype=reference.dtype).expand_as(reference)
+    if not bool(torch.isfinite(expanded).all()) or bool((expanded < 0).any()):
+        raise ValueError(f"{name} must contain finite non-negative weights")
+    return expanded
+
+
+def masked_flow_matching_loss(
+    predicted_velocity: Tensor,
+    target_velocity: Tensor,
+    batch: dict | None = None,
+    *,
+    prefix_steps: int = 6,
+    prefix_weight: float = 1.0,
+    tail_weight: float = 1.0,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Flow MSE with optional validity masks and prefix/tail weighting.
+
+    Returns ``(training_loss, raw_prefix_mse, raw_tail_mse)``.  The diagnostic
+    terms use validity masks but intentionally exclude prefix/tail scalar
+    weights, so changing ``tail_weight`` does not hide tail quality.
+    """
+    if predicted_velocity.shape != target_velocity.shape or predicted_velocity.ndim != 4:
+        raise ValueError(
+            "predicted_velocity and target_velocity must share shape "
+            "[batch, sequence, horizon, action_dim]"
+        )
+    if prefix_steps <= 0:
+        raise ValueError("prefix_steps must be positive")
+    if prefix_weight < 0.0 or tail_weight < 0.0:
+        raise ValueError("prefix/tail flow weights must be non-negative")
+
+    squared_error = (predicted_velocity - target_velocity).square()
+    validity = torch.ones_like(squared_error)
+    if batch is not None:
+        for key in ACTION_MASK_KEYS:
+            mask = batch.get(key)
+            if mask is not None:
+                validity = validity * _expand_action_mask(mask, squared_error, key)
+
+    split = min(prefix_steps, squared_error.shape[-2])
+
+    def region_mean(error: Tensor, weight: Tensor) -> Tensor:
+        denominator = weight.sum()
+        if not bool(denominator > 0):
+            return error.new_zeros(())
+        return (error * weight).sum() / denominator
+
+    prefix_loss = region_mean(
+        squared_error[..., :split, :], validity[..., :split, :]
+    )
+    tail_loss = region_mean(
+        squared_error[..., split:, :], validity[..., split:, :]
+    )
+    horizon_weights = squared_error.new_full((squared_error.shape[-2],), tail_weight)
+    horizon_weights[:split] = prefix_weight
+    element_weights = validity * horizon_weights.view(1, 1, -1, 1)
+    denominator = element_weights.sum()
+    if not bool(denominator > 0):
+        raise ValueError("flow loss has zero valid weighted action elements")
+
+    # Preserve the exact legacy reduction when no masking/reweighting is active.
+    has_mask = batch is not None and any(batch.get(key) is not None for key in ACTION_MASK_KEYS)
+    if not has_mask and prefix_weight == 1.0 and tail_weight == 1.0:
+        loss = F.mse_loss(predicted_velocity, target_velocity)
+    else:
+        loss = (squared_error * element_weights).sum() / denominator
+    return loss, prefix_loss, tail_loss
+
+
+def effective_action_valid_fraction(batch: dict | None, reference: Tensor) -> Tensor:
+    """Return the supervised fraction after combining all optional masks.
+
+    Reporting this next to loss prevents a lower number caused by masking bad
+    H48 targets from being mistaken for genuine policy improvement.
+    """
+    validity = torch.ones_like(reference)
+    if batch is not None:
+        for key in ACTION_MASK_KEYS:
+            mask = batch.get(key)
+            if mask is not None:
+                validity = validity * _expand_action_mask(mask, reference, key)
+    return validity.mean()
 
 
 def ensure_sequence(
@@ -847,60 +1768,299 @@ def _load_mtvj_metric_checkpoint(
     path: Path,
     device: torch.device,
     config: VACompoundConfig,
+    *,
+    train_relation: bool = False,
+    train_metric_head: bool = False,
+    policy_relation_state: dict[str, Tensor] | None = None,
+    policy_metric_state: dict[str, Tensor] | None = None,
+    policy_metric_config: dict | None = None,
+    policy_metric_identity: dict | None = None,
+    policy_metric_migration: dict | None = None,
+    policy_training_contract: dict | None = None,
+    exact_resume: bool = False,
+    replace_metric_head_from_external: bool = False,
 ) -> tuple[nn.Module, nn.Module]:
-    """MT-VJ（契约 §2/§6）：加载并冻结 LanguageMetricField + RelationStateEncoder。
+    """MT-VJ（契约 §2/§6）：加载 metric head 与 relation encoder。
 
     checkpoint 契约：``{"config": {...}, "metric_head": state_dict,
     "relation_encoder": state_dict, "contract": "mt_vj_metric_field_v1"}``。
     ctor 参数从 checkpoint config 按签名过滤注入（缺省用契约默认值）；
-    两模块置 eval + requires_grad_(False)（冻结，eval/no_grad）。
+    V-JEPA 始终冻结；metric localization path 与 relation encoder 可分别由
+    动作 loss 以独立小学习率联合微调。
     """
-    import inspect
-
     from va_compound.metric_visual_head import LanguageMetricField, RelationStateEncoder
 
     ckpt = torch.load(path, map_location="cpu", weights_only=True)
-    for key in ("metric_head", "relation_encoder"):
+    policy_contract = policy_training_contract or {}
+    if exact_resume and replace_metric_head_from_external:
+        raise ValueError(
+            "--replace-mtvj-metric-head-from-external 禁止与 --resume-exact 同时使用"
+        )
+    if replace_metric_head_from_external and policy_relation_state is None:
+        raise ValueError(
+            "--replace-mtvj-metric-head-from-external requires the --resume "
+            "checkpoint to contain mtvj_relation_encoder；迁移只替换 metric head，"
+            "不会随机重建主策略的 8D relation encoder"
+        )
+    if replace_metric_head_from_external and not train_relation:
+        raise ValueError(
+            "visibility-gated metric-state migration preserves old relation weights "
+            "only as a warm start；requires train_relation=True"
+        )
+    if (
+        policy_contract.get("metric_head_checkpointed") is True
+        and not replace_metric_head_from_external
+    ):
+        missing_main = [
+            key
+            for key, value in (
+                ("mtvj_metric_head", policy_metric_state),
+                ("mtvj_metric_head_config", policy_metric_config),
+                ("mtvj_metric_checkpoint_identity", policy_metric_identity),
+            )
+            if value is None
+        ]
+        if missing_main:
+            raise ValueError(
+                "resume checkpoint 声明 metric_head_checkpointed=True，"
+                f"但缺少 {missing_main}"
+            )
+    if not replace_metric_head_from_external and policy_metric_state is not None and (
+        policy_metric_config is None or policy_metric_identity is None
+    ):
+        raise ValueError(
+            "主 checkpoint 含 mtvj_metric_head，但缺少完整构造配置或外部来源指纹；"
+            "拒绝用当前外部 checkpoint 猜测网络语义"
+        )
+    if (
+        not replace_metric_head_from_external
+        and policy_metric_config is not None
+        and policy_metric_state is None
+    ):
+        raise ValueError(
+            "主 checkpoint 含 mtvj_metric_head_config 但缺少 mtvj_metric_head"
+        )
+
+    required_external_states = []
+    if policy_metric_state is None or replace_metric_head_from_external:
+        required_external_states.append("metric_head")
+    if policy_relation_state is None:
+        required_external_states.append("relation_encoder")
+    for key in required_external_states:
         if key not in ckpt:
             raise ValueError(
                 f"--metric-visual-checkpoint {path} 缺少键 {key!r}（契约 §2）"
             )
     contract = ckpt.get("contract")
+    if (
+        replace_metric_head_from_external
+        and contract != "mt_vj_metric_field_v1"
+    ):
+        raise ValueError(
+            "显式 MT-VJ metric-head 迁移要求 external checkpoint contract="
+            f"'mt_vj_metric_field_v1'，实际为 {contract!r}"
+        )
     if contract is not None and contract != "mt_vj_metric_field_v1":
         raise ValueError(
             f"--metric-visual-checkpoint contract={contract!r} != "
             f"'mt_vj_metric_field_v1'（阶段 V checkpoint 不匹配）"
         )
-    ctor_config = ckpt.get("config") or {}
-
-    def ctor_kwargs(cls) -> dict:
-        return {
-            key: value
-            for key, value in ctor_config.items()
-            if key in inspect.signature(cls.__init__).parameters and key != "self"
+    external_config = ckpt.get("config")
+    external_ctor_config = _canonical_mtvj_metric_head_config(
+        external_config,
+        require_complete=replace_metric_head_from_external,
+    )
+    external_visibility_proven = (
+        isinstance(external_config, dict)
+        and external_config.get("loc_only") is False
+        and external_config.get("relation_encoder_trained") is True
+        and int(external_config.get("training_state_version", 0)) >= 2
+        and int(external_config.get("steps_done", 0)) > 0
+    )
+    if policy_metric_state is None and not external_visibility_proven:
+        raise ValueError(
+            "MT-VJ visibility-gated runtime requires an external checkpoint that "
+            "proves visibility training (loc_only=False, "
+            "relation_encoder_trained=True, training_state_version>=2, "
+            "steps_done>0)"
+        )
+    if replace_metric_head_from_external or policy_relation_state is None:
+        runtime_metric_source = MTVJ_METRIC_STATE_SOURCE
+        runtime_metric_version = MTVJ_METRIC_CONTRACT_VERSION
+    else:
+        runtime_metric_source = policy_contract.get(
+            "metric_state_source", MTVJ_LEGACY_METRIC_STATE_SOURCE
+        )
+        runtime_metric_version = int(
+            policy_contract.get(
+                "metric_contract_version", MTVJ_LEGACY_METRIC_CONTRACT_VERSION
+            )
+        )
+        allowed_runtime = {
+            (MTVJ_LEGACY_METRIC_STATE_SOURCE, MTVJ_LEGACY_METRIC_CONTRACT_VERSION),
+            (MTVJ_METRIC_STATE_SOURCE, MTVJ_METRIC_CONTRACT_VERSION),
         }
+        if (runtime_metric_source, runtime_metric_version) not in allowed_runtime:
+            raise ValueError(
+                "主 checkpoint 的 MT-VJ metric-state 契约未知："
+                f"source={runtime_metric_source!r}, version={runtime_metric_version}"
+            )
+    required_metric_tasks: tuple[str, ...] = ()
+    if replace_metric_head_from_external:
+        from scripts.build_longtraj_features import ENV_TO_TASK
 
-    metric_head = LanguageMetricField(**ctor_kwargs(LanguageMetricField)).to(device)
-    metric_head.load_state_dict(ckpt["metric_head"])
-    # metric tokens 输入改用 v4 实证定位 out.p（[B, R=4, 2] = 8 维）替代 loc-only
+        required_metric_tasks = tuple(sorted(ENV_TO_TASK))
+        external_tasks = (
+            external_config.get("tasks")
+            if isinstance(external_config, dict)
+            else None
+        )
+        external_task_set = (
+            {str(task) for task in external_tasks}
+            if isinstance(external_tasks, (list, tuple))
+            else set()
+        )
+        missing_tasks = sorted(set(required_metric_tasks) - external_task_set)
+        if missing_tasks:
+            raise ValueError(
+                "显式 MT-VJ metric-head 迁移要求 external checkpoint "
+                "config.tasks 覆盖全部 49 个 MetaWorld 任务；"
+                f"缺少 {missing_tasks}（实际为 {external_tasks!r}）"
+            )
+        if not external_visibility_proven:
+            raise ValueError(
+                "显式 MT-VJ metric-head 迁移要求 checkpoint 明确证明 visibility "
+                "head 已训练：loc_only=False, relation_encoder_trained=True, "
+                "training_state_version>=2, steps_done>0；拒绝把 loc-only/random "
+                f"vis_mlp 接入动作门控（config={external_config!r}）"
+            )
+    current_identity = _mtvj_metric_checkpoint_identity(path, ckpt)
+    migration_record = None
+    if replace_metric_head_from_external:
+        ctor_config = external_ctor_config
+        metric_state = ckpt["metric_head"]
+        source_identity = current_identity
+        metric_source = "external metric checkpoint (explicit all-task migration)"
+        migration_record = {
+            "contract_version": 3,
+            "kind": "replace_mtvj_metric_head_from_external",
+            "metric_state_transition": {
+                "from": policy_contract.get("metric_state_source"),
+                "to": MTVJ_METRIC_STATE_SOURCE,
+            },
+            "relation_encoder_initialization": "policy_warm_start_requires_finetune",
+            "required_tasks": list(required_metric_tasks),
+            "replaced_policy_metric_head": policy_metric_state is not None,
+            "source_checkpoint_identity": dict(current_identity),
+            "previous_policy_checkpoint_identity": (
+                dict(policy_metric_identity)
+                if isinstance(policy_metric_identity, dict)
+                else None
+            ),
+        }
+    elif policy_metric_state is not None:
+        ctor_config = _canonical_mtvj_metric_head_config(
+            policy_metric_config,
+            require_complete=True,
+        )
+        config_mismatch = (
+            {"checkpoint": ctor_config, "external": external_ctor_config}
+            if ctor_config != external_ctor_config
+            else None
+        )
+        identity_mismatch = _mtvj_metric_identity_mismatches(
+            policy_metric_identity or {}, current_identity
+        )
+        if config_mismatch or identity_mismatch:
+            detail = (
+                f"constructor={config_mismatch}, fingerprint={identity_mismatch}"
+            )
+            if exact_resume:
+                raise ValueError(
+                    "--resume-exact 的 MT-VJ 外部 checkpoint 与保存时不一致："
+                    f"{detail}"
+                )
+            print(
+                "WARNING: --resume 检测到外部 MT-VJ checkpoint 已变化；"
+                "本次严格使用主 checkpoint 的构造配置和权重，不使用变化后的外部语义。"
+                f" {detail}",
+                flush=True,
+            )
+        metric_state = policy_metric_state
+        source_identity = dict(policy_metric_identity or {})
+        metric_source = "main policy checkpoint"
+        if isinstance(policy_metric_migration, dict):
+            migration_record = dict(policy_metric_migration)
+    else:
+        ctor_config = external_ctor_config
+        metric_state = ckpt["metric_head"]
+        source_identity = current_identity
+        metric_source = "external metric checkpoint (legacy migration)"
+
+    metric_head = LanguageMetricField(**ctor_config).to(device)
+    try:
+        metric_head.load_state_dict(metric_state, strict=True)
+    except RuntimeError as exc:
+        raise ValueError(
+            "MT-VJ metric head 与保存的构造配置不兼容；"
+            f"source={metric_source}: {exc}"
+        ) from exc
+    metric_head._mtvj_constructor_config = dict(ctor_config)
+    metric_head._mtvj_external_checkpoint_identity = dict(source_identity)
+    metric_head._mtvj_current_external_checkpoint_identity = dict(current_identity)
+    metric_head._mtvj_metric_head_source = metric_source
+    metric_head._mtvj_metric_head_migration = migration_record
+    metric_head._mtvj_metric_state_source = runtime_metric_source
+    metric_head._mtvj_metric_contract_version = runtime_metric_version
+    # metric tokens 保持 8 维，但用可见度门控定位坐标，避免把未监督/不可见角色
+    # 的任意坐标注入动作策略。
     # 下未训练的 out.relation；RelationStateEncoder 以 state_dim=8 重建——旧权重是
     # loc-only 随机初始化且从未训练（Codex v4 审查 P0-1），维度不匹配时直接丢弃。
-    relation_encoder = RelationStateEncoder(
-        state_dim=8,
-        d_model=int(ctor_config.get("d_model", 512)),
-    ).to(device)
-    old_rel_sd = ckpt["relation_encoder"]
+    relation_d_model = (
+        int(config.hidden_dim)
+        if policy_relation_state is not None
+        else int((ckpt.get("config") or {}).get("d_model", 512))
+    )
+
+    def new_relation_encoder() -> nn.Module:
+        return RelationStateEncoder(state_dim=8, d_model=relation_d_model).to(device)
+
+    relation_encoder = new_relation_encoder()
+    old_rel_sd = (
+        policy_relation_state
+        if policy_relation_state is not None
+        else ckpt["relation_encoder"]
+    )
     try:
-        relation_encoder.load_state_dict(old_rel_sd)
+        relation_encoder.load_state_dict(old_rel_sd, strict=True)
     except RuntimeError as e:
+        if policy_relation_state is not None:
+            raise ValueError(
+                "主 checkpoint 的 mtvj_relation_encoder 与 8D p_flat/"
+                f"hidden_dim={config.hidden_dim} 契约不兼容：{e}"
+            ) from e
+        # load_state_dict 可能在报 shape mismatch 前已拷贝兼容的 bias/norm；
+        # 必须重新构建，不能留下“半旧半新”的隐式状态。
+        relation_encoder = new_relation_encoder()
         print(
             f"[mtvj] relation_encoder state_dim 不兼容，丢弃旧随机权重重建 "
             f"（loc-only 下未训练，Codex P0-1）：{e}"
         )
-    for module in (metric_head, relation_encoder):
-        module.eval()
-        for parameter in module.parameters():
-            parameter.requires_grad_(False)
+    metric_head.train(train_metric_head)
+    for name, parameter in metric_head.named_parameters():
+        # The gated action state consumes out.p and out.visibility.  rel_mlp is
+        # still auxiliary-only and must not enter the action optimizer.
+        action_connected = not name.startswith("rel_mlp.")
+        if name == "temperature" and not metric_head.l2_norm:
+            action_connected = False
+        if name == "spatial_bias" and metric_head.freeze_bias:
+            action_connected = False
+        parameter.requires_grad_(train_metric_head and action_connected)
+    relation_encoder.train(train_relation)
+    for name, parameter in relation_encoder.named_parameters():
+        # recon 只有阶段 V 的重建辅助 loss 才会用到；动作前向不调用，
+        # 因此联合微调时仍冻结，避免“进 optimizer 但永远无梯度”。
+        parameter.requires_grad_(train_relation and not name.startswith("recon."))
     # metric_tokens [B, 2, d_model] 加入每层 action cross-attention（契约 §5）：
     # d_model 必须等于 VACompoundConfig.hidden_dim，启动即校验（fail-fast）。
     # 注意：metric tokens 输入已切换为 v4 定位 out.p（8 维），probe 用 state_dim=8。
@@ -922,14 +2082,41 @@ def _load_mtvj_metric_checkpoint(
             "（metric_tokens 加入每层 action cross-attention 需同维）"
         )
     print(
-        "mtvj: 冻结 metric head "
-        f"（params={sum(p.numel() for p in metric_head.parameters()):,}）"
-        "+ relation encoder "
+        f"mtvj: {'可训练定位路径' if train_metric_head else '冻结'} metric head "
+        f"（params={sum(p.numel() for p in metric_head.parameters()):,}，"
+        f"trainable={sum(p.numel() for p in metric_head.parameters() if p.requires_grad):,}）"
+        f" + {'可训练' if train_relation else '冻结'} relation encoder "
         f"（params={sum(p.numel() for p in relation_encoder.parameters()):,}）"
-        f" from {path}",
+        f"，trainable={sum(p.numel() for p in relation_encoder.parameters() if p.requires_grad):,}"
+        f" from {metric_source}；external={path}",
         flush=True,
     )
     return metric_head, relation_encoder
+
+
+def _mtvj_metric_deltas(g: Tensor) -> Tensor:
+    """Return causal metric deltas, with no invented predecessor at t=0."""
+    if g.ndim != 3:
+        raise ValueError(f"MT-VJ metric state must be [B, T, D], got {tuple(g.shape)}")
+    nu = torch.zeros_like(g)
+    if g.shape[1] > 1:
+        nu[:, 1:] = g[:, 1:] - g[:, :-1]
+    return nu
+
+
+def _mtvj_relation_tokens(g: Tensor, relation_encoder: nn.Module) -> Tensor:
+    """Encode metric positions while preserving every enabled upstream gradient."""
+    if g.ndim != 3:
+        raise ValueError(f"MT-VJ metric state must be [B, T, D], got {tuple(g.shape)}")
+    batch_size, sequence_length, _ = g.shape
+    nu = _mtvj_metric_deltas(g)
+    z_g, z_nu = relation_encoder(
+        g.reshape(batch_size * sequence_length, -1),
+        nu.reshape(batch_size * sequence_length, -1),
+    )
+    return torch.stack((z_g, z_nu), dim=1).reshape(
+        batch_size, sequence_length, 2, -1
+    )
 
 
 def _mtvj_online_encode(
@@ -939,6 +2126,10 @@ def _mtvj_online_encode(
     relation_encoder,
     batch: dict[str, Tensor],
     device: torch.device,
+    *,
+    train_metric_head: bool = False,
+    roi_head: nn.Module | None = None,
+    roi_alpha: float = 0.0,
 ) -> tuple[dict[int, Tensor], Tensor | None]:
     """MT-VJ（契约 §6）：frames [B, T, W, 384, 384, 3] uint8 → (dense_evidence, metric_tokens)。
 
@@ -947,9 +2138,9 @@ def _mtvj_online_encode(
       冻结 ``forward_hierarchical_dense``（fp16）→ 未池化全 patch（t→y→x 序），
       注入模型前以 fp32 交付（与既有 ``vision_tokens = encoded.float()`` 约定一致）；
     - metric_tokens：有 metric_head 时 ``[B, T, 2, d_model] = stack(z_g, z_nu)``，
-      g_t = metric head 输出 ``relation``（契约 §2，head 输出约定即 g_t），
+      g_t = ``out.p * out.visibility`` 展平后的8维可见度门控坐标，
       ν_t = g_t − g_{t−1}（首决策 ν≡0，与 servo g_prev 语义一致）。
-    全程 no_grad（骨干与 head 冻结）。
+    V-JEPA 始终 no_grad；metric localization path 与 relation encoder 可选联合微调。
     """
     if frames.ndim != 6 or frames.shape[-1] != 3:
         raise ValueError(
@@ -966,10 +2157,11 @@ def _mtvj_online_encode(
     # GPU 预处理（2026-08-10，Codex P1-13 优化 + phase2 卡死修复同款）：
     # preprocess_batch 的 CPU bicubic+antialias + list() 逐元素转换极慢（曾卡死），
     # 且 480 原尺寸帧由 GPU bicubic 缩到 384。与 phase2 编码路径同一实现。
+    # Preserve the original full-frame path byte-for-byte when ROI is disabled.
     frames_np = frames.cpu().numpy() if isinstance(frames, torch.Tensor) else frames
     b, t, w, hh, ww, _ = frames_np.shape
-    flat = np.ascontiguousarray(frames_np.reshape(b * t * w, hh, ww, 3))
-    video = torch.from_numpy(flat).permute(0, 3, 1, 2).float().div_(255.0).to(device)
+    flat_frames = np.ascontiguousarray(frames_np.reshape(b * t * w, hh, ww, 3))
+    video = torch.from_numpy(flat_frames).permute(0, 3, 1, 2).float().div_(255.0).to(device)
     if video.shape[-1] != IMAGE_SIZE or video.shape[-2] != IMAGE_SIZE:
         video = F.interpolate(
             video, size=(IMAGE_SIZE, IMAGE_SIZE), mode="bicubic",
@@ -978,6 +2170,11 @@ def _mtvj_online_encode(
     mean = torch.tensor((0.485, 0.456, 0.406), device=video.device).view(1, 3, 1, 1)
     std = torch.tensor((0.229, 0.224, 0.225), device=video.device).view(1, 3, 1, 1)
     inputs = ((video - mean) / std).reshape(b * t, w, 3, IMAGE_SIZE, IMAGE_SIZE)
+    raw_video = (
+        prepare_metric_roi_video(frames, device, image_size=None)
+        if roi_head is not None and roi_alpha != 0.0
+        else None
+    )
     with torch.no_grad():
         hierarchical = backbone.forward_hierarchical_dense(inputs, out_layers=(5, 11))
     dense_evidence = {
@@ -1009,28 +2206,219 @@ def _mtvj_online_encode(
             )
             for layer, ev in dense_evidence.items()
         }
-        with torch.no_grad():
-            out = metric_head(
+        def run_metric_head():
+            return metric_head(
                 flat[5],
                 flat[11],
                 language_hidden.repeat_interleave(sequence_length, dim=0),
                 language_mask.repeat_interleave(sequence_length, dim=0),
                 coords,
             )
-            # metric tokens 输入 = v4 实证定位 out.p（[B*T, R=4, 2] → [B, T, 8]），
-            # 替代 loc-only 下未训练的 out.relation（Codex v4 审查 P0-1：随机 relation
-            # 注入 = 随机语义；13.45px 反事实验证过的定位才是有效度量证据）。
-            g = out.p.reshape(batch_size, sequence_length, -1)  # [B, T, 8]
-            # ν_t = g_t − g_{t−1}；首决策 ν≡0（无 g_prev，与闭环语义一致）。
-            nu = g - torch.cat((torch.zeros_like(g[:, :1]), g[:, :-1]), dim=1)
-            z_g, z_nu = relation_encoder(
-                g.reshape(batch_size * sequence_length, -1),
-                nu.reshape(batch_size * sequence_length, -1),
+
+        if train_metric_head:
+            trainable = [p for p in metric_head.parameters() if p.requires_grad]
+            if not trainable:
+                raise ValueError(
+                    "--mtvj-train-metric-head 已开启但 metric head 没有可训练参数"
+                )
+            out = run_metric_head()
+            if roi_head is not None and roi_alpha != 0.0:
+                out.p, out.visibility = refine_metric_roi_positions(
+                    out.p,
+                    out.visibility,
+                    raw_video,
+                    backbone,
+                    roi_head,
+                    language_hidden.repeat_interleave(sequence_length, dim=0),
+                    language_mask.repeat_interleave(sequence_length, dim=0),
+                    coords,
+                    alpha=roi_alpha,
+                )
+            g = _mtvj_metric_positions(
+                out,
+                getattr(metric_head, "_mtvj_metric_state_source", MTVJ_LEGACY_METRIC_STATE_SOURCE),
+            ).reshape(
+                batch_size, sequence_length, -1
             )
-            metric_tokens = torch.stack((z_g, z_nu), dim=1).reshape(
-                batch_size, sequence_length, 2, -1
-            )
+        else:
+            with torch.no_grad():
+                out = run_metric_head()
+                if roi_head is not None and roi_alpha != 0.0:
+                    out.p, out.visibility = refine_metric_roi_positions(
+                        out.p,
+                        out.visibility,
+                        raw_video,
+                        backbone,
+                        roi_head,
+                        language_hidden.repeat_interleave(sequence_length, dim=0),
+                        language_mask.repeat_interleave(sequence_length, dim=0),
+                        coords,
+                        alpha=roi_alpha,
+                    )
+                g = _mtvj_metric_positions(
+                    out,
+                    getattr(metric_head, "_mtvj_metric_state_source", MTVJ_LEGACY_METRIC_STATE_SOURCE),
+                ).reshape(
+                    batch_size, sequence_length, -1
+                ).detach()
+        # metric tokens 输入 = 可见度门控定位坐标（[B*T, R=4, 2] → [B,T,8]），
+        # 替代 loc-only 下未训练的 out.relation（Codex v4 审查 P0-1：随机 relation
+        # 注入 = 随机语义；13.45px 反事实验证过的定位才是有效度量证据）。
+        # 不能放在上面的 no_grad 里：联合微调时动作 loss 需反传到
+        # relation encoder；冻结模式下参数和 g 都不求导，仍不会建图。
+        metric_tokens = _mtvj_relation_tokens(g, relation_encoder)
     return dense_evidence, metric_tokens
+
+
+def _mtvj_encode_frames_dense(
+    frames_np: np.ndarray, backbone: nn.Module, device: torch.device,
+) -> dict[int, Tensor]:
+    """MT-VJ 帧 → 冻结 V-JEPA dense evidence（与 _mtvj_online_encode 预处理同款：
+    GPU bicubic 384 + ImageNet 归一化 + forward_hierarchical_dense fp16 → {5,11}
+    fp32。输入 [B, T, W, 384, 384, 3] uint8；双数据流辅助批次复用。"""
+    from va_compound.live_vjepa import IMAGE_SIZE
+
+    b, t, w, hh, ww, _ = frames_np.shape
+    flat = np.ascontiguousarray(frames_np.reshape(b * t * w, hh, ww, 3))
+    video = torch.from_numpy(flat).permute(0, 3, 1, 2).float().div_(255.0).to(device)
+    if video.shape[-1] != IMAGE_SIZE or video.shape[-2] != IMAGE_SIZE:
+        video = F.interpolate(
+            video, size=(IMAGE_SIZE, IMAGE_SIZE), mode="bicubic",
+            align_corners=False, antialias=True,
+        )
+    mean = torch.tensor((0.485, 0.456, 0.406), device=video.device).view(1, 3, 1, 1)
+    std = torch.tensor((0.229, 0.224, 0.225), device=video.device).view(1, 3, 1, 1)
+    inputs = ((video - mean) / std).reshape(b * t, w, 3, IMAGE_SIZE, IMAGE_SIZE)
+    with torch.no_grad():
+        hierarchical = backbone.forward_hierarchical_dense(inputs, out_layers=(5, 11))
+    dense_evidence = {
+        layer: tokens.reshape(b, t, -1, tokens.shape[-1]).float()
+        for layer, tokens in hierarchical.items()
+    }
+    if sorted(dense_evidence) != [5, 11]:
+        raise ValueError(
+            f"forward_hierarchical_dense 应返回 {5, 11} 两层，"
+            f"got {sorted(dense_evidence)}"
+        )
+    return dense_evidence
+
+
+def _mtvj_visual_aux_loss(
+    backbone: nn.Module,
+    metric_head: nn.Module,
+    task: str,
+    rng: np.random.Generator,
+    aux_batch: int,
+    lang_aux_cache: dict,
+    device: torch.device,
+    loc_lambda: float,
+    vis_lambda: float,
+    sigma_px: float = 4.0,
+    hinge_margin: float = 0.1,
+) -> tuple[Tensor, dict]:
+    """双数据流视觉辅助批次（阶段 C，2026-08-12）：在线仿真真值（
+    make_metric_batch）→ 冻结 V-JEPA dense 编码 → metric head 前向 →
+    L_aux = λ_loc·(hinge + pos + offset) + λ_vis·BCE(visibility)。
+
+    - 只反传 metric head：V-JEPA no_grad、语言缓存为预计算张量（冻结）、
+      rel_mlp 无梯度（compute_losses loc_only=True 不产生 rel 项）。
+    - 语言用数据集预计算 hidden（metadata.tasks[tid] ↔ instruction_id=tid，
+      与 build_longtraj_features 的 task_language_t 一致），不加载 Qwen。
+    - 动作批次与辅助批次不需要同一帧：标准多数据集联合目标。
+    """
+    from prepare_metaworld_metric import make_metric_batch
+    from scripts.build_longtraj_features import ENV_TO_TASK
+    from train_metric_visual import compute_losses
+    from va_compound.live_vjepa import _dense_coords
+
+    sim = make_metric_batch(task, rng, aux_batch)
+    text = ENV_TO_TASK.get(task, task)
+    if text not in lang_aux_cache:
+        raise KeyError(
+            f"visual aux: 语言缓存缺少 {text!r}（instruction_id 映射不一致）；"
+            f"任务 {task!r} 无法取预计算 hidden"
+        )
+    head_dtype = next(metric_head.parameters()).dtype
+    hid, mask = lang_aux_cache[text]
+    lang_hidden = hid.repeat(aux_batch, 1, 1).to(device=device, dtype=head_dtype)
+    lang_mask = mask.repeat(aux_batch, 1).to(device=device)
+    frames_np = np.asarray(sim["frames"])  # [B, 4, 384, 384, 3] uint8
+    if frames_np.ndim != 5 or frames_np.shape[1] != 4:
+        raise ValueError(
+            f"make_metric_batch frames 必须 [B,4,384,384,3] uint8，"
+            f"got {tuple(frames_np.shape)}"
+        )
+    dense_evidence = _mtvj_encode_frames_dense(
+        frames_np[:, None, :, :, :, :], backbone, device  # [B, T=1, W=4, ...]
+    )
+    flat = {
+        layer: ev.reshape(aux_batch, -1, ev.shape[-1]).to(dtype=head_dtype)
+        for layer, ev in dense_evidence.items()
+    }
+    coords = torch.from_numpy(_dense_coords()).to(device=device, dtype=head_dtype)
+    out = metric_head(flat[5], flat[11], lang_hidden, lang_mask, coords)
+    keypoints = torch.from_numpy(sim["keypoints"]).to(device=device, dtype=head_dtype)
+    visibility = torch.from_numpy(sim["visibility"]).to(device=device, dtype=head_dtype)
+    loc_total, parts = compute_losses(
+        out, keypoints, visibility, torch.zeros_like(out.p),
+        sigma_px=sigma_px, loc_only=True, offset_supervision=True,
+        hinge=True, hinge_margin=hinge_margin,
+    )
+    vis_loss = F.binary_cross_entropy_with_logits(
+        out.visibility_logits, visibility, reduction="mean"
+    )
+    vis = visibility
+    radial_error_px = (out.p - keypoints).norm(dim=-1) * 384.0
+    rmse_px = torch.sqrt(
+        (radial_error_px.square() * vis).sum() / vis.sum().clamp_min(1.0)
+    )
+    loss_aux = loc_lambda * loc_total + vis_lambda * vis_loss
+    parts.update(
+        {
+            "loc": loc_total.item(),
+            "vis": vis_loss.item(),
+            "rmse_px": rmse_px.item(),
+            "total": loss_aux.item(),
+        }
+    )
+    return loss_aux, parts
+
+
+def _mtvj_visual_aux_sample(
+    task_descriptions: list[str],
+    task_weights: Tensor,
+    env_by_description: dict[str, str],
+    *,
+    seed: int,
+    global_step: int,
+) -> tuple[str, np.random.Generator]:
+    """Choose one reproducible auxiliary environment for a committed step.
+
+    Dataset metadata stores human-readable instructions while MetaWorld's data
+    generator accepts environment names.  Keeping that conversion here makes
+    the contract testable and prevents exact resumes from silently changing
+    the auxiliary sequence.
+    """
+    if not task_descriptions:
+        raise ValueError("visual aux: metadata.tasks is empty")
+    probabilities = torch.as_tensor(task_weights, dtype=torch.float64).cpu().numpy()
+    if probabilities.shape != (len(task_descriptions),):
+        raise ValueError(
+            "visual aux: task weight count does not match metadata.tasks: "
+            f"{probabilities.shape} vs {len(task_descriptions)}"
+        )
+    probabilities = probabilities / probabilities.sum()
+    rng = np.random.default_rng(
+        np.random.SeedSequence((int(seed), int(global_step), 0xA17))
+    )
+    description = task_descriptions[int(rng.choice(len(task_descriptions), p=probabilities))]
+    env_name = env_by_description.get(description)
+    if env_name is None:
+        raise KeyError(
+            "visual aux: metadata.tasks 描述无法映射到 MetaWorld 环境名："
+            f"{description!r}"
+        )
+    return env_name, rng
 
 
 def servo_correction_t0(
@@ -1184,7 +2572,7 @@ def rollout_policy(
         mtvj_kwargs = {}
         if dense_evidence is not None:
             # MT-VJ（契约 §5）：dense evidence 只做 K/V（1152 不进 VA 自注意力），
-            # metric_tokens（冻结 RelationStateEncoder 输出）加入 action
+            # metric_tokens（RelationStateEncoder 输出，可选联合微调）加入 action
             # cross-attention；None 时该步与旧路径完全一致。
             mtvj_kwargs["dense_evidence"] = {
                 layer: evidence[:, time_index] for layer, evidence in dense_evidence.items()
@@ -1204,9 +2592,7 @@ def rollout_policy(
         elif dense_evidence is not None:
             # MT-VJ：VA 基础路径输入 = H11 池化 16 粗 token（设计 C_t=Pool16(H11)）
             h11 = dense_evidence[11][:, time_index]  # [B, 1152, 768]
-            vision_in = h11.reshape(
-                h11.shape[0], 16, -1, h11.shape[-1]
-            ).mean(dim=2)  # [B, 16, 768]
+            vision_in = pool_mtvj_coarse_tokens(h11)  # [B, 16, 768]
         else:
             vision_in = batch["vision_tokens"][:, time_index]
         condition, visual_memory = model.encode_condition(
@@ -1884,10 +3270,84 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=None,
         help="MT-VJ 阶段 V checkpoint（契约 §2：{metric_head, relation_encoder, "
-        "contract='mt_vj_metric_field_v1'}）：加载并冻结 LanguageMetricField + "
-        "RelationStateEncoder（eval/no_grad），每决策产出 metric_tokens "
-        "[B, 2, d_model]（g_t = head 输出 relation，ν_t = g_t − g_{t−1}）加入 "
+        "contract='mt_vj_metric_field_v1'}）：加载 LanguageMetricField + "
+        "RelationStateEncoder（默认均冻结），每决策产出 metric_tokens "
+        "[B, 2, d_model]（g_t = out.p 四角色坐标展平，ν_t = g_t − g_{t−1}）加入 "
         "action cross-attention。需要 --dense-readout-mtvj。",
+    )
+    parser.add_argument(
+        "--replace-mtvj-metric-head-from-external",
+        action="store_true",
+        help="一次性 clean-FT 迁移：普通 --resume 时用当前 "
+        "--metric-visual-checkpoint 的 all-task constructor/weights/"
+        "identity 显式替换主 policy 中的旧 metric head，同时严格保留主 policy "
+        "的 8D relation encoder。禁止 --resume-exact；默认关闭时仍以主 policy "
+        "head 为准。",
+    )
+    parser.add_argument(
+        "--mtvj-roi-checkpoint",
+        type=Path,
+        default=None,
+        help="可选 MT-VJ 原图 ROI 精修 checkpoint（contract="
+        "'mt_vj_metric_roi_v1'）。默认关闭；提供时仍冻结 ROI head，并复用同一"
+        "冻结 V-JEPA 对每个四帧窗口做第二次原图 crop 编码。",
+    )
+    parser.add_argument(
+        "--mtvj-roi-alpha",
+        type=float,
+        default=None,
+        help="ROI 有界残差融合系数 [0,1]；启用 --mtvj-roi-checkpoint 时必须显式给出。",
+    )
+    parser.add_argument(
+        "--mtvj-train-relation",
+        action="store_true",
+        help="仅解冻 MT-VJ RelationStateEncoder，让 8 维定位坐标→VA tokens "
+        "由动作 loss 联合微调；V-JEPA 与 metric head 仍冻结。",
+    )
+    parser.add_argument(
+        "--lr-mtvj-relation",
+        type=float,
+        default=2e-5,
+        help="MT-VJ relation encoder 的独立学习率（默认 2e-5）。",
+    )
+    parser.add_argument(
+        "--mtvj-train-metric-head",
+        action="store_true",
+        help="解冻 MT-VJ LanguageMetricField 中连接 out.p/out.visibility→action loss "
+        "的定位与可见度路径；rel_mlp 辅助分支与 V-JEPA 仍冻结。",
+    )
+    parser.add_argument(
+        "--lr-mtvj-metric-head",
+        type=float,
+        default=1e-6,
+        help="MT-VJ metric localization path 的独立极小学习率（默认 1e-6）。",
+    )
+    parser.add_argument(
+        "--mtvj-visual-aux-every",
+        type=int,
+        default=0,
+        help="双数据流联合训练（阶段 C，2026-08-12）：每 N 个动作 step 插入一个"
+        "在线仿真视觉辅助批次（make_metric_batch 提供精确定位/可见度真值），"
+        "辅助 loss = λ_loc·(hinge+pos+offset) + λ_vis·BCE(vis)，只反传 metric "
+        "head（V-JEPA no_grad、语言缓存冻结、rel_mlp 无梯度）。0 = 关闭。",
+    )
+    parser.add_argument(
+        "--mtvj-visual-aux-loc-lambda",
+        type=float,
+        default=1.0,
+        help="视觉辅助 loss 定位项（hinge+pos+offset）权重（默认 1.0）。",
+    )
+    parser.add_argument(
+        "--mtvj-visual-aux-vis-lambda",
+        type=float,
+        default=0.5,
+        help="视觉辅助 loss 可见度 BCE 权重（默认 0.5）。",
+    )
+    parser.add_argument(
+        "--mtvj-visual-aux-batch",
+        type=int,
+        default=8,
+        help="视觉辅助批次大小（在线仿真生成；默认 8，与 train_metric_visual 一致）。",
     )
     parser.add_argument(
         "--multi-mode",
@@ -2047,11 +3507,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--task-sampling",
-        choices=("uniform", "weighted"),
+        choices=("uniform", "balanced", "weighted"),
         default="uniform",
         help="难度分层采样（E7 用 weighted，2026-08-09）：按 instruction_id → "
         "MT50 难度权重（easy 0.5/med 1.0/hard 2.0/vh 3.0，scripts/mt50_difficulty.py）"
-        "多项式抽样，困难任务过采样、简单任务降采样；uniform = 原始均匀采样",
+        "多项式抽样，困难任务过采样、简单任务降采样；balanced = 每个 epoch "
+        "严格均衡所有活跃任务；uniform = 按数据行均匀采样（会继承窗口数偏置）",
+    )
+    parser.add_argument(
+        "--task-locality-block-batches",
+        type=int,
+        default=16,
+        help="MT-VJ weighted/balanced sampler 每个同任务块的 batch 数（默认 16；"
+        "解码切换成为瓶颈时可调到 32）。",
     )
     parser.add_argument(
         "--fork-data",
@@ -2104,6 +3572,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--flow-steps", type=int, default=8, help="deployment Euler steps")
     parser.add_argument(
+        "--flow-prefix-steps",
+        type=int,
+        default=6,
+        help="flow horizon 前缀长度；默认 6，与闭环每次实际执行步数一致。",
+    )
+    parser.add_argument(
+        "--flow-prefix-weight",
+        type=float,
+        default=1.0,
+        help="flow 前缀逐元素 MSE 权重（默认 1.0，保持旧行为）。",
+    )
+    parser.add_argument(
+        "--flow-tail-weight",
+        type=float,
+        default=1.0,
+        help="flow 尾部逐元素 MSE 权重（默认 1.0；H48 的6步前缀若希望约80/20 "
+        "总权重，尾部应约0.036，而非0.1）。",
+    )
+    parser.add_argument(
         "--va-layers",
         type=int,
         default=4,
@@ -2147,10 +3634,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "rho*grad/||grad|| then take the real step; costs one extra forward/backward.",
     )
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument(
+    resume_group = parser.add_mutually_exclusive_group()
+    resume_group.add_argument(
         "--resume",
         type=Path,
-        help="resume training from a feature-pipeline checkpoint (--data mode)",
+        help="load model weights from a checkpoint; optimizer/sampler/RNG restart",
+    )
+    resume_group.add_argument(
+        "--resume-exact",
+        type=Path,
+        help="strictly continue model, AdamW, TaskLocality sampler, step, and RNG state",
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--save", type=Path)
@@ -2170,10 +3663,87 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("training steps, flow steps, and learning rate must be positive")
     if args.pair_loss_weight < 0.0:
         raise ValueError("pair loss weight must be non-negative")
+    flow_prefix_steps = getattr(args, "flow_prefix_steps", 6)
+    flow_prefix_weight = getattr(args, "flow_prefix_weight", 1.0)
+    flow_tail_weight = getattr(args, "flow_tail_weight", 1.0)
+    if flow_prefix_steps <= 0:
+        raise ValueError("--flow-prefix-steps must be positive")
+    if flow_prefix_weight < 0.0 or flow_tail_weight < 0.0:
+        raise ValueError("--flow-prefix-weight/--flow-tail-weight must be non-negative")
+    if flow_prefix_weight == 0.0 and flow_tail_weight == 0.0:
+        raise ValueError("flow prefix and tail weights cannot both be zero")
+    replace_metric_head = getattr(
+        args, "replace_mtvj_metric_head_from_external", False
+    )
+    roi_checkpoint = getattr(args, "mtvj_roi_checkpoint", None)
+    roi_alpha = getattr(args, "mtvj_roi_alpha", None)
+    if roi_checkpoint is None and roi_alpha is not None:
+        raise ValueError("--mtvj-roi-alpha requires --mtvj-roi-checkpoint")
+    if roi_checkpoint is not None:
+        if not args.dense_readout_mtvj or args.metric_visual_checkpoint is None:
+            raise ValueError(
+                "--mtvj-roi-checkpoint requires --dense-readout-mtvj and "
+                "--metric-visual-checkpoint"
+            )
+        if getattr(args, "mtvj_train_metric_head", False):
+            raise ValueError(
+                "--mtvj-roi-checkpoint forbids --mtvj-train-metric-head: ROI is "
+                "bound to a fixed coarse checkpoint and may only run while the "
+                "coarse metric head is frozen"
+            )
+        if roi_alpha is None or not math.isfinite(roi_alpha) or not 0.0 <= roi_alpha <= 1.0:
+            raise ValueError(
+                "--mtvj-roi-checkpoint requires finite --mtvj-roi-alpha in [0,1]"
+            )
+    if replace_metric_head:
+        if getattr(args, "resume_exact", None) is not None:
+            raise ValueError(
+                "--replace-mtvj-metric-head-from-external 禁止与 "
+                "--resume-exact 同时使用；这是一次性普通 --resume 迁移"
+            )
+        if args.resume is None:
+            raise ValueError(
+                "--replace-mtvj-metric-head-from-external requires ordinary --resume"
+            )
+        if args.metric_visual_checkpoint is None or not args.dense_readout_mtvj:
+            raise ValueError(
+                "--replace-mtvj-metric-head-from-external requires "
+                "--dense-readout-mtvj and --metric-visual-checkpoint"
+            )
+        if getattr(args, "mtvj_train_metric_head", False):
+            raise ValueError(
+                "clean-FT migration keeps the replacement metric head frozen；"
+                "不要同时使用 --mtvj-train-metric-head"
+            )
+        if not getattr(args, "mtvj_train_relation", False):
+            raise ValueError(
+                "visibility-gated metric-state migration changes the 8D relation "
+                "semantics；必须同时启用 --mtvj-train-relation 让旧 projection "
+                "作为 warm start 适配"
+            )
     if not args.single_task and (args.batch_size < 2 or args.batch_size % 2):
         raise ValueError("paired batch size must be even")
     if args.single_task and args.batch_size < 1:
         raise ValueError("batch size must be positive")
+    if getattr(args, "task_locality_block_batches", 16) <= 0:
+        raise ValueError("--task-locality-block-batches must be positive")
+    if getattr(args, "resume_exact", None) is not None:
+        if args.num_workers != 0:
+            raise ValueError("--resume-exact requires --num-workers 0 (worker RNG is not checkpointed)")
+        if not (
+            args.data is not None
+            and args.single_task
+            and args.task_sampling in {"weighted", "balanced"}
+            and args.dense_readout_mtvj
+        ):
+            raise ValueError(
+                "--resume-exact currently requires the single-task weighted/balanced "
+                "MT-VJ data path (TaskLocalityWeightedSampler)"
+            )
+        if args.fork_data is not None or args.perturb_data is not None or args.c2_controller:
+            raise ValueError(
+                "--resume-exact does not support fork/perturb/C2 auxiliary loaders"
+            )
     if args.evsm and not (args.memory_split and args.future_predict):
         raise ValueError("--evsm requires --memory-split and --future-predict")
     if args.evsm and args.future_predict_weight <= 0.0:
@@ -2291,7 +3861,13 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError(
                 "--multi-mode 与 --local-slots-direct288 互斥：direct288 无角色读出路径"
             )
-    if getattr(args, "dense_readout_mtvj", False) or getattr(args, "metric_visual_checkpoint", None) is not None:
+    if (
+        getattr(args, "dense_readout_mtvj", False)
+        or getattr(args, "metric_visual_checkpoint", None) is not None
+        or getattr(args, "mtvj_train_relation", False)
+        or getattr(args, "mtvj_train_metric_head", False)
+        or replace_metric_head
+    ):
         # MT-VJ（契约 §6）：在线 dense 编码需要原始帧（live 数据集或合成冒烟）。
         if args.e2e_data:
             raise ValueError(
@@ -2311,6 +3887,68 @@ def validate_args(args: argparse.Namespace) -> None:
                 "--metric-visual-checkpoint requires --dense-readout-mtvj"
                 "（metric_tokens 由 dense action readout 消费）"
             )
+        train_relation = getattr(args, "mtvj_train_relation", False)
+        train_metric_head = getattr(args, "mtvj_train_metric_head", False)
+        train_mtvj_action_path = train_relation or train_metric_head
+        if train_mtvj_action_path:
+            if not args.dense_readout_mtvj or args.metric_visual_checkpoint is None:
+                raise ValueError(
+                    "MT-VJ joint training requires --dense-readout-mtvj and "
+                    "--metric-visual-checkpoint"
+                )
+            if args.resume is None and getattr(args, "resume_exact", None) is None:
+                raise ValueError(
+                    "MT-VJ joint training requires --resume or --resume-exact"
+                )
+            if args.sam_rho > 0.0:
+                raise ValueError(
+                    "MT-VJ joint training forbids --sam-rho：SAM 二次反向需要"
+                    "重新计算 metric/relation tokens"
+                )
+            if args.head_only or args.servo_only or args.c2_controller:
+                raise ValueError(
+                    "MT-VJ joint training 与 --head-only/--servo-only/"
+                    "--c2-controller 的冻结语义冲突"
+                )
+        if train_relation:
+            if getattr(args, "lr_mtvj_relation", 2e-5) <= 0.0:
+                raise ValueError("--lr-mtvj-relation must be positive")
+        if train_metric_head and getattr(args, "lr_mtvj_metric_head", 1e-6) <= 0.0:
+            raise ValueError("--lr-mtvj-metric-head must be positive")
+        if getattr(args, "mtvj_visual_aux_every", 0) > 0:
+            if not args.dense_readout_mtvj:
+                raise ValueError(
+                    "--mtvj-visual-aux-every requires --dense-readout-mtvj"
+                )
+            if args.metric_visual_checkpoint is None:
+                raise ValueError(
+                    "--mtvj-visual-aux-every requires --metric-visual-checkpoint"
+                )
+            if not train_metric_head:
+                raise ValueError(
+                    "--mtvj-visual-aux-every 要求解冻视觉头（--mtvj-train-metric-head）："
+                    "辅助 loss 的反传目标是 metric head，冻结时无梯度可学"
+                )
+            if not args.single_task:
+                raise ValueError(
+                    "--mtvj-visual-aux-every requires --single-task "
+                    "（辅助语言缓存与任务局部性采样只在该路径定义）"
+                )
+            if not train_relation:
+                raise ValueError(
+                    "--mtvj-visual-aux-every requires --mtvj-train-relation："
+                    "视觉坐标漂移时 relation bridge 必须同步适配"
+                )
+            if args.task_sampling != "weighted":
+                raise ValueError(
+                    "--mtvj-visual-aux-every requires --task-sampling weighted"
+                    "（辅助任务按难度权重采样）"
+                )
+            if args.sam_rho > 0.0:
+                raise ValueError(
+                    "--mtvj-visual-aux-every forbids --sam-rho（辅助 loss 的"
+                    "二次前向语义未定义）"
+                )
         if args.dense_readout:
             raise ValueError(
                 "--dense-readout-mtvj 与 --dense-readout 互斥（Step 0 1152 槽读出 vs "
@@ -2559,7 +4197,151 @@ def _feature_optimizer_groups(args, model, vision_backbone):
     return groups
 
 
-def save_checkpoint(args, config, model, e2e_model, scene_teacher=None, vision_backbone=None, servo=None) -> None:
+def _mtvj_relation_optimizer_group(
+    args: argparse.Namespace,
+    relation_encoder: nn.Module | None,
+) -> dict | None:
+    """Return the isolated low-LR group for action-connected relation weights."""
+    if not args.mtvj_train_relation:
+        return None
+    if relation_encoder is None:
+        raise ValueError("--mtvj-train-relation 已开启但 relation encoder 未构建")
+    parameters = [p for p in relation_encoder.parameters() if p.requires_grad]
+    if not parameters:
+        raise ValueError("--mtvj-train-relation 已开启但没有可训练参数")
+    return {"params": parameters, "lr": args.lr_mtvj_relation}
+
+
+def _mtvj_metric_head_optimizer_group(
+    args: argparse.Namespace,
+    metric_head: nn.Module | None,
+) -> dict | None:
+    """Return the isolated tiny-LR group for action-connected localization weights."""
+    if not args.mtvj_train_metric_head:
+        return None
+    if metric_head is None:
+        raise ValueError("--mtvj-train-metric-head 已开启但 metric head 未构建")
+    parameters = [p for p in metric_head.parameters() if p.requires_grad]
+    if not parameters:
+        raise ValueError("--mtvj-train-metric-head 已开启但没有可训练参数")
+    return {"params": parameters, "lr": args.lr_mtvj_metric_head}
+
+
+def _module_action_gradient_norm(module: nn.Module, flag: str, device: torch.device) -> Tensor:
+    """Fail fast when a requested joint-training branch is disconnected."""
+    missing = [
+        name
+        for name, parameter in module.named_parameters()
+        if parameter.requires_grad and parameter.grad is None
+    ]
+    if missing:
+        raise RuntimeError(
+            f"{flag} 已开启，但动作 loss 未连接这些可训练参数：{missing[:8]}"
+        )
+    gradients = [
+        parameter.grad.detach().norm(2)
+        for parameter in module.parameters()
+        if parameter.requires_grad and parameter.grad is not None
+    ]
+    if not gradients:
+        raise RuntimeError(
+            f"{flag} 已开启，但动作 loss 没有传到任何可训练参数；拒绝继续伪解冻训练"
+        )
+    return torch.stack(gradients).norm(2).to(device=device)
+
+
+def _restore_mtvj_policy_modules(
+    resume_ckpt: dict,
+    *,
+    relation_encoder: nn.Module | None,
+    metric_head: nn.Module | None,
+    train_relation: bool,
+    replace_metric_head_from_external: bool = False,
+) -> None:
+    """Strictly restore MT-VJ runtime modules from the main policy checkpoint.
+
+    Legacy policy checkpoints did not contain the metric head.  For that one-way
+    migration the already-strictly-loaded external metric checkpoint remains the
+    source; every checkpoint saved by this code records and subsequently requires
+    ``mtvj_metric_head``.
+    """
+    contract = resume_ckpt.get("training_contract") or {}
+    if relation_encoder is not None:
+        saved_relation = resume_ckpt.get("mtvj_relation_encoder")
+        if saved_relation is None:
+            if train_relation:
+                raise ValueError(
+                    "--mtvj-train-relation requires --resume checkpoint "
+                    "containing mtvj_relation_encoder；拒绝从随机映射起步"
+                )
+            print(
+                "resume: 旧 checkpoint 未保存 MT-VJ relation encoder；"
+                "本次使用外部 metric checkpoint 的兼容映射，并会从下一次保存起写入。",
+                flush=True,
+            )
+        else:
+            relation_encoder.load_state_dict(saved_relation, strict=True)
+            print("mtvj: relation encoder 从主 checkpoint 严格恢复", flush=True)
+
+    if metric_head is not None:
+        saved_head = resume_ckpt.get("mtvj_metric_head")
+        if saved_head is not None:
+            if replace_metric_head_from_external:
+                print(
+                    "mtvj migration: 已严格恢复主 policy 的 8D relation encoder；"
+                    "显式跳过主 policy 的旧 metric head，保留 external "
+                    "all-task head",
+                    flush=True,
+                )
+                return
+            saved_config = resume_ckpt.get("mtvj_metric_head_config")
+            saved_identity = resume_ckpt.get("mtvj_metric_checkpoint_identity")
+            if saved_config is None or saved_identity is None:
+                raise ValueError(
+                    "主 checkpoint 含 mtvj_metric_head，但缺少完整构造配置或"
+                    "外部来源指纹"
+                )
+            expected_config = _canonical_mtvj_metric_head_config(
+                saved_config,
+                require_complete=True,
+            )
+            runtime_config = _mtvj_metric_head_constructor_config(metric_head)
+            if runtime_config != expected_config:
+                raise ValueError(
+                    "runtime metric head 构造配置与主 checkpoint 不一致："
+                    f"checkpoint={expected_config}, runtime={runtime_config}"
+                )
+            metric_head.load_state_dict(saved_head, strict=True)
+            print("mtvj: metric head 从主 checkpoint 严格恢复", flush=True)
+        elif contract.get("metric_head_checkpointed"):
+            raise ValueError(
+                "resume checkpoint 声明 metric_head_checkpointed=True，"
+                "但缺少 mtvj_metric_head"
+            )
+        else:
+            print(
+                "mtvj: legacy 主 checkpoint 无 metric head；首次迁移严格使用 "
+                "--metric-visual-checkpoint 权重，下一次保存将写入主 checkpoint",
+                flush=True,
+            )
+
+
+def save_checkpoint(
+    args,
+    config,
+    model,
+    e2e_model,
+    scene_teacher=None,
+    vision_backbone=None,
+    servo=None,
+    relation_encoder=None,
+    metric_head=None,
+    roi_head=None,
+    optimizer=None,
+    global_step: int = 0,
+    sampler: TaskLocalityWeightedSampler | None = None,
+    exact_run_contract: dict | None = None,
+) -> None:
     """原子保存 checkpoint（tmp 文件 + rename），供周期/最终保存复用。"""
     if not args.save:
         return
@@ -2646,12 +4428,62 @@ def save_checkpoint(args, config, model, e2e_model, scene_teacher=None, vision_b
                 "pair_probe_tau_max": args.pair_probe_tau_max,
                 "pair_start_atol": args.pair_start_atol,
                 "min_pair_action_delta": args.min_pair_action_delta,
+                "task_sampling": args.task_sampling,
+                "task_locality_block_batches": args.task_locality_block_batches,
                 # Step 2（C²-IRF v2）：双新息伺服契约（评估侧据此重建 InteractionServo）。
                 "servo": args.servo,
                 "servo_only": args.servo_only,
                 "servo_dls": args.servo_dls,
                 "servo_rank": args.servo_rank,
                 "servo_lambda": args.servo_lambda,
+                # MT-VJ runtime contract: keep 8-D shape but null coordinates for
+                # roles the visual head predicts as invisible.
+                "metric_tokens_enabled": relation_encoder is not None,
+                "metric_state_source": (
+                    getattr(
+                        metric_head,
+                        "_mtvj_metric_state_source",
+                        MTVJ_LEGACY_METRIC_STATE_SOURCE,
+                    )
+                    if relation_encoder is not None else None
+                ),
+                "metric_state_dim": 8 if relation_encoder is not None else None,
+                "metric_d_model": config.hidden_dim if relation_encoder is not None else None,
+                "metric_contract_version": (
+                    getattr(
+                        metric_head,
+                        "_mtvj_metric_contract_version",
+                        MTVJ_LEGACY_METRIC_CONTRACT_VERSION,
+                    )
+                    if relation_encoder is not None else None
+                ),
+                "metric_relation_joint_trained": (
+                    bool(args.mtvj_train_relation)
+                    if relation_encoder is not None
+                    else False
+                ),
+                "metric_relation_lr": (
+                    args.lr_mtvj_relation
+                    if relation_encoder is not None and args.mtvj_train_relation
+                    else None
+                ),
+                "metric_head_checkpointed": metric_head is not None,
+                "metric_head_constructor_contract_version": (
+                    1 if metric_head is not None else None
+                ),
+                "metric_head_joint_trained": (
+                    bool(args.mtvj_train_metric_head)
+                    if metric_head is not None
+                    else False
+                ),
+                "metric_head_lr": (
+                    args.lr_mtvj_metric_head
+                    if metric_head is not None and args.mtvj_train_metric_head
+                    else None
+                ),
+                "flow_prefix_steps": args.flow_prefix_steps,
+                "flow_prefix_weight": args.flow_prefix_weight,
+                "flow_tail_weight": args.flow_tail_weight,
             },
         }
         if servo is not None:
@@ -2662,6 +4494,72 @@ def save_checkpoint(args, config, model, e2e_model, scene_teacher=None, vision_b
             # Stage B：解冻后的 V-JEPA 权重必须随 checkpoint 保存（评估侧
             # eval_metaworld.py 已支持 vjepa_state_dict 恢复）。
             payload["vjepa_state_dict"] = vision_backbone.model.state_dict()
+    if roi_head is not None:
+        roi_config = getattr(roi_head, "_mtvj_roi_config", None)
+        roi_identity = getattr(roi_head, "_mtvj_roi_checkpoint_identity", None)
+        roi_coarse_identity = getattr(roi_head, "_mtvj_roi_coarse_identity", None)
+        if not isinstance(roi_config, dict) or not isinstance(roi_identity, dict):
+            raise ValueError("保存 MT-VJ ROI head 需要已校验的 config/identity")
+        if not roi_identity.get("sha256") or not isinstance(roi_coarse_identity, dict):
+            raise ValueError("保存 MT-VJ ROI head 需要完整 ROI/coarse SHA identity")
+        payload["training_contract"].update(
+            {
+                "mtvj_roi_enabled": True,
+                "mtvj_roi_alpha": float(args.mtvj_roi_alpha),
+                "mtvj_roi_contract_version": METRIC_ROI_CONTRACT_VERSION,
+                "mtvj_roi_coarse_sha256": roi_coarse_identity.get("sha256"),
+                "mtvj_roi_coarse_head_state_sha256": roi_config.get(
+                    "coarse_head_state_sha256"
+                ),
+                "mtvj_roi_head_checkpointed": True,
+            }
+        )
+        payload["mtvj_roi_head"] = {
+            key: value.detach().cpu()
+            for key, value in roi_head.state_dict().items()
+        }
+        payload["mtvj_roi_config"] = dict(roi_config)
+        payload["mtvj_roi_checkpoint_identity"] = dict(roi_identity)
+    if relation_encoder is not None:
+        payload["mtvj_relation_encoder"] = {
+            key: value.detach().cpu()
+            for key, value in relation_encoder.state_dict().items()
+        }
+    if metric_head is not None:
+        metric_config = _mtvj_metric_head_constructor_config(metric_head)
+        metric_identity = getattr(
+            metric_head, "_mtvj_external_checkpoint_identity", None
+        )
+        if not isinstance(metric_identity, dict) or not metric_identity.get("sha256"):
+            raise ValueError(
+                "保存 MT-VJ metric head 需要已校验的外部 checkpoint 来源指纹；"
+                "请通过 _load_mtvj_metric_checkpoint 构造该模块"
+            )
+        payload["mtvj_metric_head"] = {
+            key: value.detach().cpu()
+            for key, value in metric_head.state_dict().items()
+        }
+        payload["mtvj_metric_head_config"] = metric_config
+        payload["mtvj_metric_checkpoint_identity"] = dict(metric_identity)
+        metric_source = getattr(
+            metric_head, "_mtvj_metric_head_source", "unknown"
+        )
+        payload["training_contract"]["metric_head_source"] = metric_source
+        migration_record = getattr(
+            metric_head, "_mtvj_metric_head_migration", None
+        )
+        if isinstance(migration_record, dict):
+            payload["mtvj_metric_head_migration"] = dict(migration_record)
+    if optimizer is not None:
+        if exact_run_contract is None:
+            exact_run_contract = build_exact_run_contract(
+                args, config, optimizer, sampler, metric_head, roi_head
+            )
+        payload.update(
+            build_exact_resume_state(
+                optimizer, global_step, sampler, exact_run_contract
+            )
+        )
     tmp_path = args.save.with_suffix(args.save.suffix + ".tmp")
     torch.save(payload, tmp_path)
     tmp_path.replace(args.save)
@@ -2732,11 +4630,14 @@ def main() -> None:
             "(not enforced)"
         )
 
+    random.seed(args.seed)
+    np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
 
     loader = None
     iterator = None
+    sampler = None
     model = None
     e2e_model = None
     vision_backbone = None
@@ -2744,9 +4645,12 @@ def main() -> None:
     perturb_iter = None
     use_payload_vision = True
     m = 0
+    task_log_names: dict[int, str] = {}
+    env_by_description: dict[str, str] = {}
     fork_iter = None  # 修复 HEAD 隐患：无 --data 的合成冒烟路径此前 UnboundLocalError
     if args.e2e_data:
         dataset = E2EDataset(args.e2e_data, min_sequence_length=args.min_sequence_length)
+        _enable_optional_action_masks(dataset)
         payload = dataset.payload
         config = VACompoundConfig(
             language_dim=2048,
@@ -2877,6 +4781,20 @@ def main() -> None:
                 local_tokens=local_tokens,
                 coords=(local_payload["coords"] if local_payload is not None else None),
             )
+        _enable_optional_action_masks(dataset)
+        descriptions = list(
+            dataset.payload.get("metadata", {}).get("tasks", [])
+        )
+        if descriptions:
+            from scripts.build_longtraj_features import ENV_TO_TASK
+
+            env_by_description = {
+                description: env_name for env_name, description in ENV_TO_TASK.items()
+            }
+            task_log_names = {
+                index: env_by_description.get(description, f"task-{index}")
+                for index, description in enumerate(descriptions)
+            }
         config = VACompoundConfig(
             language_dim=int(dataset.payload["language_hidden"].shape[-1]),
             vision_dim=(
@@ -2977,43 +4895,123 @@ def main() -> None:
                 if args.perturb_data is not None
                 else (c2_clean_n if args.c2_controller else args.batch_size)
             )
-            if args.task_sampling == "weighted":
+            if args.task_sampling in {"weighted", "balanced"}:
                 tasks = list(dataset.payload.get("metadata", {}).get("tasks", []))
                 if not tasks:
                     raise ValueError(
-                        "--task-sampling weighted 需要数据集 metadata.tasks "
+                        f"--task-sampling {args.task_sampling} 需要数据集 metadata.tasks "
                         "（instruction_id → 难度权重映射）"
                     )
-                task_w = torch.tensor(task_weights_for(tasks), dtype=torch.float64)
+                raw_task_w = (
+                    torch.ones(len(tasks), dtype=torch.float64)
+                    if args.task_sampling == "balanced"
+                    else torch.tensor(task_weights_for(tasks), dtype=torch.float64)
+                )
                 # Codex P1-2（2026-08-09）：曝光 = 窗口数 × 难度权重会引入轨迹
                 # 长度偏置（各任务窗口 360-2186）。除以任务窗口数 → 每任务总曝光
                 # ∝ 难度权重，消除窗口数偏置（任务级分层）。
                 task_rows = torch.bincount(
                     dataset.payload["instruction_id"], minlength=len(tasks)
                 ).to(torch.float64)
-                task_w = task_w / task_rows.clamp_min(1.0)
+                task_w = raw_task_w / task_rows.clamp_min(1.0)
                 per_sample = task_w[dataset.payload["instruction_id"]]
                 print(
-                    "--task-sampling weighted: 难度权重 "
-                    f"{sorted(set(task_w.tolist()))}（tasks={len(tasks)}，"
-                    f"samples={len(per_sample)}，easy 档样本占比 "
-                    f"{(per_sample < 1.0).float().mean().item() * 100:.1f}%）",
+                    f"--task-sampling {args.task_sampling}: 任务权重 "
+                    f"{sorted(set(raw_task_w.tolist()))}（active_tasks="
+                    f"{int((task_rows > 0).sum())}, samples={len(per_sample)}；"
+                    + (
+                        "每 epoch 严格均衡任务 batch）"
+                        if args.task_sampling == "balanced"
+                        else "按难度分层）"
+                    ),
                     flush=True,
                 )
+                # 双数据流辅助批次（阶段 C）：任务文本 → 数据集预计算
+                # language_hidden/mask 缓存（metadata.tasks[tid] ↔ instruction_id=tid，
+                # 与 build_longtraj_features.task_language_t 同源）；辅助任务按
+                # 难度权重 raw_task_w 多项式采样。
+                lang_aux_cache: dict[str, tuple[Tensor, Tensor]] = {}
+                if args.mtvj_visual_aux_every > 0:
+                    hid_all = dataset.payload["language_hidden"]
+                    mask_all = dataset.payload["language_mask"]
+                    id_all = dataset.payload["instruction_id"]
+                    for tid, text in enumerate(tasks):
+                        row = int((id_all == tid).nonzero()[0, 0])
+                        lang_aux_cache[text] = (
+                            hid_all[row].float(),
+                            mask_all[row],
+                        )
+                    missing_text = [
+                        t
+                        for t in ENV_TO_TASK.values()
+                        if t not in lang_aux_cache
+                    ]
+                    if missing_text:
+                        raise ValueError(
+                            "visual aux: 语言缓存缺 "
+                            f"{len(missing_text)} 个任务文本（ENV_TO_TASK 与 "
+                            "metadata.tasks 不一致，样例 "
+                            f"{missing_text[:3]}）"
+                        )
+                    aux_task_w = raw_task_w / raw_task_w.sum()
+                    print(
+                        "mtvj visual aux: 每 "
+                        f"{args.mtvj_visual_aux_every} 步一个在线仿真视觉批次"
+                        f"（λ_loc={args.mtvj_visual_aux_loc_lambda}, "
+                        f"λ_vis={args.mtvj_visual_aux_vis_lambda}, "
+                        f"batch={args.mtvj_visual_aux_batch}）",
+                        flush=True,
+                    )
                 if args.dense_readout_mtvj:
                     # MT-VJ（LongTrajFramesDataset）：任务局部性采样，缓存命中
                     # ~100%（Codex P1-13，纯随机加权实测 50s/step 不可行）。
                     from va_compound.longtraj_frames import mtvj_collate
                     sampler = TaskLocalityWeightedSampler(
-                        dataset.payload["instruction_id"], task_w,
-                        effective_batch, args.seed,
+                        dataset.payload["instruction_id"],
+                        dataset.payload["episode_id"],
+                        raw_task_w,
+                        effective_batch,
+                        args.seed,
+                        args.task_locality_block_batches,
+                        args.task_sampling,
                     )
+                    if args.save is not None or args.resume_exact is not None:
+                        # Full payload hashing happens once here; periodic/final
+                        # checkpoints reuse the sampler-cached identity.
+                        sampler.bind_dataset_content_identity(
+                            build_dataset_content_identity(
+                                args.data,
+                                dataset.payload,
+                                longtraj_dir=getattr(dataset, "longtraj_dir", None),
+                            )
+                        )
                     loader = DataLoader(
                         dataset,
                         batch_sampler=sampler,
                         collate_fn=mtvj_collate,
                         num_workers=args.num_workers,
                         persistent_workers=args.num_workers > 0,
+                        # Keep iterator base-seed generation off the global torch
+                        # RNG restored by --resume-exact. With num_workers=0 this
+                        # generator has no data/augmentation semantics.
+                        generator=torch.Generator().manual_seed(args.seed),
+                    )
+                elif args.task_sampling == "balanced":
+                    sampler = TaskLocalityWeightedSampler(
+                        dataset.payload["instruction_id"],
+                        dataset.payload["episode_id"],
+                        raw_task_w,
+                        effective_batch,
+                        args.seed,
+                        args.task_locality_block_batches,
+                        args.task_sampling,
+                    )
+                    loader = DataLoader(
+                        dataset,
+                        batch_sampler=sampler,
+                        num_workers=args.num_workers,
+                        persistent_workers=args.num_workers > 0,
+                        generator=torch.Generator().manual_seed(args.seed),
                     )
                 else:
                     loader = DataLoader(
@@ -3109,18 +5107,113 @@ def main() -> None:
             with_frames=args.dense_readout_mtvj,
         )
 
-    # MT-VJ（契约 §6）：冻结 fp16 V-JEPA（dense evidence 只读）+ 冻结 metric
-    # head/relation encoder（eval/no_grad，均不进 optimizer）。两 flag 都未给时
-    # 以下对象全为 None，训练路径与旧版逐字一致。
+    # MT-VJ（契约 §6）：fp16 V-JEPA 始终冻结只读；metric localization path
+    # 与 relation encoder 默认冻结，可分别显式联合微调。
+    # MT-VJ flags 都未给时以下对象全为 None，旧路径不变。
     mtvj_backbone = None
     metric_head = None
     relation_encoder = None
+    roi_head = None
+    resume_path = args.resume_exact if args.resume_exact is not None else args.resume
+    preloaded_resume_ckpt = None
+    if args.metric_visual_checkpoint is not None and resume_path is not None:
+        # Metric head 的网络形状必须先由主 checkpoint 决定，再建 optimizer；
+        # 因此在通用 resume 块之前只读一次，后面复用同一个 payload。
+        preloaded_resume_ckpt = torch.load(
+            resume_path, map_location="cpu", weights_only=True
+        )
     if args.dense_readout_mtvj:
         mtvj_backbone = _maybe_build_mtvj_backbone(device)
     if args.metric_visual_checkpoint is not None:
-        metric_head, relation_encoder = _load_mtvj_metric_checkpoint(
-            args.metric_visual_checkpoint, device, config
+        policy_contract = (
+            (preloaded_resume_ckpt.get("training_contract") or {})
+            if preloaded_resume_ckpt is not None
+            else {}
         )
+        metric_head, relation_encoder = _load_mtvj_metric_checkpoint(
+            args.metric_visual_checkpoint,
+            device,
+            config,
+            train_relation=args.mtvj_train_relation,
+            train_metric_head=args.mtvj_train_metric_head,
+            policy_relation_state=(
+                preloaded_resume_ckpt.get("mtvj_relation_encoder")
+                if preloaded_resume_ckpt is not None
+                else None
+            ),
+            policy_metric_state=(
+                preloaded_resume_ckpt.get("mtvj_metric_head")
+                if preloaded_resume_ckpt is not None
+                else None
+            ),
+            policy_metric_config=(
+                preloaded_resume_ckpt.get("mtvj_metric_head_config")
+                if preloaded_resume_ckpt is not None
+                else None
+            ),
+            policy_metric_identity=(
+                preloaded_resume_ckpt.get("mtvj_metric_checkpoint_identity")
+                if preloaded_resume_ckpt is not None
+                else None
+            ),
+            policy_metric_migration=(
+                preloaded_resume_ckpt.get("mtvj_metric_head_migration")
+                if preloaded_resume_ckpt is not None
+                else None
+            ),
+            policy_training_contract=policy_contract,
+            exact_resume=args.resume_exact is not None,
+            replace_metric_head_from_external=(
+                args.replace_mtvj_metric_head_from_external
+            ),
+        )
+        policy_roi_enabled = policy_contract.get("mtvj_roi_enabled") is True
+        if policy_roi_enabled and args.mtvj_roi_checkpoint is None:
+            raise ValueError(
+                "resume checkpoint requires --mtvj-roi-checkpoint; refusing to "
+                "silently disable its trained ROI runtime"
+            )
+        if args.mtvj_roi_checkpoint is not None:
+            if policy_roi_enabled:
+                saved_alpha = policy_contract.get("mtvj_roi_alpha")
+                if saved_alpha is None or float(saved_alpha) != float(args.mtvj_roi_alpha):
+                    raise ValueError(
+                        "--mtvj-roi-alpha must exactly match the resume checkpoint: "
+                        f"policy={saved_alpha!r}, runtime={args.mtvj_roi_alpha!r}"
+                    )
+            coarse_identity = getattr(
+                metric_head, "_mtvj_current_external_checkpoint_identity", None
+            )
+            if not isinstance(coarse_identity, dict):
+                raise ValueError("MT-VJ metric head lacks its external coarse identity")
+            roi_head = load_metric_roi_checkpoint(
+                args.mtvj_roi_checkpoint,
+                device,
+                coarse_identity=coarse_identity,
+                coarse_head_state_sha256=metric_head_state_sha256(metric_head),
+                policy_state=(
+                    preloaded_resume_ckpt.get("mtvj_roi_head")
+                    if preloaded_resume_ckpt is not None
+                    else None
+                ),
+                policy_config=(
+                    preloaded_resume_ckpt.get("mtvj_roi_config")
+                    if preloaded_resume_ckpt is not None
+                    else None
+                ),
+                policy_identity=(
+                    preloaded_resume_ckpt.get("mtvj_roi_checkpoint_identity")
+                    if preloaded_resume_ckpt is not None
+                    else None
+                ),
+                policy_training_contract=policy_contract,
+            )
+            print(
+                "mtvj: frozen ROI head loaded "
+                f"(alpha={args.mtvj_roi_alpha}, "
+                f"params={sum(p.numel() for p in roi_head.parameters()):,})",
+                flush=True,
+            )
 
     # Step 2：双新息中央凹交互伺服（C²-IRF v2 §七 Step 2；--servo-only 隐含
     # --servo 已在 validate_args 生效）。独立模块（契约文件 va_compound/servo.py），
@@ -3266,11 +5359,13 @@ def main() -> None:
     # 阶段 compute language_hidden 所用的字符串完全一致）。
     scene_teacher = None
     text_backbone = None
-    tasks = None
+    # Keep the dataset task list alive for MT-VJ auxiliary sampling even when
+    # SceneTeacher is disabled.  The previous ``tasks = None`` assignment made
+    # Stage-C fail on its first auxiliary update.
+    tasks = list(dataset.payload.get("metadata", {}).get("tasks", []))
     if args.scene_teacher:
         from va_compound.backbones import QwenTextBackbone, SceneTeacher
 
-        tasks = dataset.payload["metadata"]["tasks"]
         if not tasks:
             raise ValueError("--scene-teacher requires metadata.tasks in the dataset")
         text_backbone = QwenTextBackbone.from_pretrained(
@@ -3289,6 +5384,25 @@ def main() -> None:
             f"projector+readout params={sum(p.numel() for p in scene_teacher.parameters()):,}"
         )
 
+    relation_group = _mtvj_relation_optimizer_group(args, relation_encoder)
+    if relation_group is not None:
+        optimizer.add_param_group(relation_group)
+        print(
+            "mtvj: relation action path 加入 optimizer "
+            f"（params={sum(p.numel() for p in relation_group['params']):,}, "
+            f"lr={args.lr_mtvj_relation}）",
+            flush=True,
+        )
+    metric_head_group = _mtvj_metric_head_optimizer_group(args, metric_head)
+    if metric_head_group is not None:
+        optimizer.add_param_group(metric_head_group)
+        print(
+            "mtvj: metric localization action path 加入 optimizer "
+            f"（params={sum(p.numel() for p in metric_head_group['params']):,}, "
+            f"lr={args.lr_mtvj_metric_head}）；V-JEPA 保持冻结",
+            flush=True,
+        )
+
     if args.sam_rho > 0:
         optimizer = SAM(
             optimizer.param_groups,
@@ -3299,12 +5413,31 @@ def main() -> None:
         )
         print(f"SAM enabled: rho={args.sam_rho} (2x forward per step)")
 
+    # Cheap after startup: the expensive data digest is already cached on the
+    # locality sampler. This immutable value is reused by every checkpoint.
+    runtime_exact_run_contract = build_exact_run_contract(
+        args, config, optimizer, sampler, metric_head, roi_head
+    )
+
     if e2e_model is not None:
         e2e_model.train()
     else:
         model.train()
-    if args.resume:
-        resume_ckpt = torch.load(args.resume, map_location="cpu", weights_only=True)
+    global_step = 0
+    resume_rng_state = None
+    exact_resume = args.resume_exact is not None
+    if resume_path is not None:
+        resume_ckpt = (
+            preloaded_resume_ckpt
+            if preloaded_resume_ckpt is not None
+            else torch.load(resume_path, map_location="cpu", weights_only=True)
+        )
+        if exact_resume:
+            # Fail before restoring model/optimizer/sampler/RNG if any data,
+            # objective, sampler, architecture or optimizer semantic changed.
+            validate_exact_run_contract(
+                resume_ckpt.get("exact_run_contract"), runtime_exact_run_contract
+            )
         resume_config = resume_ckpt["config"]
         for key in ("num_layers", "hidden_dim", "action_dim", "proprio_dim", "mode"):
             if resume_config.get(key) != getattr(config, key):
@@ -3337,9 +5470,11 @@ def main() -> None:
                     own_compiler.load_state_dict(
                         resume_ckpt["semantic_compiler"], strict=False
                     )
-            print(f"e2e resumed from {args.resume}")
+            print(f"e2e resumed from {resume_path}")
         else:
-            if args.c2_controller:
+            if exact_resume:
+                model.load_state_dict(resume_ckpt["model"], strict=True)
+            elif args.c2_controller:
                 # Stage A → C² 迁移：仅允许新 C² keys（c2_head/control_projector）缺失；
                 # P 的 PCA 权重随后由 v6b 注入覆盖（保持与当前数据一致）。
                 has_c2_keys = any(
@@ -3416,7 +5551,30 @@ def main() -> None:
                     print("servo: 权重从 checkpoint 恢复")
                 else:
                     print("resume: checkpoint 无 servo 权重（servo 随机初始化）")
-            print(f"resumed from {args.resume}")
+            _restore_mtvj_policy_modules(
+                resume_ckpt,
+                relation_encoder=relation_encoder,
+                metric_head=metric_head,
+                train_relation=args.mtvj_train_relation,
+                replace_metric_head_from_external=(
+                    args.replace_mtvj_metric_head_from_external
+                ),
+            )
+            print(f"resumed from {resume_path}")
+        if exact_resume:
+            global_step = restore_exact_resume_state(
+                resume_ckpt,
+                optimizer,
+                sampler,
+                runtime_exact_run_contract=runtime_exact_run_contract,
+                restore_rng=False,
+            )
+            resume_rng_state = resume_ckpt["rng_state"]
+            print(f"exact training state restored at global_step={global_step}", flush=True)
+        else:
+            # Metadata only: --resume intentionally does not restore optimizer,
+            # sampler, or RNG, but preserves the known update count when present.
+            global_step = int(resume_ckpt.get("global_step", 0))
     if args.c2_controller and recovery_loader is not None:
         # resume 之后再次注入 PCA：P 的权重恒取自当前 v6b 文件（冻结），
         # 与 ckpt 是否携带旧 P 权重无关。
@@ -3443,13 +5601,51 @@ def main() -> None:
         lang_fixed_vec = dataset.payload["language_hidden"].mean(dim=(0, 1), keepdim=True)
         print(f"lang-fixed-vector: 语言通道替换为全局均值（shape={tuple(lang_fixed_vec.shape)}）")
 
+    if resume_rng_state is not None:
+        # DataLoader iterator construction consumes a torch base-seed. Rebuild it
+        # from the restored sampler first, then restore global RNG immediately
+        # before fetching the next batch/noise.
+        iterator = iter(loader)
+        restore_rng_state(resume_rng_state)
+
+    def commit_successful_update(local_step: int, consumed_locality_batch: bool) -> None:
+        """Advance all resumable state only after the optimizer update succeeds."""
+        nonlocal global_step
+        if consumed_locality_batch:
+            sampler.advance()
+        global_step += 1
+        if args.save_every > 0 and global_step % args.save_every == 0:
+            save_checkpoint(
+                args,
+                config,
+                model,
+                e2e_model,
+                scene_teacher,
+                vision_backbone,
+                servo=servo,
+                relation_encoder=relation_encoder,
+                metric_head=metric_head,
+                roi_head=roi_head,
+                optimizer=optimizer,
+                global_step=global_step,
+                sampler=sampler,
+                exact_run_contract=runtime_exact_run_contract,
+            )
+            print(
+                f"step={local_step} global_step={global_step} "
+                f"periodic checkpoint saved to {args.save}",
+                flush=True,
+            )
+
     for step in range(1, args.steps + 1):
         rec_batch = None
+        consumed_locality_batch = False
         is_fork_batch = fork_iter is not None and step % (args.fork_k + 1) == 0
         if args.c2_controller:
             # C² 3:1 混合：clean 部分（v5 + v6a 目标）+ recovery 部分（v6b）。
             batch = move_batch(next(clean_iter), device)
             rec_batch = move_batch(next(rec_iter), device)
+            consumed_locality_batch = isinstance(sampler, TaskLocalityWeightedSampler)
         elif iterator is None:
             batch = smoke_batch
         else:
@@ -3462,6 +5658,7 @@ def main() -> None:
                 except StopIteration:
                     iterator = iter(loader)
                     batch = next(iterator)
+                consumed_locality_batch = isinstance(sampler, TaskLocalityWeightedSampler)
         if mtvj_backbone is not None:
             # MT-VJ（契约 §6）：在线 dense 编码——frames（live 数据集或合成冒烟）
             # → 冻结 V-JEPA forward_hierarchical_dense（fp16）→ {5,11} →
@@ -3483,6 +5680,11 @@ def main() -> None:
                 relation_encoder,
                 batch,
                 device,
+                train_metric_head=args.mtvj_train_metric_head,
+                roi_head=roi_head,
+                roi_alpha=(
+                    float(args.mtvj_roi_alpha) if roi_head is not None else 0.0
+                ),
             )
         if args.live_vjepa:
             # Stage B：在线 V-JEPA 编码（frames 仍为 CPU numpy；编码在 GPU 上，
@@ -3540,10 +5742,6 @@ def main() -> None:
             batch["previous_action"] = batch["previous_action"] * (
                 ~prev_mask
             ).view(-1, 1, 1).float()
-        if args.save_every > 0 and step % args.save_every == 0:
-            save_checkpoint(args, config, model, e2e_model, scene_teacher, vision_backbone, servo=servo)
-            print(f"step={step} periodic checkpoint saved to {args.save}")
-
         if model.config.c2_controller:
             # C²-VA Stage B 训练路径（SAM 不适用：冻结参数下无意义，跳过）。
             loss, c2_logs = compute_c2_loss(model, batch, rec_batch, args)
@@ -3564,6 +5762,7 @@ def main() -> None:
             loss.backward()
             gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            commit_successful_update(step, consumed_locality_batch)
             print(
                 f"step={step} mode={args.mode} contract=single_c2 "
                 f"sequence={batch['actions'].shape[1]} "
@@ -3604,7 +5803,14 @@ def main() -> None:
                     flow_time,
                     compile_every=args.compile_every,
                 )
-                flow_loss = e2e_model.policy.flow_matching_loss(predicted_velocity, target_velocity)
+                flow_loss, flow_prefix_loss, flow_tail_loss = masked_flow_matching_loss(
+                    predicted_velocity,
+                    target_velocity,
+                    batch,
+                    prefix_steps=args.flow_prefix_steps,
+                    prefix_weight=args.flow_prefix_weight,
+                    tail_weight=args.flow_tail_weight,
+                )
                 if args.single_task:
                     pair_loss = flow_loss.new_zeros(())
                     pred_delta = flow_loss.new_zeros(())
@@ -3666,11 +5872,24 @@ def main() -> None:
                     # （v5 数据：一个执行动作 ↔ 一个标签）。pair 是 flow 专属
                     # 损失（共享噪声/中点探针），direct 模式跳过（打印 pair=0）。
                     flow_loss = F.smooth_l1_loss(predicted_velocity, batch["actions"])
+                    _, flow_prefix_loss, flow_tail_loss = masked_flow_matching_loss(
+                        predicted_velocity,
+                        batch["actions"],
+                        batch,
+                        prefix_steps=args.flow_prefix_steps,
+                    )
                     pair_loss = flow_loss.new_zeros(())
                     pred_delta = flow_loss.new_zeros(())
                     tgt_delta = flow_loss.new_zeros(())
                 else:
-                    flow_loss = model.flow_matching_loss(predicted_velocity, target_velocity)
+                    flow_loss, flow_prefix_loss, flow_tail_loss = masked_flow_matching_loss(
+                        predicted_velocity,
+                        target_velocity,
+                        batch,
+                        prefix_steps=args.flow_prefix_steps,
+                        prefix_weight=args.flow_prefix_weight,
+                        tail_weight=args.flow_tail_weight,
+                    )
                     if args.single_task and not is_fork_batch:
                         pair_loss = flow_loss.new_zeros(())
                         pred_delta = flow_loss.new_zeros(())
@@ -3867,6 +6086,8 @@ def main() -> None:
                 action_total,
                 action_total + semantic_total,
                 flow_loss,
+                flow_prefix_loss,
+                flow_tail_loss,
                 pair_loss,
                 pred_delta,
                 tgt_delta,
@@ -3880,6 +6101,8 @@ def main() -> None:
             action_total,
             total_loss,
             flow_loss,
+            flow_prefix_loss,
+            flow_tail_loss,
             pair_loss,
             predicted_delta,
             target_delta,
@@ -3893,6 +6116,38 @@ def main() -> None:
         # P0-5：动作损失与语义损失分开 backward——LoRA 参数只缩放动作侧梯度
         # （η_act），anchor/geometry 梯度完整（旧实现统一缩放两者）。
         action_total.backward()
+        # 双数据流视觉辅助批次（阶段 C）：每 N 步一个在线仿真批次，辅助 loss
+        # 累积到同一优化器 step；辅助分支只反传 metric head，且视觉头与
+        # VA/relation 分别 clip，避免大辅助梯度压小动作学习信号。
+        aux_parts: dict[str, float] = {}
+        # Derive the auxiliary schedule and simulator RNG only from the next
+        # committed global update.  This keeps auxiliary data bit-reproducible
+        # across --resume-exact without serializing a second NumPy Generator,
+        # and avoids resetting the cadence when the local loop restarts at 1.
+        next_global_step = global_step + 1
+        if (
+            args.mtvj_visual_aux_every > 0
+            and next_global_step % args.mtvj_visual_aux_every == 0
+        ):
+            aux_task, aux_rng = _mtvj_visual_aux_sample(
+                tasks,
+                aux_task_w,
+                env_by_description,
+                seed=args.seed,
+                global_step=next_global_step,
+            )
+            aux_loss, aux_parts = _mtvj_visual_aux_loss(
+                mtvj_backbone,
+                metric_head,
+                aux_task,
+                aux_rng,
+                args.mtvj_visual_aux_batch,
+                lang_aux_cache,
+                device,
+                loc_lambda=args.mtvj_visual_aux_loc_lambda,
+                vis_lambda=args.mtvj_visual_aux_vis_lambda,
+            )
+            aux_loss.backward()
         if e2e_model is not None and args.semantic_adapter:
             scale_semantic_lora_grads(
                 e2e_model.text_backbone, args.semantic_act_grad_scale
@@ -3916,16 +6171,41 @@ def main() -> None:
         )
         if servo is not None:
             clip_params = [*clip_params, *servo.parameters()]
+        relation_gradient_norm = None
+        if relation_encoder is not None and args.mtvj_train_relation:
+            relation_gradient_norm = _module_action_gradient_norm(
+                relation_encoder, "--mtvj-train-relation", device
+            )
+            clip_params = [
+                *clip_params,
+                *(p for p in relation_encoder.parameters() if p.requires_grad),
+            ]
+        metric_head_gradient_norm = None
+        metric_clip_params: list[Tensor] = []
+        if metric_head is not None and args.mtvj_train_metric_head:
+            metric_head_gradient_norm = _module_action_gradient_norm(
+                metric_head, "--mtvj-train-metric-head", device
+            )
+            # Visual auxiliary updates can be much larger than the flow loss.
+            # Clip the metric head independently so an auxiliary step cannot
+            # shrink the VA/relation gradients through one shared global norm.
+            metric_clip_params = [
+                p for p in metric_head.parameters() if p.requires_grad
+            ]
         gradient_norm = torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
+        metric_clip_norm = (
+            torch.nn.utils.clip_grad_norm_(metric_clip_params, 1.0)
+            if metric_clip_params
+            else None
+        )
         if args.sam_rho > 0:
             # SAM：先沿梯度方向扰动权重（worst-case 邻域），重算 loss 后走真实步。
             # η_act 对两次 backward 都按动作/语义拆分缩放（见 scale_semantic_lora_grads
             # 文档：first_step 的扰动方向与缩放无关——ρ·g/‖g‖ 与缩放无关；实际步长
             # 由第二次缩放后的梯度决定，因此两次缩放才使 η_act 对 SAM 生效）。
             optimizer.first_step(zero_grad=True)
-            action_total2, semantic_total2, _, _, _, _, _, _, _, _ = compute_loss(
-                batch, noisy_actions, flow_time
-            )
+            second_losses = compute_loss(batch, noisy_actions, flow_time)
+            action_total2, semantic_total2 = second_losses[:2]
             action_total2.backward()
             if e2e_model is not None and args.semantic_adapter:
                 scale_semantic_lora_grads(
@@ -3940,6 +6220,7 @@ def main() -> None:
             optimizer.second_step(zero_grad=True)
         else:
             optimizer.step()
+        commit_successful_update(step, consumed_locality_batch)
         gate_log = (
             f" evsm_gate={evsm_gate_mean:.3f}" if evsm_gate_mean is not None else ""
         )
@@ -3954,6 +6235,28 @@ def main() -> None:
             compile_step_log = f" compile={args.compile_every}"
             if args.training_stage:
                 compile_step_log += f" stage={args.training_stage}"
+        relation_log = (
+            f" rel_grad={float(relation_gradient_norm):.6f}"
+            if relation_gradient_norm is not None
+            else ""
+        )
+        metric_head_log = (
+            f" metric_grad={float(metric_head_gradient_norm):.6f}"
+            if metric_head_gradient_norm is not None
+            else ""
+        )
+        aux_log = ""
+        if aux_parts:
+            aux_log = (
+                f" aux_total={aux_parts.get('total', 0.0):.4f}"
+                f" aux_hinge={aux_parts.get('hinge', 0.0):.4f}"
+                f" aux_pos={aux_parts.get('pos', 0.0):.4f}"
+                f" aux_offset={aux_parts.get('offset', 0.0):.4f}"
+                f" aux_vis={aux_parts.get('vis', 0.0):.4f}"
+                f" aux_rmse={aux_parts.get('rmse_px', 0.0):.1f}px"
+            )
+        if metric_clip_norm is not None:
+            metric_head_log += f" metric_clip={float(metric_clip_norm):.6f}"
         servo_log = ""
         if servo_stats is not None:
             # Step 2 伺服运行日志：信任缩放 β / 重读触发率 / 假设熵 / 修正幅度 / 阶段分布。
@@ -3975,19 +6278,50 @@ def main() -> None:
                 f"|Δa|={float(servo_stats['correction'].norm(dim=-1).mean()):.4f} "
                 f"stage={'/'.join(f'{k}:{v}' for k, v in counts.items())}]"
             )
+        task_ids = sorted(
+            int(value)
+            for value in torch.unique(batch["instruction_id"]).detach().cpu()
+        )
+        task_log = "/".join(
+            task_log_names.get(value, str(value)) for value in task_ids
+        )
+        valid_fraction = effective_action_valid_fraction(
+            batch, batch["actions"]
+        ).detach()
         print(
             f"step={step} mode={args.mode} contract="
             f"{'e2e_single' if e2e_model is not None else ('single' if args.single_task else 'paired')} "
+            f"task={task_log} action_valid={float(valid_fraction):.4f} "
             f"sequence={noisy_actions.shape[1]} "
             f"loss={total_loss.item():.6f} flow={flow_loss.item():.6f} "
+            f"flow_first{min(args.flow_prefix_steps, noisy_actions.shape[-2])}="
+            f"{flow_prefix_loss.item():.6f} "
+            f"flow_tail{max(noisy_actions.shape[-2] - args.flow_prefix_steps, 0)}="
+            f"{flow_tail_loss.item():.6f} "
             f"pair={pair_loss.item():.6f} future={future_loss.item():.6f} "
             f"goal_delta={predicted_delta.item():.6f}/"
             f"{target_delta.item():.6f} grad={float(gradient_norm):.6f}"
-            f"{gate_log}{semantic_log}{compile_step_log}{servo_log}"
+            f"{relation_log}{metric_head_log}{aux_log}{gate_log}{semantic_log}"
+            f"{compile_step_log}{servo_log}"
         )
 
     if args.save:
-        save_checkpoint(args, config, model, e2e_model, scene_teacher, vision_backbone, servo=servo)
+        save_checkpoint(
+            args,
+            config,
+            model,
+            e2e_model,
+            scene_teacher,
+            vision_backbone,
+            servo=servo,
+            relation_encoder=relation_encoder,
+            metric_head=metric_head,
+            roi_head=roi_head,
+            optimizer=optimizer,
+            global_step=global_step,
+            sampler=sampler,
+            exact_run_contract=runtime_exact_run_contract,
+        )
 
 
 if __name__ == "__main__":

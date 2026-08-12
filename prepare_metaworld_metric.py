@@ -10,12 +10,12 @@
 随机物体颜色（对象 geom rgba 亮度/色相扰动）。
 
 关键点真值（世界坐标 → 图像坐标 pinhole 投影，0-1 归一化 y,x 序）：
-    tool      = tcp_center（rightEndEffector/leftEndEffector 中点，metaworld 官方 EEF）
-    object    = 被操作物体 body xpos（per-task 映射表）
-    target    = 目标 site/body（per-task 映射表）
-    interface = 接触界面 site/body/计算点（per-task 映射表）
-支持任务：peg-insert-side-v3 / assembly-v3 / hand-insert-v3；其余任务 fallback
-返回形状一致的零值标签（meta["supported"]=False 标记）。
+    tool      = tcp_center（MetaWorld 官方 EEF）
+    object    = env._get_pos_objects()[0:3]（主操作实体）
+    target    = env._target_pos（任务成功目标）
+    interface = 第二实体（若存在），否则 object（progress anchor）
+覆盖本项目全部 49 个 MetaWorld 任务。reach 操作族直接控制 TCP，因此该族的
+object/interface 均取 tool；这是操作族语义，不是逐任务关键点映射。
 
 投影（2026-08-09 实测验证，误差 <2px）：
     p_cam = R^T (p − cam_pos)，R = mju_quat2Mat(cam_quat) 列 = 相机轴
@@ -26,15 +26,15 @@ site marker / seg geom 质心对照（右/左 EEF 1.0/2.0px、hole 0.6px、assem
 「模型 pos 被改写过的 world 系 site」（如 peg-insert 的 goal）给出陈旧/错误位置，
 故可见度与验证一律用深度（renderer depth）判遮挡、RGB marker 验 site。
 
-relation 语义（[n,6]，与 metric head 输出同空间；拍板 2A 2026-08-10）：
-    rel[:,0:2] = p_eef − p_obj；rel[:,2:4] = p_obj − p_target（归一化图像坐标 y,x）
-    rel[:,4] = axis_cos；rel[:,5] = depth_m(z_obj−z_target)
-relation_aux（额外键，[n,4]）：[axis_alignment(cos∈[-1,1]), depth_m(z_obj−z_target),
-    |eef−obj|_m, |obj−target|_m]（世界距离供 mm 级评估用）。
+relation 语义（[n,6]，与 metric head 输出同空间）：
+    rel[:,0:2] = p_tool − p_object；rel[:,2:4] = p_progress − p_target
+    rel[:,4] = axis_cos；rel[:,5] = depth_m(z_progress−z_target)
+relation_aux（额外键，[n,4]）：[axis_alignment(cos∈[-1,1]),
+    depth_m(z_progress−z_target), |tool−object|_m, |progress−target|_m]。
 contact：|eef − obj| < 3cm → 1.0。
 
 用法（CPU 仿真，无 GPU）：
-    python prepare_metaworld_metric.py            # 冒烟：2 样本 + 三任务投影验证 + /tmp/metric_sample.png
+    python prepare_metaworld_metric.py            # 冒烟：2 样本 + 投影验证 + /tmp/metric_sample.png
     python prepare_metaworld_metric.py --task assembly-v3 --n 8 --out-png /tmp/m.png
     python prepare_metaworld_metric.py --task any --n 4        # 混合任务
 """
@@ -57,7 +57,9 @@ os.environ.setdefault("EGL_PLATFORM", "surfaceless")
 from scripts.build_longtraj_features import ENV_TO_TASK  # noqa: E402
 
 ROLE_NAMES = ("tool", "object", "target", "interface")
-SUPPORTED_TASKS = ("peg-insert-side-v3", "assembly-v3", "hand-insert-v3")
+SUPPORTED_TASKS = tuple(ENV_TO_TASK)
+# Reach 的成功量是 TCP→target；场景中的 dummy object 不参与任务。
+DIRECT_TOOL_TARGET_TASKS = frozenset(("reach-v3", "reach-wall-v3"))
 CAMERA_NAME = "corner2"
 CAM_POS_DEFAULT = np.array([0.75, 0.075, 0.7])  # lerobot 采集同款 corner2
 RENDER_SIZE = 480  # metaworld env 渲染分辨率（square）
@@ -65,17 +67,17 @@ IMAGE_SIZE = 384   # 输出帧分辨率
 VISION_STRIDE = 2  # 历史帧步距（eval 契约 [d-6, d-4, d-2, d]）
 SETTLE_STEPS = 10  # 随机臂位 IK settle 步数
 OCCLUSION_TOL_M = 0.05  # 深度判遮挡容差（关键点表面深度 vs 像素深度）
+ENTITY_RAY_TOL_M = 0.03  # 内部实体锚点：首个同实体命中可略晚于语义点
+ENTITY_NEIGHBOR_RADIUS_PX = 24.0  # 只接纳语义点附近的同 body 可见表面
 CONTACT_DIST_M = 0.03   # 接触判据：|eef − obj|
 CAM_JITTER_M = 0.03     # 视角随机：cam_pos ±3cm
 OBJ_JITTER_M = 0.03     # 物体位置随机：水平 ±3cm
 _MT1_CACHE: dict[str, object] = {}
+SAMPLE_RNG_CONTRACT = "parent_seed_per_sample_v1"
 
 
-# --------------------------------------------------------------------------
-# 每任务关键点映射表
-#   kind ∈ {"body", "site", "point"}；point 为 (任务内计算函数名, ) 于运行时求值
-# --------------------------------------------------------------------------
-TASK_KEYPOINT_TABLE: dict[str, dict[str, tuple]] = {
+# 仅供人工投影校准使用；训练标签不读取此表。
+PROJECTION_REFERENCE_TABLE: dict[str, dict[str, tuple]] = {
     "peg-insert-side-v3": {
         "object": ("body", "peg"),          # 被插的 peg（自由体）
         "target": ("site", "hole"),         # 插入目标：孔（可见；goal site 在方块内部不可见）
@@ -92,20 +94,6 @@ TASK_KEYPOINT_TABLE: dict[str, dict[str, tuple]] = {
         "target": ("site", "goal"),         # 孔中心（桌面以下 2cm，孔口可见）
         "interface": ("point", "hole_mouth"),  # 孔口 = goal + [0,0,0.02]
     },
-}
-
-# 每任务「可动对象 body 名」（free joint 平移用；fallback 走 obs[4:7] 匹配）
-TASK_OBJECT_BODY: dict[str, str] = {
-    "peg-insert-side-v3": "peg",
-    "assembly-v3": "asmbly_peg",
-    "hand-insert-v3": "obj",
-}
-
-# 每任务对象 geom 名（颜色随机化用；None → 按 body 名找）
-TASK_OBJECT_GEOM: dict[str, str | None] = {
-    "peg-insert-side-v3": "peg",
-    "assembly-v3": None,      # RoundNut body 上的全部 geom
-    "hand-insert-v3": "objGeom",
 }
 
 
@@ -165,8 +153,8 @@ def project_points(env, points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return np.stack([px, py], axis=1), depth
 
 
-def _resolve_keypoint_world(env, spec: tuple, task: str) -> np.ndarray | None:
-    """映射表条目 → 世界坐标 [3]；找不到（如 task 无该 site）返回 None。"""
+def _resolve_projection_reference(env, spec: tuple) -> np.ndarray | None:
+    """人工投影校准表条目 → 世界坐标；不参与训练标签生成。"""
     kind, name = spec
     try:
         if kind == "body":
@@ -185,51 +173,117 @@ def _resolve_keypoint_world(env, spec: tuple, task: str) -> np.ndarray | None:
 
 
 def keypoint_world_positions(env, task: str) -> np.ndarray | None:
-    """四角色世界坐标 [4,3]（tool=tcp_center；其余 per-task 表）。不支持 → None。"""
-    if task not in TASK_KEYPOINT_TABLE:
+    """统一 MetaWorld 四角色世界坐标 ``[tool, object, target, progress]``。
+
+    ``_get_pos_objects`` 是 MetaWorld observation 的官方 achieved-entity
+    接口。双实体任务（hammer/stick）用第二实体表示任务进度；其余任务的
+    progress 与 object 相同。直接控制 TCP 的 reach 操作族不使用场景 dummy
+    object。未知任务返回 ``None``，已声明支持的任务接口异常则立即报错。
+    """
+    if task not in SUPPORTED_TASKS:
         return None
-    pts = [env.tcp_center]
-    for role in ("object", "target", "interface"):
-        spec = TASK_KEYPOINT_TABLE[task][role]
-        p = _resolve_keypoint_world(env, spec, task)
-        if p is None:
-            return None
-        pts.append(p)
-    return np.stack(pts)
+    tool = np.asarray(env.tcp_center, dtype=float).reshape(-1)
+    objects = np.asarray(env._get_pos_objects(), dtype=float).reshape(-1)
+    target = np.asarray(getattr(env, "_target_pos", None), dtype=float).reshape(-1)
+    if tool.shape != (3,):
+        raise ValueError(f"{task}: tcp_center must have shape (3,), got {tool.shape}")
+    if objects.size < 3 or objects.size % 3:
+        raise ValueError(
+            f"{task}: _get_pos_objects must contain one or more 3D entities, "
+            f"got shape {objects.shape}"
+        )
+    if target.shape != (3,):
+        raise ValueError(f"{task}: _target_pos must have shape (3,), got {target.shape}")
+    entities = objects.reshape(-1, 3)
+    if task in DIRECT_TOOL_TARGET_TASKS:
+        obj = progress = tool
+    else:
+        obj = entities[0]
+        progress = entities[1] if len(entities) > 1 else obj
+    world = np.stack((tool, obj, target, progress))
+    if not np.isfinite(world).all():
+        raise ValueError(f"{task}: non-finite metric role coordinates")
+    return world
+
+
+def _relation_labels(
+    keypoints_yx: np.ndarray,
+    world: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build relation/diagnostic labels from the generic four-role contract."""
+    kp = np.asarray(keypoints_yx, dtype=float)
+    xyz = np.asarray(world, dtype=float)
+    if kp.shape != (4, 2) or xyz.shape != (4, 3):
+        raise ValueError(f"expected keypoints (4,2) and world (4,3), got {kp.shape}, {xyz.shape}")
+    tool, obj, target, progress = xyz
+    tool_to_object = tool - obj
+    progress_to_target = progress - target
+    rel = np.zeros(6, dtype=np.float32)
+    rel[0:2] = kp[0] - kp[1]
+    rel[2:4] = kp[3] - kp[2]
+    lhs = tool_to_object[:2]
+    rhs = progress_to_target[:2]
+    denom = float(np.linalg.norm(lhs) * np.linalg.norm(rhs))
+    rel[4] = float(np.dot(lhs, rhs) / denom) if denom > 1e-12 else 0.0
+    rel[5] = float(progress[2] - target[2])
+    aux = np.array(
+        [
+            rel[4],
+            rel[5],
+            np.linalg.norm(tool_to_object),
+            np.linalg.norm(progress_to_target),
+        ],
+        dtype=np.float32,
+    )
+    return rel, aux
 
 
 # --------------------------------------------------------------------------
 # 随机化
 # --------------------------------------------------------------------------
-def _move_object_random(env, task: str, rng: np.random.Generator) -> None:
-    """物体 free joint 水平平移 ±OBJ_JITTER_M（同 move_obj1 手法：free joint 改 qpos）。"""
-    import metaworld  # noqa: F401
+def _entity_anchor_body(
+    env, point: np.ndarray, max_distance_m: float = 0.08
+) -> int | None:
+    """Find the nearest non-robot entity body for one semantic 3-D point."""
+    point = np.asarray(point, dtype=float).reshape(-1)
+    if point.shape != (3,) or not np.isfinite(point).all():
+        raise ValueError(f"entity point must be finite (3,), got {point.shape}")
+    candidates: list[tuple[float, int]] = []
+    for site_id in range(env.model.nsite):
+        body_id = int(env.model.site_bodyid[site_id])
+        if body_id > 0 and not _is_robot_body(env, body_id):
+            candidates.append(
+                (float(np.linalg.norm(env.data.site_xpos[site_id] - point)), body_id)
+            )
+    for geom_id in range(env.model.ngeom):
+        body_id = int(env.model.geom_bodyid[geom_id])
+        if body_id > 0 and not _is_robot_body(env, body_id):
+            candidates.append(
+                (float(np.linalg.norm(env.data.geom_xpos[geom_id] - point)), body_id)
+            )
+    for body_id in range(1, env.model.nbody):
+        if not _is_robot_body(env, body_id):
+            candidates.append(
+                (float(np.linalg.norm(env.data.body(body_id).xpos - point)), body_id)
+            )
+    if not candidates:
+        return None
+    distance, body_id = min(candidates)
+    return body_id if distance <= max_distance_m else None
+
+
+def _object_anchor_body(env, max_distance_m: float = 0.08) -> int | None:
+    """Find the primary entity body through the generic MetaWorld object API."""
+    obj = np.asarray(env._get_pos_objects(), dtype=float).reshape(-1)[:3]
+    return _entity_anchor_body(env, obj, max_distance_m=max_distance_m)
+
+
+def _move_object_random(env, rng: np.random.Generator) -> None:
+    """Horizontally jitter a primary entity only when it has a free joint."""
     mujoco = _import_mujoco_metaworld()[0]
-    bid = None
-    body_name = TASK_OBJECT_BODY.get(task)
-    if body_name is not None:
-        try:
-            bid = int(env.model.body(body_name).id)
-        except KeyError:
-            bid = None
+    bid = _object_anchor_body(env)
     if bid is None:
-        # fallback：obs[4:7] 匹配 site/body（跳过机械臂自身），与 move_obj1 一致
-        cur = env._get_obs()[4:7].copy()
-        for i in range(env.model.nsite):
-            if _is_robot_body(env, int(env.model.site_bodyid[i])):
-                continue
-            if np.allclose(env.data.site_xpos[i], cur, atol=0.02):
-                bid = int(env.model.site_bodyid[i])
-                break
-        if bid is None:
-            for b in range(env.model.nbody):
-                if _is_robot_body(env, b):
-                    continue
-                if np.allclose(env.data.body(b).xpos, cur, atol=0.02):
-                    bid = b
-                    break
-    if bid is None:
-        return  # 找不到可动物体：跳过（保持默认位置）
+        return
     delta = np.zeros(3)
     delta[:2] = rng.uniform(-OBJ_JITTER_M, OBJ_JITTER_M, 2)
     # free joint 平移（沿父链找，同 mw_expert_replay.move_body）
@@ -262,25 +316,15 @@ def _is_robot_body(env, bid: int) -> bool:
     return False
 
 
-def _randomize_colors(env, task: str, rng: np.random.Generator) -> None:
-    """对象 geom 颜色随机化（亮度/饱和度缩放 或 绕灰轴色相旋转），alpha 保持。"""
+def _randomize_colors(env, rng: np.random.Generator) -> None:
+    """Randomize primary-entity geoms found through the generic object API."""
     m = env.model
-    gids: list[int] = []
-    gname = TASK_OBJECT_GEOM.get(task)
-    if gname is not None:
-        try:
-            gids.append(int(m.geom(gname).id))
-        except KeyError:
-            pass
-    else:
-        bname = TASK_OBJECT_BODY.get(task)
-        if bname is not None:
-            try:
-                bid = int(m.body(bname).id)
-            except KeyError:
-                bid = None
-            if bid is not None:
-                gids = [g for g in range(m.ngeom) if int(m.geom_bodyid[g]) == bid]
+    body_id = _object_anchor_body(env)
+    gids = (
+        [g for g in range(m.ngeom) if int(m.geom_bodyid[g]) == body_id]
+        if body_id is not None
+        else []
+    )
     if not gids:
         return
     gray = np.ones(3) / np.sqrt(3)
@@ -315,15 +359,215 @@ def _jitter_camera(env, rng: np.random.Generator) -> None:
         cam[2] = 0.55
 
 
+def _randomize_nonrobot_articulation(env, rng: np.random.Generator) -> int:
+    """Sample every finite non-robot hinge/slide joint over its valid range.
+
+    This single mechanism covers buttons, dials, doors, drawers, faucets,
+    handles, levers, nails, plates, sticks and windows. Free joints remain under
+    ``_move_object_random`` so rotations/translations are not made inconsistent.
+    Returns the number of randomized scalar joints for contract tests.
+    """
+    mujoco = _import_mujoco_metaworld()[0]
+    randomized = 0
+    for joint_id in range(env.model.njnt):
+        body_id = int(env.model.jnt_bodyid[joint_id])
+        joint_type = int(env.model.jnt_type[joint_id])
+        if (
+            _is_robot_body(env, body_id)
+            or joint_type not in (2, 3)  # slide / hinge
+            or not bool(env.model.jnt_limited[joint_id])
+        ):
+            continue
+        low, high = np.asarray(env.model.jnt_range[joint_id], dtype=float)
+        if not np.isfinite((low, high)).all() or high - low <= 1e-8:
+            continue
+        qpos_addr = int(env.model.jnt_qposadr[joint_id])
+        env.data.qpos[qpos_addr] = rng.uniform(low, high)
+        dof_addr = int(env.model.jnt_dofadr[joint_id])
+        env.data.qvel[dof_addr] = 0.0
+        randomized += 1
+    if randomized:
+        mujoco.mj_forward(env.model, env.data)
+    return randomized
+
+
 # --------------------------------------------------------------------------
 # 单样本采集
 # --------------------------------------------------------------------------
-def _sample_one(env, task: str, rng: np.random.Generator, w: int) -> dict:
+def _chronological_capture_offsets(w: int) -> tuple[int, ...]:
+    """Return oldest-to-newest frame offsets used by train and deployment."""
+    if w < 1:
+        raise ValueError("vision window must contain at least one frame")
+    return tuple(VISION_STRIDE * k for k in range(w))
+
+
+def _resize_chronological_frames(frames: list[np.ndarray]) -> np.ndarray:
+    """Resize without changing the oldest-to-newest temporal order."""
+    if not frames:
+        raise ValueError("cannot resize an empty vision window")
+    return np.stack(
+        [
+            np.asarray(
+                Image.fromarray(frame).resize(
+                    (IMAGE_SIZE, IMAGE_SIZE), Image.BICUBIC
+                )
+            )
+            for frame in frames
+        ]
+    )
+
+
+def _role_visibility(
+    pixels_xy: np.ndarray,
+    point_depths: np.ndarray,
+    surface_depth: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return honest visibility, surface visibility and in-frame diagnostics.
+
+    All roles use the same depth-surface rule. In particular, an in-frame
+    simulator target is not called visible when it is only a virtual coordinate;
+    such an unobservable point must not contribute localization gradients.
+    """
+    pixels = np.asarray(pixels_xy, dtype=float)
+    depths = np.asarray(point_depths, dtype=float)
+    if pixels.shape != (4, 2) or depths.shape != (4,):
+        raise ValueError(f"expected pixels (4,2) and depths (4,), got {pixels.shape}, {depths.shape}")
+    in_frame = (
+        (pixels[:, 0] >= 0)
+        & (pixels[:, 0] < RENDER_SIZE)
+        & (pixels[:, 1] >= 0)
+        & (pixels[:, 1] < RENDER_SIZE)
+        & (depths > 0)
+    )
+    surface_visible = np.zeros(4, dtype=np.float32)
+    for role in range(4):
+        if not in_frame[role]:
+            continue
+        px = int(round(float(pixels[role, 0])))
+        py = int(round(float(pixels[role, 1])))
+        px = min(px, RENDER_SIZE - 1)
+        py = min(py, RENDER_SIZE - 1)
+        if abs(float(surface_depth[py, px]) - float(depths[role])) < OCCLUSION_TOL_M:
+            surface_visible[role] = 1.0
+    visibility = surface_visible.copy()
+    return visibility, surface_visible, in_frame.astype(np.float32)
+
+
+def _first_ray_hit_body(env, point: np.ndarray) -> int | None:
+    """Return the first body hit on the finite camera-to-point ray segment."""
+    mujoco = _import_mujoco_metaworld()[0]
+    camera, _, _ = camera_params(env)
+    delta = np.asarray(point, dtype=np.float64) - camera
+    point_distance = float(np.linalg.norm(delta))
+    if not np.isfinite(point_distance) or point_distance <= 1e-9:
+        return None
+    geom_id = np.full(1, -1, dtype=np.int32)
+    hit_distance = float(
+        mujoco.mj_ray(
+            env.model,
+            env.data,
+            camera.astype(np.float64),
+            (delta / point_distance).astype(np.float64),
+            None,
+            1,
+            -1,
+            geom_id,
+        )
+    )
+    if (
+        hit_distance < 0.0
+        or hit_distance > point_distance + ENTITY_RAY_TOL_M
+        or int(geom_id[0]) < 0
+    ):
+        return None
+    return int(env.model.geom_bodyid[int(geom_id[0])])
+
+
+def _nearby_entity_surface_visible(
+    env,
+    anchor_point: np.ndarray,
+    entity_body: int,
+    *,
+    max_radius_px: float = ENTITY_NEIGHBOR_RADIUS_PX,
+) -> bool:
+    """Probe visible same-body geom centers near an internal semantic anchor.
+
+    The label coordinate stays at ``anchor_point``.  Geometry centers are only
+    ray probes, and only when their image projection is within a bounded pixel
+    neighborhood.  A different entity/robot hit remains an occlusion.
+    """
+    if max_radius_px < 0 or not np.isfinite(max_radius_px):
+        raise ValueError("entity neighborhood radius must be finite and non-negative")
+    anchor_px, anchor_depth = project_points(
+        env, np.asarray(anchor_point, dtype=float).reshape(1, 3)
+    )
+    if anchor_depth[0] <= 0 or not np.isfinite(anchor_px).all():
+        return False
+    candidates: list[tuple[float, np.ndarray]] = []
+    for geom_id in range(env.model.ngeom):
+        if int(env.model.geom_bodyid[geom_id]) != int(entity_body):
+            continue
+        center = np.asarray(env.data.geom_xpos[geom_id], dtype=float).copy()
+        center_px, center_depth = project_points(env, center.reshape(1, 3))
+        if center_depth[0] <= 0 or not np.isfinite(center_px).all():
+            continue
+        pixel_distance = float(np.linalg.norm(center_px[0] - anchor_px[0]))
+        if pixel_distance <= max_radius_px:
+            candidates.append((pixel_distance, center))
+    for _, center in sorted(candidates, key=lambda item: item[0]):
+        if _first_ray_hit_body(env, center) == entity_body:
+            return True
+    return False
+
+
+def _entity_aware_visibility(
+    env,
+    world: np.ndarray,
+    surface_visible: np.ndarray,
+    in_frame: np.ndarray,
+) -> np.ndarray:
+    """Augment only object/progress when the first ray hit is their own entity.
+
+    This recovers generic internal anchors (drawers, pegs, handles) without
+    treating a robot or another scene entity as evidence for the semantic point.
+    Tool and target retain the strict depth-surface rule.
+    """
+    points = np.asarray(world, dtype=float)
+    strict = np.asarray(surface_visible, dtype=np.float32)
+    framed = np.asarray(in_frame, dtype=np.float32)
+    if points.shape != (4, 3) or strict.shape != (4,) or framed.shape != (4,):
+        raise ValueError("entity-aware visibility expects world (4,3) and masks (4,)")
+    entity_visible = strict.copy()
+    for role in (1, 3):  # object, interface/progress
+        if entity_visible[role] >= 0.5 or framed[role] < 0.5:
+            continue
+        entity_body = _entity_anchor_body(env, points[role])
+        if entity_body is None or _is_robot_body(env, entity_body):
+            continue
+        hit_body = _first_ray_hit_body(env, points[role])
+        same_entity_visible = hit_body == entity_body or (
+            hit_body is None
+            and _nearby_entity_surface_visible(env, points[role], entity_body)
+        )
+        if same_entity_visible:
+            entity_visible[role] = 1.0
+    return entity_visible
+
+
+def _sample_one(
+    env,
+    task: str,
+    rng: np.random.Generator,
+    w: int,
+    *,
+    include_raw_frames: bool = False,
+) -> dict:
     mujoco = _import_mujoco_metaworld()[0]
     # 随机化（颜色/相机/物体位置；reset 随机化已在 make_metric_batch 里做）
-    _randomize_colors(env, task, rng)
+    _randomize_colors(env, rng)
     _jitter_camera(env, rng)
-    _move_object_random(env, task, rng)
+    _move_object_random(env, rng)
+    _randomize_nonrobot_articulation(env, rng)
 
     # 随机臂位：mocap 目标 + IK settle + 窗口内随机小动作（帧间有运动）
     env.data.mocap_pos[0] = [
@@ -333,11 +577,14 @@ def _sample_one(env, task: str, rng: np.random.Generator, w: int) -> dict:
     ]
     env.data.mocap_quat[0] = np.array([1.0, 0.0, 1.0, 0.0])
 
-    offsets = [VISION_STRIDE * (w - 1 - k) for k in range(w)]  # [6,4,2,0]
-    # Codex P0-2（2026-08-10）：total = SETTLE + offsets[0] + 1——保证
-    # i=SETTLE+offsets[0] 的"最新帧"也被渲染（4 帧齐全）；该帧渲染后不再
+    # Capture in the same chronological contract as action train/eval:
+    # [t-6, t-4, t-2, t].  The loop advances forward in simulator time, so the
+    # ascending offsets are already oldest-to-newest and must not be reversed.
+    offsets = _chronological_capture_offsets(w)  # [0,2,4,6]
+    # Codex P0-2（2026-08-10）：total = SETTLE + offsets[-1] + 1——保证
+    # i=SETTLE+offsets[-1] 的"最新帧"也被渲染（4 帧齐全）；该帧渲染后不再
     # step（i < total-1 才 step），标签（world 坐标）与最新帧严格同状态。
-    total = SETTLE_STEPS + offsets[0] + 1
+    total = SETTLE_STEPS + offsets[-1] + 1
 
     def _rand_action() -> np.ndarray:
         a = np.zeros(4, dtype=np.float32)
@@ -363,52 +610,48 @@ def _sample_one(env, task: str, rng: np.random.Generator, w: int) -> dict:
     pixels, depths = project_points(env, world)
     kp = np.stack([pixels[:, 1] / RENDER_SIZE, pixels[:, 0] / RENDER_SIZE], axis=1)  # y,x 归一化
     kp = np.clip(kp, 0.0, 1.0)  # 帧外点 clamp 到边界（visibility=0 掩码）
-    # 可见度：帧内 + 深度一致（像素处表面深度 ≈ 关键点真实深度，容忍 OCCLUSION_TOL_M）
-    vis = np.zeros(4, dtype=np.float32)
-    for r in range(4):
-        px, py = int(round(pixels[r, 0])), int(round(pixels[r, 1]))
-        if 0 <= px < RENDER_SIZE and 0 <= py < RENDER_SIZE and depths[r] > 0:
-            if abs(float(depth[py, px]) - float(depths[r])) < OCCLUSION_TOL_M:
-                vis[r] = 1.0
+    _, surface_visible, in_frame = _role_visibility(pixels, depths, depth)
+    entity_visible = (
+        _entity_aware_visibility(env, world, surface_visible, in_frame)
+        if supported
+        else surface_visible.copy()
+    )
+    vis = entity_visible.copy()
     if not supported:
         vis[:] = 0.0
+        surface_visible[:] = 0.0
+        entity_visible[:] = 0.0
+        in_frame[:] = 0.0
 
-    # relation：6 维（拍板 2A，Codex P0-5）= [p_eef−p_obj(2), p_obj−p_target(2),
-    # axis_cos, depth_m]（与 metric head 输出同空间；axis/depth 从世界坐标算）
-    rel = np.zeros(6, dtype=np.float32)
-    aux = np.zeros(4, dtype=np.float32)
-    if supported:
-        pe, po, pt, pi = world  # 世界坐标
-        rel[0:2] = kp[0, :] - kp[1, :]   # p_eef − p_obj (y,x)
-        rel[2:4] = kp[1, :] - kp[2, :]   # p_obj − p_target (y,x)
-        deo = pe - po
-        dot_ = po - pt
-        d_xy = np.linalg.norm(dot_[:2])
-        if d_xy > 1e-6:
-            rel[4] = float(np.dot(deo[:2], dot_[:2]) / (np.linalg.norm(deo[:2]) * d_xy))
-        else:
-            rel[4] = 0.0  # 共线退化 → 对齐度 0（不可判）
-        rel[5] = float(po[2] - pt[2])            # depth：物体在目标上方的高度差
-        aux[2] = float(np.linalg.norm(deo))      # |eef − obj|（米）
-        aux[3] = float(np.linalg.norm(dot_))     # |obj − target|（米）
-    contact = float(np.linalg.norm(world[0] - world[1]) < CONTACT_DIST_M) if supported else 0.0
+    rel, aux = _relation_labels(kp, world) if supported else (
+        np.zeros(6, dtype=np.float32),
+        np.zeros(4, dtype=np.float32),
+    )
+    contact = (
+        float(np.linalg.norm(world[0] - world[1]) < CONTACT_DIST_M)
+        if supported and task not in DIRECT_TOOL_TARGET_TASKS
+        else 0.0
+    )
 
     # 帧 → [w, 384, 384, 3] uint8（PIL BICUBIC，与 prepare_mw_perturbations 同款）。
-    # 捕获时序：循环按时间升序渲染，frames=[t, t-2, t-4, t-6] → 反转成历史在前。
-    frames.reverse()
-    frames_small = np.stack(
-        [np.asarray(Image.fromarray(f).resize((IMAGE_SIZE, IMAGE_SIZE), Image.BICUBIC)) for f in frames]
-    )
-    return {
+    # 捕获循环本身按时间升序，frames 已是 [t-6,t-4,t-2,t]；不要反转。
+    frames_small = _resize_chronological_frames(frames)
+    record = {
         "frames": frames_small,
         "keypoints": kp.astype(np.float32),
         "visibility": vis,
+        "surface_visible": surface_visible,
+        "entity_visible": entity_visible,
+        "in_frame": in_frame,
         "relation": rel,
         "relation_aux": aux,
         "contact": np.float32(contact),
         "world": world.astype(np.float32),
         "supported": bool(supported),
     }
+    if include_raw_frames:
+        record["raw_frames"] = np.stack(frames)
+    return record
 
 
 class _Renderer:
@@ -437,63 +680,139 @@ class _Renderer:
         self._renderer.close()
 
 
-def _pick_tasks(task: str, rng: np.random.Generator, n: int) -> list[str]:
-    if task == "any":
-        return [str(rng.choice(SUPPORTED_TASKS)) for _ in range(n)]
-    if task not in SUPPORTED_TASKS:
-        return [task] * n  # 不支持任务：fallback（空标签），逐样本标记 supported=False
-    return [task] * n
+def _derive_sample_specs(
+    task: str,
+    rng: np.random.Generator,
+    n: int,
+) -> list[tuple[str, int]]:
+    """Resolve task and RNG identity before any sample is generated.
+
+    Each record consumes exactly two 31-bit words from the caller's generator:
+    one task-selection word and one sample-seed word.  Task selection uses the
+    first word only for ``task='any'``; consuming it for fixed tasks keeps the
+    parent stream independent of that branch.  Subsequent sample generation is
+    driven solely by its local generator, so env reuse and batch boundaries do
+    not change records.
+    """
+    if n < 1:
+        raise ValueError(f"n must be >= 1, got {n}")
+    if task != "any" and task not in SUPPORTED_TASKS:
+        raise ValueError(
+            f"unknown task {task!r}; expected one of {len(SUPPORTED_TASKS)} "
+            "project MetaWorld tasks or 'any'"
+        )
+    # Keep the legacy reset-seed domain [0, 2**31), preserving every individual
+    # augmentation's marginal distribution while decoupling sample streams.
+    words = rng.integers(0, 2**31, size=(n, 2), dtype=np.int64)
+    specs: list[tuple[str, int]] = []
+    for task_word, seed_word in words:
+        # Let Generator perform rejection sampling rather than using modulo, so
+        # ``any`` remains exactly uniform even though 2**31 is not divisible by
+        # 49.  This local draw cannot perturb another sample's stream.
+        resolved_task = task
+        if task == "any":
+            task_rng = np.random.default_rng(int(task_word))
+            resolved_task = SUPPORTED_TASKS[
+                int(task_rng.integers(0, len(SUPPORTED_TASKS)))
+            ]
+        specs.append((resolved_task, int(seed_word)))
+    return specs
 
 
-def make_metric_batch(task: str, rng: np.random.Generator, n: int,
-                      frames_per_sample: int = 4) -> dict:
+def _reset_env_for_sample(
+    env,
+    sample_seed: int,
+    base_geom_rgba: np.ndarray | None,
+) -> None:
+    """Reset one reused env from an isolated per-sample seed."""
+    # Our colour augmentation mutates the MuJoCo model, while env.reset only
+    # resets simulator data.  Restore the construction-time colours so sample
+    # i cannot leak into i+1 (and a new batch's fresh env is equivalent).
+    if base_geom_rgba is not None:
+        env.model.geom_rgba[:] = base_geom_rgba
+    np.random.seed(sample_seed)
+    env.reset(seed=sample_seed)
+
+
+def make_metric_batch(
+    task: str,
+    rng: np.random.Generator,
+    n: int,
+    frames_per_sample: int = 4,
+    *,
+    include_raw_frames: bool = False,
+) -> dict:
     """仿真器随机生成阶段 V 数据（无策略，任意观测）。
 
     契约（artifacts/mt_vj_contract.md §3）：
-        frames:        [n, frames_per_sample, 384, 384, 3] uint8（当前帧+历史帧，步距 2）
+        frames:        [n, frames_per_sample, 384, 384, 3] uint8（历史→当前，步距 2）
         language_text: [n] str（scripts/build_longtraj_features.ENV_TO_TASK）
         keypoints:     [n, 4, 2] float32（图像坐标 0-1，y,x 序；tool/object/target/interface）
-        visibility:    [n, 4] float32（帧内 + 深度遮挡判据）
-        relation:      [n, 6] float32（[p_eef−p_obj(2), p_obj−p_target(2), axis_cos, depth_m]）
+        visibility:    [n, 4] float32（tool/target 严格表面；object/interface
+                       允许相机首个 ray hit 为所属非机器人实体 body）
+        relation:      [n, 6] float32（[tool−object(2), progress−target(2), axis_cos, depth_m]）
         contact:       [n] float32（|eef−obj| < 3cm）
-    额外键（自描述）：tasks [n] str、relation_aux [n,4]、world [n,4,3]、
-        supported [n] bool、meta dict（role/语义/相机说明）。
-    task 支持 "any"（每样本随机抽支持任务）；不支持的任务 → 形状一致的零标签。
+    额外键（自描述）：surface_visible/entity_visible/in_frame [n,4]、tasks [n] str、
+        relation_aux [n,4]、world [n,4,3]、supported [n] bool、meta dict。
+    task 支持 "any"（每样本从全部 49 任务均匀抽样）；未知任务 fail-fast。
+    随机性契约 ``parent_seed_per_sample_v1``：调用开始即从父 rng 为每个样本
+    派生独立 seed，因此同一父 rng 下 8 个样本一次生成或分成 4+4 完全一致。
     """
     if frames_per_sample < 1:
         raise ValueError(f"frames_per_sample must be >= 1, got {frames_per_sample}")
-    tasks = _pick_tasks(task, rng, n)
+    sample_specs = _derive_sample_specs(task, rng, n)
+    tasks = [sample_task for sample_task, _ in sample_specs]
     batch: list[dict] = []
     # env 复用（2026-08-10 性能修复）：每样本新建 env ~0.9s（8 样本 → 7s/batch，
     # 20k 步 40-59h 不可行）。batch 内共享 1 个 env：样本间 reset（metaworld
     # reset 的 _get_state_rand_vec 随机化布局）+ _sample_one 内的颜色/相机/
     # 物体位置/臂位随机化保证样本多样性。混合任务（task="any"）回退新建。
     if len(set(tasks)) > 1:
-        for i, t in enumerate(tasks):
-            np.random.seed(int(rng.integers(0, 2**31)))
-            env = make_env(t, seed=42)
+        for t, sample_seed in sample_specs:
+            sample_rng = np.random.default_rng(sample_seed)
+            np.random.seed(sample_seed)
+            env = make_env(t, seed=sample_seed)
             try:
-                rec = _sample_one(env, t, rng, frames_per_sample)
+                rec = _sample_one(
+                    env,
+                    t,
+                    sample_rng,
+                    frames_per_sample,
+                    include_raw_frames=include_raw_frames,
+                )
             finally:
                 env.close()
             batch.append(rec)
     else:
-        np.random.seed(int(rng.integers(0, 2**31)))
-        env = make_env(tasks[0], seed=42)
+        first_seed = sample_specs[0][1]
+        np.random.seed(first_seed)
+        env = make_env(tasks[0], seed=first_seed)
+        model = getattr(env, "model", None)
+        geom_rgba = getattr(model, "geom_rgba", None)
+        base_geom_rgba = None if geom_rgba is None else geom_rgba.copy()
         try:
-            for i, t in enumerate(tasks):
+            for i, (t, sample_seed) in enumerate(sample_specs):
                 if i > 0:
-                    np.random.seed(int(rng.integers(0, 2**31)))
-                    env.reset(seed=int(rng.integers(0, 2**31)))
-                rec = _sample_one(env, t, rng, frames_per_sample)
+                    _reset_env_for_sample(env, sample_seed, base_geom_rgba)
+                sample_rng = np.random.default_rng(sample_seed)
+                rec = _sample_one(
+                    env,
+                    t,
+                    sample_rng,
+                    frames_per_sample,
+                    include_raw_frames=include_raw_frames,
+                )
                 batch.append(rec)
         finally:
             env.close()
-    return {
+    result = {
         "frames": np.stack([b["frames"] for b in batch]),
         "language_text": [ENV_TO_TASK.get(t, t) for t in tasks],
         "keypoints": np.stack([b["keypoints"] for b in batch]),
         "visibility": np.stack([b["visibility"] for b in batch]),
+        "surface_visible": np.stack([b["surface_visible"] for b in batch]),
+        "entity_visible": np.stack([b["entity_visible"] for b in batch]),
+        "in_frame": np.stack([b["in_frame"] for b in batch]),
         "relation": np.stack([b["relation"] for b in batch]),
         "relation_aux": np.stack([b["relation_aux"] for b in batch]),
         "contact": np.stack([b["contact"] for b in batch]),
@@ -502,29 +821,44 @@ def make_metric_batch(task: str, rng: np.random.Generator, n: int,
         "supported": np.asarray([b["supported"] for b in batch], dtype=bool),
         "meta": {
             "contract": "mt_vj_metric_field_v1",
+            "sample_rng_contract": SAMPLE_RNG_CONTRACT,
             "roles": list(ROLE_NAMES),
+            "interface_semantics": "progress anchor: second achieved entity when present, else object",
             "keypoints_order": "y,x normalized 0-1",
-            "relation_units": "normalized image coords (p_eef-p_obj, p_obj-p_target)",
-            "relation_aux_units": ["axis_alignment cos", "depth_m (z_obj-z_target)",
-                                   "|eef-obj|_m", "|obj-target|_m"],
+            "relation_units": "normalized image coords (p_tool-p_object, p_progress-p_target)",
+            "relation_aux_units": ["axis_alignment cos", "depth_m (z_progress-z_target)",
+                                   "|tool-object|_m", "|progress-target|_m"],
             "contact_units": "|eef-obj| < 0.03m -> 1",
-            "visibility": "in-frame & depth-occlusion check (tol 0.05m)",
+            "visibility": "tool/target strict depth-surface; object/interface strict OR first ray hit is same non-robot entity body",
+            "surface_visible": "strict in-frame + depth-surface diagnostic for every role",
+            "entity_visible": "training visibility after generic same-entity ray augmentation for object/interface only",
+            "in_frame": "projection-only diagnostic; never used as localization supervision",
             "camera": CAMERA_NAME,
             "camera_jitter_m": CAM_JITTER_M,
             "frame_size": IMAGE_SIZE,
             "render_size": RENDER_SIZE,
             "vision_stride": VISION_STRIDE,
-            "task_keypoint_table": {t: v for t, v in TASK_KEYPOINT_TABLE.items()},
+            "task_role_source": {
+                "tool": "env.tcp_center",
+                "object_and_progress": "env._get_pos_objects()",
+                "target": "env._target_pos",
+                "direct_tool_target_families": sorted(DIRECT_TOOL_TARGET_TASKS),
+            },
             "language_text_source": "scripts/build_longtraj_features.ENV_TO_TASK",
             "randomization": {
-                "reset_seed": "global np.random seeded per sample",
+                "reset_seed": "isolated per-sample seed derived from caller rng",
                 "object_pos_jitter_m": OBJ_JITTER_M,
                 "arm_pose": "random mocap target + IK settle + random small actions",
                 "camera_jitter_m": CAM_JITTER_M,
                 "object_color": "hue rotation / channel scale on object geoms",
+                "articulation": "all finite non-robot hinge/slide joints",
             },
         },
     }
+    if include_raw_frames:
+        result["raw_frames"] = np.stack([b["raw_frames"] for b in batch])
+        result["meta"]["raw_frame_size"] = RENDER_SIZE
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -595,7 +929,7 @@ def verify_projection(task: str, seed: int = 0, verbose: bool = True) -> float:
                 print(f"  {label}: proj={np.round(pp, 1)} gt={np.round(gt_px, 1)} "
                       f"err={err:.2f}px [{flag}]")
 
-        table = TASK_KEYPOINT_TABLE.get(task, {})
+        table = PROJECTION_REFERENCE_TABLE.get(task, {})
         # tool：tcp_center = 两指 marker 中点（右/左 EEF seg 各自 ~1-2px）
         mids = []
         for sname in ("rightEndEffector", "leftEndEffector"):
@@ -680,7 +1014,7 @@ def main() -> None:
 
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--task", default="peg-insert-side-v3",
-                    help="任务名或 any（混合）；不支持任务 → 零标签 fallback")
+                    help="49 个项目任务之一，或 any（全任务均匀混合）")
     ap.add_argument("--n", type=int, default=2)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out-png", default="/tmp/metric_sample.png")
@@ -715,7 +1049,7 @@ def main() -> None:
     if not args.no_verify:
         print("\n投影验证（世界坐标 → 渲染图，目标 <2px）:")
         max_errs = {}
-        for t in SUPPORTED_TASKS:
+        for t in PROJECTION_REFERENCE_TABLE:
             print(f"  [{t}]")
             max_errs[t] = verify_projection(t, seed=args.seed)
         print(f"\n[verify] max projection error per task: "

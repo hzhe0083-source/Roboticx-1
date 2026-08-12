@@ -106,68 +106,172 @@ def collect_episode(env, policy, task_name: str, rng: np.random.Generator,
 
 def _collect_episode_inner(env, policy, task_name: str, rng: np.random.Generator,
                            perturb: bool = True) -> dict | None:
-    obs, _ = env.reset(seed=int(rng.integers(0, 2**31)))
+    # MetaWorld v3 的 reset_model 仍从全局 NumPy RNG 取布局；仅传
+    # env.reset(seed=...) 在部分版本不会控制它。两边同时设种子，保证同一个
+    # collector seed 真正可复现，并把 episode_seed 写进样本供审计/去重。
+    episode_seed = int(rng.integers(0, 2**31))
+    np.random.seed(episode_seed)
+    obs, _ = env.reset(seed=episode_seed)
     frames: list[np.ndarray] = []
     actions: list[np.ndarray] = []
     states: list[np.ndarray] = []
-    success_frame = None
-    perturbed = False
+    action_success: list[bool] = []
+    action_sources: list[str] = []
+    lock_positions: list[np.ndarray] = []
+    lock_targets: list[np.ndarray] = []
+    lock_metric_valid: list[bool] = []
+    first_success: int | None = None
+    perturb_event: dict | None = None
     hold_target: int | None = None
     consec_success = 0
 
-    for step in range(500):
-        a = np.clip(np.asarray(policy.get_action(obs), dtype=np.float32), -1.0, 1.0)
-        # 契约（Codex P0-1，2026-08-09）：先保存【当前观测 + 即将执行的动作】，
-        # 再 step。此前顺序是 step 后才保存 (o_{t+1}, a_t)——图像/状态泄漏
-        # a_t 的执行结果且 prev 错位，整批数据作废需重采。
+    def _record_lock_metric(current_obs: np.ndarray) -> None:
+        """Record the pre-action door state on the same index as the action."""
+        if task_name != "door-lock-v3":
+            return
+        pos = np.asarray(current_obs[4:7], dtype=np.float32)
+        target = np.asarray(
+            getattr(env, "_target_pos", np.full(3, np.nan)), dtype=np.float32
+        ).reshape(-1)[:3]
+        valid = pos.shape == (3,) and target.shape == (3,)
+        if not valid:
+            pos = np.full(3, np.nan, dtype=np.float32)
+            target = np.full(3, np.nan, dtype=np.float32)
+        lock_positions.append(pos)
+        lock_targets.append(target)
+        lock_metric_valid.append(bool(valid and np.isfinite(pos).all() and np.isfinite(target).all()))
+
+    def _execute(action: np.ndarray, source: str):
+        """Store (pre-action observation, action), then execute exactly once."""
+        nonlocal obs, first_success, hold_target, consec_success
+        index = len(actions)
         frames.append(env.render())
-        actions.append(a)
-        states.append(obs[:4].astype(np.float32))
-        obs, _r, term, trunc, info = env.step(a)
-        if info.get("success") and success_frame is None:
-            success_frame = step
-        # 接触扰动：成功前随机一步注入 2-8mm，之后继续 policy 恢复
-        if perturb and not perturbed and success_frame is None and step > 20 and rng.random() < 0.05:
-            mag = rng.uniform(*PERTURB_MM) / 1000.0
-            kind = str(rng.choice(PERTURB_KINDS))
-            _apply_perturb(env, kind, mag)
-            # settle 步必须进入时间轴并刷新 obs（Codex P0-2）：12 个零动作
-            # 逐帧保存 (观测, 零动作, 状态) 再 step——否则扰动后 policy 用
-            # stale obs 决策，且隐藏的 12 个真实执行步破坏跨边界窗口与 prev。
-            for _ in range(PERTURB_SETTLE_STEPS):
-                frames.append(env.render())
-                actions.append(np.zeros(4, dtype=np.float32))
-                states.append(obs[:4].astype(np.float32))
-                obs, _r2, _t2, _tr2, _i2 = env.step(np.zeros(4))
-            perturbed = True
-        # hold：首次成功时固定目标长度，连续成功计数，掉出成功即清零
-        # （Codex P0-2：旧逻辑每帧重抽阈值且结束时不要求仍成功）。
-        if info.get("success") and success_frame is not None:
+        actions.append(np.asarray(action, dtype=np.float32))
+        states.append(np.asarray(obs[:4], dtype=np.float32))
+        action_sources.append(source)
+        _record_lock_metric(obs)
+        obs, reward, term, trunc, info = env.step(action)
+        succeeded = bool(info.get("success"))
+        action_success.append(succeeded)
+        if succeeded and first_success is None:
+            # Index in the stored frames/actions timeline, including settle actions.
+            first_success = index
+        if succeeded:
             if hold_target is None:
                 hold_target = int(rng.integers(*HOLD_FRAMES))
             consec_success += 1
         else:
             consec_success = 0
-        if success_frame is not None and consec_success >= hold_target:
+        return reward, term, trunc, info
+
+    for policy_step in range(500):
+        a = np.clip(np.asarray(policy.get_action(obs), dtype=np.float32), -1.0, 1.0)
+        # 契约（Codex P0-1，2026-08-09）：先保存【当前观测 + 即将执行的动作】，
+        # 再 step。此前顺序是 step 后才保存 (o_{t+1}, a_t)——图像/状态泄漏
+        # a_t 的执行结果且 prev 错位，整批数据作废需重采。
+        _r, term, trunc, info = _execute(a, "policy")
+        # 接触扰动：成功前随机一步注入 2-8mm，之后继续 policy 恢复
+        if (perturb and perturb_event is None and first_success is None
+                and not term and not trunc and policy_step > 20
+                and rng.random() < 0.05):
+            mag = rng.uniform(*PERTURB_MM) / 1000.0
+            kind = str(rng.choice(PERTURB_KINDS))
+            applied = _apply_perturb(env, kind, mag, rng)
+            if applied["applied"]:
+                # MuJoCo state changed outside env.step; refresh the proprio/object
+                # observation before recording the first settle action.
+                get_obs = getattr(env, "_get_obs", None)
+                if callable(get_obs):
+                    obs = get_obs()
+                start = len(actions)
+                settle_truncated = False
+                for _ in range(PERTURB_SETTLE_STEPS):
+                    _r2, _t2, _tr2, _i2 = _execute(
+                        np.zeros(4, dtype=np.float32), "perturb_settle"
+                    )
+                    if _t2 or _tr2:
+                        settle_truncated = True
+                        break
+                perturb_event = {
+                    "start": start,
+                    "end": len(actions),  # exclusive
+                    "kind": kind,
+                    "magnitude_m": float(mag),
+                    "magnitude_mm": float(mag * 1000.0),
+                    "delta": applied["delta"],
+                    "applied": True,
+                }
+                if settle_truncated:
+                    term, trunc = True, True
+        # hold：所有真实执行步（包括 settle）都参与成功状态计数。
+        if first_success is not None and consec_success >= hold_target:
             break
-        if trunc:
+        if term or trunc:
             break
-    if success_frame is None:
+    if first_success is None:
         return None  # 纯失败轨迹，丢弃（Codex P0-2 核心：剔除失败长尾）
     # hold 未达标但含成功段：保留（精密任务 success 信号会抖动，连续达标
     # 过苛会整条丢弃；全局成功跨度 >= HOLD_FRAMES[0] 即视为含稳定成功段）。
-    if step - success_frame < int(HOLD_FRAMES[0]):
+    completed_hold = hold_target is not None and consec_success >= hold_target
+    if (not completed_hold
+            and len(actions) - 1 - first_success < int(HOLD_FRAMES[0])):
         return None
-    return {
+
+    n = len(actions)
+    settle_mask = np.asarray(
+        [source == "perturb_settle" for source in action_sources], dtype=bool
+    )
+    frame_valid = np.ones(n, dtype=bool)
+    action_executed = np.ones(n, dtype=bool)
+    action_supervision_valid = ~settle_mask
+    action_supervision_valid[first_success + 1:] = False
+    recovery_mask = np.zeros(n, dtype=bool)
+    if perturb_event is not None:
+        recovery_mask[perturb_event["start"]:first_success + 1] = True
+
+    result = {
+        "episode_seed": episode_seed,
         "frames": compress_frames(np.stack(frames)),  # list[bytes] JPEG
         "actions": np.stack(actions),     # [T, 4]
         "states": np.stack(states),       # [T, 4]
-        "success_frame": success_frame,
-        "perturbed": perturbed,
+        # success_frame is retained as a precise compatibility alias. Unlike the
+        # v1 collector it now uses the stored action timeline, including settle.
+        "first_success": first_success,
+        "success_frame": first_success,
+        "action_success": np.asarray(action_success, dtype=bool),
+        "frame_valid": frame_valid,
+        "action_executed": action_executed,
+        "action_source": action_sources,
+        "settle_mask": settle_mask,
+        "action_valid": action_supervision_valid,
+        "action_supervision_valid": action_supervision_valid,
+        "recovery_mask": recovery_mask,
+        "perturbed": perturb_event is not None,
+        "perturb_start": None if perturb_event is None else perturb_event["start"],
+        "perturb_end": None if perturb_event is None else perturb_event["end"],
+        "perturb_kind": None if perturb_event is None else perturb_event["kind"],
+        "perturb_magnitude": (
+            None if perturb_event is None else perturb_event["magnitude_m"]
+        ),
+        "perturb_magnitude_mm": (
+            None if perturb_event is None else perturb_event["magnitude_mm"]
+        ),
+        "perturb_event": perturb_event,
     }
+    if task_name == "door-lock-v3":
+        result.update({
+            "lock_pos": np.stack(lock_positions),
+            "lock_target": np.stack(lock_targets),
+            "metric_state": np.concatenate(
+                [np.stack(lock_positions), np.stack(lock_targets)], axis=-1
+            ),
+            "metric_state_valid": np.asarray(lock_metric_valid, dtype=bool),
+        })
+    return result
 
 
-def _apply_perturb(env, kind: str, mag: float) -> None:
+def _apply_perturb(env, kind: str, mag: float,
+                   rng: np.random.Generator) -> dict:
     """注入 2-8mm 扰动（复用 prepare_mw_perturbations 的机制：mocap/obj1）。
 
     settle 步由调用方进入时间轴（PERTURB_SETTLE_STEPS 循环），此处只改环境。
@@ -175,20 +279,22 @@ def _apply_perturb(env, kind: str, mag: float) -> None:
     if kind in ("eef_lateral", "eef_height"):
         delta = np.zeros(3)
         if kind == "eef_lateral":
-            theta = np.random.uniform(0, 2 * np.pi)
+            theta = rng.uniform(0, 2 * np.pi)
             delta[:2] = mag * np.array([np.cos(theta), np.sin(theta)])
         else:
             delta[2] = mag
         env.data.mocap_pos[0] += delta
+        return {"applied": True, "delta": delta.astype(np.float32)}
     else:
         from scripts.prepare_mw_perturbations import move_obj1
         delta = np.zeros(3)
-        theta = np.random.uniform(0, 2 * np.pi)
+        theta = rng.uniform(0, 2 * np.pi)
         delta[:2] = mag * np.array([np.cos(theta), np.sin(theta)])
         try:
             move_obj1(env, delta)
         except RuntimeError:
-            pass  # 该任务 obj1 不可动则跳过
+            return {"applied": False, "delta": np.zeros(3, dtype=np.float32)}
+        return {"applied": True, "delta": delta.astype(np.float32)}
 
 
 def main() -> None:
@@ -197,6 +303,14 @@ def main() -> None:
     parser.add_argument("--episodes", type=int, default=30)
     parser.add_argument("--no-perturb", action="store_true", help="不注入接触扰动")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--output", type=Path,
+        help="新输出路径；默认使用带 clean/recovery、v2、seed 后缀的新文件",
+    )
+    parser.add_argument(
+        "--overwrite", action="store_true",
+        help="显式允许覆盖 --output（默认拒绝覆盖任何现有数据）",
+    )
     args = parser.parse_args()
 
     rng = np.random.default_rng(args.seed)
@@ -237,20 +351,50 @@ def main() -> None:
         "n_episodes": len(episodes),
         "normalization": norm,
         "metadata": {
-            "contract": "long_trajectory_scripted",
+            "contract": "long_trajectory_scripted_v2",
+            "contract_version": 2,
             "fps": FPS,
             "control_stride": CONTROL_STRIDE,
             "policy": type(policy).__name__,
+            # Keep the legacy field, but make configured-vs-observed semantics
+            # explicit. Episode `perturbed` records whether an event was applied.
             "perturbed": not args.no_perturb,
+            "perturbation_enabled": not args.no_perturb,
+            "perturbation_mode": (
+                "disabled_by_no_perturb" if args.no_perturb else "single_random_pre_success"
+            ),
             "perturb_mm": list(PERTURB_MM),
+            "perturb_settle_steps": PERTURB_SETTLE_STEPS,
             "hold_frames": list(HOLD_FRAMES),
             "action_contract": "executed-clip-fullframe",
+            "observation_action_alignment": (
+                "frames/states/metric_state[i] are pre-action observations; "
+                "actions[i] was executed exactly once; action_success[i] is its post-step result"
+            ),
+            "index_contract": (
+                "first_success, perturb_start and perturb_end index the stored action timeline; "
+                "perturb_end is exclusive"
+            ),
+            "supervision_contract": (
+                "action_supervision_valid excludes perturb settle and all actions after first_success"
+            ),
+            "door_metric_state": "[lock_pos_xyz=obs[4:7], lock_target_xyz=env._target_pos]",
         },
     }
-    out_path = OUT_DIR / f"metaworld_longtraj_{args.task}.pt"
+    mode = "clean" if args.no_perturb else "recovery"
+    out_path = args.output or (
+        OUT_DIR / f"metaworld_longtraj_{args.task}_{mode}_v2_seed{args.seed}.pt"
+    )
+    if out_path.exists() and not args.overwrite:
+        raise FileExistsError(
+            f"refusing to overwrite existing data: {out_path}; choose --output or pass --overwrite"
+        )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     # 原子写入（2026-08-10 保护）：先写临时文件再 rename——进程被 kill 时
     # 不会留下半截文件（旧实现直接 torch.save，被杀会损坏并被 skip 跳过）。
-    tmp_path = out_path.with_suffix(".pt.tmp")
+    tmp_path = out_path.with_name(f".{out_path.name}.tmp")
+    if tmp_path.exists():
+        raise FileExistsError(f"stale temporary output exists: {tmp_path}")
     torch.save(out, tmp_path)
     tmp_path.replace(out_path)
     lens = [len(e["frames"]) for e in episodes]
