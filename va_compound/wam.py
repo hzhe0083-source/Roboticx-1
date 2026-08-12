@@ -6,9 +6,14 @@
 docs/superpowers/specs/2026-08-13-e7-wam-design.md §3.1。
 
 - 逐层旁路耦合（方案 C）：第 i 层 cross-attn 只读 VA 记忆快照
-  va_layers[min(i * n_va // num_layers, n_va - 1)]（K/V 投影 bias=False）。
+  va_layers[min(i * n_va // num_layers, n_va - 1)]，并与 spatial/geo 条件
+  拼接为 K/V = [16 va, 16 spatial, 1 geo] 共 33 token（每层独立投影参数，
+  K/V 各一套，bias=False，投影正常初始化、受 W_O 零屏障保护）。
 - 零初始化纪律：AdaLN 每层 Linear(256, 6d) 权重+bias 全零；CA W_O 全零；
   动作残差速度头全零（训练起点 Δv ≡ 0）；场景头正常初始化。
+  CA 出口用残差门 gate2 = 1.0 + ada_gate2——避免与零初始化 W_O 构成双重
+  零屏障使 CA 永久死亡（SA gate1 与 FFN ffn_gate 维持零门，详见
+  _WAMBlock.forward 注释）。
 - 时间条件 slim AdaLN：t_emb = SiLU(Linear(256)(sinusoidal(flow_time)))，
   每层 Linear(256, 6*512) chunk(6) → scale1,shift1,gate1,scale2,shift2,gate2。
 - 无 eval() 时间随机性；CPU 确定性。
@@ -29,7 +34,7 @@ class WAMConfig:
     hidden_dim: int = 512
     num_layers: int = 12
     num_heads: int = 8
-    ffn_hidden: int = 1408          # SwiGLU intermediate (2/3 * 4h ≈ GELU-2048 equivalent)
+    ffn_hidden: int = 1000          # SwiGLU intermediate；1408 会让加入每层 K/V 条件投影后破 65M 预算（1000 → 实测 ~64.7M）
     cond_dim: int = 256             # slim AdaLN MLP input
     vision_dim: int = 768           # V-JEPA H11 latent dim
     geo_dim: int = 8                # MT-VJ p_times_visibility_flat
@@ -91,8 +96,15 @@ class _WAMBlock(nn.Module):
 
         self.norm2 = _RMSNorm(d)
         self.ca_q = nn.Linear(d, d)
-        self.ca_k = nn.Linear(d, d, bias=False)
-        self.ca_v = nn.Linear(d, d, bias=False)
+        # CA K/V 条件：每层独立投影参数，K/V 各一套，bias=False；
+        # K/V = [16 va 快照, 16 spatial, 1 geo] 共 33 token（拼接见 forward）。
+        # 这些投影正常初始化——受下方 W_O 零屏障保护，不破坏初始等价。
+        self.proj_va_k = nn.Linear(d, d, bias=False)
+        self.proj_va_v = nn.Linear(d, d, bias=False)
+        self.proj_spatial_k = nn.Linear(config.vision_dim, d, bias=False)
+        self.proj_spatial_v = nn.Linear(config.vision_dim, d, bias=False)
+        self.proj_geo_k = nn.Linear(config.geo_dim, d, bias=False)
+        self.proj_geo_v = nn.Linear(config.geo_dim, d, bias=False)
         self.ca_o = nn.Linear(d, d)
         # 旁路 CA 出口零初始化：训练起点世界分支注入为零。
         nn.init.zeros_(self.ca_o.weight)
@@ -134,9 +146,10 @@ class _WAMBlock(nn.Module):
         k = k.view(B, k.shape[1], nh, hd).transpose(1, 2)
         v = v.view(B, v.shape[1], nh, hd).transpose(1, 2)
         if self.qk_norm and apply_qk_norm:
-            # 苏式 per-head QK RMSNorm（与 model.py qk_norm 两行一致）。
-            q = F.rms_norm(q, (q.shape[-1],))
-            k = F.rms_norm(k, (k.shape[-1],))
+            # 苏式 per-head QK RMSNorm；统计量在 fp32 计算再回落原 dtype，
+            # 避免 BF16 下 q/k 的 RMS 统计精度不足（与仓库 qk_norm 惯例一致）。
+            q = F.rms_norm(q.float(), (q.shape[-1],)).to(q.dtype)
+            k = F.rms_norm(k.float(), (k.shape[-1],)).to(k.dtype)
         # logits 用 fp32，softmax 后回到原 dtype（与 FlowMatchingHead 一致）。
         scores = torch.matmul(q.float(), k.float().transpose(-1, -2)) * self.scale
         w = torch.softmax(scores, dim=-1).to(dtype=q.dtype)
@@ -146,21 +159,53 @@ class _WAMBlock(nn.Module):
         out = out.transpose(1, 2).reshape(B, N, nh * hd)
         return out_proj(out)
 
-    def forward(self, hidden: Tensor, va_kv: Tensor, t_emb: Tensor) -> Tensor:
+    def forward(
+        self,
+        hidden: Tensor,
+        va_kv: Tensor,
+        spatial_tokens: Tensor,
+        geo_tokens: Tensor,
+        t_emb: Tensor,
+    ) -> Tensor:
         mod = self.ada(t_emb).unsqueeze(1)  # [B, 1, 6d]
         scale1, shift1, gate1, scale2, shift2, gate2 = mod.chunk(6, dim=-1)
 
-        # 子层 1：自注意力（102 token 全互看）。
+        # 子层 1：自注意力（102 token 全互看）。零门 gate1：SA 内部没有
+        # 零初始化输出投影（sa_o 正常初始化），单零屏障下 gate1/sa_* 梯度
+        # 第一步即非零，零门安全。
         h = self.norm1(hidden)
         h = h * (1.0 + scale1) + shift1
         h = self._attn(self.sa_q(h), self.sa_k(h), self.sa_v(h), self.sa_o, True)
         hidden = hidden + gate1 * h
 
-        # 子层 2：交叉注意力（只读 VA 层快照）。
+        # 子层 2：交叉注意力（只读 VA 层快照 + spatial/geo 条件），
+        # K/V = [16 va, 16 spatial, 1 geo] 共 33 token。
         h = self.norm2(hidden)
         h = h * (1.0 + scale2) + shift2
-        h = self._attn(self.ca_q(h), self.ca_k(va_kv), self.ca_v(va_kv), self.ca_o, False)
-        hidden = hidden + gate2 * h
+        k = torch.cat(
+            (
+                self.proj_va_k(va_kv),
+                self.proj_spatial_k(spatial_tokens),
+                self.proj_geo_k(geo_tokens[:, None, :]),
+            ),
+            dim=1,
+        )
+        v = torch.cat(
+            (
+                self.proj_va_v(va_kv),
+                self.proj_spatial_v(spatial_tokens),
+                self.proj_geo_v(geo_tokens[:, None, :]),
+            ),
+            dim=1,
+        )
+        h = self._attn(self.ca_q(h), k, v, self.ca_o, True)
+        # CA 出口用残差门 gate2 = 1.0 + ada_gate2（ada 零初始化 → 初始 gate2 = 1）。
+        # 为什么 CA 用残差门而 SA/FFN 用零门：CA 的 W_O 被设计纪律要求零
+        # 初始化，若 gate2 也零初始化则构成双重零屏障——gate2 梯度
+        # = out·dL/dh = (h·W_O)·dL/dh ≡ 0，W_O/K/V/Q 梯度也恒 0，CA 分支
+        # 永久死亡。残差门下初始贡献 = 1·(h·W_O=0) = 0（初始等价不变式
+        # 保住），且 W_O 第一步即有梯度、K/V/Q 随 W_O 打开后获得梯度。
+        hidden = hidden + (1.0 + gate2) * h
 
         # 子层 3：SwiGLU FFN（无 AdaLN 调制，出口 gate3）。
         h = self.norm3(hidden)
@@ -179,6 +224,16 @@ class JointWorldActionFlow(nn.Module):
     （action/space/geo）+ 组内位置嵌入（动作 index / 4×4 空间 / 跨度 id），
     无 RoPE。共享同一 flow time τ。
     """
+
+    # 逐层 VA 读取映射：n_va=8 / num_layers=12 下 va_index_for_layer(i) 的
+    # 结果序列（min(i*n_va//num_layers, n_va-1)）。运行路径用同一公式动态
+    # 计算（va_index_for_layer）；类属性供测试直接断言映射。
+    VA_IDX_MAP = (0, 0, 1, 2, 2, 3, 4, 4, 5, 6, 6, 7)
+
+    @staticmethod
+    def va_index_for_layer(i: int, n_va: int, num_layers: int) -> int:
+        """第 i 层 CA 读取的 VA 层索引：min(i * n_va // num_layers, n_va - 1)。"""
+        return min(i * n_va // num_layers, n_va - 1)
 
     def __init__(self, config: WAMConfig) -> None:
         super().__init__()
@@ -240,8 +295,8 @@ class JointWorldActionFlow(nn.Module):
         *,
         action_condition: Tensor,          # [B, 48, 512] 只读
         va_layers: tuple,                  # tuple of n_va tensors [B, 16, 512]，只读
-        spatial_tokens: Tensor,            # [B, 16, 768] 当前 4×4 pool（保留接口契约）
-        geo_tokens: Tensor,                # [B, 8] 当前 p*vis flat（保留接口契约）
+        spatial_tokens: Tensor,            # [B, 16, 768] 当前 4×4 pool（每层 CA K/V 条件）
+        geo_tokens: Tensor,                # [B, 8] 当前 p*vis flat（每层 CA K/V 条件）
         noisy_actions: Tensor,             # [B, 48, 4] 动作路径 x_t
         noisy_scene_latents: Tensor,       # [B, 3, 16, 768] 场景路径 x_t
         noisy_scene_geo: Tensor,           # [B, 3, 2, 8]
@@ -281,9 +336,13 @@ class JointWorldActionFlow(nn.Module):
         )  # [B, 102, d]
 
         n_va = len(va_layers)
+        spatial_tokens = spatial_tokens.to(dtype)
+        geo_tokens = geo_tokens.to(dtype)
         for i, block in enumerate(self.blocks):
-            va_idx = min(i * n_va // cfg.num_layers, n_va - 1)
-            hidden = block(hidden, va_layers[va_idx].to(dtype), t_emb)
+            va_idx = self.va_index_for_layer(i, n_va, cfg.num_layers)
+            hidden = block(
+                hidden, va_layers[va_idx].to(dtype), spatial_tokens, geo_tokens, t_emb
+            )
 
         # 动作残差速度头（零初始化 → 训练起点 Δv ≡ 0）。
         action_tokens = hidden[:, : cfg.action_horizon]
