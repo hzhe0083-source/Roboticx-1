@@ -78,6 +78,8 @@ class VACompoundConfig:
     # 下一决策点的冻结 V-JEPA 特征（stop-grad target），使 Action→Vision 反向
     # 通路学习"执行后状态变化"而非普通特征混合。训练 loss 见 train.py。
     future_predict: bool = False
+    # E7 WAM v1：联合残差世界动作流（独立模块/权重，见 wam.py）
+    wam_joint: bool = False
     # 顺序式 A→V→A 耦合（2026-08-07 审阅落地④）：每 N 层使用
     # proposal→reorganize→correction 三遍注意力；0 = 全层同步联合（旧行为）。
     sequential_coupling: int = 0
@@ -2265,6 +2267,7 @@ class VACompoundPolicy(nn.Module):
         steps: int = 8,
         noise: Tensor | None = None,
         semantic_context: Tensor | None = None,
+        wam_residual_fn: object | None = None,
     ) -> Tensor:
         """Integrate noise at tau=0 to an action chunk at tau=1 with Euler steps."""
         if steps < 1:
@@ -2293,12 +2296,15 @@ class VACompoundPolicy(nn.Module):
                 device=action_condition.device,
                 dtype=action_condition.dtype,
             )
-            actions = actions + step_size * self.flow_velocity(
+            v = self.flow_velocity(
                 action_condition,
                 actions,
                 flow_time,
                 semantic_context=semantic_context,
             )
+            if wam_residual_fn is not None:
+                v = v + wam_residual_fn(action_condition, actions, flow_time)
+            actions = actions + step_size * v
         return actions
 
     def decode_actions(
@@ -2309,6 +2315,7 @@ class VACompoundPolicy(nn.Module):
         noise: Tensor | None = None,
         c_current: Tensor | None = None,
         semantic_context: Tensor | None = None,
+        wam_residual_fn: object | None = None,
     ) -> Tensor:
         """从 action_condition 解码归一化动作 chunk（C²-VA 统一入口）。
 
@@ -2337,6 +2344,7 @@ class VACompoundPolicy(nn.Module):
             steps=steps,
             noise=noise,
             semantic_context=semantic_context,
+            wam_residual_fn=wam_residual_fn,
         )
 
     def controller_params(
