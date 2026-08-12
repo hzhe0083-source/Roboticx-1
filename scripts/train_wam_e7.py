@@ -9,23 +9,42 @@ using the joint loss from design doc §4:
 
 - L_action: masked_flow_matching_loss(v_base + dv, target, prefix_steps=6,
   prefix_weight=1.0, tail_weight=0.036) — copied/imported from train.py.
-- L_VJ:  sum_k w_k * SmoothL1(scene_v.latent[:,k], v_latent_target[:,k]) / 3, w=(1,.5,.25)
-- L_geo: same over scene_v.geo / geo targets.
-- Scene straight-path targets: v_target = delta_target - noise, x_t = (1-tau)*noise + tau*delta.
-  latent delta = record["future_latent_target"] (already Delta-latent);
-  geo delta slice 0 = future_geo[:,:,0] - geo8 (g(d+k) - g(d)), slice 1 = nu as stored.
+- L_VJ / L_geo: per-horizon smooth-L1 with cache-provided weights
+  w = horizon_weight * (~perturbed_future) * valid_future; horizons with zero
+  weight leave the denominator and are counted in the `excluded=` log field.
+- One shared flow time tau (design §3.1: action / spatial-latent / geo tokens
+  share the same flow time): x_t = (1-tau)*noise + tau*target,
+  v_target = target - noise on all three paths.
+- Targets are taken from the cache as stored, no re-derivation:
+  latent target = future_latent_target (already Delta = z(d+k) - z(d));
+  geo target = future_geo_target (slice0 = g_future absolute, slice1 = nu).
+- Record schema: every record (real cache or synthetic) is checked against
+  va_compound.wam_cache.assert_record_schema (whitelist keys/types/shapes).
 
 Determinism contract (bitwise resume):
-- Sequential deterministic record order (no shuffling); step s consumes records
-  [s*grad_accum*batch_size ... +grad_accum*batch_size).
+- Deterministic cyclic record order (no shuffling): step s consumes rows
+  ((s*grad_accum*batch_size + i) % n_train) for i in 0..eff-1, so any step
+  count is in-bounds and resume reproduces the uninterrupted run bitwise.
 - Checkpoint stores wam_model / optimizer_state / global_step / rng_state /
   exact_run_contract (saved after optimizer.step, i.e. post-step state), so a
   --resume continuation reproduces the uninterrupted run bitwise.
 - Stateless warmup+cosine LR schedule (function of completed steps only).
 
-Smoke (--smoke): synthetic CPU records, BaseStub frozen base (v = 0.1*x_t),
-fp32 (no autocast), asserts per-term gradients non-zero, finite losses and
-consistency == 0.
+Modes:
+- --smoke: synthetic CPU records + BaseStub frozen base (v = 0.1*x_t), fp32,
+  asserts per-term gradients non-zero, finite losses, consistency == 0.
+  base_ckpt_sha256 recorded as "smoke".
+- --fake-cache: builds a synthetic cache via build_wam_cache(None, ...), then
+  runs WAMCacheDataset + the real JointWorldActionFlow for a few CPU steps —
+  end-to-end proof that the cache schema feeds the trainer (M0 substitute for
+  the real-cache end-to-end run).
+
+Gates:
+- --cache-dir requires manifest with contract_version == 1 and non-empty
+  data_sha256 + base_ckpt_sha256 (skipped only for --fake-cache, which builds
+  its own synthetic cache).
+- Training without --base-ckpt is rejected unless --smoke/--fake-cache
+  (real cache + BaseStub combination is forbidden).
 """
 
 from __future__ import annotations
@@ -36,6 +55,7 @@ import hashlib
 import math
 import os
 import sys
+import tempfile
 from dataclasses import asdict
 
 import torch
@@ -181,11 +201,48 @@ except Exception:  # module missing or mid-edit by the Task 1 agent
 # Task 5 interface: va_compound/wam_cache.py (implemented by a parallel agent).
 # ---------------------------------------------------------------------------
 try:
-    from va_compound.wam_cache import WAMCacheDataset, WAMCacheManifest  # noqa: F401
+    from va_compound.wam_cache import (  # noqa: F401
+        WAMCacheDataset,
+        WAMCacheManifest,
+        assert_record_schema,
+    )
 
     _CACHE_AVAILABLE = True
-except Exception:
+except Exception:  # module missing or mid-edit by the Task 5 agent
     _CACHE_AVAILABLE = False
+
+    def assert_record_schema(record: dict) -> dict:
+        """Minimal mirror of va_compound.wam_cache.assert_record_schema so the
+        trainer stays self-testable while Task 5's module is absent. The real
+        whitelist in wam_cache.RECORD_SCHEMA is authoritative."""
+        spec = {
+            "action_condition": (48, 512),
+            "va_layers": "va_layers",
+            "spatial16": (16, 768),
+            "geo8": (8,),
+            "actions": (48, 4),
+            "future_latent_target": (3, 16, 768),
+            "future_geo_target": (3, 2, 8),
+            "action_valid": (48,),
+            "perturbed_future": (3,),
+            "valid_future": (3,),
+            "horizon_weight": (3,),
+            "episode_id": None,
+            "task_id": None,
+            "task_file": None,
+            "ep_idx": None,
+            "decision_frame": None,
+        }
+        if not isinstance(record, dict) or set(record) != set(spec):
+            raise ValueError(f"record keys != Task 5 whitelist: {sorted(set(record) ^ set(spec))}")
+        for key, shape in spec.items():
+            value = record[key]
+            if key == "va_layers":
+                if len(value) != 8 or any(tuple(t.shape) != (16, 512) for t in value):
+                    raise ValueError(f"{key}: expected 8x[16,512]")
+            elif shape is not None and tuple(value.shape) != shape:
+                raise ValueError(f"{key}: shape {tuple(value.shape)} != {shape}")
+        return record
 
 # ---------------------------------------------------------------------------
 # Flow-matching loss from train.py (source: train.py lines 1435-1524, 31).
@@ -325,10 +382,14 @@ def load_base_policy(path: str, device: torch.device) -> nn.Module:
 
 # ---------------------------------------------------------------------------
 # Synthetic smoke dataset (deterministic per index; stateless w.r.t. access order).
-# Record schema mirrors Task 5: action_condition [48,512], va_layers 8x[16,512],
-# spatial16 [16,768], geo8 [8], actions [48,4], future_latent_target [3,16,768],
-# future_geo [3,2,8] (slice0 = g_future, slice1 = nu), action_valid_mask [48].
+# Record schema + target semantics match the real cache exactly (same whitelist
+# via assert_record_schema, Δlatent targets, [g_future, nu] geo targets):
+#   future_latent_target = z(d+k) - z(d)          (Delta, not absolute)
+#   future_geo_target    = [g_future, nu]          (slice0 absolute, slice1 delta)
 # ---------------------------------------------------------------------------
+_SYNTH_HORIZON_WEIGHTS = (1.0, 0.5, 0.25)
+
+
 class SyntheticWAMDataset:
     def __init__(self, n: int, seed: int = 1234) -> None:
         self.n = int(n)
@@ -346,12 +407,14 @@ class SyntheticWAMDataset:
         gen = self._gen(index)
         action_condition = torch.randn(48, 512, generator=gen)
         va_layers = tuple(torch.randn(16, 512, generator=gen) for _ in range(8))
-        spatial16 = torch.randn(16, 768, generator=gen)
-        geo8 = torch.randn(8, generator=gen)
+        spatial16 = torch.randn(16, 768, generator=gen)          # z(d)
+        geo8 = torch.randn(8, generator=gen)                     # g(d)
         actions = torch.randn(48, 4, generator=gen)
-        future_latent_target = torch.randn(3, 16, 768, generator=gen)
-        future_geo = torch.randn(3, 2, 8, generator=gen)
-        action_valid_mask = torch.ones(48)
+        z_future = torch.randn(3, 16, 768, generator=gen)        # z(d+k) absolute
+        future_latent_target = z_future - spatial16              # Δlatent（cache 语义）
+        g_future = torch.randn(3, 8, generator=gen)              # g(d+k) absolute
+        nu = g_future - geo8                                     # ν = g_future − g_current
+        future_geo_target = torch.stack([g_future, nu], dim=1)   # [3,2,8]
         return {
             "action_condition": action_condition,
             "va_layers": va_layers,
@@ -359,8 +422,16 @@ class SyntheticWAMDataset:
             "geo8": geo8,
             "actions": actions,
             "future_latent_target": future_latent_target,
-            "future_geo": future_geo,
-            "action_valid_mask": action_valid_mask,
+            "future_geo_target": future_geo_target,
+            "action_valid": torch.ones(48, dtype=torch.bool),
+            "perturbed_future": torch.zeros(3, dtype=torch.bool),
+            "valid_future": torch.ones(3, dtype=torch.bool),
+            "horizon_weight": torch.tensor(_SYNTH_HORIZON_WEIGHTS, dtype=torch.float32),
+            "episode_id": index,
+            "task_id": index % 3,
+            "task_file": f"fake-task-{index % 3:02d}",
+            "ep_idx": 0,
+            "decision_frame": index,
         }
 
 
@@ -373,11 +444,22 @@ def make_dataset(args: argparse.Namespace):
         manifest_path = os.path.join(args.cache_dir, "manifest.json")
         if not os.path.exists(manifest_path):
             raise SystemExit(f"no manifest.json under {args.cache_dir}")
-        import json
-
-        with open(manifest_path) as fh:
-            data = json.load(fh)
-        manifest = WAMCacheManifest(**data)
+        manifest = WAMCacheManifest.load(manifest_path)
+        # contract_version gate: trainer only accepts the schema it was built for.
+        if int(manifest.contract_version) != 1:
+            raise SystemExit(
+                f"cache manifest contract_version={manifest.contract_version} != 1: "
+                "cache/trainer schema mismatch (rebuild the cache)"
+            )
+        # SHA gate: real training requires both data and base SHA; --fake-cache
+        # builds its own synthetic cache (no real data/base SHAs to check).
+        if not args.fake_cache and (
+            not manifest.data_sha256 or not manifest.base_ckpt_sha256
+        ):
+            raise SystemExit(
+                "cache manifest is missing data_sha256 or base_ckpt_sha256: "
+                "real training requires both (rebuild the cache after the base freeze)"
+            )
         return WAMCacheDataset(args.cache_dir, manifest, split="train")
     print("synthetic WAM records (--smoke path, deterministic per index)")
     n_needed = args.steps * args.grad_accum * args.batch_size
@@ -386,25 +468,32 @@ def make_dataset(args: argparse.Namespace):
 
 def collate_records(records: list[dict]) -> dict:
     out: dict = {}
+    for record in records:
+        assert_record_schema(record)  # 白名单键/类型/形状，与 cache 写入同契约
     for key in sorted(records[0]):
-        values = [record[key] for record in records]
         if key == "va_layers":
-            n_layers = len(values[0])
-            out[key] = tuple(torch.stack([v[i] for v in values]) for i in range(n_layers))
+            n_layers = len(records[0][key])
+            out[key] = tuple(
+                torch.stack([record[key][i] for record in records])
+                for i in range(n_layers)
+            )
+        elif isinstance(records[0][key], torch.Tensor):
+            out[key] = torch.stack([record[key] for record in records])
         else:
-            out[key] = torch.stack(values)
+            out[key] = [record[key] for record in records]  # provenance，不进 loss
     return out
 
 
 def batch_to(batch: dict, device: torch.device) -> dict:
-    return {
-        key: (
-            tuple(t.to(device) for t in value)
-            if isinstance(value, tuple)
-            else value.to(device)
-        )
-        for key, value in batch.items()
-    }
+    out: dict = {}
+    for key, value in batch.items():
+        if isinstance(value, tuple):
+            out[key] = tuple(t.to(device) for t in value)
+        elif isinstance(value, torch.Tensor):
+            out[key] = value.to(device)
+        else:
+            out[key] = value  # provenance 列表等非张量字段，不进 loss
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -421,31 +510,30 @@ def compute_losses(
     device = actions.device
     dtype = actions.dtype
 
-    # Action straight path.
+    # 单一共享 flow time τ（设计 §3.1：动作/空间 latent/几何三路同 τ）：
+    # x_t = (1-τ)·noise + τ·target, v_target = target − noise。
     noise = torch.randn_like(actions)
     tau = torch.rand(n_batch, device=device, dtype=dtype)
     tau_b = tau[:, None, None]
     x_t = (1.0 - tau_b) * noise + tau_b * actions
     target_v = actions - noise
 
-    # Scene latent straight path over Delta-latent (cache future_latent_target IS Delta).
+    # 场景 latent：cache 已存 Δlatent = z(d+k) − z(d)，直接作 target，
+    # 不再减当前（fill_record_latents 内已做差分）。
     delta_z = batch["future_latent_target"]  # [B,3,16,768]
     scene_noise = torch.randn_like(delta_z)
-    tau_scene = torch.rand(n_batch, device=device, dtype=dtype)
-    tau_s = tau_scene[:, None, None, None]
+    tau_s = tau[:, None, None, None]
     x_scene = (1.0 - tau_s) * scene_noise + tau_s * delta_z
     v_scene_target = delta_z - scene_noise
 
-    # Geo straight path (isomorphic to latent):
-    # slice 0 target = g(d+k) - g(d) (delta-geometry), slice 1 = nu as stored (already relative).
-    future_geo = batch["future_geo"]  # [B,3,2,8]
-    geo_noise = torch.randn_like(future_geo)
-    delta_g = future_geo.clone()
-    delta_g[:, :, 0] = future_geo[:, :, 0] - batch["geo8"][:, None, :]
-    tau_geo = torch.rand(n_batch, device=device, dtype=dtype)
-    tau_g = tau_geo[:, None, None, None]
-    x_geo = (1.0 - tau_g) * geo_noise + tau_g * delta_g
-    v_geo_target = delta_g - geo_noise
+    # 场景 geo：cache 已存 [g_future, ν]（slice0 绝对 g(d+k)、slice1 差分
+    # ν = g_future − g_current），两条 slice 分别做直线路径，不再手算
+    # g(d+k) − geo8。
+    geo_target = batch["future_geo_target"]  # [B,3,2,8]
+    geo_noise = torch.randn_like(geo_target)
+    tau_g = tau[:, None, None, None]
+    x_geo = (1.0 - tau_g) * geo_noise + tau_g * geo_target
+    v_geo_target = geo_target - geo_noise
 
     with torch.no_grad():
         v_base = base.flow_velocity(batch["action_condition"], x_t, tau)
@@ -466,21 +554,42 @@ def compute_losses(
     loss_action = masked_flow_matching_loss(
         v_pred.unsqueeze(1),
         target_v.unsqueeze(1),
-        batch,
+        {"action_valid_mask": batch["action_valid"]},
         prefix_steps=6,
         prefix_weight=1.0,
         tail_weight=0.036,
     )[0]
 
-    horizon_weights = (1.0, 0.5, 0.25)
-    loss_vj = sum(
-        w * F.smooth_l1_loss(scene_v.latent[:, k], v_scene_target[:, k])
-        for k, w in enumerate(horizon_weights)
-    ) / 3.0
-    loss_geo = sum(
-        w * F.smooth_l1_loss(scene_v.geo[:, k], v_geo_target[:, k])
-        for k, w in enumerate(horizon_weights)
-    ) / 3.0
+    # 未来目标 mask 入 loss：w = horizon_weight · (~perturbed_future) · valid_future
+    # （两者都来自 cache 白名单字段；w=0 的跨度退出分母并计入 excluded）。
+    horizon_w = batch["horizon_weight"]  # [B,3]
+    future_w = (
+        horizon_w
+        * (~batch["perturbed_future"]).float()
+        * batch["valid_future"].float()
+    )  # [B,3]
+
+    def masked_smooth_l1(pred: Tensor, target: Tensor, w: Tensor) -> Tensor:
+        se = F.smooth_l1_loss(pred, target, reduction="none").mean(
+            dim=tuple(range(1, pred.ndim))
+        )  # [B]
+        denom = w.sum()
+        if not bool(denom > 0):
+            return pred.new_zeros(())
+        return (se * w).sum() / denom
+
+    loss_vj = torch.zeros((), device=device, dtype=dtype)
+    loss_geo = torch.zeros((), device=device, dtype=dtype)
+    for k in range(3):
+        loss_vj = loss_vj + masked_smooth_l1(
+            scene_v.latent[:, k], v_scene_target[:, k], future_w[:, k]
+        )
+        loss_geo = loss_geo + masked_smooth_l1(
+            scene_v.geo[:, k], v_geo_target[:, k], future_w[:, k]
+        )
+    loss_vj = loss_vj / 3.0
+    loss_geo = loss_geo / 3.0
+    excluded = int((future_w <= 0).sum().item())
 
     # Placeholder: first-round consistency term is 0 (enabled post G1/G2 gates).
     loss_consistency = loss_action.new_zeros(())
@@ -496,6 +605,7 @@ def compute_losses(
         "geo": loss_geo,
         "consistency": loss_consistency,
         "total": total,
+        "excluded": excluded,
     }
 
 
@@ -540,7 +650,7 @@ def build_contract(args: argparse.Namespace, wam_config, base_sha: str) -> dict:
         "save_every": int(args.save_every),
         "horizons": list(wam_config.horizons),
         "consistency_weight": float(args.consistency_weight),
-        "base_ckpt": args.base_ckpt if args.base_ckpt else "stub",
+        "base_ckpt": args.base_ckpt if args.base_ckpt else "smoke",
         "base_ckpt_sha256": base_sha,
         "weight_decay": 1e-4,
         "seed": int(args.seed),
@@ -558,7 +668,7 @@ def validate_contract(saved: dict, current: dict) -> None:
 
 def sha256_file(path: str | None) -> str:
     if not path:
-        return "stub"
+        return "smoke"  # --smoke/--fake-cache 无真实基座：SHA 记为 "smoke"
     digest = hashlib.sha256()
     with open(path, "rb") as fh:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
@@ -622,8 +732,8 @@ def run_training(
     """Run steps [start_step, args.steps); returns {completed_step: total_loss_tensor}."""
     if rng_state is not None:
         restore_rng(rng_state)
-    smoke = args.smoke
-    if smoke:
+    validate = args.smoke or args.fake_cache  # CPU validation modes
+    if validate:
         device = torch.device("cpu")
         autocast_ctx = contextlib.nullcontext()
     else:
@@ -634,19 +744,30 @@ def run_training(
             else contextlib.nullcontext()
         )
 
+    n_train = len(dataset)
+    if n_train < 1:
+        raise SystemExit("train split is empty (no records for training)")
+    eff_batch = args.grad_accum * args.batch_size
+
     step_losses: dict[int, Tensor] = {}
     for step in range(start_step, args.steps):
         for group in optimizer.param_groups:
             group["lr"] = lr_at(step, args.lr, args.warmup, args.steps)
 
         acc = {name: 0.0 for name in ("total", "action", "vj", "geo", "consistency")}
+        acc_excluded = 0
         for micro in range(args.grad_accum):
-            base_idx = (step * args.grad_accum + micro) * args.batch_size
-            batch = collate_records([dataset[base_idx + j] for j in range(args.batch_size)])
+            # 确定性循环采样：step s 消费行号 (s*eff_batch + i) % n_train。
+            # 无 shuffle、永不越界、可精确续训（resume 从 start_step 续吃同一序列）。
+            idxs = [
+                (step * eff_batch + micro * args.batch_size + j) % n_train
+                for j in range(args.batch_size)
+            ]
+            batch = collate_records([dataset[idx] for idx in idxs])
             batch = batch_to(batch, device)
             with autocast_ctx:
                 losses = compute_losses(wam, base, batch, args.consistency_weight)
-                if smoke:
+                if validate:
                     for name in ("action", "vj", "geo", "total"):
                         assert bool(torch.isfinite(losses[name])), f"{name} loss not finite in smoke"
                     assert float(losses["consistency"]) == 0.0, "consistency placeholder must be 0"
@@ -655,6 +776,7 @@ def run_training(
             (losses["total"] / args.grad_accum).backward()
             for name in acc:
                 acc[name] += losses[name].detach().float()
+            acc_excluded += int(losses["excluded"])
 
         grad_norm = float(torch.nn.utils.clip_grad_norm_(wam.parameters(), 1.0))
         optimizer.step()
@@ -664,7 +786,8 @@ def run_training(
         print(
             f"step={completed} loss={means['total']:.6f} action={means['action']:.6f} "
             f"vj={means['vj']:.6f} geo={means['geo']:.6f} "
-            f"consistency={means['consistency']:.6f} grad={grad_norm:.6f}",
+            f"consistency={means['consistency']:.6f} grad={grad_norm:.6f} "
+            f"excluded={acc_excluded}",
             flush=True,
         )
         step_losses[completed] = means["total"].clone()
@@ -738,8 +861,13 @@ def self_check_resume(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    cli_args = sys.argv[1:] if argv is None else list(argv)
     parser = argparse.ArgumentParser(description="E7 WAM M0 standalone trainer (Task 6)")
     parser.add_argument("--smoke", action="store_true", help="synthetic CPU run with BaseStub")
+    parser.add_argument("--fake-cache", action="store_true",
+                        help="build synthetic cache via build_wam_cache(None, ...) and train "
+                             "a few CPU steps through WAMCacheDataset + real JointWorldActionFlow "
+                             "(cache->trainer schema end-to-end check)")
     parser.add_argument("--base-ckpt", type=str, default=None, help="frozen base VACompoundPolicy checkpoint")
     parser.add_argument("--cache-dir", type=str, default=None, help="WAM cache directory (Task 5)")
     parser.add_argument("--steps", type=int, default=20000)
@@ -755,7 +883,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--self-check-resume", action="store_true",
                         help="in-process bitwise resume self test")
     parser.add_argument("--seed", type=int, default=0)
-    args = parser.parse_args(argv)
+    args = parser.parse_args(cli_args)
 
     if args.batch_size < 1 or args.grad_accum < 1 or args.steps < 1:
         raise SystemExit("batch-size/grad-accum/steps must be positive")
@@ -763,26 +891,54 @@ def main(argv: list[str] | None = None) -> int:
     if args.self_check_resume:
         return self_check_resume(args)
 
+    # Gate: 训练（非 --smoke/--fake-cache）必须给 --base-ckpt；
+    # 真实 cache + BaseStub 组合被直接拒绝。
+    if not args.base_ckpt and not args.smoke and not args.fake_cache:
+        raise SystemExit(
+            "--base-ckpt is required for training (real cache + BaseStub is forbidden); "
+            "use --smoke/--fake-cache for BaseStub validation runs"
+        )
+
+    # --fake-cache：build_wam_cache(None, ...) 合成 cache → 走真实
+    # WAMCacheDataset + 真实 JointWorldActionFlow 的 CPU 端到端。
+    if args.fake_cache:
+        if args.resume:
+            raise SystemExit("--fake-cache does not support --resume")
+        if not _CACHE_AVAILABLE:
+            raise SystemExit("--fake-cache requires va_compound/wam_cache.py (Task 5)")
+        from va_compound.wam_cache import build_wam_cache
+
+        if not args.cache_dir:
+            args.cache_dir = tempfile.mkdtemp(prefix="wam_fake_cache_")
+        if "--steps" not in cli_args:
+            args.steps = 3
+            print("--fake-cache: steps defaulting to 3 (CPU schema end-to-end check)")
+        manifest = build_wam_cache(None, args.cache_dir, base_ckpt=None)
+        print(
+            f"--fake-cache: built {manifest.n_anchors} synthetic records at "
+            f"{args.cache_dir} (contract={manifest.contract} "
+            f"v{manifest.contract_version}, action_axis_units={manifest.action_axis_units})"
+        )
+
     if _USING_WAM_STUB:
         print("WARNING: va_compound/wam.py not importable; using temporary smoke stand-in")
     torch.manual_seed(args.seed)
-    dataset = make_dataset(args)
-    base_sha = sha256_file(args.base_ckpt)
-    if args.smoke or not args.base_ckpt:
+    dataset = make_dataset(args)  # 含 contract_version + SHA 门禁（cache-dir 路径）
+    if args.smoke or args.fake_cache:
         base = BaseStub()
-        if not args.smoke and not args.base_ckpt and not args.cache_dir:
-            print("WARNING: no --base-ckpt/--cache-dir/--smoke: training against BaseStub + synthetic data")
+        base_sha = "smoke"
     else:
         base = load_base_policy(
             args.base_ckpt,
             torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"),
         )
+        base_sha = sha256_file(args.base_ckpt)
     if args.smoke and args.base_ckpt is not None:
         print("NOTE: --smoke forces BaseStub; --base-ckpt ignored for the base velocity")
 
     smoke_device = torch.device("cpu")
     train_device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    device = smoke_device if args.smoke else train_device
+    device = smoke_device if (args.smoke or args.fake_cache) else train_device
 
     wam_config = WAMConfig()
     wam = JointWorldActionFlow(wam_config).to(device)
@@ -813,6 +969,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     if args.smoke:
         print(f"smoke completed: {args.steps} steps, gradient/finiteness gates passed")
+    elif args.fake_cache:
+        print(
+            f"fake-cache completed: {args.steps} steps through WAMCacheDataset + "
+            f"{type(wam).__name__} (cache->trainer schema E2E ok)"
+        )
     return 0
 
 

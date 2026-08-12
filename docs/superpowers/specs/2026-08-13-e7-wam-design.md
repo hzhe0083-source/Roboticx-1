@@ -199,7 +199,7 @@ latent 定义（H11/时间片/池化）、跨度、归一化统计、训练契�
 
 ## 11. 固定假设与风险
 
-- 相关工作参照（2026-08-13 Grok 查证）：Lin et al., "From Pixels to Tokens"（arXiv:2605.04678）在统一 VLA 基线上验证中间 latent 监督（图像/动作 VQ 离散码）涨点显著（LIBERO +4.0pp、RoboTwin +17.5pp、多任务 +20.9pp），λ∈{0.1,0.2,0.5} 稳定、连续回归在长程同样有效。与 WAM 是机制类比（该文监督 VLM 本体+离散 token，我们外挂连续 flow+冻结基座），不作为架构背书；M1 训练时监控 L_VJ 与 L_action 相对收敛（该文观察到图像/动作 latent 分任务强弱不同），防止两路监督互相拖累。
+- 相关工作参照（2026-08-13 Grok 查证）：Lin et al., "From Pixels to Tokens"（arXiv:2605.04678）在统一 VLA 基线上验证中间 latent 监督（图像/动作 VQ 离散码）涨点显著（LIBERO +4.0pp、RoboTwin +17.5pp、多任务 +20.9pp），λ∈{0.1,0.2,0.5} 稳定、连续回归在长程同样有效。与 WAM 是机制类比（该文监督 VLM 本体+离散 token，我们外挂连续 flow+冻结基座），不作为架构背书；M1 训练时监控 L_VJ 与 L_action 相对收敛（该文观察到图像/动作 latent 分任务强弱不同），防止两路监督互相拖累。动作表示领域双轨并存：π0 连续 flow matching（arXiv:2410.24164）、π0-FAST 离散动作 token+自回归（arXiv:2501.09747，DCT 频域 tokenization）、π0.5 离散预训练+flow 后训练混合（arXiv:2504.16054）。WAM 属纯连续 flow 族，不宣称离散路线已被淘汰。
 - 第一版不用视频 VAE、RGB 解码或随机 latent；只有 V-JEPA 空间 latent 和
   MT-VJ 几何。
 - 结果只表述为 49-task subset，不称官方 MT50。

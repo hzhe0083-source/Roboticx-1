@@ -6,8 +6,9 @@ trainer、Task 7 probe、Task 8 tests）按文末契约调用。
 内容：
   1. ``wam_split_from_episode``：episode_id % 10 → 0..7 train、8 val、9 test；
      整条 episode 归属一个 split，禁止随机窗口切分。
-  2. ``wam_anchor_index`` / ``wam_future_frame``：4 决策上下文锚点索引与
-     未来帧换算（CONTROL_STRIDE=6）。
+  2. ``wam_anchor_index`` / ``wam_future_frame`` / ``future_frame_in_bounds``：
+     4 决策上下文锚点索引与未来帧换算。k 单位 = 动作列/帧偏移
+     （action_axis_units="frame_offset"），帧号 = decision_frame + k。
   3. ``wam_last_slice_pool``：H11 dense [B,1152,768] → 最后时间片 576 →
      24×24 网格 → 6×6 块均值 → 4×4=16 空间 token [B,16,768]。刻意不用
      ``pool_mtvj_coarse_tokens``（那是 16 个连续桶，不是 4×4 空间池化）。
@@ -15,6 +16,8 @@ trainer、Task 7 probe、Task 8 tests）按文末契约调用。
      一条记录，按 task 分片 torch.save + manifest.json + index.json。
   5. ``WAMCacheDataset``：按 split mask 读取分片记录，__getitem__ 返回
      record dict。
+  6. ``assert_record_schema``：record 键/类型/形状白名单校验（RECORD_SCHEMA），
+     cache 写分片前与 trainer collate 前共用，杜绝两侧 schema 漂移。
 
 M0 阶段 latent/condition 编码依赖冻结基座前向（GPU 被基座训练占用），因此
 这些字段以占位零张量写入、形状与最终一致，由 M1 GPU 管线调用
@@ -28,16 +31,21 @@ M0 阶段 latent/condition 编码依赖冻结基座前向（GPU 被基座训练�
   frame_refs [(task_file, ep_idx, frame_idx[4,4])]（frame_idx 最后一列 =
   该决策点的帧索引，帧/状态 i 为 action[i] 执行前观测）。
 
-每 anchor 一条记录（按 task 分片存储）：
+每 anchor 一条记录（按 task 分片存储；键白名单 = RECORD_SCHEMA，cache 写入与
+trainer 读取两侧都经 ``assert_record_schema`` 校验，见「record schema 白名单」节）：
   action_condition [48,512]        VA action condition（M1 填）
   va_layers        8×[16,512]      VA 记忆快照（M1 填）
-  spatial16        [16,768]        H11 最后时间片 4×4 池化（M1 填）
-  geo8             [8]             p*visibility 扁平（M1 填）
-  actions          [48,4]          q01/q99 归一化动作（M0 写）
-  future_latent_target [3,16,768]  latent(d+k)，k∈(6,24,48)（M1 填）
-  future_geo_target    [3,2,8]     (g_future, nu)，g_future=p*vis(d+k)，
-                                   nu=g_future-g_current（M1 填）
+  spatial16        [16,768]        H11 最后时间片 4×4 池化 = z(d)（M1 填）
+  geo8             [8]             g(d) = p*visibility 扁平（M1 填）
+  actions          [48,4]          q01/q99 归一化动作（M0 写）；action[h] 对应
+                                   帧 decision_frame + h（动作列索引 = 帧偏移）
+  future_latent_target [3,16,768]  Δlatent = z(d+k) − z(d)，k∈(6,24,48)
+                                   （M1 填；M0 fake 同语义）
+  future_geo_target    [3,2,8]     slice0 = g_future = p*vis(d+k)（绝对），
+                                   slice1 = ν = g_future − g_current
+                                   （M1 填；M0 fake 同语义）
   action_valid     [48]            动作监督 mask（M0 写）
+  valid_future     [3]             未来帧越界 mask（M0 写，语义见下）
   perturbed_future [3]             未来目标排除 mask（M0 写，语义见下）
   horizon_weight   [3]             (1.0, 0.5, 0.25)（M0 写）
   episode_id / task_id             int（M0 写）
@@ -51,9 +59,15 @@ perturbed_future[h]=True 表示第 h 个跨度未来目标应从损失中排除�
     * 「从正常阶段跨越外部随机扰动」= recovery 目标 ∧ 决策点早于
       perturb_start（unseen_recovery）——扰动已可观测的 recovery 监督
       有意保留。因此直接 OR recovery_mask 会误伤 ~80% 目标（recovery 段
-      从扰动持续到 first_success），这里只信 action_valid_mask；
-  - 或 d+k 超出该 episode 的帧范围（仅 k=48 可能；由 per-task 文件帧数判定，
-    per-task 文件缺失时跳过该项检查并告警，M1 填充时须自查）。
+      从扰动持续到 first_success），这里只信 action_valid_mask。
+
+valid_future[h]=False 表示未来帧 d+k 超出该 episode 帧范围（+48 终点
+frame d+48 不在 48 个动作列内，perturbed_future 的窗口检查够不到它，
+由 ``future_frame_in_bounds(decision_frame, k, last_frame)`` 单独判定）。
+per-task 文件存在时按每 episode 帧数写；文件缺失或 --fake 模式给合理
+默认 True（M1 有 raw episode 时须用真实 last_frame 重填并自查）。
+trainer 端组合权重 w = horizon_weight · (~perturbed_future) · valid_future，
+无效跨度退出损失分母。
 """
 from __future__ import annotations
 
@@ -71,7 +85,9 @@ ROOT = Path(__file__).resolve().parent.parent
 
 # ---- 契约常量（与 E7 基座事实对齐，2026-08-13） ----
 CONTRACT = "e7_wam_cache_v1"
-HORIZONS = (6, 24, 48)          # 未来跨度（帧单位）
+CONTRACT_VERSION = 1
+ACTION_AXIS_UNITS = "frame_offset"   # 动作列索引 = 帧偏移：action[h] 对应 decision_frame + h
+HORIZONS = (6, 24, 48)          # 未来跨度（帧偏移/动作列单位）
 HORIZON_WEIGHTS = (1.0, 0.5, 0.25)
 N_VA_LAYERS = 8                 # VA 层数（memory_split=False → 每层 [B,16,512]）
 VA_TOKENS = 16
@@ -89,6 +105,86 @@ ACTION_DIM = 4
 SEQUENCE_LENGTH = 4            # 决策上下文窗口决策点数
 CONTROL_STRIDE = 6             # 相邻决策点帧间隔
 SPLITS = ("train", "val", "test")
+
+
+# --------------------------------------------------------------------------
+# record schema 白名单（cache 写入与 trainer 读取的唯一契约）
+# --------------------------------------------------------------------------
+
+RECORD_SCHEMA: dict = {
+    "action_condition": ("float", (ACTION_HORIZON, VA_DIM)),
+    "va_layers": ("va_layers", (N_VA_LAYERS, VA_TOKENS, VA_DIM)),
+    "spatial16": ("float", (N_SCENE_TOKENS, VISION_DIM)),
+    "geo8": ("float", (GEO_DIM,)),
+    "actions": ("float", (ACTION_HORIZON, ACTION_DIM)),
+    "future_latent_target": ("float", (3, N_SCENE_TOKENS, VISION_DIM)),
+    "future_geo_target": ("float", (3, 2, GEO_DIM)),
+    "action_valid": ("bool", (ACTION_HORIZON,)),
+    "perturbed_future": ("bool", (3,)),
+    "valid_future": ("bool", (3,)),
+    "horizon_weight": ("float", (3,)),
+    "episode_id": ("int", None),
+    "task_id": ("int", None),
+    "task_file": ("str", None),
+    "ep_idx": ("int", None),
+    "decision_frame": ("int", None),
+}
+
+
+def assert_record_schema(record: dict) -> dict:
+    """按 RECORD_SCHEMA 白名单校验 record 的键/类型/形状；违反即 ValueError。
+
+    cache 构建器在写分片前调用，trainer 在 collate 每个 record 前调用，
+    保证两侧使用同一组键与同一语义（严格白名单：缺键/多余键都报错）。
+    通过则原样返回 record。
+    """
+    if not isinstance(record, dict):
+        raise ValueError(f"record 必须是 dict，got {type(record).__name__}")
+    expected = set(RECORD_SCHEMA)
+    actual = set(record)
+    if actual != expected:
+        raise ValueError(
+            f"record 键与白名单不符：missing={sorted(expected - actual)}, "
+            f"unexpected={sorted(actual - expected)}"
+        )
+    for key, (kind, shape) in RECORD_SCHEMA.items():
+        value = record[key]
+        if kind == "va_layers":
+            if not isinstance(value, (list, tuple)) or len(value) != N_VA_LAYERS:
+                n = len(value) if isinstance(value, (list, tuple)) else None
+                raise ValueError(
+                    f"{key} 必须是 {N_VA_LAYERS} 层 list/tuple，got "
+                    f"{type(value).__name__}/{n}"
+                )
+            for i, layer in enumerate(value):
+                if (not isinstance(layer, torch.Tensor)
+                        or tuple(layer.shape) != (VA_TOKENS, VA_DIM)):
+                    raise ValueError(
+                        f"{key}[{i}] 形状 {getattr(layer, 'shape', None)} != "
+                        f"({VA_TOKENS},{VA_DIM})"
+                    )
+        elif kind == "float":
+            if not isinstance(value, torch.Tensor) or not torch.is_floating_point(value):
+                raise ValueError(
+                    f"{key} 必须是浮点 torch.Tensor，got {type(value).__name__}"
+                )
+            if tuple(value.shape) != shape:
+                raise ValueError(f"{key} 形状 {tuple(value.shape)} != {shape}")
+        elif kind == "bool":
+            if not isinstance(value, torch.Tensor) or value.dtype != torch.bool:
+                raise ValueError(
+                    f"{key} 必须是 bool torch.Tensor，got "
+                    f"{getattr(value, 'dtype', type(value).__name__)}"
+                )
+            if tuple(value.shape) != shape:
+                raise ValueError(f"{key} 形状 {tuple(value.shape)} != {shape}")
+        elif kind == "int":
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(f"{key} 必须是 int，got {type(value).__name__}")
+        elif kind == "str":
+            if not isinstance(value, str):
+                raise ValueError(f"{key} 必须是 str，got {type(value).__name__}")
+    return record
 
 
 # --------------------------------------------------------------------------
@@ -120,12 +216,27 @@ def wam_anchor_index(seq_len: int = SEQUENCE_LENGTH) -> int:
 
 
 def wam_future_frame(decision_frame, k) -> int:
-    """未来帧换算：decision_frame + k*CONTROL_STRIDE。
+    """未来帧换算：帧号 = decision_frame + k。
 
-    k 为决策步数（每步 6 帧）；frame 级跨度 = k*6。horizons (6,24,48)
-    帧对应 k=(1,4,8)。
+    k 单位 = 动作列/帧偏移（ACTION_AXIS_UNITS="frame_offset"）。依据
+    build_longtraj_features.py 的 action→frame 映射（target_idx =
+    s + t*CONTROL_STRIDE + h，见该文件 503-507）：锚点决策帧 d 的 action
+    列 h 就是帧偏移，action[h] 对应帧 decision_frame + h。因此未来目标帧
+    d+k（k∈(6,24,48)）直接相加，不再乘 CONTROL_STRIDE。
     """
-    return int(decision_frame) + int(k) * CONTROL_STRIDE
+    return int(decision_frame) + int(k)
+
+
+def future_frame_in_bounds(decision_frame, k, episode_last_frame) -> bool:
+    """未来帧 d+k 是否落在 episode 内：帧号 ≤ episode 末帧帧号。
+
+    k 单位 = 动作列/帧偏移。episode_last_frame = 该 episode 最后一帧的
+    帧号（per-task 文件帧数 − 1）。+48 终点 frame d+48 超出 48 个动作列，
+    perturbed_future 的窗口检查够不到它，必须由本函数单独判定；M1 有
+    raw episode 时用真实 last_frame 调用，M0 fake 模式无帧数信息时给
+    合理默认（True）。
+    """
+    return wam_future_frame(decision_frame, k) <= int(episode_last_frame)
 
 
 def wam_last_slice_pool(h11_dense: torch.Tensor) -> torch.Tensor:
@@ -165,6 +276,8 @@ def wam_last_slice_pool(h11_dense: torch.Tensor) -> torch.Tensor:
 class WAMCacheManifest:
     """缓存 sidecar 契约（评测与训练不得自行猜测默认值）。"""
     contract: str = CONTRACT
+    contract_version: int = CONTRACT_VERSION
+    action_axis_units: str = ACTION_AXIS_UNITS
     base_ckpt_sha256: str = ""
     data_sha256: str = ""
     horizons: tuple = HORIZONS
@@ -175,6 +288,8 @@ class WAMCacheManifest:
     def to_dict(self) -> dict:
         return {
             "contract": self.contract,
+            "contract_version": self.contract_version,
+            "action_axis_units": self.action_axis_units,
             "base_ckpt_sha256": self.base_ckpt_sha256,
             "data_sha256": self.data_sha256,
             "horizons": list(self.horizons),
@@ -187,6 +302,8 @@ class WAMCacheManifest:
     def from_dict(cls, d: dict) -> "WAMCacheManifest":
         return cls(
             contract=d["contract"],
+            contract_version=int(d["contract_version"]),
+            action_axis_units=d["action_axis_units"],
             base_ckpt_sha256=d["base_ckpt_sha256"],
             data_sha256=d["data_sha256"],
             horizons=tuple(d["horizons"]),
@@ -220,11 +337,16 @@ def fill_record_latents(record: dict, base_outputs: dict) -> dict:
     base_outputs 键（全部相对当前 anchor 决策点 d）：
       action_condition [48,512]          VA action condition
       va_layers        8×[16,512]        VA 每层记忆快照
-      spatial16        [16,768]          wam_last_slice_pool(H11 dense)
-      geo8             [8]               (p * visibility.unsqueeze(-1)).reshape(-1,8)
-      future_latent    3×[16,768]        未来 latent(d+k)，顺序 = HORIZONS
+      spatial16        [16,768]          wam_last_slice_pool(H11 dense) = z(d)
+      geo8             [8]               g(d) = (p * visibility.unsqueeze(-1)).reshape(-1,8)
+      future_latent    3×[16,768]        未来绝对 latent z(d+k)，顺序 = HORIZONS
       future_geo       3×[2,8]           (g_future, nu)，nu = g_future - g_current
-    future_latent/future_geo 接受 list/tuple 或已 stack 的 [3,...] 张量。
+    future_latent/future_geo 接受 list/tuple 或已 stack 的 [3,...] 张量；
+    future_geo 额外接受 3 个 (g_future, nu) 对的 list（每对 [8]）。
+
+    记录目标语义（trainer 直接取用，不再减当前值）：
+      future_latent_target = z(d+k) − z(d)   （Δlatent，本函数内计算）
+      future_geo_target    = (g_future, ν)   （原样存储，slice0 绝对、slice1 差分）
     就地修改并返回 record，便于链式 torch.save。形状不符即 ValueError。
     """
     required = (
@@ -259,14 +381,24 @@ def fill_record_latents(record: dict, base_outputs: dict) -> dict:
         return stacked
 
     fl = _stack3(base_outputs["future_latent"], (N_SCENE_TOKENS, VISION_DIM),
-                 "future_latent")
-    fg = _stack3(base_outputs["future_geo"], (2, GEO_DIM), "future_geo")
+                 "future_latent")   # 绝对 z(d+k)
+    if isinstance(base_outputs["future_geo"], torch.Tensor):
+        fg = _stack3(base_outputs["future_geo"], (2, GEO_DIM), "future_geo")
+    else:
+        # list of 3 个 (g_future, nu) 对 → [3,2,8]
+        fg = torch.stack([
+            torch.stack([torch.as_tensor(t) for t in pair])
+            for pair in base_outputs["future_geo"]
+        ])
+        _expect_tensor(fg, (3, 2, GEO_DIM), "future_geo")
 
     record["action_condition"] = ac.float()
     record["va_layers"] = [layer.float() for layer in va]
     record["spatial16"] = sp.float()
     record["geo8"] = geo.float()
-    record["future_latent_target"] = fl.float()
+    # Δlatent = z(d+k) − z(d)：trainer 不再减当前（cache 已存差分）。
+    record["future_latent_target"] = (fl - sp).float()
+    # (g_future, ν) 原样存储：slice0 = g(d+k) 绝对，slice1 = ν = g_future − g_current。
     record["future_geo_target"] = fg.float()
     return record
 
@@ -301,8 +433,10 @@ def _jsonable(x):
 def _future_window_cols(k: int) -> list[int]:
     """未来窗口 [d+k-6, d+k-4, d+k-2, d+k] 的 action 列偏移。
 
-    裁剪到 0..ACTION_HORIZON-1；k=48 时第 48 列（d+48 帧，超出 48 动作
-    范围）不在 windows 文件的 mask 内，靠 per-task 帧数越界检测兜底。
+    裁剪到 0..ACTION_HORIZON-1；k=48 时终点列 48（frame d+48）不在 48
+    动作列内、且其有效性不在 action_valid_mask 语义内，因此窗口检查
+    只覆盖 d+k-6..d+k-2 三列，+48 终点越界由 valid_future（
+    future_frame_in_bounds）单独判定。
     """
     cols = [k - 6, k - 4, k - 2, k]
     return [c for c in cols if 0 <= c < ACTION_HORIZON]
@@ -325,14 +459,14 @@ def _build_anchor(payload: dict, i: int, *, anchor_row: int,
     decision_frame = int(fidx[anchor_row, -1])
 
     perturbed = torch.zeros(len(HORIZONS), dtype=torch.bool)
+    valid_future = torch.ones(len(HORIZONS), dtype=torch.bool)
     for h, k in enumerate(HORIZONS):
-        bad = False
+        # perturbed_future：只信 action_valid_mask（其已含成功后/settle/
+        # 无效动作与 unseen-recovery 扰动跨越，见模块 docstring）。
         cols = _future_window_cols(k)
-        if cols:
-            # 只信 action_valid_mask：其已含成功后/settle/无效动作与
-            # unseen-recovery 扰动跨越（见模块 docstring）。
-            if bool((~valid[cols]).any().item()):
-                bad = True
+        if cols and bool((~valid[cols]).any().item()):
+            perturbed[h] = True
+        # valid_future：frame d+k 是否在 episode 内（+48 终点单独判定）。
         if frame_counts is not None:
             total = frame_counts.get(int(ep_idx))
             if total is None:
@@ -340,9 +474,7 @@ def _build_anchor(payload: dict, i: int, *, anchor_row: int,
                     f"cache 时间对齐失败：{task_file}:episode[{ep_idx}] "
                     f"在 per-task 文件中不存在"
                 )
-            if wam_future_frame(decision_frame, k // CONTROL_STRIDE) > total - 1:
-                bad = True
-        perturbed[h] = bad
+            valid_future[h] = future_frame_in_bounds(decision_frame, k, total - 1)
 
     return {
         "action_condition": torch.zeros(ACTION_HORIZON, VA_DIM),
@@ -354,6 +486,7 @@ def _build_anchor(payload: dict, i: int, *, anchor_row: int,
         "future_geo_target": torch.zeros(3, 2, GEO_DIM),
         "action_valid": valid.clone(),
         "perturbed_future": perturbed,
+        "valid_future": valid_future,
         "horizon_weight": torch.tensor(HORIZON_WEIGHTS, dtype=torch.float32),
         "episode_id": int(payload["episode_id"][i]),
         "task_id": int(payload["instruction_id"][i]),
@@ -443,19 +576,31 @@ def _fake_payload(n_tasks: int = 3, eps_per_task: int = 10,
 
 
 def _fake_latent_fn():
-    """fake 模式按 anchor 索引确定性生成合成 base_outputs 并填充记录。"""
+    """fake 模式按 anchor 索引确定性生成合成 base_outputs 并填充记录。
+
+    语义与真实 M1 管线一致：future_latent 传绝对 z(d+k)，由
+    fill_record_latents 转为 Δlatent = z(d+k) − z(d)；future_geo 传
+    (g_future, ν = g_future − g_current) 对，原样入记录。
+    """
 
     def fill(record: dict, i: int) -> None:
         g = torch.Generator().manual_seed(1000 + i)
+        sp = torch.randn(N_SCENE_TOKENS, VISION_DIM, generator=g)      # z(d)
+        geo = torch.randn(GEO_DIM, generator=g)                         # g(d)
+        z_future = [torch.randn(N_SCENE_TOKENS, VISION_DIM, generator=g)
+                    for _ in range(3)]                                   # z(d+k) 绝对
+        g_future = [torch.randn(GEO_DIM, generator=g) for _ in range(3)]  # g(d+k) 绝对
+        future_geo = [
+            (gf, gf - geo) for gf in g_future
+        ]   # ν = g_future − g_current（与 M1 语义一致）
         fill_record_latents(record, {
             "action_condition": torch.randn(ACTION_HORIZON, VA_DIM, generator=g),
             "va_layers": [torch.randn(VA_TOKENS, VA_DIM, generator=g)
                           for _ in range(N_VA_LAYERS)],
-            "spatial16": torch.randn(N_SCENE_TOKENS, VISION_DIM, generator=g),
-            "geo8": torch.randn(GEO_DIM, generator=g),
-            "future_latent": [torch.randn(N_SCENE_TOKENS, VISION_DIM, generator=g)
-                              for _ in range(3)],
-            "future_geo": [torch.randn(2, GEO_DIM, generator=g) for _ in range(3)],
+            "spatial16": sp,
+            "geo8": geo,
+            "future_latent": z_future,
+            "future_geo": future_geo,
         })
 
     return fill
@@ -531,6 +676,7 @@ def build_wam_cache(windows_pt, out_dir, *, base_ckpt, device: str = "cpu",
                                    frame_counts=frame_counts)
             if latent_fn is not None:
                 latent_fn(record, j)
+            assert_record_schema(record)  # 写分片前白名单校验
             records.append(record)
             ep_list.append(record["episode_id"])
             t_list.append(record["task_id"])
@@ -544,6 +690,8 @@ def build_wam_cache(windows_pt, out_dir, *, base_ckpt, device: str = "cpu",
 
     manifest = WAMCacheManifest(
         contract=CONTRACT,
+        contract_version=CONTRACT_VERSION,
+        action_axis_units=ACTION_AXIS_UNITS,
         base_ckpt_sha256=base_sha,
         data_sha256=data_sha,
         horizons=HORIZONS,
@@ -587,6 +735,11 @@ class WAMCacheDataset(Dataset):
             raise ValueError(
                 f"manifest contract {manifest.contract!r} != {CONTRACT!r}"
                 f"（sidecar 不匹配，训练/评测不得自行猜测默认值）"
+            )
+        if int(manifest.contract_version) != CONTRACT_VERSION:
+            raise ValueError(
+                f"manifest contract_version {manifest.contract_version} != "
+                f"{CONTRACT_VERSION}（cache/trainer schema 不匹配，须重建 cache）"
             )
         self.manifest = manifest
         index_path = self.out_dir / "index.json"
@@ -634,13 +787,32 @@ if __name__ == "__main__":
         and not (va & te).any() and not (tr & te).any(), "split 泄漏"
     assert int(tr.sum()) == 24 and int(va.sum()) == 3 and int(te.sum()) == 3, \
         "split 比例不是 8:1:1"
-    assert wam_anchor_index() == 3 and wam_future_frame(100, 24) == 244
+    assert wam_anchor_index() == 3
+    # 单测：k 单位 = 动作列/帧偏移（帧号 = decision_frame + k）
+    assert wam_future_frame(100, 24) == 124
+    assert wam_future_frame(0, 48) == 48
+    # 单测：future_frame_in_bounds（+48 终点越界判定）
+    assert future_frame_in_bounds(100, 48, 147) is False   # 148 > 147
+    assert future_frame_in_bounds(100, 48, 148) is True    # 148 <= 148
+    assert future_frame_in_bounds(0, 6, 5) is False        # 6 > 5
+    assert future_frame_in_bounds(0, 6, 6) is True
     z = wam_last_slice_pool(torch.randn(2, 1152, 768))
     assert z.shape == (2, 16, 768)
     man = build_wam_cache(None, "/tmp/wam_cache_demo", base_ckpt=None)
+    assert man.contract_version == CONTRACT_VERSION
+    assert man.action_axis_units == ACTION_AXIS_UNITS
     ds = WAMCacheDataset("/tmp/wam_cache_demo", man, split="train")
     r = ds[0]
     assert r["actions"].shape == (48, 4)
     assert r["future_latent_target"].shape == (3, 16, 768)
+    assert_record_schema(r)  # 读回记录过白名单
+    # 单测：fake 记录目标语义（Δlatent / (g_future, ν)）与 schema 白名单
+    bad = dict(r)
+    del bad["valid_future"]
+    try:
+        assert_record_schema(bad)
+        raise AssertionError("缺键记录应被白名单拒绝")
+    except ValueError:
+        pass
     print(f"demo ok: splits {int(tr.sum())}/{int(va.sum())}/{int(te.sum())}, "
           f"anchors={man.n_anchors}, train rows={len(ds)}")
