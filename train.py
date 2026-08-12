@@ -3787,7 +3787,7 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--evsm requires a positive --future-predict-weight")
     if args.evsm and args.evsm_temp <= 0.0:
         raise ValueError("--evsm-temp must be positive")
-    if args.wam_joint and (args.future_predict or args.evsm):
+    if getattr(args, "wam_joint", False) and (args.future_predict or args.evsm):
         raise ValueError("--wam-joint is mutually exclusive with --future-predict/--evsm")
     if args.compile_task and not args.e2e_data:
         raise ValueError(
