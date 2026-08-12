@@ -1,0 +1,400 @@
+% !TeX program = lualatex
+\documentclass[11pt,a4paper]{ctexart}
+\usepackage[margin=2.6cm]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{tcolorbox}
+\usepackage{microtype}
+\usepackage[colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
+
+\newtheorem{lemma}{引理}
+\newtheorem{assumption}{假设}
+
+\tcbset{
+  notebox/.style={colback=gray!6,colframe=gray!60,boxrule=0.5pt,arc=1.5pt,
+                  left=6pt,right=6pt,top=5pt,bottom=5pt}
+}
+
+\newcommand{\zvis}{z^{\mathrm{vis}}}
+\newcommand{\zmot}{z^{\mathrm{mot}}}
+\newcommand{\Rt}{R_t}
+\newcommand{\At}{A_t}
+\newcommand{\Ak}{A_t^{k_0}}
+\newcommand{\Sk}{S_k}
+\newcommand{\Dt}{D_t}
+\newcommand{\Emin}{E^{\min}_t}
+\newcommand{\norM}[1]{\left\lVert #1 \right\rVert_M}
+\newcommand{\aff}{\operatorname{aff}}
+\newcommand{\hull}{\operatorname{hull}}
+\newcommand{\Paff}{\Pi_{\aff(\Rt)}}
+
+\title{\bfseries VETO：可达结果集上的执行前否决\\
+\Large 面向双潜变量视觉--语言--动作策略的可达性--选择精确分解\\
+\large\mdseries Verified Executability via Testable Outcome-reachability}
+\author{研究提案（Research Proposal）}
+\date{2026 年 7 月 25 日}
+
+\begin{document}
+\maketitle
+
+\begin{tcolorbox}[notebox]
+\textbf{文档定位。}本文是一份可执行的研究提案。写法遵循一条纪律：先把问题钉死（第~\ref{sec:nail} 节，``钉子''），再给出解决它的最小数学结构（第~\ref{sec:hammer} 节，``锤子''），最后逐一列出把该结构落到系统里的多种可选打法与我们的选择理由（第~\ref{sec:drive} 节，``打钉子的方式''）。方法不是模块的拼接：全部部件都由第~\ref{sec:hammer} 节的同一个几何恒等式派生出必要性，任何删不掉理由的部件都已删除。配套的逐步执行计划（M1--M5，含每一步的通过/停机判据）见同仓库的 \texttt{idea.std.zh.md}，两份文档口径逐字一致。
+\end{tcolorbox}
+
+\begin{abstract}
+VLA 策略在提交一段动作的那一刻，内部没有任何量能回答``这段动作真的会带来我想要的场景变化吗''。我们把被测对象从``每个候选一个分数''换成一个几何结构：对采样出的 $K$ 个候选动作，用一个在计划自身特征空间里做预测的结果头 $F_\psi$ 构造\textbf{可达结果集} $\Rt$，并在一个学到的正定度量下把计划与任一候选之间的总失配\textbf{精确}分解为选择无关的\textbf{可达性} $\At$ 与纯属选择的 $\Sk$（一行勾股引理，无交叉项）。由此得到一条带理由的否决规则：可达性超阈、或计划在候选单纯形之外、或最优候选的总失配仍超阈，则拒绝执行并向规划器要新计划；阈值用分裂式 conformal 校准，校准统计量与线上检验统计量是同一个，误拒率 $\le 5\%$ 成为可核查陈述。执行后独立测量响应项 $\Dt$，三个读数把失败归因到规划、选择、执行三个级别，并驱动按级别路由的纠正更新。我们同时预注册了整套失败准则：分量共线即停在归因检验之前，全部延迟、域差与对抗绕过空间照实测量并报告。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%=====================================================================
+\section{钉子：提交动作那一刻缺失的量}\label{sec:nail}
+
+\subsection{两种失败，一个面孔}
+
+VLA（Vision--Language--Action）策略读入相机图像和一句语言指令、输出电机指令。当前主流设计在内部维护两份摘要：$\zvis$ 表示场景应该发生什么变化（视觉计划），$\zmot$ 表示机器人该怎么动（运动程序）。系统性比较已经表明二者各有强项：image-based latent 有利于长时推理与场景级泛化，action-based latent 有利于高维与双臂协调~\cite{pixels2tokens}。但两者是用同一批示教视频、同一个 likelihood 目标训出来的，于是在真正要提交一段动作的那一刻，模型里\textbf{不存在}任何量回答人类最先会问的问题：
+
+\begin{center}
+\emph{这段动作真的会带来我想要的那个变化吗？}
+\end{center}
+
+模型只知道哪段动作在局部上更像示教。结果是两种完全不同的失败从外面看起来一模一样：
+\begin{enumerate}[label=(\alph*),itemsep=1pt]
+  \item 计划是对的，但机器人能产生的\textbf{任何}动作都实现不了它（该找规划器算账）；
+  \item 每个动作看着都合理，但在长时程里慢慢偏离任务（该找选择或执行环节算账）。
+\end{enumerate}
+分不开这两种失败，就只能用一个全局重训触发器响应所有问题——这正是当前系统的现状。
+
+\subsection{标量分数的结构性极限（诚实版）}\label{sec:scalar}
+
+现有最接近的工具都把一个候选动作压成一个标量：TapSampling 用预测任务进度给候选打分~\cite{tapsampling}；VLA-ATTC 做候选两两比较~\cite{vlaattc}；TDCal 输出校准过的成功概率并把它解释为策略价值的估计~\cite{tdcal}；Sentinel-VLA 报告状态已经出了问题~\cite{sentinel}。
+
+必须诚实承认：\textbf{标量方法做得到集合级拒绝}。对 $K$ 个分数取 $\min$ 再设阈值，就是一条形式完备的集合级拒绝规则；声称``标量永远说不出整个候选集合都不合格''是不成立的，我们不做这个主张。标量真正做不到的是把``拒绝''\textbf{拆开}：一个纠缠了所有失败原因的分数，无法区分``这个意图变化根本不在当前动作生成器的能力范围内''与``能力范围内有好动作、只是打分选错了''。前者的正确响应是换计划，后者是换候选——响应不同，可归因对象不同，重训该流向的模块不同。本文的差异化主张自始至终只有一条：\textbf{被测量的量是选择无关的，且总失配能无余项地分解、按级别归因}。
+
+\subsection{问题的几何形态}\label{sec:geometry}
+
+把上面的话翻成几何，钉子的形状就出来了。设计划 $\zvis$ 是特征空间 $\mathbb{R}^{512}$ 中一个点，$K$ 个候选动作的预测结果是同一空间中的 $K$ 个点。那么``提交时刻缺失的量''其实是三个相互独立的几何问题：
+\begin{enumerate}[itemsep=1pt]
+  \item \textbf{可达性}：计划点离候选结果所张的集合有多远？——与选哪个候选无关；
+  \item \textbf{选择}：在这个集合内部，被选中的那个候选偏了多少？——纯粹是选择问题；
+  \item \textbf{响应}：执行之后，真实发生的变化与被执行候选的预测差多少？——执行后才可测。
+\end{enumerate}
+一个标量分数是这三个量的某种未知混合。要回答提交时刻的问题，需要的不是更好的标量，而是让这三个量\textbf{各自可测、且第一与第二个量精确相加}的表示结构。这决定了锤子必须长什么样：一个把候选动作映射进计划空间的预测头（否则两边不可比）、一个正定度量（否则距离有盲区）、一个正交分解（否则两项加不回总量）。第~\ref{sec:hammer} 节按此顺序给出。
+
+%=====================================================================
+\section{锤子：一个几何恒等式与三个读数}\label{sec:hammer}
+
+\subsection{可达结果集}
+
+对采样出的 $K$ 个候选运动摘要 $\zmot_1,\dots,\zmot_K$（采样机制在第~\ref{sec:sampling} 节定死），各自送进一个学出来的结果头 $F_\psi$，在与视觉计划完全相同的 pre-quantisation 连续特征空间里预测这段运动会造成的场景变化：
+\begin{equation}
+  r_k = F_\psi(o_t,\, s_t,\, e,\, \zmot_k)\in\mathbb{R}^{512},\qquad
+  \Rt=\{r_1,\dots,r_K\},
+  \label{eq:reachset}
+\end{equation}
+其中 $o_t$ 为当前观察、$s_t$ 为关节状态、$e$ 为由 URDF 确定性读出的本体描述。$\Rt$ 是一个\textbf{可达结果集}，不是 $K$ 个互不相关的分数：计划与任一候选的预测结果处在同一空间，可以直接相减，完全不需要把两边压进同一套离散码本。
+
+\subsection{正定度量：半范盲区的教训}\label{sec:metric}
+
+比较用的距离由故意配错的负样本学出（配方见第~\ref{sec:metriclearn} 节），形式为
+\begin{equation}
+  \norM{u}^2 = u^\top\!\bigl(W^\top W+\lambda I\bigr)u,\qquad
+  W\in\mathbb{R}^{64\times512},\quad
+  \lambda=\operatorname{softplus}(\eta)\ \ge\ \lambda_{\min}=0.01 .
+  \label{eq:metric}
+\end{equation}
+$\lambda I$ 不是修饰。若去掉它，$W^\top W$ 只是半范，零空间维数至少 448：合成核验工卷（见第~\ref{sec:provenance} 节的出处声明）上，沿一个盲方向把计划推 50 个单位步长，计划到最近预测结果的\textbf{欧氏}距离达到 58.3，而\textbf{平方 M-半范}读数一位都没变（前后都是 35.946）——两个数字度量不同、单位不同，并列只为说明``真实位移巨大而检验盲视''。带已知盲区的否决检验可以被攻击者、甚至只是运气不好的计划直接穿过。正定化的代价是放弃 $m=64$ 低秩结构当初所图的算力节省，我们照实付出并在 M3 里直接测量每 chunk 增加的延迟。间隔式训练损失对整体缩放不变，因此约定：训练后把 $(W,\lambda)$ 整体重标定，使留出集正确配对残差的中位数恰为 $1$；此后全部阈值都在这个``中位数$=1$''的单位制下表述。
+
+\subsection{核心引理：可达性--选择的精确分解}
+
+\begin{lemma}[M-内积下的勾股分解]\label{lem:pyth}
+设 $\Paff(\zvis)$ 是 $\zvis$ 在 $\aff(\Rt)$ 上按度量~\eqref{eq:metric} 的正交投影，记
+\begin{equation}
+  \At=\norM{\zvis-\Paff(\zvis)}^2,\qquad
+  \Sk=\norM{\Paff(\zvis)-r_k}^2 .
+\end{equation}
+则对每个候选 $k$，
+\begin{equation}
+  \norM{\zvis-r_k}^2=\At+\Sk\qquad\text{（无交叉项）}.
+  \label{eq:identity}
+\end{equation}
+\end{lemma}
+
+\begin{proof}
+$\zvis-\Paff(\zvis)$ 按 M-内积正交于 $\aff(\Rt)$ 的方向空间，而 $\Paff(\zvis)-r_k$ 落在该方向空间内，二者的 M-内积为零，展开平方即得。
+\end{proof}
+
+这是一行引理，不是实验发现。实现中的数值复核（合成工卷上残差 $2.6\times10^{-13}$）只作为求解器的 sanity check——防止投影求解器无声失败时给出看起来合理的数——\textbf{不}作为``代数事实''的证据。
+
+分解~\eqref{eq:identity} 的意义在于两项的语义完全分离：$\At$ 与选哪个候选无关，$\At$ 很大意味着\emph{这个策略此刻能提出的任何动作都产生不了预期变化}，多采候选也没用，正确响应是拒绝并要新计划；$\Sk$ 则纯粹是选择问题。这正是第~\ref{sec:geometry} 节要求的结构。
+
+\subsection{第三个读数及其角色边界}
+
+动作执行后，用环境自身观测到的转移独立测量\textbf{响应项}
+\begin{equation}
+  \Dt=\norM{\zvis_{\mathrm{obs}}-r_{k^*}}^2 ,
+\end{equation}
+其中 $k^*$ 为被执行候选。$\Dt$ \textbf{绝不是}恒等式~\eqref{eq:identity} 的第三个加项：合成工卷上把 $A,S,D$ 三项硬加，三项之和与端到端总失配之差为 $+11.37$（其中可辨认的交叉项贡献 $+2.2748$），三路可加的说法是错的。恒等式严格按两项报告，$\Dt$ 单独读数、只在执行后可用，用于归因``执行/动力学''这一级。
+
+\subsection{统计诚实：K-秩假象与固定秩统计量}\label{sec:krank}
+
+一般位置下 $\dim\aff(\Rt)=\min(K-1,\,512)$，而真正决定 $\At$ 何时被``吸干''的是\textbf{度量的秩}。在最初的 rank-64 半范下，$K-1\ge 64$（即 $K\ge65$）时全集 $\At$ 精确为 0——合成工卷实测 $K{=}4$ 时 67.03、$K{=}32$ 时 25.94、$K{=}64$ 时 0.48、$K\ge65$ 时恰为 0。加入 $\lambda I$ 后度量满秩，全集 $\At$ 精确为零要 $K\ge 513$ 才发生；上述曲线因此只是\textbf{修复前的动机性证据}，K-sweep 将在正定度量下整条重测。但教训独立于度量的秩仍然成立：全集 $\At$ 的量级依赖 $K$，跨 $K$ 不可比，在某个 $K$ 上拟合的阈值换个 $K$ 就悄悄换了含义。
+
+因此定义固定秩统计量
+\begin{equation}
+  \Ak=\mathbb{E}_{S\subset \Rt,\ |S|=4}
+  \Bigl[\ \norM{\zvis-\Pi_{\aff(S)}(\zvis)}^2\ \Bigr]
+  \qquad(\text{线上取 64 个固定种子子集，离线分析取 256 个}),
+  \label{eq:fixedrank}
+\end{equation}
+并且规定：\textbf{所有跨 $K$ 比较、阈值校准、以及线上拒绝检验本身，一律使用 $\Ak$}；全集 $\At$ 只作为部署 $K$ 下的诊断量写日志，不与任何阈值比较。这一条同时封掉两个审稿级漏洞：跨 $K$ 不可比，以及``校准统计量 $\ne$ 检验统计量''导致 conformal 保证作废。
+
+\subsection{否决规则与 conformal 校准}\label{sec:refuse}
+
+单靠可达性门控有一个概念漏洞：机器人只能执行\textbf{一个}候选，不能执行候选的仿射组合。若 $\zvis$ 恰好落在一个很大的单纯形中心，则 $\At\approx0$、门控放行，但每个候选各自的总失配 $\At+\Sk$ 仍可能都很大。按恒等式~\eqref{eq:identity}，``选择也消不掉的失配''是 $\min_k(\At+\Sk)$，所以否决规则带第三个条件。完整规则为
+\begin{equation}
+  \mathrm{REFUSE}_t=
+  \bigl[\Ak>\tau_A\bigr]\ \vee\ \bigl[\Emin>\tau_E\bigr]\ \vee\ \neg\,\mathrm{IN}_t ,
+  \qquad
+  \Emin=\min_k \norM{\zvis-r_k}^2 ,
+  \label{eq:refuse}
+\end{equation}
+其中 $\mathrm{IN}_t$ 检验\textbf{仿射投影点是否落在候选单纯形内}（512 维中 32 个点的凸包是测度为零的 $\le31$ 维单纯形，``计划落在区域内部''的说法在数学上不成立，弃用），判平采用相对松弛：$d^2_{\hull}\le(1+\varepsilon_{\mathrm{rel}})\At+\varepsilon_{\mathrm{abs}}$，$\varepsilon_{\mathrm{rel}}=10^{-3}$，$\varepsilon_{\mathrm{abs}}=10^{-6}\times$校准集 $\Ak$ 中位数。我们照实承认：$\Emin$ 这一条正是标量基线的规则形状（第~\ref{sec:scalar} 节），它是三个条件中``标量也能做到''的那一个；VETO 多出来的是另外两个条件与整套归因。
+
+三个阈值全部用分裂式 conformal 校准：取全部成功的留出 rollout，关掉拒绝功能跑内核，按\textbf{整条 rollout} 划分并把每条 rollout 先汇总成一个数（取最大值），报告口径固定为 episode 级（``$x\%$ 的成功 episode 里出现过至少一次误拒''）。5\% 误拒预算按条件拆分：$\tau_A$ 取 2\% 分位、$\tau_E$ 取 2\% 分位、$\mathrm{IN}_t$ 的松弛调到校准集假触发 $\le1\%$；union bound 保证联合误拒 $\le5\%$，并在不相交的验证分片上报告实测联合误拒率。执行后一致性 $\mathrm{CONSISTENT}_t=[\Dt\le\tau_D]$ 的阈值单独按 5\% 校准。校准按基准套件 $\times$ 机器人分别做；分布偏移下只承认同分布内的保证，真机数字标注``未校准''。
+
+拒绝触发后的重试协议：给规划器一个拒绝信号并提高采样温度重采，要求新计划到全部已拒计划的 M-距离不小于校准集计划间距的下四分位数（排除复读）；至多重试 3 次；用尽后仿真中该 episode 记为``拒绝''，真机上保持安全保位姿态并请求操作员接管。
+
+\subsection{数值出处声明}\label{sec:provenance}
+
+\begin{tcolorbox}[notebox]
+本文出现的全部实验级数字——35.946、58.3、67.03、25.94、0.48、$+2.2748$、$+11.37$、$2.6\times10^{-13}$——都来自一个\textbf{合成核验工卷}：随机初始化的压缩器、合成数据、未训练的 $64\times512$ 矩阵 $W$，且在加入 $\lambda I$ 修正\textbf{之前}测得。它们的唯一用途是核验记账结构、并暴露两个设计缺陷（K-秩假象与半范盲区），\textbf{不是}任何训练后模型的实验结果；训练完成后所有数字将在正定度量下重测并取代这里的数值，重测前不作为实验证据引用。
+\end{tcolorbox}
+
+%=====================================================================
+\section{打钉子的方式：每个部件的设计空间与选择}\label{sec:drive}
+
+锤子只有一把（第~\ref{sec:hammer} 节的结构），但把它落到系统里，每个位置都有不止一种打法。本节逐一列出可选打法、我们的选择与理由；每一小节对应逐步计划（\texttt{idea.std.zh.md}）中的一个编号步骤，全部曾标注``作者需决定''的开放项在此\textbf{关闭}。
+
+\subsection{坐标系：两个冻结压缩器（计划步骤 1）}
+
+\textbf{可选打法：}(a) 与策略联合训练压缩器；(b) 视觉与运动共享一套码本；(c) 独立训练后冻结。\quad
+\textbf{选择：}(c)。视觉压缩器读变化前后两张图像出 512 维连续向量，运动压缩器读长度 $H{=}16$ 的动作块出 256 维向量，均为 VQ-VAE、平均池化单向量，暴露 pre-quantisation 读出钩子；训练于 Open X-Embodiment 与无动作第一人称视频，然后冻结并把检查点指纹写入配置。\quad
+\textbf{理由：}冻结把整个项目的两套坐标系钉死——之后对策略的任何改动都不会悄悄挪动量距离的那把尺子；(a) 会让阈值随表示漂移全部失效，(b) 强加一对一关系而现实是一个计划对多个有效动作。
+
+两条附加纪律：\textbf{(i) 时间对齐}：图像对间隔严格取 $\Delta=H\times$控制周期，前后图像正好夹住一个动作块，否则 $\Dt$ 的观测转移与 $F_\psi$ 的预测对象不是同一个量。\textbf{(ii) 域差 sanity check}：压缩器训练于真实图像而全部评测在 LIBERO/CALVIN/RoboTwin 仿真渲染上，冻结前在三个套件各取 2000 帧对，报告重建误差相对 OXE 留出集的比值与最近邻检索一致率；若重建误差超过 2 倍，先用仿真帧微调再冻结（换指纹）。
+
+\subsection{策略头损失：连续回归为主、码本分类为辅（计划步骤 2）}
+
+\textbf{可选打法：}(a) 纯交叉熵到离散码本；(b) 连续回归为主 $+$ 码本 CE 辅助（权重约 $1/5$）。\quad
+\textbf{选择：}(b)。\quad
+\textbf{理由：}这是一个会毁掉后面全部环节的分岔。若两个头只被训练去选对码本条目，输出就是索引，而第~\ref{sec:hammer} 节全部测量需要压缩器连续空间里的向量；直接监督离散 token 在纯控制性能上的优势~\cite{pixels2tokens}对我们不是免费的，因为我们的可交付物是距离测量而不只是策略。辅助 CE 头也不是装饰——第~\ref{sec:sampling} 节的候选采样机制建立在它的 softmax 上。动作解码器为确定性稳健回归（不写成分布，记号全篇一致）。
+
+\subsection{候选生成：训练/推理输入分布闭合（计划步骤 5 前半）}\label{sec:sampling}
+
+\textbf{可选打法：}(a) 对确定性回归头``采样''——不可行，确定性头没有采样语义；(b) 从码本采离散索引再去重——候选是 post-quantisation 向量，而 $F_\psi$ 训练吃 pre-quantisation 连续摘要，输入分布断裂，且去重让 $K$ 漂移；(c) 从码本辅助 softmax \textbf{不放回}采 $K{=}32$ 个互不相同的索引，取码本 embedding，加尺度 $\sigma$ 的高斯噪声（$\sigma$ 为留出集上量化残差的逐维标准差）。\quad
+\textbf{选择：}(c)，并配套规定 $F_\psi$ 训练时输入以各 50\% 概率取真实动作的 pre-quantisation 连续摘要、或其码本 embedding 加同一 $\sigma$ 噪声——推理时候选的生成分布与训练输入增广\textbf{逐字相同}，分布缺口闭合。\quad
+\textbf{理由：}不放回采样使 $K$ 恒为 32，全集诊断量的含义不随去重漂移；采样温度 $T$ 与选择权重一起网格搜索。
+
+\subsection{结果头 $F_\psi$ 的 off-policy 覆盖（计划步骤 3）}
+
+\textbf{可选打法：}(a) 只用真正执行过的演示动作训练，依赖跨状态泛化；(b) 分布式输出头，让陌生候选返回大不确定度；(c) 可重置仿真中的重放增广。\quad
+\textbf{选择：}(c) 为主：对每条演示动作片段采样 4 个扰动版本（加噪、时间重参数化、幅度缩放），同一初始状态重放并记录真实前后图像，得到``从未示教过的运动 $\to$ 精确转移目标''的配对；真机演示不做重放、如实标注只有 on-policy 覆盖；跨状态泛化误差单独报告；(b) 留作扩展。\quad
+\textbf{理由：}检验在候选上跑，候选恰恰是没执行过的动作；覆盖缺口不闭合，M2 的一切都建立在外推上。本体描述从 URDF 确定性读出，使新机器人的\textbf{输入}零改动生成；但 $F_\psi$ 在未见本体上是否准确是跨本体外推，必须实测（M5），不宣称``只是查表''。
+
+\subsection{度量学习与第七类留出违例（计划步骤 4）}\label{sec:metriclearn}
+
+负样本六配方（施加在原始演示上、冻结压缩器之前）：任务内相位偏移；同场景换指令的运动；打乱夹爪/腕旋时序但保持末端位移；左右臂互换；速度缩放（$0.5\times$/$2\times$）；时间反转；另加回放的真实策略失败。间隔损失只比较样本自己的破坏版本。\textbf{尺度约定}与\textbf{正定化}见第~\ref{sec:metric} 节；导出时数值核验最小特征值 $\ge\lambda_{\min}$ 且原盲子空间向量长度严格大于零。\textbf{第七类留出违例（完全不参与训练，仅 M5 审计）：}时间律重参数化——几何路径、端点、总时长全部不变，只用平滑单调函数扭曲沿路径的速度剖面；破坏的物理量是速度剖面，仿真与真机施加同一重参数化函数，真值由关节编码器时间戳提供。留出一整类violation，是为了让``距离能否推广到没见过的故障''成为可测数字而不是信念。
+
+\subsection{决策内核的其余读数（计划步骤 5 后半）}
+
+全集投影是``32 个仿射系数、和为一约束、自由度 31''的距离加权方程组（内积跑满 512 维），标准稳定分解加数值缓冲求解；$\mathrm{IN}_t$ 用 Frank--Wolfe 配 away-step、上一时刻权重热启动、至多 50 步，不收敛则保守记 $\mathrm{IN}_t{=}$假并记录发生率。集合离散度 $V_t$ 定义为候选两两平方 M-距离的中位数，只入日志与分布研究、不参与阈值。运动代价 $C_{\mathrm{dyn}}$ 定义为候选过动作解码器与正运动学后（关节限位裕量违反 $+$ 自碰撞最近距离倒数 $+$ jerk 幅值）三项各自 z-score 之和——单位问题由 z-score 消掉，权重 $\beta$ 由网格搜索吸收剩余尺度。执行得分 $=-\Sk+\alpha\log p_k-\beta C_{\mathrm{dyn}}(k)$。退化情形：互不相同候选少于 2 个时平面退化为点，$\At$ 取到该点的距离，$\mathrm{IN}_t$ 取真。
+
+\subsection{归因打分的归一化（计划步骤 9）}
+
+\textbf{可选打法：}(a) 各分量除以自己的校准阈值；(b) 按成功分布均值方差标准化；(c) 换成留出成功分布上的经验分位数；(d) 训练三分类器。\quad
+\textbf{选择：}(c)：每个分量换成它在留出成功 rollout 分布上的经验 CDF 值，在与注入 episode 不重叠的数据上估计并\textbf{冻结}。\quad
+\textbf{理由：}这是决定混淆矩阵的唯一自由旋钮，也是各阶段被归责的隐式先验；分位数变换不引入可训练参数、对重尾稳健、且三个分量落到同一 $[0,1]$ 尺度上可直接比大小。
+
+%=====================================================================
+\section{逐步验证计划概要（M1--M5）}\label{sec:plan}
+
+完整步骤、每一步的``为什么''与全部通过/停机判据见 \texttt{idea.std.zh.md}；此处给对应关系与关键闸门。
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}llp{7.6cm}@{}}
+\toprule
+里程碑 & 交付物 & 关键闸门（不过即停） \\
+\midrule
+背景 & 冻结压缩器 $+$ 基线策略 & 压缩器域差 sanity check（重建误差 $\le2\times$ OXE 留出） \\
+M1 & $F_\psi$ $+$ 正定度量 & 留出集方向一致度与 M-距离误差达标；最小特征值 $\ge\lambda_{\min}$ \\
+M2 & 否决内核 $+$ conformal 阈值 & 校准统计量 $=$ 检验统计量；验证分片实测联合误拒 $\le5\%$ \\
+M3 & 可分性检验 $+$ 归因矩阵 $+$ K-sweep & 对数残差两两 $|\rho_{\mathrm{Spearman}}|_{\max}<0.8$ 且 BIC 聚类数 $\ge2$、聚类中心最大分量维度不同；任一不满足则停在 M3 发布负结果 \\
+M4 & 五版本公平对比 $+$ 路由重训 & 按阶段路由必须打过合并重训与打乱标签对照 \\
+M5 & 真机 OOD $+$ 留出违例 $+$ 对抗搜索 & 急停一律计为失败；对抗绕过空间照实报数 \\
+\bottomrule
+\end{tabular}
+\caption{里程碑与预注册闸门。M3 的停机判据在开跑前定死，防止``靠技术性理由撑到混淆矩阵''。}
+\end{table}
+
+%=====================================================================
+\section{实验设计}\label{sec:exp}
+
+\subsection{五版本公平预算对比（M4）}
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}lccccl@{}}
+\toprule
+版本 & $\zvis$ & $\zmot$ & $F_\psi$/度量/否决 & 词表 & 备注 \\
+\midrule
+V1 & \checkmark & -- & -- & 独立 & 仅场景摘要直接解码 \\
+V2 & -- & \checkmark & -- & 独立 & 没有计划可比 \\
+V3 & \checkmark & \checkmark & -- & 独立 & 拼接解码，无检验 \\
+V4 & \checkmark & \checkmark & -- & \textbf{共享} & 主要竞争设计 \\
+V5 & \checkmark & \checkmark & \checkmark & 独立 & 完整方法 \\
+\bottomrule
+\end{tabular}
+\caption{公平性口径：所有版本每步输出恰好 2 个摘要 token、总维度 768（单摘要版本拆成两个 384 维 token），token 数与总维度同时对齐；主干可训练参数量加宽/收窄每层对齐到 1\% 以内；两个数都打印。每版本 $\ge3$ 种子，报逐任务对 V5 的配对差。}
+\end{table}
+
+V5 因为会拒动，报三列：真正动手 episode 上的成功率；把每次拒动记为失败的保守成功率（\textbf{唯一}可与其他四版直接比的列）；拒动频率。吃重对比：V3 vs.\ V5（潜变量结构相同，隔离可达性机制），V4 vs.\ V5（学到的映射连接两个分离空间 vs.\ 单一共享词表）。长时序与双臂两类结果分开报告，绝不合并。
+
+\subsection{故障注入与三级归因（M3，步骤 8--9）}
+
+三种干预各只破坏一个阶段、各约 300 episode：意图故障（换成同场景他任务的计划）；实现故障（选择规则反转执行最差候选）；环境故障（改写仿真器状态：目标物平移、摩擦、未建模负载）。\textbf{强度按物理档位设置}（位移 $\{2,5,10\}$ cm、摩擦 $\{\times0.5,\times0.25\}$、负载 $\{100,300,600\}$ g、计划替换按 M-距离分三档），不做 per-episode 搜索、不设丢弃规则；分析时按实测总失配十分位\textbf{分层}比较归因正确率，归因主张只在同层内做。另跑同规模干净对照组。基线：两个标量方法（校准成功概率头、任务进度验证器，阈值在干净对照上拟合）与 conformal 校准的黑盒运动学监控器~\cite{howvlasfail}；必含把动作摘要打乱的负对照——打乱后归因若仍``正确''，矩阵测的就是有多糟而不是哪级坏了。
+
+\subsection{K-sweep（M3，步骤 10）}
+
+$K\in\{4,8,16,32,64\}$，同 checkpoint、同 rollout、同种子，只有 $K$ 不同，整条曲线在正定度量下重测。固定秩统计量从 $K{=}4$ 起报告（$K{=}4$ 时只有一个子集、$\Ak=\At$，良定义只是没有平均）；$K{=}1$ 不进这条曲线，单独作为逐候选打分基线。全集 $\At$ 同图报告并标注其为张成方向数的假象（正定度量下精确为零的区间在 $K\ge513$，照实注明），另报候选集有效秩。主动摆在前面：从 i.i.d.\ 候选抽 size-4 子集使 $\Ak$ 期望按构造近似与 $K$ 无关，平坦性本身证据很弱；吃重证据是相对标量与运动学基线的 AUROC 提升、归因优势幅度、负对照。
+
+\subsection{真机、留出违例与对抗搜索（M5）}
+
+四个 OOD 维度各 100 episode（共 400）$+$ 80 熟悉条件对照。拒动打分需要``若不拒动会怎样''的真值：真机上完全相同复位物理不可实现，采用\textbf{尽可能复位协议}（视觉基准板 $+$ 关节回零 $+$ 定位夹具），报告复位误差分布，每 episode 配对跑两遍，McNemar 检验，置信区间照实给出。人工归因核验：双标注者盲评 $+$ 第三人裁定，公开可观测语言的标注手册。第七类留出违例在真机物理复现，单独报告拒动召回率。对抗搜索：找可达性统计量低于阈值、欧氏位移最大的计划扰动（沿度量最小特征方向有闭式解），闭式与数值搜索都报，连同``每单位可达性量能换到的最大欧氏位移''与最小特征值；把最坏扰动真的执行一遍确认行为差异。急停一律计为失败、不得剔除。
+
+\subsection{指标}
+
+成功率之外报告：拒动精确率/召回率与拒动频率（与成功率永远并列）；三读数对失败的 AUROC/AUPRC（对比~\cite{howvlasfail} 的 conformal 监控器）；$3\times3$ 归因混淆矩阵、宏 F1、归因间隔分布；每 chunk 延迟四分解（候选结果预测、投影求解含 64 子集、Frank--Wolfe、512 维距离计算）与装不进 chunk 周期的控制频率上限；路由重训的 $3\times3$ 配对表与两个对照。
+
+%=====================================================================
+\section{与邻近路线的区别}\label{sec:related}
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}lp{4.6cm}p{6.6cm}@{}}
+\toprule
+路线 & 输出 & 与 VETO 的区别 \\
+\midrule
+Latent Safety Filters~\cite{lsf} & 每个 state-action 对指定 failure set 的可达值 & 安全滤波问``会不会进入失败集合''；VETO 问``候选集合能不能到达成功变化''——被测对象、失败定义、输出结构都不同 \\
+TapSampling~\cite{tapsampling} / VLA-ATTC~\cite{vlaattc} & 每候选一个进度/偏好标量 & 标量可做 $\min$ 型集合拒绝（我们照实承认），但不可分解、不可按级归因 \\
+TDCal~\cite{tdcal} / PACT~\cite{pact} & 校准成功概率的 reject-option & 拒绝依据是价值型标量；VETO 的拒绝依据是选择无关的几何量 $+$ 单纯形隶属 \\
+Sentinel-VLA~\cite{sentinel} & 执行中状态监控 & 事后报警；VETO 在提交前否决 \\
+How VLAs Fail Differently~\cite{howvlasfail} & conformal 执行前失败监控 & 这是我们 AUROC 必须超过的基线；它说不出\emph{为什么}触发 \\
+RC-aux~\cite{rcaux} & 训练期潜空间可达性辅助监督 & 训练期正则 vs.\ 推理期检验，互补不冲突 \\
+XR-1~\cite{xr1} & 统一视觉--运动码本 & 强加一对一；VETO 保留两个空间、学映射 \\
+From Pixels to Tokens~\cite{pixels2tokens} & 两类 latent 的系统比较 & 提供动机与基线配方；未建模二者的结果一致性 \\
+\bottomrule
+\end{tabular}
+\caption{定位比较。UniVLA 引用的是 Bu et al.~\cite{univla}，注意与同名工作（Wang et al., arXiv:2506.19850）区分。}
+\end{table}
+
+%=====================================================================
+\section{风险与预注册的失败准则}\label{sec:risk}
+
+\begin{description}[itemsep=2pt]
+\item[分量共线。] M3 步骤 7 的停机判据事先定死（$|\rho|_{\max}<0.8$ 且 GMM 多聚类、中心方向分离）；不过则停在 M3 发布负结果，不进 M4。
+\item[延迟。] 正定度量取消了低秩节省，每 chunk 增加的毫秒数按四分解照实报告，连同装不进 chunk 周期的控制频率上限。
+\item[压缩器域差。] 冻结前 sanity check；超标则仿真微调再冻结、换指纹。
+\item[固定秩平坦性证据弱。] 主动声明（第~\ref{sec:exp} 节），主张改押 AUROC 提升与归因优势。
+\item[跨本体外推。] URDF 只保证输入可生成，不保证预测准确；M5 如实报告。
+\item[对抗绕过空间残留。] $\lambda I$ 关掉精确盲区，但最小特征方向依然便宜；其大小是 M5 要测的数，不是见解之争。
+\item[真机反事实配对不完美。] 复位误差照实报告为协变量；置信区间宽就宽。
+\end{description}
+
+%=====================================================================
+\section{结论}
+
+VETO 把``提交动作前无人回答的那个问题''翻译成一个几何测量问题：候选动作的可达结果集离意图变化有多远、被选候选在集合内偏了多少、执行后真实响应差了多少。前两个量由一行勾股引理精确相加，第三个量独立读数；否决规则建立在选择无关的可达性统计量上、由 conformal 校准出可核查的误拒率、并带着理由把纠正更新路由到该负责的模块。整个方法只有一把锤子——恒等式~\eqref{eq:identity}——其余全部部件都是把这把锤子落到系统里的打法选择，每个选择的替代方案与放弃理由都已写明。最优先的工作是按 M1--M3 的顺序把闸门一个个过掉：如果分量共线，这个想法应当在便宜的测量上死掉，而不是在昂贵的基准上苟活。
+
+%=====================================================================
+\begin{thebibliography}{99}\small
+
+\bibitem{pixels2tokens}
+Y.~Lin, H.~Li, Y.~Li, et al.
+From Pixels to Tokens: A Systematic Study of Latent Action Supervision for Vision-Language-Action Models.
+In \emph{Proceedings of the 43rd International Conference on Machine Learning (ICML)}, 2026.
+arXiv:2605.04678.
+
+\bibitem{behaviorvla}
+B.~Hu, Z.~Li, R.~Shao, et al.
+From Abstraction to Instantiation: Learning Behavioral Representation for Vision-Language-Action Model.
+In \emph{Proceedings of the 43rd International Conference on Machine Learning (ICML)}, 2026.
+arXiv:2605.22671.
+
+\bibitem{xr1}
+S.~Fan, K.~Wu, Z.~Che, et al.
+XR-1: Towards Versatile Vision-Language-Action Models via Learning Unified Vision-Motion Representations.
+arXiv:2511.02776, 2025.
+
+\bibitem{tapsampling}
+S.~Zhao, S.~Zhang, S.~Yang, et al.
+TapSampling: Inference-Time Sampling with a Task-Progress-Understanding Verifier for Robotic Manipulation.
+In \emph{Proceedings of the 43rd International Conference on Machine Learning (ICML)}, 2026.
+
+\bibitem{sentinel}
+W.~Li, X.~Su, D.~Niu, et al.
+Sentinel-VLA: A Metacognitive VLA Model with Active Status Monitoring for Dynamic Reasoning and Error Recovery.
+In \emph{Proceedings of the 43rd International Conference on Machine Learning (ICML)}, 2026.
+
+\bibitem{lsf}
+K.~Nakamura, L.~Peters, and A.~Bajcsy.
+Generalizing Safety Beyond Collision-Avoidance via Latent-Space Reachability Analysis.
+arXiv:2502.00935, 2025.
+
+\bibitem{tdcal}
+TDCal: Temporal Difference Calibration for Vision-Language-Action Policies.
+In \emph{Proceedings of the 43rd International Conference on Machine Learning (ICML)}, 2026.
+（投稿前逐字核对原文论断口径，见执行计划核查清单。）
+
+\bibitem{vlaattc}
+VLA-ATTC: Pairwise Action-Candidate Comparison for Test-Time Verification of VLA Policies.
+In \emph{Proceedings of the 43rd International Conference on Machine Learning (ICML)}, 2026.
+（投稿前补全作者与编号，见执行计划核查清单。）
+
+\bibitem{rcaux}
+RC-aux: Budgeted Latent Reachability as Auxiliary Supervision for Robot Policies.
+In \emph{Proceedings of the 43rd International Conference on Machine Learning (ICML)}, 2026.
+（投稿前补全作者与编号，见执行计划核查清单。）
+
+\bibitem{howvlasfail}
+How VLAs Fail Differently: Conformal Pre-Execution Failure Monitoring for Vision-Language-Action Policies.
+In \emph{Proceedings of the 43rd International Conference on Machine Learning (ICML)}, 2026.
+（投稿前补全作者与编号，见执行计划核查清单。）
+
+\bibitem{pact}
+PACT: Probabilistic Action Contracts with Reject Option for Robot Policies.
+In \emph{Proceedings of the 43rd International Conference on Machine Learning (ICML)}, 2026.
+（投稿前补全作者与编号，见执行计划核查清单。）
+
+\bibitem{pi05}
+K.~Black, N.~Brown, J.~Darpinian, et al.
+$\pi_{0.5}$: A Vision-Language-Action Model with Open-World Generalization.
+arXiv:2504.16054, 2025.
+
+\bibitem{univla}
+Q.~Bu, Y.~Yang, J.~Cai, et al.
+UniVLA: Learning to Act Anywhere with Task-Centric Latent Actions.
+arXiv:2505.06111, 2025.
+
+\bibitem{vqbet}
+S.~Lee, Y.~Wang, H.~Etukuru, H.~J.~Kim, N.~M.~M.~Shafiullah, and L.~Pinto.
+Behavior Generation with Latent Actions.
+arXiv:2403.03181, 2024.
+
+\end{thebibliography}
+
+\end{document}
