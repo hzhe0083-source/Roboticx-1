@@ -2621,6 +2621,24 @@ def rollout_policy(
                 flow_time[:, time_index],
                 semantic_context=semantic_context,
             )
+            if getattr(model, "wam", None) is not None:
+                from va_compound.wam_cache import wam_last_slice_pool
+                B = condition.shape[0]
+                if dense_evidence is not None and 11 in dense_evidence:
+                    h11_t = dense_evidence[11][:, time_index]          # [B,1152,768]
+                    spatial16 = wam_last_slice_pool(h11_t)             # [B,16,768]
+                else:
+                    spatial16 = condition.new_zeros((B, 16, model.config.vision_dim))
+                geo8 = condition.new_zeros((B, 8))  # M0：联合场景输入由独立训练器提供，此处仅动作残差通路
+                wam_dv, _ = model.wam(
+                    action_condition=condition, va_layers=visual_memory.layers,
+                    spatial_tokens=spatial16, geo_tokens=geo8,
+                    noisy_actions=noisy_actions[:, time_index],
+                    noisy_scene_latents=condition.new_zeros((B, 3, 16, 768)),
+                    noisy_scene_geo=condition.new_zeros((B, 3, 2, 8)),
+                    flow_time=flow_time[:, time_index],
+                )
+                velocity = velocity + model.wam_alpha * wam_dv
             if servo is not None:
                 # Step 2：双新息伺服（设计 §七 Step 2 / 最小完整算法）——
                 # MultiModeReadout 由角色读出路径提供（与 build_local_vision
@@ -3109,6 +3127,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="第二轮架构重构：flow head 逐层读语义上下文（compile readout "
         "tokens，需 --compile-task 才有上下文；flow_cond=adaln 时经 cross-attn 注入）",
+    )
+    parser.add_argument(
+        "--wam-joint",
+        action="store_true",
+        help="E7 WAM v1：联合世界动作流残差通路（独立 WAM 模块只读推理，"
+        "与 --future-predict/--evsm 互斥）",
+    )
+    parser.add_argument(
+        "--wam-alpha",
+        type=float,
+        default=1.0,
+        help="E7 WAM v1：动作残差速度缩放系数（默认 1.0；0 = 关闭 WAM 贡献）",
+    )
+    parser.add_argument(
+        "--wam-ckpt",
+        type=str,
+        default=None,
+        help="E7 WAM v1：WAM 权重来源——独立训练器 checkpoint（含 wam_model 键）"
+        "或裸 state_dict",
     )
     parser.add_argument(
         "--training-stage",
@@ -3750,6 +3787,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--evsm requires a positive --future-predict-weight")
     if args.evsm and args.evsm_temp <= 0.0:
         raise ValueError("--evsm-temp must be positive")
+    if args.wam_joint and (args.future_predict or args.evsm):
+        raise ValueError("--wam-joint is mutually exclusive with --future-predict/--evsm")
     if args.compile_task and not args.e2e_data:
         raise ValueError(
             "--compile-task requires --e2e-data (online SemanticCompiler path only)"
@@ -4494,6 +4533,14 @@ def save_checkpoint(
             # Stage B：解冻后的 V-JEPA 权重必须随 checkpoint 保存（评估侧
             # eval_metaworld.py 已支持 vjepa_state_dict 恢复）。
             payload["vjepa_state_dict"] = vision_backbone.model.state_dict()
+        if getattr(model, "wam", None) is not None:
+            # 追加式：新增顶层键 wam_model + training_contract.wam_joint，
+            # 不改动任何既有键语义（eval_metaworld --wam auto 据此识别）。
+            payload["wam_model"] = {
+                key: value.detach().cpu()
+                for key, value in model.wam.state_dict().items()
+            }
+            payload["training_contract"]["wam_joint"] = True
     if roi_head is not None:
         roi_config = getattr(roi_head, "_mtvj_roi_config", None)
         roi_identity = getattr(roi_head, "_mtvj_roi_checkpoint_identity", None)
@@ -4680,6 +4727,7 @@ def main() -> None:
             role_query_tokens=args.role_query_tokens,
             dual_attention=args.dual_attention,
             flow_semantic=args.flow_semantic,
+            wam_joint=args.wam_joint,
             **_mtvj_config_kwargs(args),
         )
         if args.single_task:
@@ -4830,6 +4878,7 @@ def main() -> None:
             role_query_tokens=args.role_query_tokens,
             dual_attention=args.dual_attention,
             flow_semantic=args.flow_semantic,
+            wam_joint=args.wam_joint,
             local_slots=(args.local_slots_data is not None) or args.live_vjepa,
             local_slots_direct288=args.local_slots_direct288,
             local_slots_fixed_query=args.local_slots_fixed_query,
@@ -5097,6 +5146,7 @@ def main() -> None:
             role_query_tokens=args.role_query_tokens,
             dual_attention=args.dual_attention,
             flow_semantic=args.flow_semantic,
+            wam_joint=args.wam_joint,
             **_mtvj_config_kwargs(args),
         )
         smoke_batch = synthetic_sequence(
@@ -5413,6 +5463,32 @@ def main() -> None:
         )
         print(f"SAM enabled: rho={args.sam_rho} (2x forward per step)")
 
+    # E7 WAM v1（M0）：--wam-joint 时 attach 独立 WAM 模块（只读残差通路，
+    # 由 scripts/train_wam_e7.py 独立训练）。object.__setattr__ 绕过
+    # nn.Module 注册——WAM 参数不进 model.state_dict()/optimizer，
+    # 保证 checkpoint 与优化器契约完全追加式。
+    if args.wam_joint and model is not None:
+        from va_compound.wam import WAMConfig, JointWorldActionFlow
+
+        wam = JointWorldActionFlow(
+            WAMConfig(
+                action_horizon=config.action_horizon,
+                action_dim=config.action_dim,
+            )
+        ).to(device)
+        if args.wam_ckpt:
+            wam_state = torch.load(args.wam_ckpt, map_location="cpu", weights_only=True)
+            if isinstance(wam_state, dict) and "wam_model" in wam_state:
+                wam_state = wam_state["wam_model"]
+            wam.load_state_dict(wam_state)
+            print(f"wam: 权重加载自 {args.wam_ckpt}")
+        object.__setattr__(model, "wam", wam)
+        object.__setattr__(model, "wam_alpha", args.wam_alpha)
+        print(
+            f"wam: JointWorldActionFlow attached "
+            f"({wam.num_params():,} params, alpha={args.wam_alpha})"
+        )
+
     # Cheap after startup: the expensive data digest is already cached on the
     # locality sampler. This immutable value is reused by every checkpoint.
     runtime_exact_run_contract = build_exact_run_contract(
@@ -5560,6 +5636,12 @@ def main() -> None:
                     args.replace_mtvj_metric_head_from_external
                 ),
             )
+            if getattr(model, "wam", None) is not None:
+                if resume_ckpt.get("wam_model") is not None:
+                    model.wam.load_state_dict(resume_ckpt["wam_model"])
+                    print("wam: WAM 权重从 resume checkpoint 恢复")
+                else:
+                    print("wam: resume checkpoint 无 wam_model（沿用当前权重）")
             print(f"resumed from {resume_path}")
         if exact_resume:
             global_step = restore_exact_resume_state(
