@@ -867,6 +867,12 @@ _EXACT_RUN_OPERATIONAL_ARGS = {
     "data",
 }
 
+# E7 WAM args/config enter the exact-run contract only through the conditional
+# "wam" section (appended when --wam-joint is on). Excluding them
+# unconditionally from argument_semantics/model_config keeps the WAM-off
+# contract key-for-key identical to pre-WAM (main-era) checkpoints.
+_WAM_CONTRACT_ARG_KEYS = {"wam_joint", "wam_alpha", "wam_ckpt"}
+
 
 def _normalize_contract_value(value):
     """Convert runtime objects into deterministic weights-only-safe values."""
@@ -1056,6 +1062,7 @@ def build_exact_run_contract(
         key: _normalize_contract_value(value)
         for key, value in sorted(vars(args).items())
         if key not in _EXACT_RUN_OPERATIONAL_ARGS
+        and key not in _WAM_CONTRACT_ARG_KEYS
     }
     metric_config = (
         _mtvj_metric_head_constructor_config(metric_head)
@@ -1083,33 +1090,46 @@ def build_exact_run_contract(
             key: roi_identity.get(key)
             for key in ("sha256", "size_bytes", "contract")
         }
-    return _normalize_contract_value(
-        {
-            "contract_version": EXACT_RUN_CONTRACT_VERSION,
-            "data_identity": getattr(sampler, "dataset_content_identity", None),
-            "arguments": argument_semantics,
-            "model_config": dict(getattr(config, "__dict__", {})),
-            "optimizer": _optimizer_contract(optimizer),
-            "mtvj": {
-                "metric_head_config": metric_config,
-                "metric_checkpoint_identity": metric_identity,
-                "metric_head_joint_trained": bool(
-                    getattr(args, "mtvj_train_metric_head", False)
-                ),
-                "relation_joint_trained": bool(
-                    getattr(args, "mtvj_train_relation", False)
-                ),
-                "metric_state_source": getattr(
-                    metric_head, "_mtvj_metric_state_source", None
-                ),
-                "metric_contract_version": getattr(
-                    metric_head, "_mtvj_metric_contract_version", None
-                ),
-                "roi_config": getattr(roi_head, "_mtvj_roi_config", None),
-                "roi_checkpoint_identity": roi_identity,
-            },
+    # wam_joint is recorded in the conditional "wam" section below; stripping it
+    # here keeps the WAM-off model_config byte-compatible with pre-WAM configs.
+    model_config = dict(getattr(config, "__dict__", {}))
+    model_config.pop("wam_joint", None)
+    contract = {
+        "contract_version": EXACT_RUN_CONTRACT_VERSION,
+        "data_identity": getattr(sampler, "dataset_content_identity", None),
+        "arguments": argument_semantics,
+        "model_config": model_config,
+        "optimizer": _optimizer_contract(optimizer),
+        "mtvj": {
+            "metric_head_config": metric_config,
+            "metric_checkpoint_identity": metric_identity,
+            "metric_head_joint_trained": bool(
+                getattr(args, "mtvj_train_metric_head", False)
+            ),
+            "relation_joint_trained": bool(
+                getattr(args, "mtvj_train_relation", False)
+            ),
+            "metric_state_source": getattr(
+                metric_head, "_mtvj_metric_state_source", None
+            ),
+            "metric_contract_version": getattr(
+                metric_head, "_mtvj_metric_contract_version", None
+            ),
+            "roi_config": getattr(roi_head, "_mtvj_roi_config", None),
+            "roi_checkpoint_identity": roi_identity,
+        },
+    }
+    if getattr(args, "wam_joint", False):
+        # WAM-on contract: freeze alpha and the content identity of the base
+        # WAM checkpoint (path spelling is not a model semantic).
+        wam_ckpt_sha256 = "none"
+        if getattr(args, "wam_ckpt", None):
+            wam_ckpt_sha256 = _sha256_file(Path(args.wam_ckpt))
+        contract["wam"] = {
+            "wam_alpha": float(getattr(args, "wam_alpha", 1.0)),
+            "wam_ckpt_sha256": wam_ckpt_sha256,
         }
-    )
+    return _normalize_contract_value(contract)
 
 
 def exact_run_contract_mismatches(saved: dict, current: dict) -> list[tuple[str, object, object]]:
@@ -2621,7 +2641,12 @@ def rollout_policy(
                 flow_time[:, time_index],
                 semantic_context=semantic_context,
             )
-            if getattr(model, "wam", None) is not None:
+            if (
+                getattr(model, "wam", None) is not None
+                and getattr(model, "wam_alpha", 0.0) != 0
+            ):
+                # α=0 时整段 WAM 代码不执行（不是乘零），避免无意义 forward
+                # 与额外噪声来源。
                 from va_compound.wam_cache import wam_last_slice_pool
                 B = condition.shape[0]
                 if dense_evidence is not None and 11 in dense_evidence:
@@ -4534,13 +4559,22 @@ def save_checkpoint(
             # eval_metaworld.py 已支持 vjepa_state_dict 恢复）。
             payload["vjepa_state_dict"] = vision_backbone.model.state_dict()
         if getattr(model, "wam", None) is not None:
-            # 追加式：新增顶层键 wam_model + training_contract.wam_joint，
-            # 不改动任何既有键语义（eval_metaworld --wam auto 据此识别）。
+            # 追加式：WAM 启用时写入完整恢复契约（wam_model + wam_config +
+            # 来源指纹），不改动任何既有键语义（eval_metaworld --wam auto 据此识别）。
+            import dataclasses
+
             payload["wam_model"] = {
                 key: value.detach().cpu()
                 for key, value in model.wam.state_dict().items()
             }
+            payload["wam_config"] = dataclasses.asdict(model.wam.config)
+            payload["wam_base_ckpt_sha256"] = (
+                _sha256_file(Path(args.wam_ckpt))
+                if getattr(args, "wam_ckpt", None)
+                else "builtin"
+            )
             payload["training_contract"]["wam_joint"] = True
+            payload["training_contract"]["wam_contract_version"] = 1
     if roi_head is not None:
         roi_config = getattr(roi_head, "_mtvj_roi_config", None)
         roi_identity = getattr(roi_head, "_mtvj_roi_checkpoint_identity", None)
@@ -5637,11 +5671,28 @@ def main() -> None:
                 ),
             )
             if getattr(model, "wam", None) is not None:
-                if resume_ckpt.get("wam_model") is not None:
-                    model.wam.load_state_dict(resume_ckpt["wam_model"])
-                    print("wam: WAM 权重从 resume checkpoint 恢复")
-                else:
-                    print("wam: resume checkpoint 无 wam_model（沿用当前权重）")
+                # 确定性续训：WAM 权重与构造配置必须成对出现，不允许随机
+                # 初始化 WAM 继续训练（--wam-ckpt 外部文件不受 resume 兜底）。
+                if resume_ckpt.get("wam_model") is None:
+                    raise ValueError(
+                        "--wam-joint resume 需要含 wam_model 的 checkpoint"
+                    )
+                saved_wam_config = resume_ckpt.get("wam_config")
+                if saved_wam_config is None:
+                    raise ValueError(
+                        "resume checkpoint 含 wam_model 但缺少 wam_config"
+                        "（不允许随机初始化 WAM 续训）"
+                    )
+                import dataclasses
+
+                runtime_wam_config = dataclasses.asdict(model.wam.config)
+                if saved_wam_config != runtime_wam_config:
+                    raise ValueError(
+                        "resume checkpoint wam_config 与运行时 WAMConfig 不一致："
+                        f"checkpoint={saved_wam_config}, runtime={runtime_wam_config}"
+                    )
+                model.wam.load_state_dict(resume_ckpt["wam_model"])
+                print("wam: WAM 权重从 resume checkpoint 恢复")
             print(f"resumed from {resume_path}")
         if exact_resume:
             global_step = restore_exact_resume_state(
