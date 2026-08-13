@@ -21,6 +21,7 @@ docs/superpowers/specs/2026-08-13-e7-wam-design.md §3.1。
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from dataclasses import dataclass
 
@@ -46,6 +47,22 @@ class WAMConfig:
     qk_norm: bool = True
     use_swiglu: bool = True
     dropout: float = 0.0
+
+
+def wam_config_from_state(state: dict | None, **fallback) -> WAMConfig:
+    """Rebuild ``WAMConfig`` from a checkpoint ``wam_config`` dict.
+
+    ``dataclasses.asdict`` + ``torch.save`` may turn ``horizons`` into a list.
+    Unknown keys are ignored so older sidecars still load. ``fallback`` fills
+    missing fields (used when a blob has weights but no saved config).
+    """
+    payload = dict(fallback)
+    if state:
+        payload.update(state)
+    if "horizons" in payload and not isinstance(payload["horizons"], tuple):
+        payload["horizons"] = tuple(payload["horizons"])
+    fields = {item.name for item in dataclasses.fields(WAMConfig)}
+    return WAMConfig(**{key: value for key, value in payload.items() if key in fields})
 
 
 @dataclass

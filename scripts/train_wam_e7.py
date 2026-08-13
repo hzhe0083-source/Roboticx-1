@@ -9,9 +9,12 @@ using the joint loss from design doc §4:
 
 - L_action: masked_flow_matching_loss(v_base + dv, target, prefix_steps=6,
   prefix_weight=1.0, tail_weight=0.036) — copied/imported from train.py.
-- L_VJ / L_geo: per-horizon smooth-L1 with cache-provided weights
-  w = horizon_weight * (~perturbed_future) * valid_future; horizons with zero
-  weight leave the denominator and are counted in the `excluded=` log field.
+- L_VJ / L_geo: per-horizon Smooth-L1 means, then design-§4 weighted
+  average with cache weights w = horizon_weight * (~perturbed_future) *
+  valid_future (typically 1.0/0.5/0.25). Invalid horizons leave the
+  denominator and are counted in the `excluded=` log field. Do not reduce
+  per-horizon with (se*w).sum()/w.sum() and then /3 — that cancels the
+  span weights and treats missing horizons as 0.
 - One shared flow time tau (design §3.1: action / spatial-latent / geo tokens
   share the same flow time): x_t = (1-tau)*noise + tau*target,
   v_target = target - noise on all three paths.
@@ -499,6 +502,52 @@ def batch_to(batch: dict, device: torch.device) -> dict:
 # ---------------------------------------------------------------------------
 # Flow sampling + joint loss (design §4).
 # ---------------------------------------------------------------------------
+def horizon_weighted_smooth_l1(pred: Tensor, target: Tensor, weight: Tensor) -> Tensor:
+    """Per-horizon Smooth-L1, then design-§4 weighted average.
+
+    ``pred`` / ``target`` are ``[B, H, ...]`` (H=3 spans); ``weight`` is
+    ``[B, H] = horizon_weight * (~perturbed_future) * valid_future``.
+
+    Reduce tokens/features first so each (sample, horizon) is one scalar.
+    Then take the mean over valid samples of that horizon, and combine
+    the H horizon means with the cache span weights:
+
+        L = sum_h (w_h * I_h * mean_h) / sum_h (w_h * I_h)
+
+    A per-horizon ``(se * w).sum() / w.sum()`` cancels the constant
+    1.0/0.5/0.25 inside each span; averaging those three means (and
+    dividing by 3 even when a span is empty) is *not* §4. Empty spans
+    leave the denominator.
+    """
+    if pred.shape != target.shape:
+        raise ValueError(f"pred/target shape mismatch: {tuple(pred.shape)} vs {tuple(target.shape)}")
+    if pred.ndim < 3 or weight.shape != pred.shape[:2]:
+        raise ValueError(
+            f"expected pred [B, H, ...] and weight [B, H]; got pred={tuple(pred.shape)} "
+            f"weight={tuple(weight.shape)}"
+        )
+    per_elem = F.smooth_l1_loss(pred, target, reduction="none")
+    per_sample = per_elem.mean(dim=tuple(range(2, per_elem.ndim)))  # [B, H]
+    num = pred.new_zeros(())
+    den = pred.new_zeros(())
+    for k in range(per_sample.shape[1]):
+        w_k = weight[:, k]
+        valid = w_k > 0
+        if not bool(valid.any()):
+            continue
+        # Unweighted mean of valid samples. Per-sample span weights that
+        # only differ by a constant (the usual 1.0/0.5/0.25) would cancel
+        # here; they are re-applied as w_bar below. Varying cache weights
+        # inside one span still affect w_bar (mean of valid weights).
+        mean_k = per_sample[valid, k].mean()
+        w_bar = w_k[valid].mean()
+        num = num + w_bar * mean_k
+        den = den + w_bar
+    if not bool(den > 0):
+        return pred.new_zeros(())
+    return num / den
+
+
 def compute_losses(
     wam: nn.Module,
     base: nn.Module,
@@ -562,6 +611,8 @@ def compute_losses(
 
     # 未来目标 mask 入 loss：w = horizon_weight · (~perturbed_future) · valid_future
     # （两者都来自 cache 白名单字段；w=0 的跨度退出分母并计入 excluded）。
+    # 跨度权重在 horizon_weighted_smooth_l1 里按 §4 做加权平均，不能先
+    # 逐跨度 (se*w)/w 再 /3（那样 1.0/0.5/0.25 会被消掉，无效跨度当 0）。
     horizon_w = batch["horizon_weight"]  # [B,3]
     future_w = (
         horizon_w
@@ -569,26 +620,8 @@ def compute_losses(
         * batch["valid_future"].float()
     )  # [B,3]
 
-    def masked_smooth_l1(pred: Tensor, target: Tensor, w: Tensor) -> Tensor:
-        se = F.smooth_l1_loss(pred, target, reduction="none").mean(
-            dim=tuple(range(1, pred.ndim))
-        )  # [B]
-        denom = w.sum()
-        if not bool(denom > 0):
-            return pred.new_zeros(())
-        return (se * w).sum() / denom
-
-    loss_vj = torch.zeros((), device=device, dtype=dtype)
-    loss_geo = torch.zeros((), device=device, dtype=dtype)
-    for k in range(3):
-        loss_vj = loss_vj + masked_smooth_l1(
-            scene_v.latent[:, k], v_scene_target[:, k], future_w[:, k]
-        )
-        loss_geo = loss_geo + masked_smooth_l1(
-            scene_v.geo[:, k], v_geo_target[:, k], future_w[:, k]
-        )
-    loss_vj = loss_vj / 3.0
-    loss_geo = loss_geo / 3.0
+    loss_vj = horizon_weighted_smooth_l1(scene_v.latent, v_scene_target, future_w)
+    loss_geo = horizon_weighted_smooth_l1(scene_v.geo, v_geo_target, future_w)
     excluded = int((future_w <= 0).sum().item())
 
     # Placeholder: first-round consistency term is 0 (enabled post G1/G2 gates).

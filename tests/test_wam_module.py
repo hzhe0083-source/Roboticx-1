@@ -16,10 +16,11 @@ import pytest
 import torch
 
 try:
-    from va_compound.wam import WAMConfig, JointWorldActionFlow
+    from va_compound.wam import WAMConfig, JointWorldActionFlow, wam_config_from_state
 except ImportError:
     WAMConfig = None  # type: ignore[assignment]
     JointWorldActionFlow = None  # type: ignore[assignment]
+    wam_config_from_state = None  # type: ignore[assignment]
 
 N_VA_LAYERS = 8
 WAM_NUM_LAYERS = 12
@@ -204,3 +205,28 @@ def test_bf16_finite() -> None:
     assert torch.isfinite(dv.float()).all()
     assert torch.isfinite(scene.latent.float()).all()
     assert torch.isfinite(scene.geo.float()).all()
+
+
+def test_wam_config_from_state_restores_saved_fields() -> None:
+    _need_wam()
+    if wam_config_from_state is None:
+        pytest.skip("dependency not yet implemented: wam_config_from_state")
+    saved = {
+        "hidden_dim": 32,
+        "num_layers": 2,
+        "num_heads": 4,
+        "ffn_hidden": 64,
+        "horizons": [6, 24, 48],
+        "action_horizon": 8,
+        "unknown_future_key": "ignore-me",
+    }
+    cfg = wam_config_from_state(saved, hidden_dim=512, action_dim=4)
+    assert cfg.hidden_dim == 32
+    assert cfg.num_layers == 2
+    assert cfg.action_horizon == 8
+    assert cfg.horizons == (6, 24, 48)
+    assert cfg.action_dim == 4
+    fallback = wam_config_from_state(None, hidden_dim=256, action_dim=7)
+    assert fallback.hidden_dim == 256
+    assert fallback.action_dim == 7
+    assert fallback.num_layers == 12

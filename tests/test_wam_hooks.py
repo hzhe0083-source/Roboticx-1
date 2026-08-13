@@ -198,3 +198,85 @@ def test_wam_forward_not_called_when_disabled(monkeypatch) -> None:
     with pytest.raises(SystemExit):
         _resolve_wam({}, args, config, torch.device("cpu"))
     assert calls["n"] == 0
+
+
+def test_resolve_wam_uses_saved_wam_config() -> None:
+    """Checkpoint wam_config must win over VA hidden_dim / ACTION_HORIZON=8."""
+    try:
+        import dataclasses
+
+        from eval_metaworld import _resolve_wam
+        from va_compound.wam import JointWorldActionFlow, WAMConfig
+    except ImportError:
+        pytest.skip("dependency not yet implemented: eval/wam")
+    from types import SimpleNamespace
+
+    saved_cfg = WAMConfig(
+        hidden_dim=32,
+        num_layers=2,
+        num_heads=4,
+        ffn_hidden=64,
+        cond_dim=16,
+        vision_dim=16,
+        action_horizon=48,
+        action_dim=4,
+    )
+    wam = JointWorldActionFlow(saved_cfg)
+    ckpt = {
+        "wam_model": wam.state_dict(),
+        "wam_config": dataclasses.asdict(saved_cfg) | {"horizons": [6, 24, 48]},
+    }
+    va_config = SimpleNamespace(action_horizon=8, action_dim=4, hidden_dim=512)
+    args = SimpleNamespace(wam="auto", wam_alpha=1.0)
+    loaded = _resolve_wam(ckpt, args, va_config, torch.device("cpu"))
+    assert loaded is not None
+    assert loaded.config.num_layers == 2
+    assert loaded.config.hidden_dim == 32
+    assert loaded.config.action_horizon == 48
+    assert loaded.config.horizons == (6, 24, 48)
+
+
+def test_residual_fn_scene_path_is_not_zero(monkeypatch) -> None:
+    """Scene tokens must follow x=(1-τ)ε, not zeros-every-step."""
+    try:
+        from types import SimpleNamespace
+
+        from eval_metaworld import _make_wam_residual_fn
+        from va_compound.wam import WAMSceneVelocity
+    except ImportError:
+        pytest.skip("dependency not yet implemented: eval/wam")
+
+    captured = []
+
+    class _StubWAM:
+        def __call__(self, **kwargs):
+            captured.append(
+                {
+                    "t": kwargs["flow_time"].detach().clone(),
+                    "scene": kwargs["noisy_scene_latents"].detach().clone(),
+                    "geo": kwargs["noisy_scene_geo"].detach().clone(),
+                }
+            )
+            batch = kwargs["noisy_actions"].shape[0]
+            dv = torch.zeros_like(kwargs["noisy_actions"])
+            scene = WAMSceneVelocity(
+                latent=torch.zeros(batch, 3, 16, 768),
+                geo=torch.zeros(batch, 3, 2, 8),
+            )
+            return dv, scene
+
+    memory = SimpleNamespace(layers=())
+    spatial = torch.zeros(1, 16, 768)
+    geo8 = torch.zeros(1, 8)
+    fn = _make_wam_residual_fn(_StubWAM(), memory, spatial, geo8, 1.0)
+    cond = torch.zeros(1, 8, 32)
+    x_t = torch.zeros(1, 8, 4)
+    torch.manual_seed(0)
+    fn(cond, x_t, torch.tensor([0.0]))
+    fn(cond, x_t, torch.tensor([0.5]))
+    assert len(captured) == 2
+    assert captured[0]["scene"].abs().sum() > 0
+    assert captured[1]["scene"].abs().sum() > 0
+    # Same ε: x(0.5) should be half of x(0)
+    torch.testing.assert_close(captured[1]["scene"], 0.5 * captured[0]["scene"])
+    torch.testing.assert_close(captured[1]["geo"], 0.5 * captured[0]["geo"])

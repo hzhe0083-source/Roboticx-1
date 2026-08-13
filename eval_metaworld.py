@@ -135,18 +135,34 @@ def _wam_spatial16_from_h11(h11: torch.Tensor) -> torch.Tensor:
 def _make_wam_residual_fn(wam, memory, spatial16, geo8, wam_alpha):
     """E7 WAM M0 Task 4 闭包：decode_actions Euler 循环内 v += wam_alpha * wam(...)。
 
-    场景路径输入零张量（M0 仅动作残差通路，场景由独立训练器提供）；调用约定
-    与 va_compound/model.py 的 wam_residual_fn(cond, x_t, t_k) 钩子一致。
+    场景半边没有 GT 目标，走与训练相同的直线路径、目标取 0：
+    x_scene(τ) = (1-τ)·ε，ε 在本次 decode 内固定。每步重填 zeros 既不是
+    该路径，也会让 54 个场景 token 与 τ 脱节。
+    调用约定与 va_compound/model.py 的 wam_residual_fn(cond, x_t, t_k) 一致。
     """
+    scene_eps = None
+    geo_eps = None
 
     def fn(cond, x_t, t_k):
+        nonlocal scene_eps, geo_eps
+        batch = x_t.shape[0]
+        flow_time = t_k.reshape(-1)
+        if flow_time.numel() == 1:
+            flow_time = flow_time.expand(batch)
+        if scene_eps is None:
+            scene_eps = torch.randn(batch, 3, 16, 768, device=x_t.device, dtype=x_t.dtype)
+            geo_eps = torch.randn(batch, 3, 2, 8, device=x_t.device, dtype=x_t.dtype)
+        tau = flow_time.to(dtype=x_t.dtype)
+        tau_s = tau[:, None, None, None]
+        x_scene = (1.0 - tau_s) * scene_eps
+        x_geo = (1.0 - tau_s) * geo_eps
         dv, _ = wam(  # noqa
             action_condition=cond, va_layers=memory.layers,
             spatial_tokens=spatial16, geo_tokens=geo8,
             noisy_actions=x_t,
-            noisy_scene_latents=torch.zeros(x_t.shape[0], 3, 16, 768, device=x_t.device),
-            noisy_scene_geo=torch.zeros(x_t.shape[0], 3, 2, 8, device=x_t.device),
-            flow_time=t_k.expand(x_t.shape[0]),
+            noisy_scene_latents=x_scene,
+            noisy_scene_geo=x_geo,
+            flow_time=tau,
         )
         return wam_alpha * dv
 
@@ -175,9 +191,10 @@ def _resolve_wam(ckpt: dict, args, config, device: torch.device):
         return None
     # Task 1（va_compound/wam.py）为并行交付：延迟导入，wam 不可用时
     # 不触碰该模块（import eval_metaworld 始终干净）。
-    from va_compound.wam import JointWorldActionFlow, WAMConfig
+    from va_compound.wam import JointWorldActionFlow, wam_config_from_state
 
-    wam_cfg = WAMConfig(
+    wam_cfg = wam_config_from_state(
+        ckpt.get("wam_config"),
         action_horizon=int(getattr(config, "action_horizon", ACTION_HORIZON)),
         action_dim=int(getattr(config, "action_dim", 4)),
         hidden_dim=int(getattr(config, "hidden_dim", 512)),
@@ -185,11 +202,14 @@ def _resolve_wam(ckpt: dict, args, config, device: torch.device):
     wam = JointWorldActionFlow(wam_cfg)
     wam.load_state_dict(wam_state)
     wam.to(device).eval()
+    for param in wam.parameters():
+        param.requires_grad_(False)
     print(
         f"eval: WAM enabled from checkpoint wam_model "
         f"(action_horizon={wam_cfg.action_horizon}, "
         f"action_dim={wam_cfg.action_dim}, "
-        f"hidden_dim={wam_cfg.hidden_dim}, alpha={args.wam_alpha})"
+        f"hidden_dim={wam_cfg.hidden_dim}, "
+        f"num_layers={wam_cfg.num_layers}, alpha={args.wam_alpha})"
     )
     return wam
 
