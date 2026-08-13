@@ -19,6 +19,7 @@ import argparse
 import dataclasses
 import hashlib
 import os
+import sys
 from pathlib import Path
 from typing import Any, Callable
 
@@ -115,6 +116,82 @@ def _mtvj_metric_positions(
 
 
 _mtvj_visibility_gated_positions = _mtvj_metric_positions
+
+
+def _wam_spatial16_from_h11(h11: torch.Tensor) -> torch.Tensor:
+    """E7 WAM M0：H11 dense evidence → 最后时间片 4×4 空间 token [B,16,768]。
+
+    H11 dense 布局 [B,1152,768]（2 时间片 × 24×24，t→y→x 扁平）；最后时间片
+    [..., 576:, :] = [B,576,768] → 24×24 网格 → 6×6 块均值 → [B,4,4,768]
+    → flatten [B,16,768]（Task 5 wam_last_slice_pool 同构，见 wam.py 契约）。
+    """
+    last = h11[..., 576:, :]  # [B,576,768]
+    batch = last.shape[0]
+    grid = last.reshape(batch, 24, 24, 768).permute(0, 3, 1, 2)  # [B,768,24,24]
+    pooled = F.avg_pool2d(grid, kernel_size=6, stride=6)  # [B,768,4,4]
+    return pooled.permute(0, 2, 3, 1).reshape(batch, 16, 768)  # [B,16,768]
+
+
+def _make_wam_residual_fn(wam, memory, spatial16, geo8, wam_alpha):
+    """E7 WAM M0 Task 4 闭包：decode_actions Euler 循环内 v += wam_alpha * wam(...)。
+
+    场景路径输入零张量（M0 仅动作残差通路，场景由独立训练器提供）；调用约定
+    与 va_compound/model.py 的 wam_residual_fn(cond, x_t, t_k) 钩子一致。
+    """
+
+    def fn(cond, x_t, t_k):
+        dv, _ = wam(  # noqa
+            action_condition=cond, va_layers=memory.layers,
+            spatial_tokens=spatial16, geo_tokens=geo8,
+            noisy_actions=x_t,
+            noisy_scene_latents=torch.zeros(x_t.shape[0], 3, 16, 768, device=x_t.device),
+            noisy_scene_geo=torch.zeros(x_t.shape[0], 3, 2, 8, device=x_t.device),
+            flow_time=t_k.expand(x_t.shape[0]),
+        )
+        return wam_alpha * dv
+
+    return fn
+
+
+def _resolve_wam(ckpt: dict, args, config, device: torch.device):
+    """E7 WAM M0 Task 4：--wam auto|on|off 决议（返回 wam 或 None）。
+
+    auto = checkpoint 追加键 wam_model 存在则启用；on = 必须有 WAM 权重，
+    否则明确报错退出（拒绝旧 checkpoint 静默回退）；off = 永不启用。
+    --wam off 或 --wam-alpha 0 直接短路返回 None：不建 WAM、不建
+    wam_residual_fn 闭包、不传 wam_residual_fn（旧版「建闭包乘零」仍会
+    每决策步白跑一次 wam.forward，且轨迹与旧版非逐位一致）。wam=None 时
+    两个 decode 钩子均走旧版路径，行为逐位一致。
+    """
+    if args.wam == "off" or float(args.wam_alpha) == 0.0:
+        return None
+    wam_state = ckpt.get("wam_model")
+    if wam_state is None:
+        if args.wam == "on":
+            sys.exit(
+                "--wam on: checkpoint has no WAM weights (old checkpoint); "
+                "use auto/off"
+            )
+        return None
+    # Task 1（va_compound/wam.py）为并行交付：延迟导入，wam 不可用时
+    # 不触碰该模块（import eval_metaworld 始终干净）。
+    from va_compound.wam import JointWorldActionFlow, WAMConfig
+
+    wam_cfg = WAMConfig(
+        action_horizon=int(getattr(config, "action_horizon", ACTION_HORIZON)),
+        action_dim=int(getattr(config, "action_dim", 4)),
+        hidden_dim=int(getattr(config, "hidden_dim", 512)),
+    )
+    wam = JointWorldActionFlow(wam_cfg)
+    wam.load_state_dict(wam_state)
+    wam.to(device).eval()
+    print(
+        f"eval: WAM enabled from checkpoint wam_model "
+        f"(action_horizon={wam_cfg.action_horizon}, "
+        f"action_dim={wam_cfg.action_dim}, "
+        f"hidden_dim={wam_cfg.hidden_dim}, alpha={args.wam_alpha})"
+    )
+    return wam
 
 
 def select_eval_tasks(
@@ -562,6 +639,20 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="ROI 有界残差融合系数 [0,1]；启用 ROI checkpoint 时必须显式给出。",
+    )
+    parser.add_argument(
+        "--wam",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help="E7 WAM M0：联合世界动作流残差。auto = checkpoint 有 wam_model 追加键"
+        "则启用；on = 必须启用（旧 checkpoint 无 WAM 权重时报错退出）；"
+        "off = 永不启用（行为与旧版逐位一致）。",
+    )
+    parser.add_argument(
+        "--wam-alpha",
+        type=float,
+        default=1.0,
+        help="WAM 残差速度缩放系数（默认 1.0；0 = 名义动作，消融对照）。",
     )
     parser.add_argument("--trials-per-task", type=int, default=10)
     parser.add_argument("--max-tasks", type=int, default=49)
@@ -1694,6 +1785,11 @@ def main() -> None:
     )
     print(f"eval: action_horizon={ACTION_HORIZON} (from checkpoint config), "
           f"flow_steps={flow_steps} (from checkpoint contract)")
+    # E7 WAM M0 Task 4：--wam auto|on|off 决议（见 _resolve_wam）。off 或
+    # alpha=0 短路返回 None：不建 WAM、不建 wam_residual_fn 闭包，两个 decode
+    # 钩子均不传 wam_residual_fn。wam_model 为追加键，旧 checkpoint 无此键时
+    # wam=None，后续决策循环行为与旧版逐位一致。
+    wam = _resolve_wam(ckpt, args, config, device)
     # spatial-pooling ckpt 评估：vision_pooling 存在 training_contract 而非 config。
     vision_pooling = str(
         (ckpt.get("training_contract", {}) or {}).get("vision_pooling", "flat")
@@ -2337,8 +2433,23 @@ def main() -> None:
                                 )
                                 else None
                             )
+                            decode_kwargs = {}
+                            if wam is not None:
+                                # E7 WAM M0 Task 4：servo 分支无 dense_evidence /
+                                # metric head 决策点读数，场景输入零张量（与 M0
+                                # 动作残差通路约定一致）。
+                                # M0 约定：servo 路径无 dense metric 上下文，WAM
+                                # 仅动作残差通路；E7 验收走普通分支。
+                                decode_kwargs["wam_residual_fn"] = _make_wam_residual_fn(
+                                    wam,
+                                    memory,
+                                    torch.zeros(1, 16, 768, device=device),
+                                    torch.zeros(1, 8, device=device),
+                                    args.wam_alpha,
+                                )
                             chunk = model.decode_actions(
-                                cond, steps=flow_steps, semantic_context=semantic_ctx
+                                cond, steps=flow_steps, semantic_context=semantic_ctx,
+                                **decode_kwargs,
                             )[0].cpu().numpy()
                         plan_step = step
                         c2_token = 0
@@ -2553,8 +2664,29 @@ def main() -> None:
                             )
                             else None
                         )
+                        decode_kwargs = {}
+                        if wam is not None:
+                            # E7 WAM M0 Task 4：spatial16 = H11 最后时间片
+                            # 24×24 → 4×4 块均值；geo8 = 当前决策 metric head
+                            # 的 p*vis 8 维状态（与 _mtvj_metric_positions
+                            # 同源，含 ROI 精修与 v2/v3 source 选择）。
+                            wam_dense = dense_kwargs.get("dense_evidence")
+                            spatial16 = (
+                                _wam_spatial16_from_h11(wam_dense[11])
+                                if wam_dense is not None and 11 in wam_dense
+                                else torch.zeros(1, 16, 768, device=device)
+                            )
+                            geo8 = (
+                                metric_g_prev[None]
+                                if metric_g_prev is not None
+                                else torch.zeros(1, 8, device=device)
+                            )
+                            decode_kwargs["wam_residual_fn"] = _make_wam_residual_fn(
+                                wam, memory, spatial16, geo8, args.wam_alpha,
+                            )
                         chunk = model.decode_actions(
-                            cond, steps=flow_steps, semantic_context=semantic_ctx
+                            cond, steps=flow_steps, semantic_context=semantic_ctx,
+                            **decode_kwargs,
                         )[0].cpu().numpy()
                         chunk_start_step = step
                         if args.debug_first_action and not _DEBUG_FA_DONE.get("x"):
