@@ -2117,6 +2117,13 @@ def main() -> None:
     checkpoint_uses_mtvj = bool(getattr(config, "dense_readout_mtvj", False))
     # DINO-metric checkpoint 的 dense 层由 DINO block11/block23 证据驱动，
     # 不建 V-JEPA 骨干/路径（--dense-readout-mtvj CLI 保持关闭）。
+    if getattr(config, "dino_dense_metric", False):
+        if args.dense_readout_mtvj or args.metric_visual_checkpoint is not None:
+            raise ValueError(
+                "DINO-metric checkpoint 的 dense/metric 栈由 DINO 特征驱动；"
+                "禁止 --dense-readout-mtvj / --metric-visual-checkpoint "
+                "（V-JEPA 路径）混用"
+            )
     if checkpoint_uses_mtvj and not getattr(config, "dino_dense_metric", False) and not args.dense_readout_mtvj:
         args.dense_readout_mtvj = True
         print(
