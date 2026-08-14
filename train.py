@@ -2133,7 +2133,15 @@ def _build_dino_metric_stack(
                 f"grid={ctor_config['grid']} (期望 16)"
             )
     else:
-        ctor_config.update(h_dim=int(config.main_vision_dim), grid=16)
+        # 与生产 V-JEPA metric 栈（metric_field_v6，mode_readout/l2_norm/
+        # learnable_temp）同一读出语义，只是视觉输入换 DINO（1024 维、16 网格）。
+        ctor_config.update(
+            h_dim=int(config.main_vision_dim),
+            grid=16,
+            l2_norm=True,
+            learnable_temp=True,
+            mode_readout=True,
+        )
     metric_head = LanguageMetricField(
         lang_dim=int(ctor_config["lang_dim"]),
         h_dim=int(ctor_config["h_dim"]),
