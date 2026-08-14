@@ -2100,6 +2100,98 @@ def _dino_main_online_encode(
     return tokens, dense_evidence
 
 
+class DinoFeatureCache:
+    """预计算 DINO block11/block23 特征缓存（2026-08-15，步时优化）。
+
+    在线 ViT-L 编码占训练步时 84%（profile：2.97s/3.51s）；冻结塔确定性，
+    全部唯一帧特征离线预计算为 fp16 memmap（scripts/build_dino_feature_cache.py），
+    训练循环从缓存读。位级一致性由预计算脚本内置验证（torch.equal）保证；
+    eval 仍在线编码真实新帧。
+    """
+
+    def __init__(self, path: Path) -> None:
+        import json
+        import pickle
+
+        self.path = Path(path).expanduser()
+        if not self.path.is_dir():
+            raise ValueError(f"DINO feature cache directory missing: {self.path}")
+        with (self.path / "meta.json").open() as fh:
+            self.meta = json.load(fh)
+        with (self.path / "index.pkl").open("rb") as fh:
+            self.index: dict = pickle.load(fh)
+        self.block23 = np.load(
+            self.path / "block23.npy", mmap_mode="r"
+        )  # [N, 256, 1024] fp16
+        self.block11 = np.load(
+            self.path / "block11.npy", mmap_mode="r"
+        )  # [N, 256, 1024] fp16
+        if self.block23.shape != self.block11.shape:
+            raise ValueError("feature cache block23/block11 shape mismatch")
+        if self.block23.shape[0] != len(self.index):
+            raise ValueError("feature cache rows != index length")
+        print(
+            f"dino feature cache: {len(self.index)} frames, "
+            f"{self.meta.get('model_id')} @{self.meta.get('image_size')}px, "
+            f"chunk={self.meta.get('chunk')}, "
+            f"dataset_sha256={self.meta.get('dataset_sha256', '?')[:12]}…",
+            flush=True,
+        )
+
+    def frames(self, rows: np.ndarray) -> dict[int, torch.Tensor]:
+        """rows [B, T, W] int64 → {5: [B,T,W,256,D], 11: [...]} GPU fp16。
+
+        键语义与 online forward_hierarchical_dense 相同（5=block11，11=block23）。
+        """
+        b, t, w = rows.shape
+        flat = rows.reshape(-1)
+        out = {}
+        for key, mem in ((5, self.block11), (11, self.block23)):
+            picked = np.asarray(mem[flat])  # [B*T*W, 256, 1024] fp16
+            out[key] = torch.from_numpy(picked).reshape(b, t, w, 256, -1)
+        return out
+
+
+def _dino_main_encode_from_cache(
+    rows: torch.Tensor,
+    cache: DinoFeatureCache,
+    device: torch.device,
+    *,
+    grid: int,
+    window: int,
+    return_dense: bool = False,
+) -> Tensor | tuple[Tensor, dict[int, Tensor]]:
+    """缓存读 + 与在线路径同构的池化/证据组装（位级一致，见 precompute 验证）。
+
+    与 _dino_main_online_encode 的差异仅在于 block 特征来自 memmap 而非塔前向：
+    同一 16×16→grid×grid adaptive_avg_pool、同一 [d-2,d] 两帧 evidence 序。
+    """
+    if rows.ndim != 3 or rows.shape[-1] != window:
+        raise ValueError(
+            f"frame_cache_rows 必须 [B, T, {window}]，got {tuple(rows.shape)}"
+        )
+    rows_np = rows.detach().cpu().numpy().astype(np.int64)
+    evidence = cache.frames(rows_np)  # {5, 11}: [B,T,W,256,D] fp16 CPU
+    b, t, w, n_patch, dim = evidence[11].shape
+    if n_patch != 256 or dim != 1024:
+        raise RuntimeError(
+            f"feature cache 期望 256×1024 每帧，got {n_patch}×{dim}"
+        )
+    tokens = evidence[11].to(device).float()  # [B,T,W,256,D]
+    tokens = tokens.reshape(b * t * w, 16, 16, dim).permute(0, 3, 1, 2)
+    tokens = F.adaptive_avg_pool2d(tokens, (grid, grid))
+    tokens = tokens.permute(0, 2, 3, 1).reshape(b, t, w * grid * grid, dim)
+    if not return_dense:
+        return tokens
+    dense = {}
+    for key in (5, 11):
+        ev = evidence[key].to(device).float()  # [B,T,W,256,D]
+        dense[key] = torch.cat((ev[:, :, 2], ev[:, :, 3]), dim=2).reshape(
+            b, t, 512, dim
+        )
+    return tokens, dense
+
+
 def _build_dino_metric_stack(
     device: torch.device,
     config: VACompoundConfig,
@@ -3900,6 +3992,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="DINO-main 每决策消费的窗口帧数（默认 4 = [d-6,d-4,d-2,d]）。",
     )
     parser.add_argument(
+        "--dino-feature-cache",
+        type=Path,
+        default=None,
+        help="DINO-main/DINO-metric 预计算特征缓存目录（scripts/"
+        "build_dino_feature_cache.py 生成；block11/block23 fp16 memmap）。"
+        "冻结塔在线编码占步时 84%，缓存读把 13000 步从 ~9.4h 降到 ~2.5h；"
+        "位级一致性由预计算脚本内置 torch.equal 验证，eval 仍在线编码。",
+    )
+    parser.add_argument(
         "--dino-dense-metric",
         action="store_true",
         help="DINO-metric（2026-08-15 用户决策）：DINO-main 下接回 MT-VJ dense + "
@@ -4433,10 +4534,23 @@ def validate_args(args: argparse.Namespace) -> None:
                     "loss 尚未移植到 DINO 特征（V-JEPA 编码器绑定）；当前 metric "
                     "head 由动作 loss 联合微调（--mtvj-train-metric-head/relation）"
                 )
+        if args.dino_feature_cache is not None:
+            cache_dir = args.dino_feature_cache.expanduser()
+            if not cache_dir.is_dir():
+                raise ValueError(
+                    f"--dino-feature-cache directory missing: {cache_dir}"
+                )
+            for name in ("meta.json", "index.pkl", "block23.npy", "block11.npy"):
+                if not (cache_dir / name).exists():
+                    raise ValueError(
+                        f"--dino-feature-cache 缺少 {name}: {cache_dir}"
+                    )
     elif args.main_vision_checkpoint is not None:
         raise ValueError("--main-vision-checkpoint requires --dino-main-vision")
     if getattr(args, "dino_dense_metric", False) and not dino_main_vision:
         raise ValueError("--dino-dense-metric requires --dino-main-vision")
+    if getattr(args, "dino_feature_cache", None) is not None and not dino_main_vision:
+        raise ValueError("--dino-feature-cache requires --dino-main-vision")
     roi_checkpoint = getattr(args, "mtvj_roi_checkpoint", None)
     roi_alpha = getattr(args, "mtvj_roi_alpha", None)
     if roi_checkpoint is None and roi_alpha is not None:
@@ -5642,6 +5756,14 @@ def main() -> None:
             dataset = LongTrajFramesDataset(
                 args.data,
                 min_sequence_length=args.min_sequence_length,
+                feature_cache=(
+                    args.dino_feature_cache
+                    if getattr(args, "dino_main_vision", False)
+                    else None
+                ),
+                include_frames=(
+                    args.dino_feature_cache is None
+                ),
             )
             print(
                 f"{'DINO-main' if args.dino_main_vision else 'MT-VJ'} data: "
@@ -6042,9 +6164,30 @@ def main() -> None:
         args, config, device
     )
     main_vision_backbone = None
+    dino_cache = None
     if getattr(args, "dino_main_vision", False):
         # DINO-main：冻结 DINOv2 替换 V-JEPA 主视觉（V-JEPA 路径保留未删除）。
         main_vision_backbone = _build_dino_main_backbone(args, config, device)
+        if args.dino_feature_cache is not None:
+            # 特征缓存模式：训练循环从 memmap 读预计算特征（塔仅用于校验/
+            # 不在循环内前向）。位级一致由 build_dino_feature_cache.py 验证。
+            dino_cache = DinoFeatureCache(args.dino_feature_cache)
+            if (
+                dino_cache.meta.get("model_id") != config.main_vision_model_id
+                or int(dino_cache.meta.get("image_size", 0))
+                != config.main_vision_image_size
+                or int(dino_cache.meta.get("grid", 0)) != config.main_vision_grid
+                or int(dino_cache.meta.get("window", 0))
+                != config.main_vision_frames
+            ):
+                raise ValueError(
+                    "DINO feature cache 元信息与配置不一致："
+                    f"{dino_cache.meta} vs "
+                    f"model={config.main_vision_model_id}, "
+                    f"size={config.main_vision_image_size}, "
+                    f"grid={config.main_vision_grid}, "
+                    f"window={config.main_vision_frames}"
+                )
     if getattr(args, "dino_dense_metric", False):
         # DINO-metric：metric 栈从零构建（resume 时用主 checkpoint 的构造
         # 配置），不复用 V-JEPA --metric-visual-checkpoint 权重。
@@ -6709,43 +6852,79 @@ def main() -> None:
             # 中（--dense-readout-mtvj 等 flag 关闭即禁用），此处仅旁路。
             # DINO-metric（2026-08-15）：同一次窗口编码附带 block11/block23
             # 两帧 [d-2,d] patch evidence + metric tokens（--dino-dense-metric）。
-            frames_main = batch.get("frames")
-            if frames_main is None:
-                raise ValueError(
-                    "--dino-main-vision 需要原始帧：batch 无 'frames' 键"
-                )
-            if isinstance(frames_main, torch.Tensor):
-                frames_main = frames_main.cpu().numpy()
-            if config.dino_dense_metric:
-                vision_tokens, dense_evidence = _dino_main_online_encode(
-                    frames_main,
-                    main_vision_backbone,
-                    device,
-                    encode_batch=args.main_vision_encode_batch,
-                    grid=config.main_vision_grid,
-                    window=config.main_vision_frames,
-                    return_dense=True,
-                )
-                batch["vision_tokens"] = vision_tokens
-                mtvj_dense_evidence = dense_evidence
-                mtvj_metric_tokens = _dino_metric_tokens(
-                    metric_head,
-                    relation_encoder,
-                    dense_evidence,
-                    batch,
-                    device,
-                    train_metric_head=args.mtvj_train_metric_head,
-                )
+            # 特征缓存模式（--dino-feature-cache）：从 memmap 读预计算特征，
+            # 跳过在线 ViT-L 前向（占步时 84%）。
+            if dino_cache is not None:
+                rows = batch.get("frame_cache_rows")
+                if rows is None:
+                    raise ValueError(
+                        "--dino-feature-cache 需要 batch 'frame_cache_rows' 键"
+                    )
+                if config.dino_dense_metric:
+                    vision_tokens, dense_evidence = _dino_main_encode_from_cache(
+                        rows,
+                        dino_cache,
+                        device,
+                        grid=config.main_vision_grid,
+                        window=config.main_vision_frames,
+                        return_dense=True,
+                    )
+                    batch["vision_tokens"] = vision_tokens
+                    mtvj_dense_evidence = dense_evidence
+                    mtvj_metric_tokens = _dino_metric_tokens(
+                        metric_head,
+                        relation_encoder,
+                        dense_evidence,
+                        batch,
+                        device,
+                        train_metric_head=args.mtvj_train_metric_head,
+                    )
+                else:
+                    batch["vision_tokens"] = _dino_main_encode_from_cache(
+                        rows,
+                        dino_cache,
+                        device,
+                        grid=config.main_vision_grid,
+                        window=config.main_vision_frames,
+                    )
             else:
-                batch["vision_tokens"] = _dino_main_online_encode(
-                    frames_main,
-                    main_vision_backbone,
-                    device,
-                    encode_batch=args.main_vision_encode_batch,
-                    grid=config.main_vision_grid,
-                    window=config.main_vision_frames,
-                )
-            batch.pop("frames", None)
+                frames_main = batch.get("frames")
+                if frames_main is None:
+                    raise ValueError(
+                        "--dino-main-vision 需要原始帧：batch 无 'frames' 键"
+                    )
+                if isinstance(frames_main, torch.Tensor):
+                    frames_main = frames_main.cpu().numpy()
+                if config.dino_dense_metric:
+                    vision_tokens, dense_evidence = _dino_main_online_encode(
+                        frames_main,
+                        main_vision_backbone,
+                        device,
+                        encode_batch=args.main_vision_encode_batch,
+                        grid=config.main_vision_grid,
+                        window=config.main_vision_frames,
+                        return_dense=True,
+                    )
+                    batch["vision_tokens"] = vision_tokens
+                    mtvj_dense_evidence = dense_evidence
+                    mtvj_metric_tokens = _dino_metric_tokens(
+                        metric_head,
+                        relation_encoder,
+                        dense_evidence,
+                        batch,
+                        device,
+                        train_metric_head=args.mtvj_train_metric_head,
+                    )
+                else:
+                    batch["vision_tokens"] = _dino_main_online_encode(
+                        frames_main,
+                        main_vision_backbone,
+                        device,
+                        encode_batch=args.main_vision_encode_batch,
+                        grid=config.main_vision_grid,
+                        window=config.main_vision_frames,
+                    )
+                batch.pop("frames", None)
         if args.live_vjepa:
             # Stage B：在线 V-JEPA 编码（frames 仍为 CPU numpy；编码在 GPU 上，
             # 输出 [B, T, 288, D] 与 ST288 同构，替换进 batch）。

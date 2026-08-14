@@ -189,6 +189,104 @@ def test_config_dino_dense_metric_validation() -> None:
         _dino_dense_config(dense_readout_mtvj=False)
 
 
+def test_feature_cache_read_matches_online_encode(tmp_path) -> None:
+    """缓存读（含 8×8 池化 + 两帧 dense 组装）与在线编码逐位一致。"""
+    import json
+    import pickle
+
+    from train import (
+        DinoFeatureCache,
+        _dino_main_encode_from_cache,
+        _dino_main_online_encode,
+    )
+
+    n_frames = 12
+    base = torch.zeros(n_frames, 256, 1024)
+    base[..., 0] = torch.arange(256).view(1, 256)  # patch 位置编码
+    block11 = (base + 1.0).numpy().astype(np.float16)
+    block23 = (base + 11.0).numpy().astype(np.float16)
+    np.save(tmp_path / "block11.npy", block11)
+    np.save(tmp_path / "block23.npy", block23)
+    index = {("peg-insert-side-v3", 0, i): i for i in range(n_frames)}
+    with (tmp_path / "index.pkl").open("wb") as fh:
+        pickle.dump(index, fh)
+    with (tmp_path / "meta.json").open("w") as fh:
+        json.dump(
+            {
+                "frames": n_frames,
+                "dataset_sha256": "x" * 64,
+                "model_id": "vit_large_patch14_reg4_dinov2.lvd142m",
+                "image_size": 224,
+                "chunk": 32,
+                "grid": 8,
+                "window": 4,
+            },
+            fh,
+        )
+
+    cache = DinoFeatureCache(tmp_path)
+    rows = torch.tensor([[[0, 1, 2, 3]]], dtype=torch.int64)  # [1,1,4]
+    tokens_c, dense_c = _dino_main_encode_from_cache(
+        rows, cache, torch.device("cpu"), grid=8, window=4, return_dense=True
+    )
+    # 在线路径用同一假特征塔（FakeDinoBackbone 与缓存内容一致）。
+    frames = _frames(1, 1, 4)
+    tokens_o, dense_o = _dino_main_online_encode(
+        frames, FakeDinoBackbone(), torch.device("cpu"),
+        encode_batch=2, grid=8, window=4, return_dense=True,
+    )
+    assert torch.equal(tokens_c, tokens_o)
+    for layer in (5, 11):
+        assert torch.equal(dense_c[layer], dense_o[layer])
+
+
+def test_feature_cache_rows_contract(tmp_path) -> None:
+    """LongTrajFramesDataset 缓存模式：无 frames 键、rows 形状 [T,W]。"""
+    import json
+    import pickle
+
+    import numpy as np
+    import torch as _torch
+
+    from va_compound.longtraj_frames import LongTrajFramesDataset
+
+    n_frames = 16
+    np.save(tmp_path / "block11.npy", np.zeros((n_frames, 256, 1024), dtype=np.float16))
+    np.save(tmp_path / "block23.npy", np.zeros((n_frames, 256, 1024), dtype=np.float16))
+    index = {("peg-insert-side-v3", 0, i): i for i in range(n_frames)}
+    with (tmp_path / "index.pkl").open("wb") as fh:
+        pickle.dump(index, fh)
+    with (tmp_path / "meta.json").open("w") as fh:
+        json.dump({"frames": n_frames, "model_id": "m", "image_size": 224,
+                   "chunk": 32, "grid": 8, "window": 4}, fh)
+
+    payload = {
+        "actions": _torch.zeros(2, 4, 48, 4),
+        "previous_action": _torch.zeros(2, 4, 4),
+        "proprio": _torch.zeros(2, 4, 9),
+        "language_hidden": _torch.zeros(2, 5, 2048),
+        "instruction_id": _torch.zeros(2, dtype=_torch.long),
+        "pair_id": _torch.zeros(2, dtype=_torch.long),
+        "language_mask": _torch.ones(2, 5, dtype=_torch.bool),
+        "frame_refs": [
+            ("peg-insert-side-v3", 0, [[0, 1, 2, 3], [2, 3, 4, 5], [4, 5, 6, 7], [6, 7, 8, 9]]),
+            ("peg-insert-side-v3", 0, [[2, 3, 4, 5], [4, 5, 6, 7], [6, 7, 8, 9], [8, 9, 10, 11]]),
+        ],
+    }
+    data_path = tmp_path / "windows.pt"
+    _torch.save(payload, data_path)
+    dataset = LongTrajFramesDataset(
+        data_path,
+        min_sequence_length=4,
+        feature_cache=tmp_path,
+        include_frames=False,
+    )
+    item = dataset[1]
+    assert "frames" not in item
+    assert tuple(item["frame_cache_rows"].shape) == (4, 4)
+    assert item["frame_cache_rows"][0].tolist() == [2, 3, 4, 5]
+
+
 def test_main_vision_config_kwargs_dino_metric() -> None:
     from train import _main_vision_config_kwargs
 

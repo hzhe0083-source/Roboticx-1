@@ -56,7 +56,9 @@ class LongTrajFramesDataset:
 
     def __init__(self, path: str | Path, longtraj_dir: str | Path | None = None,
                  min_sequence_length: int = 4,
-                 decode_cache_tasks: int = 1) -> None:
+                 decode_cache_tasks: int = 1,
+                 feature_cache: str | Path | None = None,
+                 include_frames: bool = True) -> None:
         self.path = Path(path)
         self.longtraj_dir = Path(longtraj_dir) if longtraj_dir else ROOT / "data"
         self.payload = torch.load(self.path, map_location="cpu", weights_only=True)
@@ -76,6 +78,31 @@ class LongTrajFramesDataset:
         # 切换时解码一次（~60s/任务）；配合 num_workers=0 单 worker 防多份拷贝。
         self._decoded: dict[str, list[list[np.ndarray]]] = {}
         self.decode_cache_tasks = max(1, int(decode_cache_tasks))
+        # DINO 特征缓存（2026-08-15）：feature_cache 给定时每个样本返回其
+        # 帧窗在缓存中的行号（frame_cache_rows [T, W] int64），不再解 JPEG
+        # 帧（include_frames=False 时无 frames 键）——训练循环从预计算特征读，
+        # 跳过在线 ViT-L 编码（占步时 84%）。
+        self.feature_cache = Path(feature_cache) if feature_cache else None
+        self.include_frames = bool(include_frames)
+        self.cache_rows: np.ndarray | None = None
+        if self.feature_cache is not None:
+            import pickle
+
+            with (self.feature_cache / "index.pkl").open("rb") as fh:
+                cache_index: dict = pickle.load(fh)
+            rows = np.empty((self.length, len(self.refs[0][2]), len(self.refs[0][2][0])),
+                            dtype=np.int64)
+            for i, (task_file, ep_idx, fidx) in enumerate(self.refs):
+                for t, row in enumerate(fidx):
+                    for w, f in enumerate(row):
+                        key = (task_file, int(ep_idx), int(f))
+                        if key not in cache_index:
+                            raise KeyError(
+                                f"feature cache 缺少帧 {key}（样本 {i}）；"
+                                "缓存与数据集不匹配"
+                            )
+                        rows[i, t, w] = cache_index[key]
+            self.cache_rows = rows
 
     def _decode_task(self, task_file: str) -> list[list[np.ndarray]]:
         cached = self._decoded.get(task_file)
@@ -131,11 +158,16 @@ class LongTrajFramesDataset:
         item = {key: self.payload[key][index] for key in self.REQUIRED}
         if "language_mask" in self.payload:
             item["language_mask"] = self.payload["language_mask"][index]
+        if self.cache_rows is not None:
+            # DINO 特征缓存模式：返回帧窗行号（缓存读取代在线编码）。
+            item["frame_cache_rows"] = self.cache_rows[index]
+            if not self.include_frames:
+                return item
         task_file, ep_idx, fidx = self.refs[index]
         ep_frames = self._decode_task(task_file)[ep_idx]  # 已解码 ndarray
         frames = np.stack([
             np.stack([ep_frames[int(f)] for f in row])
             for row in fidx
-        ])  # [T, W, 384, 384, 3] uint8（零拷贝引用，与 phase2 契约一致）
+        ])  # [T, W, 480, 480, 3] uint8（零拷贝引用，与 phase2 契约一致）
         item["frames"] = frames
         return item
