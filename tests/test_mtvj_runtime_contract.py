@@ -147,7 +147,7 @@ def test_mtvj_online_encode_keeps_backbone_head_frozen_and_relation_in_graph() -
         "language_mask": torch.ones(1, 3, dtype=torch.bool),
     }
 
-    dense, tokens = _mtvj_online_encode(
+    dense, tokens, metric_g = _mtvj_online_encode(
         frames,
         backbone,
         metric_head,
@@ -156,6 +156,9 @@ def test_mtvj_online_encode_keeps_backbone_head_frozen_and_relation_in_graph() -
         torch.device("cpu"),
     )
     assert tokens is not None and tokens.requires_grad
+    assert metric_g is not None
+    assert tuple(metric_g.shape) == (1, 2, 8)
+    assert not metric_g.requires_grad
     weights = torch.linspace(-1.0, 1.0, tokens.shape[-1])
     (tokens * weights).sum().backward()
 
@@ -201,7 +204,7 @@ def test_mtvj_online_encode_can_backprop_into_metric_head_but_not_backbone() -> 
         "language_mask": torch.ones(1, 3, dtype=torch.bool),
     }
 
-    _, tokens = _mtvj_online_encode(
+    _, tokens, metric_g = _mtvj_online_encode(
         frames,
         backbone,
         metric_head,
@@ -211,6 +214,8 @@ def test_mtvj_online_encode_can_backprop_into_metric_head_but_not_backbone() -> 
         train_metric_head=True,
     )
     assert tokens is not None
+    assert metric_g is not None
+    assert tuple(metric_g.shape) == (1, 2, 8)
     weights = torch.linspace(-1.0, 1.0, tokens.shape[-1])
     (tokens * weights).sum().backward()
 
@@ -347,6 +352,7 @@ def test_main_checkpoint_roundtrips_and_strictly_restores_metric_head(tmp_path) 
         "temp_init",
         "freeze_bias",
         "mode_readout",
+        "grid",
     }
     assert saved["mtvj_metric_checkpoint_identity"]["sha256"]
     assert saved["mtvj_metric_head_config"] == {
@@ -359,6 +365,7 @@ def test_main_checkpoint_roundtrips_and_strictly_restores_metric_head(tmp_path) 
         "temp_init": 7.5,
         "freeze_bias": True,
         "mode_readout": True,
+        "grid": 24,
     }
 
     restored = LanguageMetricField(**saved["mtvj_metric_head_config"])
