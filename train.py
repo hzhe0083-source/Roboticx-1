@@ -63,6 +63,30 @@ MTVJ_LEGACY_METRIC_STATE_SOURCE = "p_flat"
 MTVJ_LEGACY_METRIC_CONTRACT_VERSION = 2
 
 
+# Action-only visual tower presets.  The policy config persists every resolved
+# field, so eval does not have to guess a model's width/resolution later.
+ACTION_VISION_SPECS = {
+    "dinov2_vitl14_reg4": {
+        "model_id": "vit_large_patch14_reg4_dinov2.lvd142m",
+        "image_size": 224,
+        "feature_dim": 1024,
+        "output_layers": (11, 23),
+    },
+    "dinov3_vitb16": {
+        "model_id": "vit_base_patch16_dinov3.lvd1689m",
+        "image_size": 256,
+        "feature_dim": 768,
+        "output_layers": (5, 11),
+    },
+    "dinov3_vitl16": {
+        "model_id": "vit_large_patch16_dinov3.lvd1689m",
+        "image_size": 256,
+        "feature_dim": 1024,
+        "output_layers": (11, 23),
+    },
+}
+
+
 def _mtvj_metric_positions(out, source: str = MTVJ_METRIC_STATE_SOURCE) -> Tensor:
     """Return the declared 8-D state; v2 stays reproducible, v3 gates visibility."""
     p = out.p
@@ -1756,7 +1780,36 @@ def _mtvj_config_kwargs(args: argparse.Namespace) -> dict:
     """
     if not getattr(args, "dense_readout_mtvj", False):
         return {}
-    return {"dense_readout_mtvj": True}
+    kwargs = {"dense_readout_mtvj": True}
+    action_vision = getattr(args, "action_vision_backbone", "none")
+    if action_vision != "none":
+        spec = ACTION_VISION_SPECS[action_vision]
+        kwargs.update(
+            action_vision_backbone=action_vision,
+            action_vision_model_id=spec["model_id"],
+            action_vision_dim=spec["feature_dim"],
+            action_vision_image_size=spec["image_size"],
+            action_vision_layers=spec["output_layers"],
+        )
+    return kwargs
+
+
+def _main_vision_config_kwargs(args: argparse.Namespace) -> dict:
+    """DINO-main replacement config（V-JEPA 路径 flag 关闭即禁用，不删除）。"""
+    if not getattr(args, "dino_main_vision", False):
+        return {}
+    spec = ACTION_VISION_SPECS["dinov2_vitl14_reg4"]
+    grid = int(args.main_vision_grid)
+    frames = int(args.main_vision_frames)
+    return {
+        "main_vision_backbone": "dinov2_vitl14_reg4",
+        "main_vision_model_id": spec["model_id"],
+        "main_vision_image_size": spec["image_size"],
+        "main_vision_dim": spec["feature_dim"],
+        "main_vision_grid": grid,
+        "main_vision_frames": frames,
+        "main_vision_tokens": grid * grid * frames,
+    }
 
 
 def _maybe_build_mtvj_backbone(device: torch.device):
@@ -1782,6 +1835,210 @@ def _maybe_build_mtvj_backbone(device: torch.device):
         flush=True,
     )
     return backbone
+
+
+def _maybe_build_action_vision_backbone(
+    args: argparse.Namespace,
+    config: VACompoundConfig,
+    device: torch.device,
+):
+    """Load the frozen action-only tower from an explicit local checkpoint."""
+    if config.action_vision_backbone == "none":
+        return None
+    checkpoint = args.action_vision_checkpoint
+    if checkpoint is None:
+        raise ValueError(
+            f"--action-vision-backbone {config.action_vision_backbone} requires "
+            "--action-vision-checkpoint"
+        )
+    # Preserve the ``.safetensors`` symlink suffix: resolving the HF cache
+    # symlink to its extensionless blob makes timm incorrectly call torch.load.
+    checkpoint = checkpoint.expanduser().absolute()
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"action vision checkpoint is missing: {checkpoint}")
+    from va_compound.backbones import TimmActionVisionBackbone
+
+    backbone = TimmActionVisionBackbone.from_pretrained(
+        device=device,
+        dtype="float16",
+        model_id=config.action_vision_model_id,
+        image_size=config.action_vision_image_size,
+        feature_dim=config.action_vision_dim,
+        output_layers=tuple(config.action_vision_layers),
+        checkpoint_path=checkpoint,
+        local_files_only=True,
+    )
+    backbone.freeze_all()
+    args.action_vision_checkpoint_sha256 = _sha256_file(checkpoint)
+    print(
+        f"action-vision: frozen {config.action_vision_backbone} "
+        f"({config.action_vision_model_id}, {config.action_vision_image_size}px, "
+        f"dim={config.action_vision_dim}, "
+        f"params={sum(p.numel() for p in backbone.parameters()):,})",
+        flush=True,
+    )
+    return backbone
+
+
+def _action_vision_online_encode(
+    frames,
+    backbone,
+    device: torch.device,
+    *,
+    encode_batch: int,
+) -> dict[int, Tensor]:
+    """Encode the two newest frames into two temporal patch grids per decision.
+
+    The raw window is ``[d-6,d-4,d-2,d]``; the action tower uses ``[d-4,d]``
+    (the newest frame from each of V-JEPA's two temporal bins).
+    V-JEPA continues to consume the complete window for the base/metric/WAM
+    paths.  Chunking bounds the frozen ViT-L workspace on a 16-GiB GPU.
+    """
+    if encode_batch < 1:
+        raise ValueError("action vision encode_batch must be positive")
+    if frames.ndim != 6 or frames.shape[-1] != 3:
+        raise ValueError(
+            "action vision frames must be [B,T,W,H,W,3], got "
+            f"{tuple(frames.shape)}"
+        )
+    frames_np = frames.cpu().numpy() if isinstance(frames, torch.Tensor) else frames
+    batch_size, sequence_length, window, height, width, _ = frames_np.shape
+    if window != 4:
+        raise ValueError(f"action vision requires the four-frame window, got {window}")
+    selected = np.ascontiguousarray(frames_np[:, :, (1, 3), :, :, :].reshape(
+        batch_size * sequence_length * 2, height, width, 3
+    ))
+    images = torch.from_numpy(selected).permute(0, 3, 1, 2).float().div_(255.0)
+    outputs: dict[int, list[Tensor]] = {5: [], 11: []}
+    mean = torch.tensor((0.485, 0.456, 0.406), device=device).view(1, 3, 1, 1)
+    std = torch.tensor((0.229, 0.224, 0.225), device=device).view(1, 3, 1, 1)
+    for start in range(0, images.shape[0], encode_batch):
+        chunk = images[start : start + encode_batch].to(device)
+        if tuple(chunk.shape[-2:]) != (backbone.image_size, backbone.image_size):
+            chunk = F.interpolate(
+                chunk,
+                size=(backbone.image_size, backbone.image_size),
+                mode="bicubic",
+                align_corners=False,
+                antialias=True,
+            )
+        chunk = (chunk - mean) / std
+        hierarchical = backbone.forward_hierarchical_dense(chunk)
+        for layer in (5, 11):
+            outputs[layer].append(hierarchical[layer])
+        del chunk, hierarchical
+    dense = {}
+    for layer, chunks in outputs.items():
+        tokens = torch.cat(chunks, dim=0)
+        dense[layer] = tokens.reshape(
+            batch_size, sequence_length, -1, tokens.shape[-1]
+        )
+    return dense
+
+
+def _build_dino_main_backbone(
+    args: argparse.Namespace,
+    config: VACompoundConfig,
+    device: torch.device,
+):
+    """Frozen DINOv2 tower as the REPLACEMENT main vision backbone.
+
+    V-JEPA stays available in the repository for the legacy path; this tower
+    is only built under ``--dino-main-vision``.
+    """
+    checkpoint = args.main_vision_checkpoint.expanduser().absolute()
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"main vision checkpoint is missing: {checkpoint}")
+    from va_compound.backbones import TimmActionVisionBackbone
+
+    backbone = TimmActionVisionBackbone.from_pretrained(
+        device=device,
+        dtype="float16",
+        model_id=config.main_vision_model_id,
+        image_size=config.main_vision_image_size,
+        feature_dim=config.main_vision_dim,
+        output_layers=(11, 23),  # reuse the canonical mid/final-key contract
+        checkpoint_path=checkpoint,
+        local_files_only=True,
+    )
+    backbone.freeze_all()
+    args.main_vision_checkpoint_sha256 = _sha256_file(checkpoint)
+    print(
+        f"dino-main: frozen {config.main_vision_backbone} REPLACES V-JEPA as the "
+        f"VA main vision ({config.main_vision_image_size}px, "
+        f"dim={config.main_vision_dim}, {config.main_vision_tokens} tokens/decision, "
+        f"params={sum(p.numel() for p in backbone.parameters()):,})",
+        flush=True,
+    )
+    return backbone
+
+
+def _dino_main_online_encode(
+    frames,
+    backbone,
+    device: torch.device,
+    *,
+    encode_batch: int,
+    grid: int,
+    window: int,
+) -> Tensor:
+    """DINO-main vision tokens: [B, T, window*grid*grid, dim] fp32 per decision.
+
+    Every decision consumes the complete ``window``-frame history window
+    ``[d-6,d-4,d-2,d]``; each frame is encoded by the frozen tower and its
+    16x16 patch grid is average-pooled to ``grid x grid``. Timm NLC patch
+    order is row-major; the pooling grid order is verified by
+    tests/test_dino_main_vision.py.
+    """
+    if encode_batch < 1:
+        raise ValueError("main vision encode_batch must be positive")
+    if not (1 <= grid <= 16) or window < 1:
+        raise ValueError("dino-main grid/window out of range")
+    if frames.ndim != 6 or frames.shape[-1] != 3:
+        raise ValueError(
+            "dino-main frames must be [B,T,W,H,W,3], got " f"{tuple(frames.shape)}"
+        )
+    frames_np = frames.cpu().numpy() if isinstance(frames, torch.Tensor) else frames
+    batch_size, sequence_length, win, height, width, _ = frames_np.shape
+    if win != window:
+        raise ValueError(f"dino-main requires the {window}-frame window, got {win}")
+    selected = np.ascontiguousarray(
+        frames_np.reshape(batch_size * sequence_length * window, height, width, 3)
+    )
+    images = torch.from_numpy(selected).permute(0, 3, 1, 2).float().div_(255.0)
+    mean = torch.tensor((0.485, 0.456, 0.406), device=device).view(1, 3, 1, 1)
+    std = torch.tensor((0.229, 0.224, 0.225), device=device).view(1, 3, 1, 1)
+    chunks: list[Tensor] = []
+    for start in range(0, images.shape[0], encode_batch):
+        chunk = images[start : start + encode_batch].to(device)
+        if tuple(chunk.shape[-2:]) != (backbone.image_size, backbone.image_size):
+            chunk = F.interpolate(
+                chunk,
+                size=(backbone.image_size, backbone.image_size),
+                mode="bicubic",
+                align_corners=False,
+                antialias=True,
+            )
+        chunk = (chunk - mean) / std
+        hierarchical = backbone.forward_hierarchical_dense(chunk)
+        tokens = hierarchical[11]
+        if tokens.shape[-2] != 256 or tokens.shape[-1] != backbone.feature_dim:
+            raise RuntimeError(
+                "dino-main expects 256 patch tokens per frame, got "
+                f"{tuple(tokens.shape)}"
+            )
+        chunks.append(tokens.float())
+        del chunk, hierarchical, tokens
+    tokens = torch.cat(chunks, dim=0)  # [B*T*W, 256, D]
+    dim = tokens.shape[-1]
+    tokens = tokens.reshape(
+        batch_size * sequence_length * window, 16, 16, dim
+    ).permute(0, 3, 1, 2)
+    tokens = F.adaptive_avg_pool2d(tokens, (grid, grid))
+    tokens = tokens.permute(0, 2, 3, 1).reshape(
+        batch_size, sequence_length, window * grid * grid, dim
+    )
+    return tokens
 
 
 def _load_mtvj_metric_checkpoint(
@@ -2150,8 +2407,8 @@ def _mtvj_online_encode(
     train_metric_head: bool = False,
     roi_head: nn.Module | None = None,
     roi_alpha: float = 0.0,
-) -> tuple[dict[int, Tensor], Tensor | None]:
-    """MT-VJ（契约 §6）：frames [B, T, W, 384, 384, 3] uint8 → (dense_evidence, metric_tokens)。
+) -> tuple[dict[int, Tensor], Tensor | None, Tensor | None]:
+    """MT-VJ（契约 §6）：frames [B, T, W, 384, 384, 3] uint8 → (dense, tokens, g)。
 
     - dense_evidence：``{5: [B, T, 1152, D], 11: [B, T, 1152, D]}``——与 live 路径
       同款 ``preprocess_batch`` 预处理（ImageNet 归一化 [B*T, W, 3, 384, 384]）→
@@ -2159,7 +2416,9 @@ def _mtvj_online_encode(
       注入模型前以 fp32 交付（与既有 ``vision_tokens = encoded.float()`` 约定一致）；
     - metric_tokens：有 metric_head 时 ``[B, T, 2, d_model] = stack(z_g, z_nu)``，
       g_t = ``out.p * out.visibility`` 展平后的8维可见度门控坐标，
-      ν_t = g_t − g_{t−1}（首决策 ν≡0，与 servo g_prev 语义一致）。
+      ν_t = g_t − g_{t−1}（首决策 ν≡0，与 servo g_prev 语义一致）；
+    - metric_g：同一 ``g_t``，``[B, T, 8]``，供 WAM ``geo8`` 与动作残差条件
+      使用；无 metric_head 时为 None（WAM 不得假装有几何）。
     V-JEPA 始终 no_grad；metric localization path 与 relation encoder 可选联合微调。
     """
     if frames.ndim != 6 or frames.shape[-1] != 3:
@@ -2207,6 +2466,7 @@ def _mtvj_online_encode(
             f"got {sorted(dense_evidence)}"
         )
     metric_tokens = None
+    metric_g = None
     if metric_head is not None:
         if relation_encoder is None:
             raise ValueError("metric_head 存在但 relation_encoder 缺失（内部契约破坏）")
@@ -2286,8 +2546,9 @@ def _mtvj_online_encode(
         # 注入 = 随机语义；13.45px 反事实验证过的定位才是有效度量证据）。
         # 不能放在上面的 no_grad 里：联合微调时动作 loss 需反传到
         # relation encoder；冻结模式下参数和 g 都不求导，仍不会建图。
+        metric_g = g
         metric_tokens = _mtvj_relation_tokens(g, relation_encoder)
-    return dense_evidence, metric_tokens
+    return dense_evidence, metric_tokens, metric_g
 
 
 def _mtvj_encode_frames_dense(
@@ -2530,6 +2791,8 @@ def rollout_policy(
     servo_stats: dict | None = None,
     dense_evidence: dict[int, Tensor] | None = None,
     metric_tokens: Tensor | None = None,
+    action_dense_evidence: dict[int, Tensor] | None = None,
+    metric_g: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     if model.config.plan_resampler:
         # Plan-Cache 方案 B：首决策场景摘要（vision 全局均值）→ plan tokens，
@@ -2599,6 +2862,11 @@ def rollout_policy(
             }
             if metric_tokens is not None:
                 mtvj_kwargs["metric_tokens"] = metric_tokens[:, time_index]
+        if action_dense_evidence is not None:
+            mtvj_kwargs["action_dense_evidence"] = {
+                layer: evidence[:, time_index]
+                for layer, evidence in action_dense_evidence.items()
+            }
         if model.config.local_slots:
             vision_in = model.build_local_vision(
                 batch["vision_tokens_st"][:, time_index],
@@ -2654,12 +2922,30 @@ def rollout_policy(
                     spatial16 = wam_last_slice_pool(h11_t)             # [B,16,768]
                 else:
                     spatial16 = condition.new_zeros((B, 16, model.config.vision_dim))
-                geo8 = condition.new_zeros((B, 8))  # M0：联合场景输入由独立训练器提供，此处仅动作残差通路
+                if metric_g is not None:
+                    geo8 = metric_g[:, time_index].to(
+                        device=condition.device, dtype=condition.dtype
+                    )
+                    if geo8.shape != (B, 8):
+                        raise ValueError(
+                            "WAM geo8 必须为当前决策的 p*vis 8 维状态 "
+                            f"[B, 8]，got {tuple(geo8.shape)}"
+                        )
+                else:
+                    geo8 = condition.new_zeros((B, 8))
+                wam_layers = visual_memory.layers if visual_memory is not None else ()
+                if len(wam_layers) == 0:
+                    raise ValueError(
+                        "WAM 残差通路需要非空 VA 记忆快照；"
+                        "encode_condition(..., return_visual_memory=True) 未返回 layers"
+                    )
                 wam_dv, _ = model.wam(
-                    action_condition=condition, va_layers=visual_memory.layers,
+                    action_condition=condition, va_layers=wam_layers,
                     spatial_tokens=spatial16, geo_tokens=geo8,
                     noisy_actions=noisy_actions[:, time_index],
-                    noisy_scene_latents=condition.new_zeros((B, 3, 16, 768)),
+                    noisy_scene_latents=condition.new_zeros(
+                        (B, 3, 16, model.wam.config.vision_dim)
+                    ),
                     noisy_scene_geo=condition.new_zeros((B, 3, 2, 8)),
                     flow_time=flow_time[:, time_index],
                 )
@@ -3328,6 +3614,72 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--e2e-data 互斥。",
     )
     parser.add_argument(
+        "--action-vision-backbone",
+        choices=("none", *ACTION_VISION_SPECS),
+        default="none",
+        help="Add a frozen DINO action-only tower while retaining the existing "
+        "V-JEPA base/metric/WAM paths. The new per-layer residual is zero-init, "
+        "so ordinary migration from an E7 checkpoint starts exactly unchanged.",
+    )
+    parser.add_argument(
+        "--action-vision-checkpoint",
+        type=Path,
+        default=None,
+        help="Local timm-compatible safetensors/pth for the selected action tower. "
+        "Required when --action-vision-backbone is not none; never downloaded "
+        "implicitly during training.",
+    )
+    parser.add_argument(
+        "--action-vision-encode-batch",
+        type=int,
+        default=4,
+        help="Frozen action-tower image microbatch (4 is the safe ViT-L default "
+        "for the 16-GiB training GPU).",
+    )
+    parser.add_argument(
+        "--dino-main-vision",
+        action="store_true",
+        help="DINO-main replacement（2026-08-14 用户决策）：冻结 DINOv2 替换 "
+        "V-JEPA 作为 VA 主视觉骨干，VA/FM/投影从零可训练。V-JEPA/dense/metric "
+        "代码保留在仓库中但被禁用（不删除）；要求 LongTrajFramesDataset 原始帧数据。",
+    )
+    parser.add_argument(
+        "--main-vision-checkpoint",
+        type=Path,
+        default=None,
+        help="DINO-main 视觉塔的本地 timm 权重（--dino-main-vision 必填）。",
+    )
+    parser.add_argument(
+        "--main-vision-encode-batch",
+        type=int,
+        default=16,
+        help="DINO-main 冻结塔图像 microbatch（ViT-L 16-GiB GPU 安全默认 16）。",
+    )
+    parser.add_argument(
+        "--main-vision-grid",
+        type=int,
+        default=8,
+        help="DINO-main 每帧 16x16 patch 网格池化到 grid x grid（默认 8 → 64 帧内 token）。",
+    )
+    parser.add_argument(
+        "--main-vision-frames",
+        type=int,
+        default=4,
+        help="DINO-main 每决策消费的窗口帧数（默认 4 = [d-6,d-4,d-2,d]）。",
+    )
+    parser.add_argument(
+        "--action-vision-only",
+        action="store_true",
+        help="Freeze the existing E7 policy and train only the new action-vision "
+        "projector/cross-attention branch. Recommended for the first causal pilot.",
+    )
+    parser.add_argument(
+        "--lr-action-vision",
+        type=float,
+        default=2e-5,
+        help="Learning rate for the additive action-vision branch.",
+    )
+    parser.add_argument(
         "--metric-visual-checkpoint",
         type=Path,
         default=None,
@@ -3737,6 +4089,103 @@ def validate_args(args: argparse.Namespace) -> None:
     replace_metric_head = getattr(
         args, "replace_mtvj_metric_head_from_external", False
     )
+    action_vision = getattr(args, "action_vision_backbone", "none")
+    action_vision_only = getattr(args, "action_vision_only", False)
+    action_vision_checkpoint = getattr(args, "action_vision_checkpoint", None)
+    if action_vision != "none":
+        if action_vision not in ACTION_VISION_SPECS:
+            raise ValueError(f"unsupported action vision backbone: {action_vision!r}")
+        if not args.dense_readout_mtvj:
+            raise ValueError(
+                "--action-vision-backbone requires --dense-readout-mtvj "
+                "(V-JEPA remains the metric/WAM anchor)"
+            )
+        if action_vision_checkpoint is None:
+            raise ValueError(
+                "--action-vision-backbone requires --action-vision-checkpoint"
+            )
+        if not action_vision_checkpoint.expanduser().is_file():
+            raise ValueError(
+                f"action vision checkpoint does not exist: {action_vision_checkpoint}"
+            )
+        if getattr(args, "action_vision_encode_batch", 0) < 1:
+            raise ValueError("--action-vision-encode-batch must be positive")
+        if getattr(args, "lr_action_vision", 0.0) <= 0.0:
+            raise ValueError("--lr-action-vision must be positive")
+        if getattr(args, "resume_exact", None) is not None:
+            # Exact continuation is valid only after a DINO checkpoint exists;
+            # an old E7 checkpoint needs the ordinary additive migration path.
+            resume_payload = torch.load(
+                args.resume_exact, map_location="cpu", weights_only=True
+            )
+            saved_backbone = (resume_payload.get("config") or {}).get(
+                "action_vision_backbone", "none"
+            )
+            if saved_backbone != action_vision:
+                raise ValueError(
+                    "first action-vision migration requires ordinary --resume; "
+                    f"checkpoint has {saved_backbone!r}, requested {action_vision!r}"
+                )
+    elif action_vision_checkpoint is not None or action_vision_only:
+        raise ValueError(
+            "--action-vision-checkpoint/--action-vision-only requires a non-none "
+            "--action-vision-backbone"
+        )
+    if action_vision_only and (
+        getattr(args, "head_only", False)
+        or getattr(args, "servo_only", False)
+        or getattr(args, "c2_controller", False)
+        or getattr(args, "mtvj_train_relation", False)
+        or getattr(args, "mtvj_train_metric_head", False)
+    ):
+        raise ValueError(
+            "--action-vision-only freezes the base policy/metric path and is "
+            "incompatible with head/servo/C2 or MT-VJ joint-training flags"
+        )
+    # DINO-main replacement（2026-08-14 用户决策）：V-JEPA/dense/metric 全部
+    # 保留在代码中（flag 关闭即禁用，不删除），此处只校验组合合法性。
+    dino_main_vision = bool(getattr(args, "dino_main_vision", False))
+    if dino_main_vision:
+        if not args.data:
+            raise ValueError("--dino-main-vision requires --data (LongTrajFramesDataset)")
+        if args.dense_readout_mtvj:
+            raise ValueError(
+                "--dino-main-vision replaces V-JEPA: --dense-readout-mtvj "
+                "(V-JEPA dense/metric path) must stay off"
+            )
+        if action_vision != "none":
+            raise ValueError(
+                "--dino-main-vision replaces the auxiliary --action-vision-backbone "
+                "branch; set --action-vision-backbone none"
+            )
+        if action_vision_only:
+            raise ValueError("--dino-main-vision is incompatible with --action-vision-only")
+        if (
+            args.live_vjepa
+            or args.local_slots_data
+            or args.scene_teacher
+            or args.plan_resampler
+            or args.servo
+        ):
+            raise ValueError(
+                "--dino-main-vision is a minimal VA+flow experiment; "
+                "V-JEPA/MT-VJ/slot/servo/plan paths must stay off"
+            )
+        if args.metric_visual_checkpoint is not None:
+            raise ValueError(
+                "--dino-main-vision: --metric-visual-checkpoint (MT-VJ metric) "
+                "must stay off"
+            )
+        if args.main_vision_checkpoint is None:
+            raise ValueError("--dino-main-vision requires --main-vision-checkpoint")
+        if not args.main_vision_checkpoint.expanduser().is_file():
+            raise FileNotFoundError(
+                f"main vision checkpoint does not exist: {args.main_vision_checkpoint}"
+            )
+        if args.main_vision_encode_batch < 1:
+            raise ValueError("--main-vision-encode-batch must be positive")
+    elif args.main_vision_checkpoint is not None:
+        raise ValueError("--main-vision-checkpoint requires --dino-main-vision")
     roi_checkpoint = getattr(args, "mtvj_roi_checkpoint", None)
     roi_alpha = getattr(args, "mtvj_roi_alpha", None)
     if roi_checkpoint is None and roi_alpha is not None:
@@ -3812,8 +4261,29 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--evsm requires a positive --future-predict-weight")
     if args.evsm and args.evsm_temp <= 0.0:
         raise ValueError("--evsm-temp must be positive")
+    if getattr(args, "wam_alpha", 1.0) == 0.0:
+        # α=0 语义 = WAM 完全关闭：不构造、不恢复、不进契约，保证旧路径
+        # 全局 bit-identical（含 RNG 消费）。必须赶在所有 wam 校验之前。
+        args.wam_joint = False
     if getattr(args, "wam_joint", False) and (args.future_predict or args.evsm):
         raise ValueError("--wam-joint is mutually exclusive with --future-predict/--evsm")
+    if getattr(args, "wam_joint", False) and args.memory_split:
+        raise ValueError(
+            "--wam-joint is mutually exclusive with --memory-split "
+            "（WAM CA 读 VA 层快照 layers，memory_split 会把 layers 置空）"
+        )
+    if getattr(args, "wam_joint", False) and (args.direct_head or args.c2_controller):
+        raise ValueError(
+            "--wam-joint 与 --direct-head/--c2-controller 互斥"
+            "（WAM 残差只作用于 flow Euler 速度路径）"
+        )
+    if getattr(args, "wam_joint", False) and (
+        not args.dense_readout_mtvj or args.metric_visual_checkpoint is None
+    ):
+        raise ValueError(
+            "--wam-joint requires --dense-readout-mtvj and "
+            "--metric-visual-checkpoint（WAM spatial16/geo8 的来源）"
+        )
     if args.compile_task and not args.e2e_data:
         raise ValueError(
             "--compile-task requires --e2e-data (online SemanticCompiler path only)"
@@ -4190,6 +4660,27 @@ def _feature_optimizer_groups(args, model, vision_backbone):
     q_v/k_v/u_v）、槽、V-JEPA 全部冻结——避免随机初始化的动作头噪声
     梯度污染已训练好的视觉/集成参数（用户 2026-08-08 架构裁决）。
     """
+    def is_action_vision_parameter(name: str) -> bool:
+        return name.startswith("action_dense_evidence_proj.") or ".action_dense_" in name
+
+    if getattr(args, "action_vision_only", False):
+        action_params = []
+        for name, param in model.named_parameters():
+            selected = is_action_vision_parameter(name)
+            param.requires_grad_(selected)
+            if selected:
+                action_params.append(param)
+        if not action_params:
+            raise ValueError(
+                "--action-vision-only requested but the policy has no action vision branch"
+            )
+        print(
+            "action-vision-only: frozen base E7; trainable additive branch "
+            f"params={sum(p.numel() for p in action_params):,} "
+            f"@ lr={args.lr_action_vision}",
+            flush=True,
+        )
+        return [{"params": action_params, "lr": args.lr_action_vision}]
     if args.head_only:
         head_params, rest_names = [], []
         for name, param in model.named_parameters():
@@ -4249,7 +4740,16 @@ def _feature_optimizer_groups(args, model, vision_backbone):
             {"params": slot_params, "lr": args.lr_slot if args.lr_slot is not None else args.lr},
         ]
     else:
-        groups = [{"params": list(model.parameters()), "lr": args.lr}]
+        if model.config.action_vision_backbone != "none":
+            action_params, base_params = [], []
+            for name, param in model.named_parameters():
+                (action_params if is_action_vision_parameter(name) else base_params).append(param)
+            groups = [
+                {"params": base_params, "lr": args.lr},
+                {"params": action_params, "lr": args.lr_action_vision},
+            ]
+        else:
+            groups = [{"params": list(model.parameters()), "lr": args.lr}]
     if vision_backbone is not None:
         vision_params = [p for p in vision_backbone.parameters() if p.requires_grad]
         if vision_params:
@@ -4545,6 +5045,51 @@ def save_checkpoint(
                     if metric_head is not None and args.mtvj_train_metric_head
                     else None
                 ),
+                "action_vision_enabled": (
+                    getattr(config, "action_vision_backbone", "none") != "none"
+                ),
+                "action_vision_backbone": getattr(
+                    config, "action_vision_backbone", "none"
+                ),
+                "action_vision_model_id": getattr(
+                    config, "action_vision_model_id", None
+                ),
+                "action_vision_image_size": getattr(
+                    config, "action_vision_image_size", None
+                ),
+                "action_vision_feature_dim": getattr(
+                    config, "action_vision_dim", None
+                ),
+                "action_vision_output_layers": list(
+                    getattr(config, "action_vision_layers", ())
+                ),
+                "action_vision_frame_indices": [1, 3],
+                "action_vision_checkpoint_sha256": getattr(
+                    args, "action_vision_checkpoint_sha256", None
+                ),
+                # DINO-main replacement contract（评估侧严格校验）。
+                "main_vision_backbone": getattr(
+                    config, "main_vision_backbone", "vjepa"
+                ),
+                "main_vision_model_id": getattr(
+                    config, "main_vision_model_id", None
+                ),
+                "main_vision_image_size": getattr(
+                    config, "main_vision_image_size", None
+                ),
+                "main_vision_feature_dim": getattr(
+                    config, "main_vision_dim", None
+                ),
+                "main_vision_grid": getattr(config, "main_vision_grid", None),
+                "main_vision_frames": getattr(
+                    config, "main_vision_frames", None
+                ),
+                "main_vision_tokens": getattr(
+                    config, "main_vision_tokens", None
+                ),
+                "main_vision_checkpoint_sha256": getattr(
+                    args, "main_vision_checkpoint_sha256", None
+                ),
                 "flow_prefix_steps": args.flow_prefix_steps,
                 "flow_prefix_weight": args.flow_prefix_weight,
                 "flow_tail_weight": args.flow_tail_weight,
@@ -4817,8 +5362,12 @@ def main() -> None:
                         f"--dense-readout with --local-slots-data requires "
                         f"1152-token dense features, got {local_tokens.shape[-2]}"
                     )
-        if args.dense_readout_mtvj and not args.live_vjepa:
-            # MT-VJ 主数据路径：longtraj windows + JPEG 帧在线解码（2026-08-10）
+        if (
+            (args.dense_readout_mtvj or getattr(args, "dino_main_vision", False))
+            and not args.live_vjepa
+        ):
+            # MT-VJ / DINO-main 主数据路径：longtraj windows + JPEG 帧在线解码
+            # （2026-08-10）。DINO-main 复用同一帧数据源（V-JEPA 路径保留）。
             from va_compound.longtraj_frames import LongTrajFramesDataset
 
             dataset = LongTrajFramesDataset(
@@ -4826,7 +5375,8 @@ def main() -> None:
                 min_sequence_length=args.min_sequence_length,
             )
             print(
-                f"MT-VJ data: LongTrajFramesDataset（{len(dataset)} 样本，"
+                f"{'DINO-main' if args.dino_main_vision else 'MT-VJ'} data: "
+                f"LongTrajFramesDataset（{len(dataset)} 样本，"
                 f"帧从 longtraj JPEG 在线解码）",
                 flush=True,
             )
@@ -4877,10 +5427,13 @@ def main() -> None:
                 index: env_by_description.get(description, f"task-{index}")
                 for index, description in enumerate(descriptions)
             }
+        dino_main_kwargs = _main_vision_config_kwargs(args)
         config = VACompoundConfig(
             language_dim=int(dataset.payload["language_hidden"].shape[-1]),
             vision_dim=(
-                768 if args.live_vjepa
+                int(dino_main_kwargs["main_vision_dim"])
+                if dino_main_kwargs  # DINO-main：主视觉维 = DINO 特征维
+                else 768 if args.live_vjepa
                 else int(local_tokens.shape[-1])
                 if local_tokens is not None  # ST288 路径无 vision_tokens 键（Codex P0-4）
                 else 768 if args.dense_readout_mtvj  # MT-VJ：在线 dense，H11 特征维 768
@@ -4919,6 +5472,7 @@ def main() -> None:
             dense_readout=args.dense_readout,
             multi_mode=args.multi_mode,
             local_slot_tokens=1152 if args.dense_readout else 288,
+            **dino_main_kwargs,
             **_mtvj_config_kwargs(args),
         )
         if args.perturb_data is not None:
@@ -5195,6 +5749,7 @@ def main() -> None:
     # 与 relation encoder 默认冻结，可分别显式联合微调。
     # MT-VJ flags 都未给时以下对象全为 None，旧路径不变。
     mtvj_backbone = None
+    action_vision_backbone = None
     metric_head = None
     relation_encoder = None
     roi_head = None
@@ -5208,6 +5763,13 @@ def main() -> None:
         )
     if args.dense_readout_mtvj:
         mtvj_backbone = _maybe_build_mtvj_backbone(device)
+    action_vision_backbone = _maybe_build_action_vision_backbone(
+        args, config, device
+    )
+    main_vision_backbone = None
+    if getattr(args, "dino_main_vision", False):
+        # DINO-main：冻结 DINOv2 替换 V-JEPA 主视觉（V-JEPA 路径保留未删除）。
+        main_vision_backbone = _build_dino_main_backbone(args, config, device)
     if args.metric_visual_checkpoint is not None:
         policy_contract = (
             (preloaded_resume_ckpt.get("training_contract") or {})
@@ -5641,6 +6203,27 @@ def main() -> None:
                     state = {key: value for key, value in state.items()
                              if key not in mismatched}
                 missing, unexpected = model.load_state_dict(state, strict=False)
+                if (
+                    config.action_vision_backbone != "none"
+                    and resume_config.get("action_vision_backbone", "none") == "none"
+                ):
+                    allowed_action_missing = {
+                        key
+                        for key in model.state_dict()
+                        if key.startswith("action_dense_evidence_proj.")
+                        or ".action_dense_" in key
+                    }
+                    forbidden_missing = set(missing) - allowed_action_missing
+                    if forbidden_missing:
+                        raise ValueError(
+                            "action-vision migration has unrelated missing keys: "
+                            f"{sorted(forbidden_missing)[:8]}"
+                        )
+                    if unexpected:
+                        raise ValueError(
+                            "action-vision migration has unexpected checkpoint keys: "
+                            f"{sorted(unexpected)[:8]}"
+                        )
                 if missing or unexpected:
                     print(
                         f"resume (non-strict): missing={len(missing)} "
@@ -5722,6 +6305,8 @@ def main() -> None:
         rec_iter = iter_forever(recovery_loader)
     mtvj_dense_evidence = None
     mtvj_metric_tokens = None
+    mtvj_metric_g = None
+    action_dense_evidence = None
     # --perturb-data 帧在线编码骨干（live 路径复用主骨干；feature 路径冻结 V-JEPA）。
     perturb_backbone = _maybe_build_perturb_backbone(
         args, device, vision_backbone, use_payload_vision
@@ -5806,7 +6391,7 @@ def main() -> None:
                 )
             if isinstance(frames_mtvj, torch.Tensor):
                 frames_mtvj = frames_mtvj.cpu().numpy()
-            mtvj_dense_evidence, mtvj_metric_tokens = _mtvj_online_encode(
+            mtvj_dense_evidence, mtvj_metric_tokens, mtvj_metric_g = _mtvj_online_encode(
                 frames_mtvj,
                 mtvj_backbone,
                 metric_head,
@@ -5819,6 +6404,33 @@ def main() -> None:
                     float(args.mtvj_roi_alpha) if roi_head is not None else 0.0
                 ),
             )
+            if action_vision_backbone is not None:
+                action_dense_evidence = _action_vision_online_encode(
+                    frames_mtvj,
+                    action_vision_backbone,
+                    device,
+                    encode_batch=args.action_vision_encode_batch,
+                )
+        if main_vision_backbone is not None:
+            # DINO-main replacement（2026-08-14 用户决策）：冻结 DINOv2 特征
+            # 替换 V-JEPA 作为 VA 主视觉。V-JEPA/dense/metric 代码保留在仓库
+            # 中（--dense-readout-mtvj 等 flag 关闭即禁用），此处仅旁路。
+            frames_main = batch.get("frames")
+            if frames_main is None:
+                raise ValueError(
+                    "--dino-main-vision 需要原始帧：batch 无 'frames' 键"
+                )
+            if isinstance(frames_main, torch.Tensor):
+                frames_main = frames_main.cpu().numpy()
+            batch["vision_tokens"] = _dino_main_online_encode(
+                frames_main,
+                main_vision_backbone,
+                device,
+                encode_batch=args.main_vision_encode_batch,
+                grid=config.main_vision_grid,
+                window=config.main_vision_frames,
+            )
+            batch.pop("frames", None)
         if args.live_vjepa:
             # Stage B：在线 V-JEPA 编码（frames 仍为 CPU numpy；编码在 GPU 上，
             # 输出 [B, T, 288, D] 与 ST288 同构，替换进 batch）。
@@ -5995,6 +6607,8 @@ def main() -> None:
                     servo_stats=servo_stats,
                     dense_evidence=mtvj_dense_evidence,
                     metric_tokens=mtvj_metric_tokens,
+                    action_dense_evidence=action_dense_evidence,
+                    metric_g=mtvj_metric_g,
                 )
                 if model.config.future_predict:
                     predicted_velocity, action_conditions, memories = rollout
