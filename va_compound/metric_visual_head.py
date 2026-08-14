@@ -73,19 +73,27 @@ class LanguageMetricField(nn.Module):
                  d_proj: int = D_PROJ, n_roles: int = N_ROLES,
                  l2_norm: bool = False, learnable_temp: bool = False,
                  temp_init: float = 10.0, freeze_bias: bool = False,
-                 mode_readout: bool = False) -> None:
+                 mode_readout: bool = False, grid: int = HEATMAP_GRID) -> None:
         """v3（2026-08-10，探针实证后）：``mode_readout`` 用模式读出替代全网格
         期望读出——heatmap（片求和）全局峰 + 局部 5×5 soft-argmax（+峰 patch
         的 offset）。实测 V-JEPA h11 余弦面近乎全平（576 片中 575 片相似度
         >0.5×max），全网格期望 ≈ 均匀分布 → 预测钉死网格质心（40-80px）；
         argmax / 模式读出在同一查询下即达 8-10px（scripts/diag_probe_oracle.py
-        与 diag_trained_linear_probe.py 实证）。v1 默认参数行为逐字节不变。"""
+        与 diag_trained_linear_probe.py 实证）。v1 默认参数行为逐字节不变。
+
+        ``grid``（2026-08-15，DINO-metric）：每时间片 patch 网格边长。
+        V-JEPA 384px/16 = 24；DINOv2 224px/14 = 16（原生不插值）。输入
+        h5/h11 每片必须恰为 grid² 个 token（两片 2·grid²），coords 同构。
+        旧 checkpoint 无 grid 键时默认 24，行为逐字节不变。"""
         super().__init__()
+        if grid < 2:
+            raise ValueError(f"metric heatmap grid 必须 >= 2，got {grid}")
         self.lang_dim = lang_dim
         self.h_dim = h_dim
         self.d_proj = d_proj
         self.n_roles = n_roles
-        self.grid = HEATMAP_GRID
+        self.grid = int(grid)
+        self.dense_tokens = 2 * self.grid * self.grid
         self.l2_norm = l2_norm
         self.learnable_temp = learnable_temp
         self.freeze_bias = freeze_bias
@@ -147,7 +155,13 @@ class LanguageMetricField(nn.Module):
         h5 = h5.to(dtype)
         h11 = h11.to(dtype)
         language_hidden = language_hidden.to(dtype)
-        coords = _normalize_coords(coords.to(dtype))  # [1152, 3]
+        coords = _normalize_coords(coords.to(dtype))  # [N, 3]
+        if h11.shape[-2] != self.dense_tokens or h5.shape[-2] != self.dense_tokens:
+            raise ValueError(
+                f"metric head 期望每片 grid={self.grid} → 两片 "
+                f"{self.dense_tokens} token，got "
+                f"{tuple(h5.shape)} / {tuple(h11.shape)}"
+            )
 
         # ---- 角色查询：掩码均值池 → q_r ----
         mask = language_mask.to(dtype)  # [B, L]
@@ -177,17 +191,17 @@ class LanguageMetricField(nn.Module):
 
         # ---- 连续 offset δ_{r,n} = ½tanh(f_offset([D_n, G_n, q_r])) ----
         offsets = torch.empty(
-            batch, self.n_roles, DENSE_TOKENS, 2, dtype=dtype, device=h11.device
+            batch, self.n_roles, self.dense_tokens, 2, dtype=dtype, device=h11.device
         )
         for role in range(self.n_roles):
             cat_in = torch.cat(
                 (
-                    d11,                                   # [B, 1152, d]
-                    d5,                                    # [B, 1152, d]
-                    query[:, role : role + 1].expand(-1, DENSE_TOKENS, -1),  # [B, 1152, d]
+                    d11,                                   # [B, N, d]
+                    d5,                                    # [B, N, d]
+                    query[:, role : role + 1].expand(-1, self.dense_tokens, -1),
                 ),
                 dim=-1,
-            )  # [B, 1152, 3d]
+            )  # [B, N, 3d]
             offsets[:, role] = 0.5 * torch.tanh(self.offset_mlp(cat_in)) / self.grid
 
         # ---- softmax 概率（含 t 轴）→ 位置 + heatmap + log-heatmap ----

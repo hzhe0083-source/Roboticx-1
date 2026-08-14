@@ -78,7 +78,10 @@ MTVJ_METRIC_HEAD_CONFIG_KEYS = (
     "temp_init",
     "freeze_bias",
     "mode_readout",
+    "grid",
 )
+# 缺省即向后兼容的构造键（旧 checkpoint 无此键 → 填默认值，不视为不完整）。
+_MTVJ_METRIC_HEAD_OPTIONAL_KEYS = frozenset({"grid"})
 _MTVJ_METRIC_HEAD_CONFIG_DEFAULTS = {
     "lang_dim": 2048,
     "h_dim": 768,
@@ -89,6 +92,7 @@ _MTVJ_METRIC_HEAD_CONFIG_DEFAULTS = {
     "temp_init": 10.0,
     "freeze_bias": False,
     "mode_readout": False,
+    "grid": 24,
 }
 MTVJ_METRIC_STATE_SOURCE = "p_times_visibility_flat"
 MTVJ_METRIC_CONTRACT_VERSION = 3
@@ -272,7 +276,8 @@ def _canonical_mtvj_metric_head_config(
 ) -> dict:
     raw = dict(config or {})
     if require_complete:
-        missing = sorted(set(MTVJ_METRIC_HEAD_CONFIG_KEYS) - set(raw))
+        required = set(MTVJ_METRIC_HEAD_CONFIG_KEYS) - _MTVJ_METRIC_HEAD_OPTIONAL_KEYS
+        missing = sorted(required - set(raw))
         if missing:
             raise ValueError(
                 "主 checkpoint 缺少完整 mtvj_metric_head_config："
@@ -282,7 +287,7 @@ def _canonical_mtvj_metric_head_config(
         key: raw.get(key, default)
         for key, default in _MTVJ_METRIC_HEAD_CONFIG_DEFAULTS.items()
     }
-    for key in ("lang_dim", "h_dim", "d_proj", "n_roles"):
+    for key in ("lang_dim", "h_dim", "d_proj", "n_roles", "grid"):
         values[key] = int(values[key])
     for key in (
         "l2_norm",
@@ -582,6 +587,69 @@ def _load_mtvj_metric_checkpoint(
         f"（params={sum(p.numel() for p in relation_encoder.parameters()):,}）"
         f" from {relation_source}; metric head from {metric_source}; "
         f"constructor config from {constructor_source}"
+    )
+    return metric_head, relation_encoder
+
+
+def _load_dino_metric_from_policy(ckpt: dict, config, device):
+    """DINO-metric（2026-08-15）：从主 checkpoint 严格重建 DINO metric 栈。
+
+    与训练 _build_dino_metric_stack 同构：LanguageMetricField 构造配置取
+    ckpt["mtvj_metric_head_config"]（h_dim=1024、grid=16），权重取
+    ckpt["mtvj_metric_head"]；RelationStateEncoder(state_dim=8,
+    d_model=config.hidden_dim) 取 ckpt["mtvj_relation_encoder"]。评测禁止
+    随机重建——缺失即 fail-fast。
+    """
+    from va_compound.metric_visual_head import LanguageMetricField, RelationStateEncoder
+
+    metric_state = ckpt.get("mtvj_metric_head")
+    metric_config = ckpt.get("mtvj_metric_head_config")
+    relation_state = ckpt.get("mtvj_relation_encoder")
+    if metric_state is None or metric_config is None or relation_state is None:
+        raise ValueError(
+            "DINO-metric checkpoint 缺少 mtvj_metric_head / "
+            "mtvj_metric_head_config / mtvj_relation_encoder；评测不能随机重建"
+        )
+    ctor_config = _canonical_mtvj_metric_head_config(metric_config, require_complete=True)
+    if int(ctor_config["h_dim"]) != int(config.main_vision_dim) or int(
+        ctor_config["grid"]
+    ) != 16:
+        raise ValueError(
+            "DINO-metric checkpoint 的 metric head 构造配置与 DINO 特征不兼容："
+            f"h_dim={ctor_config['h_dim']} (期望 {config.main_vision_dim}), "
+            f"grid={ctor_config['grid']} (期望 16)"
+        )
+    metric_head = LanguageMetricField(
+        lang_dim=int(ctor_config["lang_dim"]),
+        h_dim=int(ctor_config["h_dim"]),
+        d_proj=int(ctor_config["d_proj"]),
+        n_roles=int(ctor_config["n_roles"]),
+        l2_norm=bool(ctor_config["l2_norm"]),
+        learnable_temp=bool(ctor_config["learnable_temp"]),
+        temp_init=float(ctor_config["temp_init"]),
+        freeze_bias=bool(ctor_config["freeze_bias"]),
+        mode_readout=bool(ctor_config["mode_readout"]),
+        grid=int(ctor_config["grid"]),
+    ).to(device)
+    metric_head.load_state_dict(metric_state, strict=True)
+    metric_head._mtvj_metric_state_source = (
+        ckpt.get("training_contract", {}) or {}
+    ).get("metric_state_source", MTVJ_LEGACY_METRIC_STATE_SOURCE)
+    relation_encoder = RelationStateEncoder(
+        state_dim=8, d_model=int(config.hidden_dim)
+    ).to(device)
+    relation_encoder.load_state_dict(relation_state, strict=True)
+    for module in (metric_head, relation_encoder):
+        module.eval()
+        for parameter in module.parameters():
+            parameter.requires_grad_(False)
+    print(
+        f"eval: DINO-metric 冻结 metric head（grid={metric_head.grid}, "
+        f"dense_tokens={metric_head.dense_tokens}, "
+        f"params={sum(p.numel() for p in metric_head.parameters()):,}）+ "
+        f"relation encoder（params={sum(p.numel() for p in relation_encoder.parameters()):,}）"
+        " 从主 checkpoint 严格恢复",
+        flush=True,
     )
     return metric_head, relation_encoder
 
@@ -1003,12 +1071,17 @@ def _main_vision_encode_window(
     *,
     grid: int,
     window: int,
-) -> torch.Tensor:
+    return_dense: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, dict[int, torch.Tensor]]:
     """DINO-main replacement: [1, window*grid*grid, dim] tokens per decision.
 
     Mirrors train.py:_dino_main_online_encode exactly: the same complete
     history window, the same bicubic resize and ImageNet normalization, the
     same final-block patch-grid average pooling.
+
+    ``return_dense=True``（DINO-metric）：额外返回 dense evidence
+    ``{5: [1, 512, D], 11: [1, 512, D]}``（block11/block23 帧 [d-2,d] patch，
+    前 256 = d-2、后 256 = d，与训练同序）。
     """
     if len(frames) != VISION_WINDOW:
         raise ValueError(
@@ -1029,7 +1102,20 @@ def _main_vision_encode_window(
     tokens = tokens.reshape(window, 16, 16, dim).permute(0, 3, 1, 2)
     tokens = F.adaptive_avg_pool2d(tokens, (grid, grid))
     tokens = tokens.permute(0, 2, 3, 1).reshape(1, window * grid * grid, dim)
-    return tokens
+    if not return_dense:
+        return tokens
+    # 帧 [d-2, d] = 窗口内索引 2, 3（时间升序 → 前 256 = d-2）。
+    dense_evidence = {
+        layer: torch.cat((ev[2], ev[3]), dim=0).float()[None]
+        for layer, ev in hierarchical.items()
+    }
+    for layer, evidence in dense_evidence.items():
+        if evidence.shape[-2] != 512:
+            raise RuntimeError(
+                f"dino-metric dense evidence {layer} must be 512 tokens, got "
+                f"{tuple(evidence.shape)}"
+            )
+    return tokens, dense_evidence
 
 
 def plan_refresh_due(decision_count: int, plan_refresh: int) -> bool:
@@ -2029,7 +2115,9 @@ def main() -> None:
             "V-JEPA main vision backbone"
         )
     checkpoint_uses_mtvj = bool(getattr(config, "dense_readout_mtvj", False))
-    if checkpoint_uses_mtvj and not args.dense_readout_mtvj:
+    # DINO-metric checkpoint 的 dense 层由 DINO block11/block23 证据驱动，
+    # 不建 V-JEPA 骨干/路径（--dense-readout-mtvj CLI 保持关闭）。
+    if checkpoint_uses_mtvj and not getattr(config, "dino_dense_metric", False) and not args.dense_readout_mtvj:
         args.dense_readout_mtvj = True
         print(
             "eval: checkpoint config.dense_readout_mtvj=True；自动启用同构 MT-VJ "
@@ -2072,6 +2160,7 @@ def main() -> None:
         metric_expected
         and args.metric_visual_checkpoint is None
         and not args.mtvj_dense_only_ablation
+        and not getattr(config, "dino_dense_metric", False)
     ):
         raise ValueError(
             "checkpoint 训练时启用了 MT-VJ metric tokens；评测必须提供 "
@@ -2288,6 +2377,16 @@ def main() -> None:
     relation_encoder = None
     roi_head = None
     coords_mtvj = None
+    coords_dino_metric = None
+    if getattr(config, "dino_dense_metric", False):
+        # DINO-metric（2026-08-15）：metric 栈从主 checkpoint 严格重建
+        # （无外部 --metric-visual-checkpoint；V-JEPA metric 权重不兼容）。
+        from va_compound.model import dense_coords
+
+        metric_head, relation_encoder = _load_dino_metric_from_policy(
+            ckpt, config, device
+        )
+        coords_dino_metric = dense_coords(512, device=device)
     if args.dense_readout_mtvj:
         mtvj_backbone = VJEPA21Backbone.from_pretrained(
             device=device,
@@ -2947,13 +3046,26 @@ def main() -> None:
                         if main_vision_backbone is not None:
                             # DINO-main replacement：冻结 DINOv2 特征替换 V-JEPA
                             # 主视觉（与训练 _dino_main_online_encode 同构）。
-                            tokens = _main_vision_encode_window(
-                                frames,
-                                main_vision_backbone,
-                                device,
-                                grid=config.main_vision_grid,
-                                window=config.main_vision_frames,
-                            )
+                            # DINO-metric：同一窗口附带 block11/block23 两帧
+                            # [d-2,d] patch evidence（与训练 return_dense 同构）。
+                            dino_dense_evidence = None
+                            if getattr(config, "dino_dense_metric", False):
+                                tokens, dino_dense_evidence = _main_vision_encode_window(
+                                    frames,
+                                    main_vision_backbone,
+                                    device,
+                                    grid=config.main_vision_grid,
+                                    window=config.main_vision_frames,
+                                    return_dense=True,
+                                )
+                            else:
+                                tokens = _main_vision_encode_window(
+                                    frames,
+                                    main_vision_backbone,
+                                    device,
+                                    grid=config.main_vision_grid,
+                                    window=config.main_vision_frames,
+                                )
                         else:
                             tokens = vision_backbone(clip.unsqueeze(0), pooling=vision_pooling)
                     if has_plan and plan_refresh_due(decision_count, args.plan_refresh):
@@ -3008,6 +3120,29 @@ def main() -> None:
                         )
                         dense_kwargs = {}
                         metric_g = None
+                        if getattr(config, "dino_dense_metric", False):
+                            # DINO-metric 在线解码：dense evidence（本决策窗口
+                            # 已编码）+ metric tokens（g_t / ν_t，与训练
+                            # _dino_metric_tokens 同构；coords=512 两帧 16×16）。
+                            if dino_dense_evidence is None:
+                                raise RuntimeError(
+                                    "dino_dense_metric 已启用但本决策无 dense evidence"
+                                )
+                            dino_metric_tokens, metric_g = _mtvj_metric_tokens(
+                                metric_head,
+                                relation_encoder,
+                                dino_dense_evidence,
+                                hidden[local_task_index : local_task_index + 1],
+                                mask[local_task_index : local_task_index + 1],
+                                coords_dino_metric,
+                                metric_g_prev,
+                                device,
+                            )
+                            metric_g_prev = metric_g
+                            dense_kwargs = {
+                                "dense_evidence": dino_dense_evidence,
+                                "metric_tokens": dino_metric_tokens,
+                            }
                         if args.dense_readout_mtvj:
                             # MT-VJ 在线 dense 解码（契约 §7，与训练 §6
                             # _mtvj_online_encode 同构）：同一 4 帧历史窗。

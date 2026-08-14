@@ -172,6 +172,11 @@ class VACompoundConfig:
     main_vision_grid: int = 8    # 每帧 16x16 patch 网格池化到 grid x grid
     main_vision_frames: int = 4  # 每决策消费的窗口帧数 [d-6,d-4,d-2,d]
     main_vision_tokens: int = 256  # = grid*grid*frames
+    # DINO-metric（2026-08-15 用户决策）：DINO-main 下接回 MT-VJ dense + metric
+    # 全栈。dense evidence = DINO block11(g)/block23(d) 两帧 [d-2,d] patch
+    # （2×16×16=512 token，1024 维）+ Δt；LanguageMetricField 以 h_dim=1024、
+    # grid=16 从零训练。复用 dense_readout_mtvj 的逐层 dense K/V 机制。
+    dino_dense_metric: bool = False
 
     def __post_init__(self) -> None:
         if self.hidden_dim % self.num_heads:
@@ -240,6 +245,16 @@ class VACompoundConfig:
                 raise ValueError(
                     "main_vision_tokens must equal grid*grid*frames, got "
                     f"{self.main_vision_tokens} vs {expected_tokens}"
+                )
+        if self.dino_dense_metric:
+            if self.main_vision_backbone == "vjepa":
+                raise ValueError(
+                    "dino_dense_metric requires main_vision_backbone != 'vjepa'"
+                )
+            if not self.dense_readout_mtvj:
+                raise ValueError(
+                    "dino_dense_metric requires dense_readout_mtvj "
+                    "（逐层 dense K/V 机制复用）"
                 )
 
 
@@ -1852,9 +1867,17 @@ class VACompoundPolicy(nn.Module):
         )
         # MT-VJ（2026-08-10 契约 §5）：dense evidence 共享投影（D/G/T：
         # 768 → 192 + 坐标嵌入投影），每层 dense K/V 复用其输出。
+        # DINO-metric（2026-08-15）：DINO-main 下同一投影器以
+        # vision_dim=main_vision_dim（1024）构造，消费 block11/block23
+        # 两帧 [d-2,d] patch evidence（512 token）。
         if config.dense_readout_mtvj:
+            projector_vision_dim = (
+                config.main_vision_dim
+                if config.main_vision_backbone != "vjepa"
+                else config.vision_dim
+            )
             self.dense_evidence_proj = DenseEvidenceProjector(
-                vision_dim=config.vision_dim,
+                vision_dim=projector_vision_dim,
                 hidden_dim=config.hidden_dim,
             )
         else:
