@@ -63,6 +63,7 @@ from va_compound.metric_roi import (
     metric_head_state_sha256,
     prepare_metric_roi_video,
     refine_metric_roi_positions,
+    refine_metric_roi_positions_dino,
 )
 
 IMAGE_MEAN = torch.tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1)
@@ -654,6 +655,63 @@ def _load_dino_metric_from_policy(ckpt: dict, config, device):
     return metric_head, relation_encoder
 
 
+def _load_dino_roi_head(path: Path, device):
+    """DINO ROI 精修头（2026-08-16）：独立 artifact contract=dino_metric_roi_v1。
+
+    与 train_metric_roi_dino.py 保存格式一致：roi_metric_head 状态 +
+    ctor_config（grid=16 LanguageMetricField）+ ROI 几何配置。评测禁止
+    随机重建——缺键/合约不符即 fail-fast。``_mtvj_roi_config`` 由
+    refine_metric_roi_positions_dino 读取（canonical_image_size /
+    min_roi_size / max_roi_size / distance_scale / max_delta_px）。
+    """
+    from va_compound.metric_visual_head import LanguageMetricField
+
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    if checkpoint.get("contract") != "dino_metric_roi_v1":
+        raise ValueError(
+            f"DINO ROI checkpoint contract={checkpoint.get('contract')!r} != "
+            "'dino_metric_roi_v1'"
+        )
+    state = checkpoint.get("roi_metric_head")
+    ctor_config = checkpoint.get("ctor_config")
+    if state is None or ctor_config is None:
+        raise ValueError("DINO ROI checkpoint 缺少 roi_metric_head / ctor_config")
+    if int(ctor_config.get("grid", -1)) != 16:
+        raise ValueError(
+            f"DINO ROI head grid={ctor_config.get('grid')!r} != 16（DINO 原生网格）"
+        )
+    roi_head = LanguageMetricField(
+        lang_dim=int(ctor_config["lang_dim"]),
+        h_dim=int(ctor_config["h_dim"]),
+        d_proj=int(ctor_config["d_proj"]),
+        n_roles=int(ctor_config["n_roles"]),
+        l2_norm=bool(ctor_config["l2_norm"]),
+        learnable_temp=bool(ctor_config["learnable_temp"]),
+        temp_init=float(ctor_config.get("temp_init", 10.0)),
+        freeze_bias=bool(ctor_config.get("freeze_bias", False)),
+        mode_readout=bool(ctor_config["mode_readout"]),
+        grid=int(ctor_config["grid"]),
+    ).to(device)
+    roi_head.load_state_dict(state, strict=True)
+    roi_head._mtvj_roi_config = {
+        "canonical_image_size": int(checkpoint.get("canonical_image_size", 224)),
+        "min_roi_size": float(checkpoint.get("min_roi_size", 96)),
+        "max_roi_size": float(checkpoint.get("max_roi_size", 192)),
+        "distance_scale": float(checkpoint.get("distance_scale", 2.0)),
+        "max_delta_px": float(checkpoint.get("max_delta_px", 32.0)),
+    }
+    roi_head.eval()
+    for parameter in roi_head.parameters():
+        parameter.requires_grad_(False)
+    print(
+        f"eval: DINO ROI 精修头就绪（grid={roi_head.grid}, "
+        f"params={sum(p.numel() for p in roi_head.parameters()):,}, "
+        f"roi_config={roi_head._mtvj_roi_config}）",
+        flush=True,
+    )
+    return roi_head
+
+
 def _mtvj_metric_tokens(
     metric_head,
     relation_encoder,
@@ -668,6 +726,7 @@ def _mtvj_metric_tokens(
     roi_backbone: nn.Module | None = None,
     roi_video: torch.Tensor | None = None,
     roi_alpha: float = 0.0,
+    roi_dino: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """单决策 metric_tokens（与 train.py ``_mtvj_online_encode`` 的 metric 分支同构）。
 
@@ -686,17 +745,30 @@ def _mtvj_metric_tokens(
     if roi_head is not None and roi_alpha != 0.0:
         if roi_backbone is None or roi_video is None:
             raise ValueError("MT-VJ ROI runtime requires raw video and frozen backbone")
-        out.p, out.visibility = refine_metric_roi_positions(
-            out.p,
-            out.visibility,
-            roi_video,
-            roi_backbone,
-            roi_head,
-            language_hidden.to(device=device),
-            language_mask.to(device=device),
-            coords,
-            alpha=roi_alpha,
-        )
+        if roi_dino:
+            out.p, out.visibility = refine_metric_roi_positions_dino(
+                out.p,
+                out.visibility,
+                roi_video,
+                roi_backbone,
+                roi_head,
+                language_hidden.to(device=device),
+                language_mask.to(device=device),
+                coords,
+                alpha=roi_alpha,
+            )
+        else:
+            out.p, out.visibility = refine_metric_roi_positions(
+                out.p,
+                out.visibility,
+                roi_video,
+                roi_backbone,
+                roi_head,
+                language_hidden.to(device=device),
+                language_mask.to(device=device),
+                coords,
+                alpha=roi_alpha,
+            )
     # 与 train.py _mtvj_online_encode 完全同构：不可见角色坐标归零。
     g = _mtvj_metric_positions(
         out,
@@ -850,6 +922,20 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="ROI 有界残差融合系数 [0,1]；启用 ROI checkpoint 时必须显式给出。",
+    )
+    parser.add_argument(
+        "--dino-roi-checkpoint",
+        type=Path,
+        default=None,
+        help="可选 DINO 原图 ROI 精修 checkpoint（contract=dino_metric_roi_v1）；"
+        "默认关闭。只对 dino_dense_metric 主 checkpoint 有效。",
+    )
+    parser.add_argument(
+        "--dino-roi-alpha",
+        type=float,
+        default=None,
+        help="DINO ROI 有界残差融合系数 [0,1]；启用 DINO ROI checkpoint 时"
+        "必须显式给出。",
     )
     parser.add_argument(
         "--wam",
@@ -2124,6 +2210,22 @@ def main() -> None:
                 "禁止 --dense-readout-mtvj / --metric-visual-checkpoint "
                 "（V-JEPA 路径）混用"
             )
+    if args.dino_roi_checkpoint is None:
+        if args.dino_roi_alpha is not None:
+            raise ValueError("--dino-roi-alpha requires --dino-roi-checkpoint")
+    else:
+        if not getattr(config, "dino_dense_metric", False):
+            raise ValueError(
+                "--dino-roi-checkpoint 只对 dino_dense_metric 主 checkpoint 有效"
+            )
+        if (
+            args.dino_roi_alpha is None
+            or not np.isfinite(args.dino_roi_alpha)
+            or not 0.0 <= args.dino_roi_alpha <= 1.0
+        ):
+            raise ValueError(
+                "--dino-roi-checkpoint requires finite --dino-roi-alpha in [0,1]"
+            )
     if checkpoint_uses_mtvj and not getattr(config, "dino_dense_metric", False) and not args.dense_readout_mtvj:
         args.dense_readout_mtvj = True
         print(
@@ -2394,6 +2496,8 @@ def main() -> None:
             ckpt, config, device
         )
         coords_dino_metric = dense_coords(512, device=device)
+        if args.dino_roi_checkpoint is not None:
+            roi_head = _load_dino_roi_head(args.dino_roi_checkpoint, device)
     if args.dense_readout_mtvj:
         mtvj_backbone = VJEPA21Backbone.from_pretrained(
             device=device,
@@ -3135,6 +3239,19 @@ def main() -> None:
                                 raise RuntimeError(
                                     "dino_dense_metric 已启用但本决策无 dense evidence"
                                 )
+                            dino_roi_video = None
+                            if roi_head is not None and args.dino_roi_alpha:
+                                # ROI 原图输入与训练同构：窗口帧 [d-2,d] 双时间片
+                                # [1,2,480,480,3] 0-1 未归一化（refine 内部做
+                                # ImageNet 归一化 + 裁剪上采样）。
+                                dino_roi_video = (
+                                    torch.from_numpy(
+                                        np.stack(frames[2:4], axis=0)[None]
+                                    )
+                                    .float()
+                                    .div_(255.0)
+                                    .to(device)
+                                )
                             dino_metric_tokens, metric_g = _mtvj_metric_tokens(
                                 metric_head,
                                 relation_encoder,
@@ -3144,6 +3261,19 @@ def main() -> None:
                                 coords_dino_metric,
                                 metric_g_prev,
                                 device,
+                                roi_head=roi_head,
+                                roi_backbone=(
+                                    main_vision_backbone
+                                    if roi_head is not None
+                                    else None
+                                ),
+                                roi_video=dino_roi_video,
+                                roi_alpha=(
+                                    float(args.dino_roi_alpha)
+                                    if roi_head is not None
+                                    else 0.0
+                                ),
+                                roi_dino=True,
                             )
                             metric_g_prev = metric_g
                             dense_kwargs = {
