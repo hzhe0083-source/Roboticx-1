@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from scripts.task35_proc import find_processes, is_inspector, trainer_processes
 
 
@@ -9,6 +11,13 @@ def test_inspector_command_lines_are_ignored() -> None:
         "/home/ryan/.venvs/pytorch-gpu/bin/python -u -B train.py "
         "--task35-precision-contract --direct-head"
     )
+
+
+def test_archiver_follows_log_events_not_stdin() -> None:
+    text = Path("/home/ryan/Documents/robot/ORA0-task35-fullfix/scripts/archive_task35_fm_milestones.sh").read_text()
+    assert "tail -n 0 -F" in text
+    assert "read -r -t 30 -u 3" in text
+    assert "trainer gone before all milestones were archived" in text
 
 
 def test_find_processes_requires_all_markers() -> None:

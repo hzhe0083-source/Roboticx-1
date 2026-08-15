@@ -88,14 +88,22 @@ fi
 
 # The trainer writes checkpoint.tmp, atomically replaces CKPT, and only then
 # prints this event. tail -F is therefore an event stream, not a file poller.
-# Fail closed if the trainer dies before every requested archive exists.
-while IFS= read -r -t 30 line || true; do
-  if [[ -n "${line:-}" && "$line" =~ global_step=([0-9]+).*periodic\ checkpoint\ saved ]]; then
-    step=${BASH_REMATCH[1]}
-    if wanted "$step"; then
-      archive_step "$step"
-      all_done && exit 0
+# A 30s read timeout lets us notice a dead trainer without dropping save events.
+exec 3< <(tail -n 0 -F "$LOG")
+TAIL_PID=$!
+trap 'kill "$TAIL_PID" 2>/dev/null || true; exec 3<&-' EXIT
+while true; do
+  if IFS= read -r -t 30 -u 3 line; then
+    if [[ "$line" =~ global_step=([0-9]+).*periodic\ checkpoint\ saved ]]; then
+      step=${BASH_REMATCH[1]}
+      if wanted "$step"; then
+        archive_step "$step"
+        all_done && exit 0
+      fi
     fi
+  elif ! kill -0 "$TAIL_PID" 2>/dev/null; then
+    echo "log follower died before all milestones were archived" >&2
+    exit 4
   fi
   if ! "$PY" -B scripts/task35_proc.py --check trainer >/dev/null; then
     if all_done; then
