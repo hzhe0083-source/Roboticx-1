@@ -103,11 +103,39 @@ def archive_complete(checkpoint_stem: Path, step: int) -> bool:
     return destination.is_file() and Path(str(destination) + ".sha256").is_file()
 
 
+def validate_report_ok(path: Path, *, step: int | None = None) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    items = payload.get("reports", [payload])
+    for item in items:
+        if not (item.get("ok") and item.get("loaded_modules")):
+            continue
+        if step is not None and int(item.get("global_step", -1)) != int(step):
+            continue
+        return True
+    return False
+
+
+def slice_report_ok(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    return payload.get("contract") == "task35_clean_recovery_slice_v1"
+
+
 def pipeline_health(
     *,
     trainer: dict,
     checkpoint_stem: Path,
     latest_step: int | None = None,
+    logs_dir: Path | None = None,
     meminfo: str | None = None,
     gpu_compute_pids: list[int] | None = None,
 ) -> dict:
@@ -134,6 +162,18 @@ def pipeline_health(
             for step in ARCHIVE_MILESTONES:
                 if int(latest_step) >= int(step) and not archived[step]:
                     alerts.append(f"missing_archive_{step}")
+        logs = Path(logs_dir) if logs_dir is not None else checkpoint_stem.parent.parent / "logs"
+        waiter_by_step = {6000: "wait_6000", 9000: "wait_9000", 12000: "wait_12000"}
+        for step in (3000, 6000, 9000, 12000):
+            if not archived[step]:
+                continue
+            waiter_key = waiter_by_step.get(step)
+            waiter_up = bool(waiter_key and present.get(waiter_key))
+            name = f"{checkpoint_stem.name}_step{step}"
+            if not validate_report_ok(logs / f"{name}_validate.json", step=step) and not waiter_up:
+                alerts.append(f"missing_validate_{step}")
+            if not slice_report_ok(logs / f"{name}_clean_recovery_slices.json") and not waiter_up:
+                alerts.append(f"missing_slice_{step}")
     available = mem_available_kb(meminfo)
     if available is not None and available < LOW_RAM_KB:
         alerts.append("low_ram")
@@ -386,6 +426,7 @@ def main() -> None:
         trainer=trainer,
         checkpoint_stem=checkpoint_stem,
         latest_step=int(snapshot["latest_step"]),
+        logs_dir=args.log.parent,
     )
     snapshot["pipeline"] = health
     if health["alerts"]:

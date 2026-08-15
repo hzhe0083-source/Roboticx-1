@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from scripts.summarize_task35_fm_train import summarize_task35_fm_log
@@ -102,15 +103,109 @@ def test_pipeline_health_alerts_missing_6k_waiter(tmp_path: Path, monkeypatch) -
     assert "missing_archive_6000" in late["alerts"]
     assert "missing_archive_3000" in late["alerts"]  # files exist but no sha256
     (tmp_path / "ckpt_step3000.pt.sha256").write_text("abc\n")
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "ckpt_step3000_validate.json").write_text(
+        json.dumps({"ok": True, "loaded_modules": True, "global_step": 3000})
+    )
+    (logs / "ckpt_step3000_clean_recovery_slices.json").write_text(
+        json.dumps({"contract": "task35_clean_recovery_slice_v1"})
+    )
     late_ok = monitor.pipeline_health(
         trainer={"alive": True, "count": 1, "processes": [{"pid": 303509}]},
         checkpoint_stem=stem,
         latest_step=6500,
+        logs_dir=logs,
         meminfo="MemAvailable: 8388608 kB\n",
         gpu_compute_pids=[303509],
     )
     assert "missing_archive_3000" not in late_ok["alerts"]
+    assert "missing_validate_3000" not in late_ok["alerts"]
     assert "missing_archive_6000" in late_ok["alerts"]
+
+
+def test_pipeline_health_alerts_missing_validate_after_6k_archive(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from scripts import monitor_task35_fm_train as monitor
+
+    ckpt_dir = tmp_path / "checkpoints"
+    logs = tmp_path / "logs"
+    ckpt_dir.mkdir()
+    logs.mkdir()
+    stem = ckpt_dir / "ckpt"
+    dest = ckpt_dir / "ckpt_step6000.pt"
+    dest.write_bytes(b"x")
+    dest.with_name(dest.name + ".sha256").write_text("abc\n")
+
+    def fake_find(needle: str, *, require: tuple[str, ...] = ()):
+        del require
+        present = {
+            "archive_task35_fm_milestones.sh": True,
+            "tail -n 0 -F": True,
+            "wait_task35_fm_finished_eval.sh": True,
+            "wait_validate_task35_fm_milestone.sh 9000": True,
+            "wait_validate_task35_fm_milestone.sh 12000": True,
+        }
+        return [{"pid": 1, "cmd": needle}] if present.get(needle) else []
+
+    monkeypatch.setattr(monitor, "find_processes", fake_find)
+    missing = monitor.pipeline_health(
+        trainer={"alive": True, "count": 1, "processes": [{"pid": 303509}]},
+        checkpoint_stem=stem,
+        latest_step=6500,
+        logs_dir=logs,
+        meminfo="MemAvailable: 8388608 kB\n",
+        gpu_compute_pids=[303509],
+    )
+    assert "missing_validate_6000" in missing["alerts"]
+    assert "missing_slice_6000" in missing["alerts"]
+
+    def fake_find_up(needle: str, *, require: tuple[str, ...] = ()):
+        del require
+        present = {
+            "archive_task35_fm_milestones.sh": True,
+            "tail -n 0 -F": True,
+            "wait_task35_fm_finished_eval.sh": True,
+            "wait_validate_task35_fm_milestone.sh 6000": True,
+            "wait_validate_task35_fm_milestone.sh 9000": True,
+            "wait_validate_task35_fm_milestone.sh 12000": True,
+        }
+        return [{"pid": 1, "cmd": needle}] if present.get(needle) else []
+
+    monkeypatch.setattr(monitor, "find_processes", fake_find_up)
+    working = monitor.pipeline_health(
+        trainer={"alive": True, "count": 1, "processes": [{"pid": 303509}]},
+        checkpoint_stem=stem,
+        latest_step=6500,
+        logs_dir=logs,
+        meminfo="MemAvailable: 8388608 kB\n",
+        gpu_compute_pids=[303509],
+    )
+    assert "missing_validate_6000" not in working["alerts"]
+    (logs / "ckpt_step6000_validate.json").write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "loaded_modules": True,
+                "global_step": 6000,
+            }
+        )
+    )
+    (logs / "ckpt_step6000_clean_recovery_slices.json").write_text(
+        json.dumps({"contract": "task35_clean_recovery_slice_v1"})
+    )
+    monkeypatch.setattr(monitor, "find_processes", fake_find)
+    done = monitor.pipeline_health(
+        trainer={"alive": True, "count": 1, "processes": [{"pid": 303509}]},
+        checkpoint_stem=stem,
+        latest_step=6500,
+        logs_dir=logs,
+        meminfo="MemAvailable: 8388608 kB\n",
+        gpu_compute_pids=[303509],
+    )
+    assert "missing_validate_6000" not in done["alerts"]
+    assert "missing_slice_6000" not in done["alerts"]
 
 
 def test_pipeline_health_alerts_low_ram_and_extra_gpu(tmp_path: Path, monkeypatch) -> None:

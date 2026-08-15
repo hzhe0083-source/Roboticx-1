@@ -34,6 +34,9 @@ def test_archiver_follows_log_events_not_stdin() -> None:
     assert "milestone SHA mismatch" in waiter
     assert "wait_for_cpu_ram" in waiter
     assert "MemAvailable" in waiter
+    assert "peek_task35_checkpoint_step.py" in waiter
+    assert "archive global_step=" in waiter
+    assert "report_matches_archive" in waiter
 
 
 def test_find_processes_requires_all_markers() -> None:

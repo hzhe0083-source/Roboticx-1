@@ -24,6 +24,11 @@ if [[ -z "$expected_sha" || "$expected_sha" != "$actual_sha" ]]; then
   echo "milestone SHA mismatch for $DEST expected=$expected_sha actual=$actual_sha" >&2
   exit 4
 fi
+found_step=$("$PY" -B scripts/peek_task35_checkpoint_step.py "$DEST")
+if [[ "$found_step" != "$STEP" ]]; then
+  echo "archive global_step=$found_step != expected $STEP for $DEST" >&2
+  exit 4
+fi
 VALIDATE=logs/${NAME}_validate.json
 SLICES=logs/${NAME}_clean_recovery_slices.json
 LOCK=logs/${NAME}.lock
@@ -59,9 +64,30 @@ run_cpu() {
   fi
 }
 
+report_matches_archive() {
+  "$PY" -B - "$VALIDATE" "$actual_sha" "$STEP" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text())
+sha = sys.argv[2]
+step = int(sys.argv[3])
+items = payload.get("reports", [payload])
+ok = any(
+    item.get("ok")
+    and item.get("loaded_modules")
+    and int(item.get("global_step", -1)) == step
+    and item.get("sha256") == sha
+    for item in items
+)
+raise SystemExit(0 if ok else 1)
+PY
+}
+
 # Archiver only copies. This waiter owns full CPU validate/slice.
 need_validate=1
-if [[ -s "$VALIDATE" ]] && grep -q '"ok": true' "$VALIDATE" && grep -q '"loaded_modules": true' "$VALIDATE"; then
+if [[ -s "$VALIDATE" ]] && report_matches_archive; then
   need_validate=0
 fi
 if [[ "$need_validate" -eq 1 || ! -s "$SLICES" ]]; then
