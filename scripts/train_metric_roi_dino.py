@@ -137,8 +137,9 @@ def main() -> None:
             size_jitter=0.1, training=True,
         )
         raw_video = (
-            torch.from_numpy(frames_np[:, (2, 3)]).float().div_(255.0).to(device)
-        )  # [B,2,480,480,3]
+            torch.from_numpy(frames_np[:, (2, 3)]).float().div_(255.0)
+            .permute(0, 1, 4, 2, 3).to(device)
+        )  # [B,2,3,H,W]（crop_metric_roi_video 契约：NCHW）
         cropped = crop_metric_roi_video(
             raw_video, selection.roi, canonical_image_size=CANONICAL
         )  # [B,2,3,224,224]

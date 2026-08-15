@@ -3242,14 +3242,15 @@ def main() -> None:
                             dino_roi_video = None
                             if roi_head is not None and args.dino_roi_alpha:
                                 # ROI 原图输入与训练同构：窗口帧 [d-2,d] 双时间片
-                                # [1,2,480,480,3] 0-1 未归一化（refine 内部做
-                                # ImageNet 归一化 + 裁剪上采样）。
+                                # [1,2,3,H,W] NCHW 0-1 未归一化（refine 内部做
+                                # ImageNet 归一化 + 裁剪上采样；crop 契约 NCHW）。
                                 dino_roi_video = (
                                     torch.from_numpy(
                                         np.stack(frames[2:4], axis=0)[None]
                                     )
                                     .float()
                                     .div_(255.0)
+                                    .permute(0, 1, 4, 2, 3)
                                     .to(device)
                                 )
                             dino_metric_tokens, metric_g = _mtvj_metric_tokens(
