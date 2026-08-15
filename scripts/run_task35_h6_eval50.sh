@@ -28,6 +28,7 @@ done
 mkdir -p logs
 set -o pipefail
 PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   "$PY" -u -B eval_metaworld.py \
   --task35-precision-contract \
   --checkpoint "$CKPT" --features "$FEATURES" \

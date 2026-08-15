@@ -6,6 +6,7 @@ import torch
 
 from eval_metaworld import (
     TASK35_EVAL50_SEEDS,
+    cached_task35_language,
     evaluation_episode_seed,
     select_eval_tasks,
     task35_ablation_dense,
@@ -70,6 +71,31 @@ def test_task35_temporal_ablation_reverses_only_frame_order() -> None:
     reversed_frames = task35_ablation_frames(frames, "temporal-reverse")
     assert [int(frame[0, 0, 0]) for frame in reversed_frames] == [3, 2, 1, 0]
     assert task35_ablation_frames(frames, "none") is frames
+
+
+def test_cached_task35_language_uses_first_instruction_row() -> None:
+    features = {
+        "instruction_id": torch.tensor([35, 35]),
+        "language_hidden": torch.zeros(2, 13, 2048),
+        "language_mask": torch.ones(2, 13, dtype=torch.bool),
+    }
+    features["language_hidden"][0, 0, 0] = 3.5
+    hidden, mask = cached_task35_language(features, torch.device("cpu"))
+    assert tuple(hidden.shape) == (1, 13, 2048)
+    assert float(hidden[0, 0, 0]) == 3.5
+    assert bool(mask.all())
+
+
+def test_cached_task35_language_rejects_missing_task() -> None:
+    with pytest.raises(ValueError, match="no instruction_id=35"):
+        cached_task35_language(
+            {
+                "instruction_id": torch.tensor([0]),
+                "language_hidden": torch.zeros(1, 2, 4),
+                "language_mask": torch.ones(1, 2, dtype=torch.bool),
+            },
+            torch.device("cpu"),
+        )
 
 
 def test_task35_dense_zero_preserves_shape_dtype_and_source() -> None:

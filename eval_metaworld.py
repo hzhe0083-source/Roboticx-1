@@ -311,6 +311,31 @@ def evaluation_episode_seed(global_task_id: int, trial: int) -> int:
 TASK35_EVAL50_SEEDS = tuple(range(35000, 35050))
 
 
+def cached_task35_language(
+    features: dict[str, Any],
+    device: torch.device,
+    *,
+    task_id: int = 35,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Use the training-cache language tokens instead of loading Qwen on GPU."""
+    if "language_hidden" not in features or "language_mask" not in features:
+        raise ValueError("task35 features missing cached language_hidden/language_mask")
+    if "instruction_id" not in features:
+        raise ValueError("task35 features missing instruction_id")
+    instruction_id = torch.as_tensor(features["instruction_id"]).reshape(-1)
+    rows = (instruction_id == int(task_id)).nonzero(as_tuple=False)
+    if rows.numel() == 0:
+        raise ValueError(f"task35 features have no instruction_id={task_id} language cache")
+    row = int(rows[0, 0])
+    hidden = features["language_hidden"][row : row + 1].to(device=device)
+    mask = features["language_mask"][row : row + 1].to(device=device)
+    if hidden.ndim != 3 or mask.shape[:2] != hidden.shape[:2]:
+        raise ValueError(
+            f"cached task35 language has unexpected shape {tuple(hidden.shape)} / {tuple(mask.shape)}"
+        )
+    return hidden, mask
+
+
 def validate_task35_eval50_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """Fail-closed check for a 50-seed task35 closed-loop JSON."""
     if payload.get("contract") != "metaworld_closed_loop_trials_v1":
@@ -1282,11 +1307,18 @@ def _main_vision_encode_window(
         raise ValueError(
             f"dino-main expects {VISION_WINDOW} history frames, got {len(frames)}"
         )
-    images = torch.cat(
-        [preprocess(frames[i], backbone.image_size) for i in range(window)],
-        dim=0,
-    ).to(device)
-    hierarchical = backbone.forward_hierarchical_dense(images)
+    # Encode one frame at a time so ViT-L/14-reg4 + VA + FM fit a 16 GiB laptop
+    # GPU. The per-frame contract is identical to a batched 4-frame encode.
+    hierarchical_parts = [
+        backbone.forward_hierarchical_dense(
+            preprocess(frames[i], backbone.image_size).to(device)
+        )
+        for i in range(window)
+    ]
+    hierarchical = {
+        layer: torch.cat([part[layer] for part in hierarchical_parts], dim=0)
+        for layer in hierarchical_parts[0]
+    }
     tokens = hierarchical[11].float()  # [window, 256, D]
     if tokens.shape[-2] != 256 or tokens.shape[-1] != backbone.feature_dim:
         raise RuntimeError(
@@ -2842,7 +2874,8 @@ def main() -> None:
 
     # P0-3：统一恢复路径（普通 LoRA / semantic adapter 都按 training_contract
     # 构造并加载 qwen_state_dict / lora / semantic_gate）。
-    text_backbone = restore_text_backbone(ckpt, device, language_dtype="float16")
+    # task35 FM acceptance/causal can reuse the training language cache and
+    # skip Qwen entirely: the 15k checkpoint has no qwen/lora/plan weights.
     compiler = None
     if has_compile:
         from va_compound.backbones import SemanticCompiler
@@ -2864,15 +2897,32 @@ def main() -> None:
         raise ValueError("no tasks selected for evaluation")
     task_indices = [index for index, _ in selected_tasks]
     tasks = [text for _, text in selected_tasks]
-    if isinstance(text_backbone, QwenSemanticBackbone):
-        # P0-3：semantic adapter ckpt——语言 hidden 用 fused 嵌入
-        # （prior + g ⊙ (adapted − prior)），不是裸冻结先验。
-        with torch.no_grad():
-            prior, mask = text_backbone.encode_prior(tasks)
-            adapted, _ = text_backbone.encode_adapted(tasks)
-            hidden = text_backbone.fused_embedding(prior, adapted)
+    use_cached_task35_language = (
+        (args.task35_precision_contract or args.task35_causal_ablation != "none")
+        and not has_plan
+        and not ckpt.get("qwen_state_dict")
+        and not ckpt.get("lora")
+        and not config.scene_teacher
+        and selected_tasks == [(35, "Insert a peg sideways")]
+    )
+    text_backbone = None
+    if use_cached_task35_language:
+        hidden, mask = cached_task35_language(features, device)
+        print(
+            "eval: using cached task35 language_hidden; Qwen not loaded",
+            flush=True,
+        )
     else:
-        hidden, mask = text_backbone.encode(tasks)
+        text_backbone = restore_text_backbone(ckpt, device, language_dtype="float16")
+        if isinstance(text_backbone, QwenSemanticBackbone):
+            # P0-3：semantic adapter ckpt——语言 hidden 用 fused 嵌入
+            # （prior + g ⊙ (adapted − prior)），不是裸冻结先验。
+            with torch.no_grad():
+                prior, mask = text_backbone.encode_prior(tasks)
+                adapted, _ = text_backbone.encode_adapted(tasks)
+                hidden = text_backbone.fused_embedding(prior, adapted)
+        else:
+            hidden, mask = text_backbone.encode(tasks)
 
     scene_teacher = None
     if config.scene_teacher:
@@ -2890,14 +2940,17 @@ def main() -> None:
         # Plan-Cache：缓存按 episode 逐任务懒构建（首帧场景 → plan tokens），
         # --plan-refresh R 控制后续重建；Qwen 仅在 scene_teacher / compiler 下常驻。
         task_caches: list | None = [None] * len(tasks)
-        if not config.scene_teacher and compiler is None:
+        if text_backbone is not None and not config.scene_teacher and compiler is None:
             del text_backbone
+            text_backbone = None
     else:
         task_caches = [
             model.build_language_cache(hidden[i : i + 1].to(device), mask[i : i + 1].to(device))
             for i in range(len(tasks))
         ]
-        del text_backbone
+        if text_backbone is not None:
+            del text_backbone
+            text_backbone = None
 
     import metaworld
 

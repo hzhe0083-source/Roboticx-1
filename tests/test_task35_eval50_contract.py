@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import pytest
 
+from pathlib import Path
+
 from eval_metaworld import TASK35_EVAL50_SEEDS, validate_task35_eval50_payload
 from scripts.select_task35_best_fm import select_best_task35_fm
 
@@ -96,6 +98,17 @@ def test_selector_ranks_by_closed_loop_successes() -> None:
     assert report["selected"]["successes"] == 15
     assert report["selected"]["step"] == 15000
     assert report["label"] == "supported"
+
+
+def test_eval50_launcher_skips_qwen_and_sets_cuda_allocator() -> None:
+    root = Path(__file__).resolve().parent.parent
+    eval50 = (root / "scripts" / "run_task35_h6_eval50.sh").read_text()
+    ablation = (root / "scripts" / "run_task35_h6_ablation50.sh").read_text()
+    encode = (root / "eval_metaworld.py").read_text()
+    assert "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True" in eval50
+    assert "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True" in ablation
+    assert "cached_task35_language" in encode
+    assert "Encode one frame at a time" in encode
 
 
 def test_selector_rejects_1k_2k_even_with_eval50() -> None:
