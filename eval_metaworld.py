@@ -2285,6 +2285,14 @@ def main() -> None:
             "raw-frame identity recorded": bool(
                 policy_contract.get("task35_raw_frames_sha256")
             ),
+            "DINO feature identities recorded": set(
+                (policy_contract.get("task35_dino_feature_sha256") or {}).keys()
+            )
+            == {"block11.npy", "block23.npy"},
+            "fused VA attention": getattr(
+                config, "va_attention_backend", "manual"
+            )
+            == "auto",
             "H6": ACTION_HORIZON == 6,
             "DINO metric": getattr(config, "dino_dense_metric", False),
             "grid16": getattr(config, "main_vision_grid", None) == 16,
@@ -2712,7 +2720,10 @@ def main() -> None:
     for local_task_index, (global_task_index, task_text) in enumerate(selected_tasks):
         env_name = descriptions_to_env.get(task_text)
         if env_name is None:
-            print(f"task {task_text[:40]}: SKIP (no env_name mapping)")
+            message = f"task {task_text[:40]} has no env_name mapping"
+            if args.task35_precision_contract:
+                raise ValueError(message)
+            print(f"{message}: SKIP")
             continue
         # 采集同款环境：MT1(env_name, seed=42)，corner2 相机位置修正，
         # 物体随机化不冻结（每次 reset 随机 init，与训练数据分布一致）
@@ -3519,6 +3530,17 @@ def main() -> None:
         print(f"task {task_text[:40]}: {wins}/{args.trials_per_task}")
         env.close()
 
+    if args.task35_precision_contract:
+        expected_task_text = selected_tasks[0][1]
+        if len(selected_tasks) != 1 or set(per_task) != {expected_task_text[:40]}:
+            raise RuntimeError(
+                "task35 precision evaluation did not complete exactly one selected task"
+            )
+        completed_trials = len(per_task) * args.trials_per_task
+        if completed_trials != 50:
+            raise RuntimeError(
+                f"task35 precision evaluation completed {completed_trials} trials, expected 50"
+            )
     total = sum(per_task.values())
     trials = len(per_task) * args.trials_per_task
     print(f"\nCLOSED-LOOP SUCCESS: {total}/{trials} = {total / trials:.1%}")

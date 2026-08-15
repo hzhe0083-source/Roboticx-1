@@ -156,6 +156,72 @@ class VACompoundTests(unittest.TestCase):
         torch.testing.assert_close(visual_a, visual_b)
         self.assertFalse(torch.allclose(action_a, action_b))
 
+    def test_fused_sdpa_matches_manual_flat_attention_forward_and_backward(self) -> None:
+        manual = VACouplingLayer(
+            hidden_dim=32,
+            language_dim=24,
+            num_heads=4,
+            dropout=0.0,
+            mode="bidir_va",
+            attention_backend="manual",
+        ).eval()
+        fused = VACouplingLayer(
+            hidden_dim=32,
+            language_dim=24,
+            num_heads=4,
+            dropout=0.0,
+            mode="bidir_va",
+            attention_backend="auto",
+        ).eval()
+        fused.load_state_dict(manual.state_dict())
+        visual_a = torch.randn(2, 17, 32, requires_grad=True)
+        action_a = torch.randn(2, 5, 32, requires_grad=True)
+        hidden = torch.randn(2, 7, 24)
+        mask = torch.tensor(
+            [[1, 1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 1, 1, 1]],
+            dtype=torch.bool,
+        )
+        visual_b = visual_a.detach().clone().requires_grad_(True)
+        action_b = action_a.detach().clone().requires_grad_(True)
+        out_manual = manual(
+            visual_a, action_a, manual.project_language(hidden), mask
+        )
+        out_fused = fused(
+            visual_b, action_b, fused.project_language(hidden), mask
+        )
+        for expected, actual in zip(out_manual[:2], out_fused[:2], strict=True):
+            torch.testing.assert_close(expected, actual, rtol=2e-5, atol=2e-6)
+        sum(t.square().mean() for t in out_manual[:2]).backward()
+        sum(t.square().mean() for t in out_fused[:2]).backward()
+        torch.testing.assert_close(visual_a.grad, visual_b.grad, rtol=3e-5, atol=3e-6)
+        torch.testing.assert_close(action_a.grad, action_b.grad, rtol=3e-5, atol=3e-6)
+        for (name_a, param_a), (name_b, param_b) in zip(
+            manual.named_parameters(), fused.named_parameters(), strict=True
+        ):
+            self.assertEqual(name_a, name_b)
+            if param_a.grad is not None or param_b.grad is not None:
+                torch.testing.assert_close(
+                    param_a.grad, param_b.grad, rtol=5e-5, atol=5e-6
+                )
+        self.assertIsNone(fused.last_max_logit)
+
+    def test_fused_sdpa_falls_back_when_attention_capture_is_enabled(self) -> None:
+        layer = VACouplingLayer(
+            hidden_dim=32,
+            language_dim=24,
+            num_heads=4,
+            dropout=0.0,
+            mode="bidir_va",
+            attention_backend="auto",
+        ).eval()
+        layer.save_attention = True
+        visual = torch.randn(2, 6, 32)
+        action = torch.randn(2, 5, 32)
+        mask = torch.ones(2, 4, dtype=torch.bool)
+        layer(visual, action, layer.project_language(torch.randn(2, 4, 24)), mask)
+        self.assertIsNotNone(layer._last_attention)
+        self.assertIsInstance(layer.last_max_logit, float)
+
     def test_bidir_va_allows_language_to_update_visual_tokens(self) -> None:
         layer = VACouplingLayer(
             hidden_dim=32,

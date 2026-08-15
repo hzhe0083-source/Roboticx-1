@@ -5,7 +5,7 @@ cd "$(dirname "$0")/.."
 
 ARM=${1:?usage: $0 direct|fm [steps] [batch] [run_tag]}
 STEPS=${2:-15000}
-BATCH=${3:-1}
+BATCH=${3:-6}
 RUN_TAG=${4:-${STEPS}}
 case "$ARM" in
   direct) DECODER=(--direct-head);;
@@ -40,7 +40,8 @@ COMMON=(
   --batch-size "$BATCH" --sequence-length 4 --min-sequence-length 4
   --num-workers 0
   --lr 0.0001 --seed 0 --device cuda
-  --va-layers 8 --flow-cond adaln --flow-layers 6 --flow-steps 8
+  --va-layers 8 --va-attention-backend auto
+  --flow-cond adaln --flow-layers 6 --flow-steps 8
   --flow-prefix-steps 6 --flow-prefix-weight 1.0 --flow-tail-weight 1.0
   --mtvj-train-metric-head --lr-mtvj-metric-head 0.0003
   --mtvj-train-relation --lr-mtvj-relation 0.00002

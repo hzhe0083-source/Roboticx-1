@@ -64,6 +64,12 @@ class VACompoundConfig:
     # log N_s，使比较的是"平均证据"而非"token 数量 × 平均证据"——同一来源被复制/细分
     # 不再获得额外票数。flat = 原始共享 softmax（向后兼容）。
     attention_variant: str = "flat"  # "flat" | "smc"
+    # Memory-efficient fused SDPA for the shared VA attention.  ``auto`` uses
+    # SDPA only on the mathematically compatible flat/non-dual/no-debug path;
+    # ``manual`` preserves the legacy explicit FP32 score tensor.  The option
+    # is serialized because it changes floating-point reduction order even
+    # though the attention equation is unchanged.
+    va_attention_backend: str = "manual"  # "manual" | "auto"
     # Qwen-conditioned action queries（2026-08-06 GPT 方案 A）：语言摘要经 MLP 生成
     # 每 horizon 步的 action-query 偏移（zero-init，初始等价于静态 query）。Qwen 从
     # "被动被读的 K/V"升级为"决定动作查询找什么"的慢脑；VA 每步用视觉/状态修正。
@@ -197,6 +203,10 @@ class VACompoundConfig:
             raise ValueError(f"unsupported attention mode: {self.mode}")
         if self.attention_variant not in ("flat", "smc"):
             raise ValueError(f"unsupported attention variant: {self.attention_variant}")
+        if self.va_attention_backend not in ("manual", "auto"):
+            raise ValueError(
+                f"unsupported VA attention backend: {self.va_attention_backend}"
+            )
         if self.sequential_coupling < 0:
             raise ValueError("sequential_coupling must be >= 0")
         if self.flow_cond not in ("entry", "adaln"):
@@ -879,6 +889,7 @@ class VACouplingLayer(nn.Module):
         *,
         qk_norm: bool = False,
         attention_variant: str = "flat",
+        attention_backend: str = "manual",
         sequential: bool = False,
         dual_attention: bool = False,
         dense_readout_mtvj: bool = False,
@@ -894,6 +905,9 @@ class VACouplingLayer(nn.Module):
         self.dropout = dropout
         self.qk_norm = qk_norm
         self.attention_variant = attention_variant
+        if attention_backend not in ("manual", "auto"):
+            raise ValueError(f"unsupported VA attention backend: {attention_backend}")
+        self.attention_backend = attention_backend
         # 双注意力（第二轮架构重构 2026-08-08）：仅非 sequential 层（policy
         # 构造时 sequential 层传 False）。动作 query 的 physical 更新不含语言列，
         # 语言列走独立 semantic 注意力；融合门 g_A = σ(G([A_mean, lang_mean]))。
@@ -1148,63 +1162,98 @@ class VACouplingLayer(nn.Module):
         if self.qk_norm:
             query = F.rms_norm(query, (query.shape[-1],))
             key = F.rms_norm(key, (key.shape[-1],))
-        scores = torch.matmul(query.float(), key.float().transpose(-1, -2)) * self.scale
-        if self.attention_variant == "smc":
-            # SMC-Attn：源测度校正（2026-08-05 原创）。
-            # softmax 前对每个来源减去 log N_s → 来源总质量 ∝ 平均证据而非
-            # token 数量 × 平均证据；复制/细分同一来源不再稀释其他来源。
-            # 只作用于动作 query 行（视觉 query 保持 uni_a 语义），L 计数按
-            # 实际有效 mask 计算（padding 不计入）。
-            n_lang = key.shape[2] - (n_visual + n_memory + n_action + n_task + n_state)
-            log_n_v = math.log(max(1, n_visual))
-            log_n_m = math.log(max(1, n_memory))
-            log_n_a = math.log(max(1, n_action))
-            log_n_t = math.log(max(1, n_task))
-            log_n_s = math.log(max(1, n_state))
-            log_n_l = torch.log(
-                language_mask.to(scores.dtype).sum(-1).clamp(min=1.0)
-            )  # [B]
-            log_measure = torch.zeros(
-                (scores.shape[0], key.shape[2]),
-                device=scores.device,
-                dtype=scores.dtype,
-            )
-            off = 0
-            for n_group, log_n_group in (
-                (n_visual, log_n_v),
-                (n_memory, log_n_m),
-                (n_action, log_n_a),
-                (n_task, log_n_t),
-                (n_state, log_n_s),
-            ):
-                log_measure[:, off : off + n_group] = log_n_group
-                off += n_group
-            log_measure[:, off:] = log_n_l[:, None]
-            scores[:, :, n_visual:, :] -= log_measure[:, None, None, :]
-        scores = scores.masked_fill(~allowed, torch.finfo(scores.dtype).min)
-        self.last_max_logit = float(
-            scores.detach().masked_fill(~allowed, float("-inf")).amax()
+        # The task35 grid16 path has thousands of shared-attention queries per
+        # sample.  Materializing FP32 [B,H,Q,K] logits/weights dominates memory
+        # (hundreds of MiB per layer).  Fused SDPA evaluates the same flat
+        # masked attention without retaining that quadratic tensor.  SMC,
+        # dual-attention and attention capture need explicit logits and stay on
+        # the legacy path.  ``dropout_p`` must be zero in eval because SDPA
+        # applies dropout solely from its argument, independent of module mode.
+        use_sdpa = (
+            self.attention_backend == "auto"
+            and self.attention_variant == "flat"
+            and not self.dual_attention
+            and not self.save_attention
         )
-        if self.dual_attention:
-            weights, sem_update = self._dual_attention(
-                scores,
+        weights: Tensor | None
+        if use_sdpa:
+            update_heads = F.scaled_dot_product_attention(
                 query,
                 key,
                 value,
-                action,
-                language_mask,
-                n_visual,
-                n_memory,
-                n_action,
-                n_language,
-                n_task,
-                n_state,
+                attn_mask=allowed,
+                dropout_p=self.dropout if self.training else 0.0,
+                scale=self.scale,
             )
-        else:
-            weights = torch.softmax(scores, dim=-1).to(dtype=value.dtype)
+            # No production consumer reads this debug-only scalar.  Avoid a
+            # second quadratic QK matmul merely to populate it.
+            self.last_max_logit = None
+            weights = None
             sem_update = None
-        weights = F.dropout(weights, p=self.dropout, training=self.training)
-        update = self._from_heads(torch.matmul(weights, value))
+        else:
+            scores = (
+                torch.matmul(query.float(), key.float().transpose(-1, -2))
+                * self.scale
+            )
+            if self.attention_variant == "smc":
+                # SMC-Attn：源测度校正（2026-08-05 原创）。
+                # softmax 前对每个来源减去 log N_s → 来源总质量 ∝ 平均证据而非
+                # token 数量 × 平均证据；复制/细分同一来源不再稀释其他来源。
+                # 只作用于动作 query 行（视觉 query 保持 uni_a 语义），L 计数按
+                # 实际有效 mask 计算（padding 不计入）。
+                n_lang = key.shape[2] - (
+                    n_visual + n_memory + n_action + n_task + n_state
+                )
+                log_n_v = math.log(max(1, n_visual))
+                log_n_m = math.log(max(1, n_memory))
+                log_n_a = math.log(max(1, n_action))
+                log_n_t = math.log(max(1, n_task))
+                log_n_s = math.log(max(1, n_state))
+                log_n_l = torch.log(
+                    language_mask.to(scores.dtype).sum(-1).clamp(min=1.0)
+                )  # [B]
+                log_measure = torch.zeros(
+                    (scores.shape[0], key.shape[2]),
+                    device=scores.device,
+                    dtype=scores.dtype,
+                )
+                off = 0
+                for n_group, log_n_group in (
+                    (n_visual, log_n_v),
+                    (n_memory, log_n_m),
+                    (n_action, log_n_a),
+                    (n_task, log_n_t),
+                    (n_state, log_n_s),
+                ):
+                    log_measure[:, off : off + n_group] = log_n_group
+                    off += n_group
+                log_measure[:, off:] = log_n_l[:, None]
+                scores[:, :, n_visual:, :] -= log_measure[:, None, None, :]
+            scores = scores.masked_fill(~allowed, torch.finfo(scores.dtype).min)
+            self.last_max_logit = float(
+                scores.detach().masked_fill(~allowed, float("-inf")).amax()
+            )
+            if self.dual_attention:
+                weights, sem_update = self._dual_attention(
+                    scores,
+                    query,
+                    key,
+                    value,
+                    action,
+                    language_mask,
+                    n_visual,
+                    n_memory,
+                    n_action,
+                    n_language,
+                    n_task,
+                    n_state,
+                )
+            else:
+                weights = torch.softmax(scores, dim=-1).to(dtype=value.dtype)
+                sem_update = None
+            weights = F.dropout(weights, p=self.dropout, training=self.training)
+            update_heads = torch.matmul(weights, value)
+        update = self._from_heads(update_heads)
 
         n_query_v, n_query_a, n_query_t = n_visual, n_action, n_task
         if n_query_t:
@@ -1235,6 +1284,8 @@ class VACouplingLayer(nn.Module):
             task = task + self.ffn_t(self.norm_t_ffn(task))
             task_out = task
         if self.save_attention:
+            if weights is None:
+                raise RuntimeError("attention capture unexpectedly used fused SDPA")
             self._last_attention = (
                 weights.detach().clone(),  # [B, heads, n_query, n_key]
                 n_visual,
@@ -1894,6 +1945,7 @@ class VACompoundPolicy(nn.Module):
                 mode=config.mode,
                 qk_norm=config.qk_norm,
                 attention_variant=config.attention_variant,
+                attention_backend=config.va_attention_backend,
                 sequential=(
                     config.sequential_coupling > 0
                     and (index + 1) % config.sequential_coupling == 0

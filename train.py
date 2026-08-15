@@ -2136,6 +2136,20 @@ class DinoFeatureCache:
             self.meta = json.load(fh)
         with (self.path / "index.pkl").open("rb") as fh:
             self.index: dict = pickle.load(fh)
+        expected_features = self.meta.get("feature_sha256")
+        if (
+            self.meta.get("feature_identity_contract") != "sha256_full_npy_v1"
+            or not isinstance(expected_features, dict)
+        ):
+            raise ValueError("DINO feature cache lacks full feature SHA-256 metadata")
+        for name in ("block11.npy", "block23.npy"):
+            expected = expected_features.get(name)
+            actual = _sha256_file(self.path / name)
+            if not expected or actual != expected:
+                raise ValueError(
+                    f"DINO feature cache {name} SHA-256 mismatch: "
+                    f"expected={expected!r}, actual={actual}"
+                )
         self.block23 = np.load(
             self.path / "block23.npy", mmap_mode="r"
         )  # [N, 256, 1024] fp16
@@ -3990,6 +4004,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "source-measure correction (log N_s subtracted per source before softmax)",
     )
     parser.add_argument(
+        "--va-attention-backend",
+        choices=("manual", "auto"),
+        default="manual",
+        help="VA shared attention implementation: manual materializes FP32 QK scores; "
+        "auto uses fused SDPA on the compatible flat/non-dual path and falls back "
+        "otherwise.",
+    )
+    parser.add_argument(
         "--action-query-cond",
         action="store_true",
         help="Qwen-conditioned action queries (2026-08-06 GPT 方案 A): language "
@@ -4812,6 +4834,7 @@ def validate_args(args: argparse.Namespace) -> None:
             "--mtvj-train-relation": getattr(args, "mtvj_train_relation", False),
             "--mtvj-visual-aux-every > 0": args.mtvj_visual_aux_every > 0,
             "--mtvj-visual-aux-batch > 0": args.mtvj_visual_aux_batch > 0,
+            "--va-attention-backend auto": args.va_attention_backend == "auto",
             "--task-sampling weighted": args.task_sampling == "weighted",
             "--num-workers 0": args.num_workers == 0,
             "from scratch": args.resume is None
@@ -5799,6 +5822,9 @@ def save_checkpoint(
                 "task35_raw_frames_sha256": getattr(
                     args, "task35_raw_frames_sha256", None
                 ),
+                "task35_dino_feature_sha256": getattr(
+                    args, "task35_dino_feature_sha256", None
+                ),
                 "wam_enabled": bool(getattr(args, "wam_joint", False)),
                 "main_vision_checkpoint_sha256": getattr(
                     args, "main_vision_checkpoint_sha256", None
@@ -6068,6 +6094,7 @@ def main() -> None:
             num_layers=args.va_layers,
             qk_norm=args.qk_norm,
             attention_variant=args.attention_variant,
+            va_attention_backend=args.va_attention_backend,
             action_query_cond=args.action_query_cond,
             memory_split=args.memory_split,
             evidence_tokens=args.evidence_tokens,
@@ -6316,6 +6343,7 @@ def main() -> None:
             num_layers=args.va_layers,
             qk_norm=args.qk_norm,
             attention_variant=args.attention_variant,
+            va_attention_backend=args.va_attention_backend,
             action_query_cond=args.action_query_cond,
             memory_split=args.memory_split,
             evidence_tokens=args.evidence_tokens,
@@ -6585,6 +6613,7 @@ def main() -> None:
         config = VACompoundConfig(
             mode=args.mode, num_layers=args.va_layers, qk_norm=args.qk_norm,
             attention_variant=args.attention_variant,
+            va_attention_backend=args.va_attention_backend,
             action_query_cond=args.action_query_cond,
             memory_split=args.memory_split,
             evidence_tokens=args.evidence_tokens,
@@ -6650,6 +6679,10 @@ def main() -> None:
             # 特征缓存模式：训练循环从 memmap 读预计算特征（塔仅用于校验/
             # 不在循环内前向）。位级一致由 build_dino_feature_cache.py 验证。
             dino_cache = DinoFeatureCache(args.dino_feature_cache)
+            if getattr(args, "task35_precision_contract", False):
+                args.task35_dino_feature_sha256 = dict(
+                    dino_cache.meta["feature_sha256"]
+                )
             if (
                 dino_cache.meta.get("model_id") != config.main_vision_model_id
                 or int(dino_cache.meta.get("image_size", 0))

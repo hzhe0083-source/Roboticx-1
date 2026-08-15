@@ -170,6 +170,13 @@ def main() -> None:
     with args.data.expanduser().open("rb") as fh:
         for block in iter(lambda: fh.read(1 << 20), b""):
             digest.update(block)
+    feature_sha256 = {}
+    for name in ("block11.npy", "block23.npy"):
+        feature_digest = hashlib.sha256()
+        with (args.out / name).open("rb") as fh:
+            for block in iter(lambda: fh.read(16 << 20), b""):
+                feature_digest.update(block)
+        feature_sha256[name] = feature_digest.hexdigest()
     raw_sha256 = None
     if raw_frames is not None:
         raw_digest = hashlib.sha256()
@@ -180,6 +187,8 @@ def main() -> None:
     meta = {
         "frames": n_frames,
         "dataset_sha256": digest.hexdigest(),
+        "feature_sha256": feature_sha256,
+        "feature_identity_contract": "sha256_full_npy_v1",
         "model_id": "vit_large_patch14_reg4_dinov2.lvd142m",
         "image_size": 224,
         "chunk": args.chunk,

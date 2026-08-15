@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
 
 import numpy as np
 import pytest
@@ -375,11 +376,17 @@ def test_feature_cache_read_matches_online_encode(tmp_path) -> None:
     index = {("peg-insert-side-v3", 0, i): i for i in range(n_frames)}
     with (tmp_path / "index.pkl").open("wb") as fh:
         pickle.dump(index, fh)
+    feature_sha = {
+        name: hashlib.sha256((tmp_path / name).read_bytes()).hexdigest()
+        for name in ("block11.npy", "block23.npy")
+    }
     with (tmp_path / "meta.json").open("w") as fh:
         json.dump(
             {
                 "frames": n_frames,
                 "dataset_sha256": "x" * 64,
+                "feature_sha256": feature_sha,
+                "feature_identity_contract": "sha256_full_npy_v1",
                 "model_id": "vit_large_patch14_reg4_dinov2.lvd142m",
                 "image_size": 224,
                 "chunk": 32,
@@ -403,6 +410,38 @@ def test_feature_cache_read_matches_online_encode(tmp_path) -> None:
     assert torch.equal(tokens_c, tokens_o)
     for layer in (5, 11):
         assert torch.equal(dense_c[layer], dense_o[layer])
+
+
+def test_feature_cache_rejects_content_corruption(tmp_path) -> None:
+    import json
+    import pickle
+
+    from train import DinoFeatureCache
+
+    n_frames = 2
+    for name in ("block11.npy", "block23.npy"):
+        np.save(tmp_path / name, np.zeros((n_frames, 256, 8), dtype=np.float16))
+    with (tmp_path / "index.pkl").open("wb") as fh:
+        pickle.dump({("task", 0, index): index for index in range(n_frames)}, fh)
+    feature_sha = {
+        name: hashlib.sha256((tmp_path / name).read_bytes()).hexdigest()
+        for name in ("block11.npy", "block23.npy")
+    }
+    (tmp_path / "meta.json").write_text(
+        json.dumps(
+            {
+                "feature_sha256": feature_sha,
+                "feature_identity_contract": "sha256_full_npy_v1",
+            }
+        )
+    )
+    with (tmp_path / "block11.npy").open("r+b") as stream:
+        stream.seek(-1, 2)
+        old = stream.read(1)
+        stream.seek(-1, 2)
+        stream.write(bytes([old[0] ^ 1]))
+    with pytest.raises(ValueError, match="block11.npy SHA-256 mismatch"):
+        DinoFeatureCache(tmp_path)
 
 
 def test_feature_cache_rows_contract(tmp_path) -> None:
@@ -474,9 +513,15 @@ def test_grid16_cache_online_eval_equivalence(tmp_path) -> None:
     index = {("peg-insert-side-v3", 0, i): i for i in range(n_frames)}
     with (tmp_path / "index.pkl").open("wb") as fh:
         pickle.dump(index, fh)
+    feature_sha = {
+        name: hashlib.sha256((tmp_path / name).read_bytes()).hexdigest()
+        for name in ("block11.npy", "block23.npy")
+    }
     with (tmp_path / "meta.json").open("w") as fh:
         json.dump({"frames": n_frames, "model_id": "m", "image_size": 224,
-                   "chunk": 32, "grid": 8, "window": 4}, fh)
+                   "chunk": 32, "grid": 8, "window": 4,
+                   "feature_sha256": feature_sha,
+                   "feature_identity_contract": "sha256_full_npy_v1"}, fh)
     cache = DinoFeatureCache(tmp_path)
     rows = torch.tensor([[[0, 1, 2, 3]]], dtype=torch.int64)
     tok_c, dense_c = _dino_main_encode_from_cache(
@@ -707,6 +752,8 @@ def test_task35_precision_contract_requires_complete_stack(tmp_path) -> None:
         "10",
         "--mtvj-visual-aux-batch",
         "8",
+        "--va-attention-backend",
+        "auto",
     ]
     args = parse_args(common)
     validate_args(args)
