@@ -6248,6 +6248,18 @@ def main() -> None:
                 raise ValueError(
                     "task35 DINO dense metric requires exact H6 action chunks"
                 )
+            action_mask = dataset.payload.get("action_valid_mask")
+            expected_mask_shape = dataset.payload["actions"].shape[:-1]
+            if (
+                not isinstance(action_mask, torch.Tensor)
+                or action_mask.dtype != torch.bool
+                or action_mask.shape != expected_mask_shape
+                or not bool(action_mask.any())
+            ):
+                raise ValueError(
+                    "task35 precision payload requires nonempty boolean "
+                    f"action_valid_mask with shape {tuple(expected_mask_shape)}"
+                )
             metadata = dataset.payload.get("metadata") or {}
             if (
                 metadata.get("contract")

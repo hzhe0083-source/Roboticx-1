@@ -898,6 +898,14 @@ def parse_args() -> argparse.Namespace:
         "必须显式给出。",
     )
     parser.add_argument(
+        "--dino-feature-cache",
+        type=Path,
+        default=None,
+        help="task35 precision provenance check only: cache directory whose "
+        "block11/block23 SHA-256 identities must match the policy checkpoint; "
+        "closed-loop frames remain encoded online.",
+    )
+    parser.add_argument(
         "--wam",
         choices=("auto", "on", "off"),
         default="auto",
@@ -2275,6 +2283,14 @@ def main() -> None:
     if args.task35_precision_contract:
         expected_data_sha = policy_contract.get("task35_data_sha256")
         actual_data_sha = _sha256_file(args.features.expanduser().absolute())
+        expected_feature_sha = policy_contract.get("task35_dino_feature_sha256") or {}
+        actual_feature_sha = {}
+        if args.dino_feature_cache is not None:
+            cache_root = args.dino_feature_cache.expanduser().absolute()
+            actual_feature_sha = {
+                name: _sha256_file(cache_root / name)
+                for name in ("block11.npy", "block23.npy")
+            }
         requirements = {
             "checkpoint precision contract": policy_contract.get(
                 "task35_precision_contract"
@@ -2285,10 +2301,12 @@ def main() -> None:
             "raw-frame identity recorded": bool(
                 policy_contract.get("task35_raw_frames_sha256")
             ),
-            "DINO feature identities recorded": set(
-                (policy_contract.get("task35_dino_feature_sha256") or {}).keys()
-            )
-            == {"block11.npy", "block23.npy"},
+            "DINO feature cache provided": args.dino_feature_cache is not None,
+            "DINO feature identities match": set(expected_feature_sha)
+            == {"block11.npy", "block23.npy"}
+            and actual_feature_sha == expected_feature_sha,
+            "FM decoder": policy_contract.get("action_decoder")
+            == "conditional_flow_matching",
             "fused VA attention": getattr(
                 config, "va_attention_backend", "manual"
             )
@@ -2717,6 +2735,7 @@ def main() -> None:
     descriptions_to_env = {v: k for k, v in mw_config["TASK_DESCRIPTIONS"].items()}
 
     per_task = {}
+    completed_trials = 0
     for local_task_index, (global_task_index, task_text) in enumerate(selected_tasks):
         env_name = descriptions_to_env.get(task_text)
         if env_name is None:
@@ -3511,6 +3530,7 @@ def main() -> None:
                 if terminated or truncated:
                     break
             wins += int(success)
+            completed_trials += 1
             print(
                 f"trial task={global_task_index} trial={trial} seed={episode_seed} "
                 f"success={int(success)}"
@@ -3536,13 +3556,12 @@ def main() -> None:
             raise RuntimeError(
                 "task35 precision evaluation did not complete exactly one selected task"
             )
-        completed_trials = len(per_task) * args.trials_per_task
         if completed_trials != 50:
             raise RuntimeError(
                 f"task35 precision evaluation completed {completed_trials} trials, expected 50"
             )
     total = sum(per_task.values())
-    trials = len(per_task) * args.trials_per_task
+    trials = completed_trials
     print(f"\nCLOSED-LOOP SUCCESS: {total}/{trials} = {total / trials:.1%}")
     if per_task:
         scores = np.asarray([w / args.trials_per_task for w in per_task.values()])
