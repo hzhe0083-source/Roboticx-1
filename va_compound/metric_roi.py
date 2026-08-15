@@ -713,3 +713,77 @@ def refine_metric_roi_positions(
         alpha=alpha,
         max_delta_px=float(config["max_delta_px"]),
     )
+
+
+def refine_metric_roi_positions_dino(
+    coarse_p: Tensor,
+    coarse_visibility: Tensor,
+    raw_video: Tensor,
+    backbone: nn.Module,
+    roi_head: nn.Module,
+    language_hidden: Tensor,
+    language_mask: Tensor,
+    coords: Tensor,
+    *,
+    alpha: float,
+) -> tuple[Tensor, Tensor]:
+    """DINO 版 ROI 精修（2026-08-16）：与 refine_metric_roi_positions 同协议，
+    编码器为冻结 DINO（TimmActionVisionBackbone，224px，输入需预归一化——
+    调用方负责 (x-mean)/std 与 .half()；这里只做裁剪与合并）。
+
+    coarse_p/coarse_visibility：粗 metric 头输出（[B,4,2] 0-1 / [B,4]）；
+    raw_video：[B, 2, 3, 480, 480] 0-1 双时间片原图；roi_head 消费裁剪后的
+    block11/block23 证据 [B,512,1024] 与 dense_coords(512)。
+    """
+    if alpha == 0.0:
+        return coarse_p, coarse_visibility
+    config = getattr(roi_head, "_mtvj_roi_config", None)
+    image_size = (
+        int(config["canonical_image_size"]) if isinstance(config, dict) else 224
+    )
+    min_size = float(config["min_roi_size"]) if isinstance(config, dict) else ROI_MIN_SIZE
+    max_size = float(config["max_roi_size"]) if isinstance(config, dict) else ROI_MAX_SIZE
+    distance_scale = (
+        float(config["distance_scale"]) if isinstance(config, dict) else 2.0
+    )
+    max_delta_px = float(config["max_delta_px"]) if isinstance(config, dict) else 32.0
+    if raw_video.shape[0] != coarse_p.shape[0]:
+        raise ValueError("raw ROI video and coarse metric batch sizes differ")
+    selection = plan_metric_roi(
+        coarse_p.detach().clamp(0.0, 1.0),
+        coarse_visibility.detach().clamp(0.0, 1.0),
+        image_size,
+        min_size=min_size,
+        max_size=max_size,
+        distance_scale=distance_scale,
+    )
+    cropped = crop_metric_roi_video(
+        raw_video, selection.roi, canonical_image_size=image_size
+    )
+    mean = cropped.new_tensor((0.485, 0.456, 0.406)).view(1, 1, 3, 1, 1)
+    std = cropped.new_tensor((0.229, 0.224, 0.225)).view(1, 1, 3, 1, 1)
+    inputs = (cropped - mean) / std
+    with torch.no_grad():
+        hierarchical = backbone.forward_hierarchical_dense(
+            inputs.reshape(-1, 3, image_size, image_size).half()
+        )
+        head_dtype = next(roi_head.parameters()).dtype
+        b = coarse_p.shape[0]
+        roi_out = roi_head(
+            hierarchical[5].reshape(b, -1, hierarchical[5].shape[-1]).to(dtype=head_dtype),
+            hierarchical[11].reshape(b, -1, hierarchical[11].shape[-1]).to(dtype=head_dtype),
+            language_hidden.to(device=coarse_p.device, dtype=head_dtype),
+            language_mask.to(device=coarse_p.device),
+            coords.to(device=coarse_p.device, dtype=head_dtype),
+        )
+        batch_index = torch.arange(b, device=coarse_p.device)[:, None]
+        refined_pair = roi_out.p[batch_index, selection.pair_roles]
+    return merge_roi_refinement(
+        coarse_p,
+        coarse_visibility,
+        refined_pair,
+        selection,
+        image_size,
+        alpha=alpha,
+        max_delta_px=max_delta_px,
+    )
