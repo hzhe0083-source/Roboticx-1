@@ -36,13 +36,18 @@ for ckpt in "${TO_EVAL[@]+"${TO_EVAL[@]}"}"; do
   TASK35_SKIP_CAUSAL=1 scripts/run_task35_h6_posttrain_eval.sh "${FORCE[@]}" "$ckpt" "$name"
 done
 
+# Replan after the evals so election uses completed JSONs, not the pre-eval plan.
+"$PY" -B scripts/list_task35_fm_candidates.py >/dev/null
+"$PY" -B scripts/plan_task35_eval_suite.py --require-all --require-eval50 \
+  --output logs/task35_eval_suite_plan.json
+
 mapfile -t EVAL50 < <(
   "$PY" -B - <<'PY'
 import json
 from pathlib import Path
 plan = json.loads(Path("logs/task35_eval_suite_plan.json").read_text())
-for path in plan["eval50_paths"]:
-    print(path)
+for row in plan["already_done"]:
+    print(row["eval50"])
 PY
 )
 if (( ${#EVAL50[@]} == 0 )); then

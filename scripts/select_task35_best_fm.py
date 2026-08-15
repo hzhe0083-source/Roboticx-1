@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -16,6 +17,18 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from eval_metaworld import validate_task35_eval50_payload
+from scripts.plan_task35_eval_suite import REQUIRED_MILESTONES, SKIP_CLOSED_LOOP_STEPS
+
+STEP_RE = re.compile(r"_step(\d+)\.pt$")
+
+
+def infer_task35_step(path: str | None, explicit: int | None = None) -> int | None:
+    if explicit is not None:
+        return int(explicit)
+    if not path:
+        return None
+    match = STEP_RE.search(Path(path).name)
+    return None if match is None else int(match.group(1))
 
 
 def load_eval50(path: Path) -> dict:
@@ -51,7 +64,19 @@ def select_best_task35_fm(candidates: list[dict]) -> dict:
         if item.get("validated") is False:
             rejected.append({"path": item.get("path"), "reason": "checkpoint not validated"})
             continue
-        eligible.append(item)
+        step = infer_task35_step(item.get("path"), item.get("step"))
+        if step is None:
+            rejected.append({"path": item.get("path"), "reason": "unknown step"})
+            continue
+        if step in SKIP_CLOSED_LOOP_STEPS:
+            rejected.append(
+                {"path": item.get("path"), "reason": "early milestone kept for mechanism only"}
+            )
+            continue
+        if step not in REQUIRED_MILESTONES:
+            rejected.append({"path": item.get("path"), "reason": f"step {step} is not an acceptance milestone"})
+            continue
+        eligible.append({**item, "step": step})
     if not eligible:
         raise ValueError(
             "no reproducible FM VA: every candidate lacks a valid 50-seed eval50. "
@@ -114,9 +139,11 @@ def main() -> None:
     candidates = []
     for path in args.eval50:
         payload = load_eval50(path)
+        checkpoint = payload.get("checkpoint")
         candidates.append(
             {
-                "path": payload.get("checkpoint"),
+                "path": checkpoint,
+                "step": infer_task35_step(checkpoint),
                 "sha256": payload.get("checkpoint_sha256"),
                 "eval50": payload,
                 "validated": True,

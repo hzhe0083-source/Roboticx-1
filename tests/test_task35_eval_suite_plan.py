@@ -48,6 +48,23 @@ def test_plan_require_all_accepts_complete_validated_set(tmp_path: Path) -> None
         15000,
     ]
     assert [row["step"] for row in plan["skipped"]] == [1000, 2000]
+    assert plan["eval50_paths"] == []
+    assert len(plan["planned_eval50_paths"]) == 5
+
+
+def test_plan_require_eval50_refuses_missing_jsons(tmp_path: Path) -> None:
+    candidates = [
+        {
+            "path": f"checkpoints/a_step{step}.pt",
+            "step": step,
+            "validated": True,
+        }
+        for step in (1000, 2000, 3000, 6000, 9000, 12000, 15000)
+    ]
+    with pytest.raises(ValueError, match="missing valid 50-seed eval50"):
+        plan_task35_eval_suite(
+            candidates, logs_dir=tmp_path, require_all=True, require_eval50=True
+        )
 
 
 def test_plan_skips_early_milestones_for_closed_loop(tmp_path: Path) -> None:

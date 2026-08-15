@@ -65,6 +65,10 @@ def test_eval50_rejects_wrong_seeds_and_missing_trials() -> None:
     bad["completed_trials"] = 49
     with pytest.raises(ValueError, match="50 completed trials"):
         validate_task35_eval50_payload(bad)
+    short = _payload()
+    short["horizon"] = 400
+    with pytest.raises(ValueError, match="horizon 500"):
+        validate_task35_eval50_payload(short)
 
 
 def test_selector_refuses_to_elect_without_eval50() -> None:
@@ -90,4 +94,25 @@ def test_selector_ranks_by_closed_loop_successes() -> None:
     )
     assert report["selected"]["path"] == "b.pt"
     assert report["selected"]["successes"] == 15
+    assert report["selected"]["step"] == 15000
     assert report["label"] == "supported"
+
+
+def test_selector_rejects_1k_2k_even_with_eval50() -> None:
+    with pytest.raises(ValueError, match="no reproducible FM VA"):
+        select_best_task35_fm(
+            [
+                {
+                    "path": "checkpoints/x_step1000.pt",
+                    "step": 1000,
+                    "validated": True,
+                    "eval50": _payload(successes=40),
+                },
+                {
+                    "path": "checkpoints/x_step2000.pt",
+                    "step": 2000,
+                    "validated": True,
+                    "eval50": _payload(successes=39),
+                },
+            ]
+        )

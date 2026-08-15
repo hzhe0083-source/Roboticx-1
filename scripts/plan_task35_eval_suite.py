@@ -44,6 +44,7 @@ def plan_task35_eval_suite(
     *,
     logs_dir: Path,
     require_all: bool = False,
+    require_eval50: bool = False,
     required_steps: tuple[int, ...] = REQUIRED_MILESTONES,
 ) -> dict:
     to_eval: list[dict] = []
@@ -95,14 +96,27 @@ def plan_task35_eval_suite(
                 "missing validated milestones: "
                 + ",".join(str(step) for step in missing)
             )
+    if require_eval50:
+        missing_eval50 = [
+            step
+            for step in required_steps
+            if step not in {int(row["step"]) for row in already_done if row.get("step") is not None}
+        ]
+        if missing_eval50:
+            raise ValueError(
+                "missing valid 50-seed eval50 for: "
+                + ",".join(str(step) for step in missing_eval50)
+            )
     return {
         "contract": "task35_eval_suite_plan_v1",
         "require_all": require_all,
+        "require_eval50": require_eval50,
         "required_steps": list(required_steps),
         "to_eval": to_eval,
         "already_done": already_done,
         "skipped": skipped,
-        "eval50_paths": [row["eval50"] for row in already_done + to_eval],
+        "eval50_paths": [row["eval50"] for row in already_done],
+        "planned_eval50_paths": [row["eval50"] for row in already_done + to_eval],
     }
 
 
@@ -115,6 +129,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--logs-dir", type=Path, default=ROOT / "logs")
     parser.add_argument("--require-all", action="store_true")
+    parser.add_argument(
+        "--require-eval50",
+        action="store_true",
+        help="Fail unless every acceptance milestone already has a valid 50-seed JSON.",
+    )
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
@@ -126,6 +145,7 @@ def main() -> None:
         payload.get("candidates") or [],
         logs_dir=args.logs_dir,
         require_all=args.require_all,
+        require_eval50=args.require_eval50,
     )
     text = json.dumps(plan, indent=2) + "\n"
     print(text, end="")
