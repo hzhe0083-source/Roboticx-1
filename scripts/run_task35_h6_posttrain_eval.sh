@@ -23,10 +23,10 @@ fi
 CUDA_VISIBLE_DEVICES= "$PY" -B scripts/preflight_task35_posttrain.py \
   --checkpoint "$CKPT" --output "logs/${NAME}_preflight.json"
 
-"$PY" -B scripts/validate_task35_fm_checkpoint.py "$CKPT" \
+CUDA_VISIBLE_DEVICES= "$PY" -B scripts/validate_task35_fm_checkpoint.py "$CKPT" \
   --output "logs/${NAME}_validate.json"
 
-"$PY" -B scripts/diag_task35_clean_recovery_slices.py \
+CUDA_VISIBLE_DEVICES= "$PY" -B scripts/diag_task35_clean_recovery_slices.py \
   --checkpoint "$CKPT" \
   --features "$FEATURES" \
   --output "logs/${NAME}_clean_recovery_slices.json"

@@ -18,6 +18,8 @@ def test_archiver_follows_log_events_not_stdin() -> None:
     assert "tail -n 0 -F" in text
     assert "read -r -t 30 -u 3" in text
     assert "trainer gone before all milestones were archived" in text
+    assert "CUDA_VISIBLE_DEVICES=" in text
+    assert "flock 8" in text
 
 
 def test_find_processes_requires_all_markers() -> None:

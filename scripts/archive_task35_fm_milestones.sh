@@ -28,9 +28,19 @@ wanted() {
 validate_destination() {
   local destination=$1
   local step=$2
-  local report=logs/$(basename "${destination%.pt}")_validate.json
+  local name
+  name=$(basename "${destination%.pt}")
+  local report=logs/${name}_validate.json
+  local lock=logs/${name}.lock
   [[ -f "$VALIDATE" ]] || return 0
-  "$PY" -B "$VALIDATE" "$destination" --expected-step "$step" --output "$report"
+  mkdir -p logs
+  (
+    flock 8
+    if [[ ! -s "$report" ]]; then
+      CUDA_VISIBLE_DEVICES= "$PY" -B "$VALIDATE" \
+        "$destination" --expected-step "$step" --output "$report"
+    fi
+  ) 8>"$lock"
 }
 
 archive_step() {

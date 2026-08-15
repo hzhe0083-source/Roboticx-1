@@ -3,6 +3,8 @@ from __future__ import annotations
 import pytest
 import torch
 
+from pathlib import Path
+
 from scripts.validate_task35_fm_checkpoint import (
     EXPECTED_DATA_SHA256,
     EXPECTED_DINO_WEIGHT_SHA256,
@@ -100,3 +102,15 @@ def test_task35_fm_contract_rejects_zero_geometry_after_one_thousand_steps() -> 
     payload["model"]["geometry_projection.weight"] = torch.zeros(512, 8)
     with pytest.raises(ValueError, match="still all zeros"):
         validate_task35_fm_checkpoint(payload, load_modules=False)
+
+
+def test_validator_and_slice_diag_default_to_no_cuda() -> None:
+    root = Path(__file__).resolve().parent.parent
+    validate = (root / "scripts" / "validate_task35_fm_checkpoint.py").read_text()
+    slices = (root / "scripts" / "diag_task35_clean_recovery_slices.py").read_text()
+    posttrain = (root / "scripts" / "run_task35_h6_posttrain_eval.sh").read_text()
+    waiter = (root / "scripts" / "wait_validate_task35_fm_milestone.sh").read_text()
+    assert 'os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")' in validate
+    assert 'os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")' in slices
+    assert posttrain.count("CUDA_VISIBLE_DEVICES=") >= 3
+    assert "CUDA_VISIBLE_DEVICES=" in waiter

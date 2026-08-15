@@ -10,9 +10,13 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import sys
 from pathlib import Path
 from typing import Any
+
+# CPU-only even if imported after a CUDA-capable interpreter starts.
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import torch
 

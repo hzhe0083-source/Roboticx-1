@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
+
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import numpy as np
 import torch
