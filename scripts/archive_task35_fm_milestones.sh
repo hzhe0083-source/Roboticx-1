@@ -44,28 +44,58 @@ archive_complete() {
   [[ -s "$destination" && -s "${destination}.sha256" ]]
 }
 
+peek_step() {
+  "$PY" -B scripts/peek_task35_checkpoint_step.py "$1"
+}
+
+hash_existing() {
+  local destination=$1
+  local digest
+  digest=$(sha256sum "$destination" | awk '{print $1}')
+  if [[ -z "$digest" ]]; then
+    echo "failed to hash existing archive $destination" >&2
+    return 1
+  fi
+  printf '%s  %s\n' "$digest" "$destination" > "${destination}.sha256"
+  echo "wrote missing sha256 for $destination" >&2
+}
+
 archive_step() {
   local step=$1
   local stem=${CKPT%.pt}
   local destination="${stem}_step${step}.pt"
   local temporary="${destination}.tmp"
-  local sidecar attempt
+  local sidecar attempt found
   if archive_complete "$destination"; then
     echo "milestone already exists: $destination" >&2
     return 0
   fi
-  if [[ -e "$destination" && ! -s "${destination}.sha256" ]]; then
-    echo "incomplete archive $destination missing sha256; recopying" >&2
-    rm -f "$destination"
+  if [[ -s "$destination" ]]; then
+    # Never replace a same-name file with a later live checkpoint.
+    if found=$(peek_step "$destination") && [[ "$found" == "$step" ]]; then
+      hash_existing "$destination"
+      return 0
+    fi
+    echo "refuse to recopy live over $destination (found_step=${found:-?}; want=$step)" >&2
+    return 1
   fi
   [[ -f "$CKPT" ]] || {
     echo "checkpoint missing after save event: $CKPT" >&2
     return 1
   }
+  if found=$(peek_step "$CKPT") && [[ "$found" != "$step" ]]; then
+    echo "refuse to copy live global_step=$found as step=$step" >&2
+    return 1
+  fi
   for attempt in 1 2; do
     rm -f "$temporary"
     cp --reflink=auto --sparse=always "$CKPT" "$temporary"
     if sidecar=$(verify_copy_sha "$CKPT" "$temporary"); then
+      if found=$(peek_step "$temporary") && [[ "$found" != "$step" ]]; then
+        echo "copied file is global_step=$found, not $step; discarding" >&2
+        rm -f "$temporary"
+        return 1
+      fi
       mv "$temporary" "$destination"
       printf '%s\n' "$sidecar" > "${destination}.sha256"
       echo "archived global_step=$step to $destination" >&2

@@ -25,7 +25,9 @@ def test_archiver_follows_log_events_not_stdin() -> None:
     assert "archive SHA mismatch" in text
     assert "keep listening for later milestones" in text
     assert "archive_complete" in text
-    assert "incomplete archive" in text
+    assert "peek_task35_checkpoint_step.py" in text
+    assert "refuse to recopy live" in text
+    assert "refuse to copy live global_step" in text
     waiter = Path("/home/ryan/Documents/robot/ORA0-task35-fullfix/scripts/wait_validate_task35_fm_milestone.sh").read_text()
     assert "loaded_modules" in waiter
     assert "CUDA_VISIBLE_DEVICES=" in waiter
