@@ -148,6 +148,47 @@ def test_dino_main_pool_preserves_row_major_grid() -> None:
                 assert frame[gy, gx, 2].item() == pytest.approx(2 * gx + 0.5)
 
 
+class ContentSensitiveFakeDino:
+    """Fake tower that records per-image mean so frame order is testable."""
+
+    image_size = 224
+    feature_dim = 1024
+
+    def forward_hierarchical_dense(self, images: torch.Tensor) -> dict[int, torch.Tensor]:
+        n = int(images.shape[0])
+        tokens = torch.zeros(n, 256, self.feature_dim)
+        mean = images.float().mean(dim=(1, 2, 3))
+        tokens[..., 0] = mean.view(n, 1)
+        tokens[..., 3] = images[:, 0, 0, 0].float().view(n, 1)
+        return {5: tokens.clone(), 11: tokens}
+
+
+def test_eval_one_frame_encode_matches_batched_window() -> None:
+    from eval_metaworld import _main_vision_encode_window, preprocess
+
+    backbone = ContentSensitiveFakeDino()
+    frames = [
+        np.full((224, 224, 3), fill, dtype=np.uint8) for fill in (10, 40, 80, 160)
+    ]
+    tokens, dense = _main_vision_encode_window(
+        frames,
+        backbone,
+        torch.device("cpu"),
+        grid=16,
+        window=4,
+        return_dense=True,
+    )
+    batched = backbone.forward_hierarchical_dense(
+        torch.cat([preprocess(frame, 224) for frame in frames], dim=0)
+    )
+    assert torch.allclose(
+        tokens[0].reshape(4, 256, 1024)[..., 0], batched[11][..., 0], atol=1e-6, rtol=1e-6
+    )
+    assert torch.allclose(dense[11][0, :256, 0], batched[11][2, :, 0], atol=1e-6, rtol=1e-6)
+    assert torch.allclose(dense[11][0, 256:, 0], batched[11][3, :, 0], atol=1e-6, rtol=1e-6)
+    assert float(tokens[0, 0, 0]) != float(tokens[0, 256, 0])
+
+
 def test_train_eval_main_encode_equivalence() -> None:
     from train import _dino_main_online_encode
     from eval_metaworld import _main_vision_encode_window
