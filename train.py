@@ -4800,9 +4800,12 @@ def validate_args(args: argparse.Namespace) -> None:
                     "--metric-visual-checkpoint（或 --dino-main-vision "
                     "--dino-dense-metric 从零 metric 栈）"
                 )
-            if args.resume is None and getattr(args, "resume_exact", None) is None:
+            if args.resume is None and getattr(args, "resume_exact", None) is None and not dino_joint:
+                # DINO-metric 例外：metric 栈从零构建是设计本身（_build_dino_
+                # metric_stack），无需 V-JEPA 的 warm-start 语义。
                 raise ValueError(
                     "MT-VJ joint training requires --resume or --resume-exact"
+                    "（--dino-dense-metric 从零 metric 栈除外）"
                 )
             if args.sam_rho > 0.0:
                 raise ValueError(
@@ -6176,7 +6179,6 @@ def main() -> None:
                 dino_cache.meta.get("model_id") != config.main_vision_model_id
                 or int(dino_cache.meta.get("image_size", 0))
                 != config.main_vision_image_size
-                or int(dino_cache.meta.get("grid", 0)) != config.main_vision_grid
                 or int(dino_cache.meta.get("window", 0))
                 != config.main_vision_frames
             ):
@@ -6185,8 +6187,8 @@ def main() -> None:
                     f"{dino_cache.meta} vs "
                     f"model={config.main_vision_model_id}, "
                     f"size={config.main_vision_image_size}, "
-                    f"grid={config.main_vision_grid}, "
                     f"window={config.main_vision_frames}"
+                    "（缓存存全 16×16 patch，grid 在读取时池化，不参与比对）"
                 )
     if getattr(args, "dino_dense_metric", False):
         # DINO-metric：metric 栈从零构建（resume 时用主 checkpoint 的构造
