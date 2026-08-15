@@ -273,6 +273,36 @@ def evaluation_episode_seed(global_task_id: int, trial: int) -> int:
     return 1000 * int(global_task_id) + int(trial)
 
 
+def task35_ablation_frames(
+    frames: list[np.ndarray], ablation: str
+) -> list[np.ndarray]:
+    """Apply the fixed frame permutation used by the task35 temporal diagnostic."""
+    return list(reversed(frames)) if ablation == "temporal-reverse" else frames
+
+
+def task35_ablation_dense(
+    dense_evidence: dict[int, torch.Tensor], ablation: str
+) -> dict[int, torch.Tensor]:
+    """Zero both DINO dense levels without changing their shape or dtype."""
+    if ablation != "dense-zero":
+        return dense_evidence
+    return {
+        layer: torch.zeros_like(evidence)
+        for layer, evidence in dense_evidence.items()
+    }
+
+
+def task35_ablation_geometry(metric_g: torch.Tensor, ablation: str) -> torch.Tensor:
+    """Ablate only the direct 8-D geometry route, preserving relation tokens."""
+    if ablation == "geometry-zero":
+        return torch.zeros_like(metric_g)
+    if ablation == "geometry-shuffle":
+        # Keep each role's (x,y) pair intact while swapping tool↔pegGrasp and
+        # hole↔pegHead.  This is deterministic and identical across trials.
+        return metric_g[:, [2, 3, 0, 1, 6, 7, 4, 5]]
+    return metric_g
+
+
 def _canonical_mtvj_metric_head_config(
     config: dict | None,
     *,
@@ -964,6 +994,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="逐 trial 汇报 MetaWorld 阶段指标（max near/grasp/in_place、min obj_to_target），"
         "只读诊断，不改变动作或成功判定。",
+    )
+    parser.add_argument(
+        "--task35-causal-ablation",
+        choices=("none", "temporal-reverse", "geometry-zero", "geometry-shuffle", "roi-off", "dense-zero"),
+        default="none",
+        help="task35 FM causal diagnostic; changes exactly one inference signal while "
+        "keeping checkpoint and episode seeds fixed. Non-none runs are diagnostics, "
+        "not precision acceptance.",
     )
     parser.add_argument(
         "--flow-samples",
@@ -2280,6 +2318,36 @@ def main() -> None:
     # 2026-08-09：ACTION_HORIZON 从 checkpoint config 读（E7 H=48），不再硬编码 8。
     global ACTION_HORIZON
     ACTION_HORIZON = int(getattr(config, "action_horizon", 8))
+    if args.task35_precision_contract and args.task35_causal_ablation != "none":
+        raise ValueError(
+            "--task35-precision-contract is acceptance-only; causal ablations must "
+            "run without it and be reported as diagnostics"
+        )
+    if args.task35_causal_ablation != "none":
+        ablation_requirements = {
+            "task35 only": args.task_ids == "35",
+            "50 trials": args.trials_per_task == 50,
+            "execute_steps 6": args.execute_steps == 6,
+            "stage telemetry": args.debug_stage_metrics,
+            "WAM off": args.wam == "off",
+            "FM checkpoint": policy_contract.get("action_decoder")
+            == "conditional_flow_matching",
+            "DINO metric": getattr(config, "dino_dense_metric", False),
+            "H6": ACTION_HORIZON == 6,
+        }
+        missing_ablation = [
+            name for name, enabled in ablation_requirements.items() if not enabled
+        ]
+        if missing_ablation:
+            raise ValueError(
+                "task35 causal ablation missing fixed protocol: "
+                + ", ".join(missing_ablation)
+            )
+        print(
+            f"TASK35 CAUSAL ABLATION: {args.task35_causal_ablation} "
+            "(diagnostic only; not acceptance evidence)",
+            flush=True,
+        )
     if args.task35_precision_contract:
         expected_data_sha = policy_contract.get("task35_data_sha256")
         actual_data_sha = _sha256_file(args.features.expanduser().absolute())
@@ -3262,8 +3330,11 @@ def main() -> None:
                             # [d-2,d] patch evidence（与训练 return_dense 同构）。
                             dino_dense_evidence = None
                             if getattr(config, "dino_dense_metric", False):
+                                encode_frames = task35_ablation_frames(
+                                    frames, args.task35_causal_ablation
+                                )
                                 tokens, dino_dense_evidence = _main_vision_encode_window(
-                                    frames,
+                                    encode_frames,
                                     main_vision_backbone,
                                     device,
                                     grid=config.main_vision_grid,
@@ -3347,41 +3418,53 @@ def main() -> None:
                                 # ImageNet 归一化 + 裁剪上采样；crop 契约 NCHW）。
                                 dino_roi_video = (
                                     torch.from_numpy(
-                                        np.stack(frames[2:4], axis=0)[None]
+                                        np.stack(encode_frames[2:4], axis=0)[None]
                                     )
                                     .float()
                                     .div_(255.0)
                                     .permute(0, 1, 4, 2, 3)
                                     .to(device)
                                 )
+                            metric_dense_evidence = task35_ablation_dense(
+                                dino_dense_evidence, args.task35_causal_ablation
+                            )
                             dino_metric_tokens, metric_g = _mtvj_metric_tokens(
                                 metric_head,
                                 relation_encoder,
-                                dino_dense_evidence,
+                                metric_dense_evidence,
                                 hidden[local_task_index : local_task_index + 1],
                                 mask[local_task_index : local_task_index + 1],
                                 coords_dino_metric,
                                 metric_g_prev,
                                 device,
-                                roi_head=roi_head,
+                                roi_head=(
+                                    None
+                                    if args.task35_causal_ablation == "roi-off"
+                                    else roi_head
+                                ),
                                 roi_backbone=(
                                     main_vision_backbone
                                     if roi_head is not None
+                                    and args.task35_causal_ablation != "roi-off"
                                     else None
                                 ),
                                 roi_video=dino_roi_video,
                                 roi_alpha=(
                                     float(args.dino_roi_alpha)
                                     if roi_head is not None
+                                    and args.task35_causal_ablation != "roi-off"
                                     else 0.0
                                 ),
                                 roi_dino=True,
                             )
                             metric_g_prev = metric_g
+                            metric_g_policy = task35_ablation_geometry(
+                                metric_g[None], args.task35_causal_ablation
+                            )
                             dense_kwargs = {
-                                "dense_evidence": dino_dense_evidence,
+                                "dense_evidence": metric_dense_evidence,
                                 "metric_tokens": dino_metric_tokens,
-                                "metric_g": metric_g[None],
+                                "metric_g": metric_g_policy,
                             }
                         if args.dense_readout_mtvj:
                             # MT-VJ 在线 dense 解码（契约 §7，与训练 §6
