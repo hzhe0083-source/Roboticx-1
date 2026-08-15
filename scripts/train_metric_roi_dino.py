@@ -6,7 +6,7 @@
 量化下限 ~0.8px + 连续 offset 回归 → 亚像素级精修。
 
 协议（镜像 train_metric_roi.py，编码器换 DINO）：
-- 数据：make_metric_batch 仿真真值（keypoints/visibility，480px 原图）；
+- 数据：make_metric_batch 仿真真值（keypoints/visibility + true 480px raw_frames）；
 - 粗定位：GT + 均匀抖动（±10px，模拟粗头误差；plan_metric_roi 再叠加
   中心/尺寸抖动）→ 动态 ROI（96-192px，按可见度选角色对）；
 - 编码：crop_metric_roi_video 原图裁剪 → 224px 双时间片（帧 [d-2,d]）→
@@ -43,6 +43,8 @@ from prepare_metaworld_metric import make_metric_batch  # noqa: E402
 from scripts.build_longtraj_features import ENV_TO_TASK  # noqa: E402
 from train_metric_visual import compute_losses  # noqa: E402
 from va_compound.metric_roi import (  # noqa: E402
+    DINO_METRIC_ROI_CONTRACT,
+    TASK35_METRIC_ROLE_CONTRACT,
     crop_metric_roi_video,
     crop_to_full,
     full_to_crop,
@@ -90,7 +92,17 @@ def main() -> None:
                                  "model.safetensors"))
     ap.add_argument("--jitter-px", type=float, default=10.0,
                     help="GT 粗定位模拟误差（px，224 尺度）")
+    ap.add_argument(
+        "--language-data",
+        type=Path,
+        default=ROOT / "data/metaworld_longtraj_windows_h6_dino35_clean_v2_seed350.pt",
+        help="仅用于读取 task35 预计算语言 hidden/mask 的 windows payload。",
+    )
     args = ap.parse_args()
+    if args.task != "peg-insert-side-v3":
+        raise ValueError(
+            "this v2 ROI trainer is bound to the task35 aligned role contract"
+        )
 
     from va_compound.backbones import TimmActionVisionBackbone
     from va_compound.metric_visual_head import LanguageMetricField
@@ -111,8 +123,10 @@ def main() -> None:
     ).to(device)
     optimizer = torch.optim.Adam(roi_head.parameters(), lr=args.lr)
     dataset = LongTrajFramesDataset(
-        ROOT / "data/metaworld_longtraj_windows_h48_dino35_clean.pt",
-        min_sequence_length=4, feature_cache=None, include_frames=False,
+        args.language_data,
+        min_sequence_length=4,
+        feature_cache=None,
+        include_frames=False,
     )
     lang_hid, lang_mask = load_language(dataset.payload, args.task, device)
     coords = dense_coords(512, device=device)
@@ -124,17 +138,26 @@ def main() -> None:
           f"{args.steps} 步 × batch {args.batch}（sim 在线生成）", flush=True)
 
     for step in range(1, args.steps + 1):
-        sim = make_metric_batch(args.task, rng, args.batch)
-        frames_np = np.ascontiguousarray(sim["frames"])  # [B,4,480,480,3]
+        sim = make_metric_batch(
+            args.task, rng, args.batch, include_raw_frames=True
+        )
+        frames_np = np.ascontiguousarray(
+            sim["raw_frames"]
+        )  # [B,4,480,480,3] true render pixels
         kp = torch.from_numpy(sim["keypoints"]).to(device)  # [B,4,2] 0-1
         vis = torch.from_numpy(sim["visibility"]).to(device)  # [B,4]
-        # 粗定位 = GT + 均匀抖动（224 尺度归一化 ±jitter/224）
+        # coarse coordinates and ROI geometry are expressed in the canonical
+        # 224px frame; raw 480px pixels are scaled inside crop_metric_roi_video.
         jitter = (torch.rand_like(kp) * 2.0 - 1.0) * (args.jitter_px / CANONICAL)
         coarse = (kp + jitter).clamp(0.0, 1.0)
         selection = plan_metric_roi(
-            coarse, vis, CANONICAL,
+            coarse,
+            vis,
+            CANONICAL,
             center_jitter_px=args.jitter_px * 0.8,
-            size_jitter=0.1, training=True,
+            size_jitter=0.1,
+            training=True,
+            forced_pair_index=1,  # task35: (pegHead, hole)
         )
         raw_video = (
             torch.from_numpy(frames_np[:, (2, 3)]).float().div_(255.0)
@@ -199,9 +222,13 @@ def main() -> None:
         "canonical_image_size": CANONICAL,
         "min_roi_size": 96, "max_roi_size": 192, "distance_scale": 2.0,
         "max_delta_px": 32.0,
-        "contract": "dino_metric_roi_v1",
+        "contract": DINO_METRIC_ROI_CONTRACT,
+        "metric_role_contract": TASK35_METRIC_ROLE_CONTRACT,
+        "role_order": ["tool", "pegGrasp", "hole", "pegHead"],
+        "role_pairs": [[0, 1], [3, 2]],
         "steps": args.steps, "batch": args.batch, "lr": args.lr,
         "jitter_px": args.jitter_px, "task": args.task,
+        "language_data": str(args.language_data.resolve()),
     }
     tmp = args.save.with_suffix(args.save.suffix + ".tmp")
     torch.save(payload, tmp)

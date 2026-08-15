@@ -18,11 +18,15 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 from va_compound import VACompoundConfig, VACompoundPolicy
 from va_compound.backbones import pool_flat_tokens, pool_mtvj_coarse_tokens
 from va_compound.metric_roi import (
+    DINO_METRIC_ROI_CONTRACT,
     METRIC_ROI_CONTRACT_VERSION,
+    TASK35_METRIC_ROLE_CONTRACT,
+    load_dino_metric_roi_checkpoint,
     load_metric_roi_checkpoint,
     metric_head_state_sha256,
     prepare_metric_roi_video,
     refine_metric_roi_positions,
+    refine_metric_roi_positions_dino,
 )
 from va_compound.servo import InteractionServo
 from scripts.mt50_difficulty import task_weights_for
@@ -1113,11 +1117,13 @@ def build_exact_run_contract(
             key: metric_identity.get(key)
             for key in ("sha256", "size_bytes", "contract")
         }
-    roi_identity = (
-        getattr(roi_head, "_mtvj_roi_checkpoint_identity", None)
-        if roi_head is not None
-        else None
-    )
+    roi_identity = None
+    if roi_head is not None:
+        roi_identity = getattr(roi_head, "_dino_roi_identity", None)
+        if roi_identity is None:
+            roi_identity = getattr(
+                roi_head, "_mtvj_roi_checkpoint_identity", None
+            )
     if isinstance(roi_identity, dict):
         roi_identity = {
             key: roi_identity.get(key)
@@ -1818,12 +1824,22 @@ def _main_vision_config_kwargs(args: argparse.Namespace) -> dict:
         "main_vision_grid": grid,
         "main_vision_frames": frames,
         "main_vision_tokens": grid * grid * frames,
+        "main_vision_temporal": bool(
+            getattr(args, "main_vision_temporal", False)
+        ),
+        "main_vision_temporal_scale": float(
+            getattr(args, "main_vision_temporal_scale", 1.0)
+        ),
     }
     if getattr(args, "dino_dense_metric", False):
         # DINO-metric：复用逐层 dense K/V 机制（DenseEvidenceProjector 以
         # main_vision_dim=1024 构造），metric head/relation encoder 从零构建。
         kwargs["dense_readout_mtvj"] = True
         kwargs["dino_dense_metric"] = True
+        kwargs["metric_geometry_inject"] = bool(
+            getattr(args, "metric_geometry_inject", False)
+        )
+        kwargs["metric_geometry_dim"] = 8
     return kwargs
 
 
@@ -2292,17 +2308,20 @@ def _dino_metric_tokens(
     device: torch.device,
     *,
     train_metric_head: bool = False,
-) -> Tensor | None:
-    """DINO-metric：dense_evidence {5,11} [B, T, 512, 1024] → metric_tokens。
+    roi_head: nn.Module | None = None,
+    roi_backbone: nn.Module | None = None,
+    roi_frames=None,
+    roi_alpha: float = 0.0,
+) -> tuple[Tensor | None, Tensor | None]:
+    """DINO-metric dense evidence → ``(metric_tokens, metric_g)``。
 
-    与 train.py ``_mtvj_online_encode`` 的 metric 分支同构（仅 token 数/
-    网格不同）：language_hidden 沿 T 复制 → LanguageMetricField(block11,
-    block23, lang, mask, dense_coords(512)) → g_t = out.p * out.visibility
-    [B, T, 8] → ν_t = g_t − g_{t−1}（首决策 ν≡0）→ RelationStateEncoder
-    → [B, T, 2, d_model]。冻结时全程 no_grad 并 detach。
+    与 ``_mtvj_online_encode`` 同构（仅 token 数/网格不同）：language hidden
+    沿 T 复制 → coarse LanguageMetricField → 可选、训练/评测同构的 task35 ROI
+    refinement → ``g_t = p * visibility [B,T,8]`` → RelationStateEncoder
+    ``[B,T,2,d_model]``。冻结时 detach；联合训练时 coarse localization 保留梯度。
     """
     if metric_head is None or relation_encoder is None:
-        return None
+        return None, None
     from va_compound.model import dense_coords
 
     batch_size, sequence_length, _, _ = dense_evidence[11].shape
@@ -2317,6 +2336,9 @@ def _dino_metric_tokens(
         language_mask = language_mask.to(device=device)
     coords = dense_coords(512, device=device, dtype=head_dtype)
 
+    language_flat = language_hidden.repeat_interleave(sequence_length, dim=0)
+    mask_flat = language_mask.repeat_interleave(sequence_length, dim=0)
+
     def run_metric_head():
         flat = {
             layer: evidence.reshape(
@@ -2327,10 +2349,57 @@ def _dino_metric_tokens(
         return metric_head(
             flat[5],
             flat[11],
-            language_hidden.repeat_interleave(sequence_length, dim=0),
-            language_mask.repeat_interleave(sequence_length, dim=0),
+            language_flat,
+            mask_flat,
             coords,
         )
+
+    def apply_roi(out):
+        if roi_head is None or roi_alpha == 0.0:
+            return out
+        if roi_backbone is None or roi_frames is None:
+            raise ValueError(
+                "DINO ROI policy training requires the frozen backbone and raw frames"
+            )
+        frames_np = (
+            roi_frames.detach().cpu().numpy()
+            if isinstance(roi_frames, Tensor)
+            else np.asarray(roi_frames)
+        )
+        if frames_np.ndim != 6 or frames_np.shape[:3] != (
+            batch_size,
+            sequence_length,
+            4,
+        ):
+            raise ValueError(
+                "DINO ROI frames must be [B,T,4,H,W,3], got "
+                f"{tuple(frames_np.shape)}"
+            )
+        raw = (
+            torch.from_numpy(
+                np.ascontiguousarray(frames_np[:, :, (2, 3)]).reshape(
+                    batch_size * sequence_length,
+                    2,
+                    *frames_np.shape[3:],
+                )
+            )
+            .float()
+            .div_(255.0)
+            .permute(0, 1, 4, 2, 3)
+            .to(device)
+        )
+        out.p, out.visibility = refine_metric_roi_positions_dino(
+            out.p,
+            out.visibility,
+            raw,
+            roi_backbone,
+            roi_head,
+            language_flat,
+            mask_flat,
+            coords,
+            alpha=roi_alpha,
+        )
+        return out
 
     if train_metric_head:
         trainable = [p for p in metric_head.parameters() if p.requires_grad]
@@ -2338,7 +2407,7 @@ def _dino_metric_tokens(
             raise ValueError(
                 "--mtvj-train-metric-head 已开启但 DINO metric head 没有可训练参数"
             )
-        out = run_metric_head()
+        out = apply_roi(run_metric_head())
         g = _mtvj_metric_positions(
             out,
             getattr(
@@ -2349,7 +2418,7 @@ def _dino_metric_tokens(
         ).reshape(batch_size, sequence_length, -1)
     else:
         with torch.no_grad():
-            out = run_metric_head()
+            out = apply_roi(run_metric_head())
             g = (
                 _mtvj_metric_positions(
                     out,
@@ -2362,7 +2431,7 @@ def _dino_metric_tokens(
                 .reshape(batch_size, sequence_length, -1)
                 .detach()
             )
-    return _mtvj_relation_tokens(g, relation_encoder)
+    return _mtvj_relation_tokens(g, relation_encoder), g
 
 
 def _load_mtvj_metric_checkpoint(
@@ -3277,14 +3346,16 @@ def rollout_policy(
         semantic_context = None
         mtvj_kwargs = {}
         if dense_evidence is not None:
-            # MT-VJ（契约 §5）：dense evidence 只做 K/V（1152 不进 VA 自注意力），
+            # MT-VJ（契约 §5）：dense evidence 只做 K/V（不进 VA 自注意力），
             # metric_tokens（RelationStateEncoder 输出，可选联合微调）加入 action
-            # cross-attention；None 时该步与旧路径完全一致。
+            # cross-attention；DINO-main 的 full grid tokens 保持为 base vision。
             mtvj_kwargs["dense_evidence"] = {
                 layer: evidence[:, time_index] for layer, evidence in dense_evidence.items()
             }
             if metric_tokens is not None:
                 mtvj_kwargs["metric_tokens"] = metric_tokens[:, time_index]
+        if metric_g is not None:
+            mtvj_kwargs["metric_g"] = metric_g[:, time_index]
         if action_dense_evidence is not None:
             mtvj_kwargs["action_dense_evidence"] = {
                 layer: evidence[:, time_index]
@@ -3300,8 +3371,10 @@ def rollout_policy(
                 # π0 式逐层 cross-attn：槽/关系 token（语言实例化语义上下文）
                 # 作为 flow head 的 cross-attn K/V，逐层注入。
                 semantic_context = vision_in  # [B, 25, vision_dim]
-        elif dense_evidence is not None:
-            # MT-VJ：VA 基础路径输入 = H11 池化 16 粗 token（设计 C_t=Pool16(H11)）
+        elif dense_evidence is not None and not model.config.dino_dense_metric:
+            # 传统 V-JEPA MT-VJ：VA base vision = H11 Pool16。DINO-main 必须保留
+            # batch['vision_tokens'] 的四帧 full-grid token；旧代码在训练时错误地
+            # 也走 Pool16，而 eval 保留 grid16，造成 train/eval P0 mismatch。
             h11 = dense_evidence[11][:, time_index]  # [B, 1152, 768]
             vision_in = pool_mtvj_coarse_tokens(h11)  # [B, 16, 768]
         else:
@@ -4091,6 +4164,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="DINO-main 每决策消费的窗口帧数（默认 4 = [d-6,d-4,d-2,d]）。",
     )
     parser.add_argument(
+        "--main-vision-temporal",
+        action="store_true",
+        help="为 frame-major DINO patch tokens 加 learned 四帧 slot embedding；"
+        "打破旧路径对 [d-6,d-4,d-2,d] 顺序的集合置换不变性。",
+    )
+    parser.add_argument(
+        "--main-vision-temporal-scale",
+        type=float,
+        default=1.0,
+        help="learned frame embedding 的乘法 gate（训练默认 1；0 仅用于因果消融）。",
+    )
+    parser.add_argument(
         "--dino-feature-cache",
         type=Path,
         default=None,
@@ -4107,7 +4192,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "patch（512 token，1024 维）+ Δt；LanguageMetricField 以 h_dim=1024、"
         "grid=16 从零训练（不复用 V-JEPA metric 权重）。metric head/relation "
         "encoder 可用 --mtvj-train-metric-head/--mtvj-train-relation 以动作 loss "
-        "联合微调（同 V-JEPA 联合协议；DINO 视觉辅助 loss 移植待后续）。",
+        "联合微调。",
+    )
+    parser.add_argument(
+        "--metric-geometry-inject",
+        action="store_true",
+        help="把 metric/ROI 的 8-D p×visibility 经 zero-init Linear 直接加到 "
+        "state/action-query 条件；保留旧 2-token route 供消融，但不再只依赖它。",
+    )
+    parser.add_argument(
+        "--dino-roi-checkpoint",
+        type=Path,
+        default=None,
+        help="task35 DINO ROI v2 artifact；策略训练时也从原始帧运行同一 crop "
+        "refinement，禁止 eval-only ROI 分布移位。",
+    )
+    parser.add_argument(
+        "--dino-roi-alpha",
+        type=float,
+        default=None,
+        help="task35 DINO ROI 有界残差融合系数 [0,1]。",
     )
     parser.add_argument(
         "--action-vision-only",
@@ -4648,12 +4752,36 @@ def validate_args(args: argparse.Namespace) -> None:
                     raise ValueError(
                         f"--dino-feature-cache 缺少 {name}: {cache_dir}"
                     )
-    elif args.main_vision_checkpoint is not None:
+    elif getattr(args, "main_vision_checkpoint", None) is not None:
         raise ValueError("--main-vision-checkpoint requires --dino-main-vision")
     if getattr(args, "dino_dense_metric", False) and not dino_main_vision:
         raise ValueError("--dino-dense-metric requires --dino-main-vision")
     if getattr(args, "dino_feature_cache", None) is not None and not dino_main_vision:
         raise ValueError("--dino-feature-cache requires --dino-main-vision")
+    if getattr(args, "main_vision_temporal", False) and not dino_main_vision:
+        raise ValueError("--main-vision-temporal requires --dino-main-vision")
+    if not math.isfinite(float(getattr(args, "main_vision_temporal_scale", 1.0))):
+        raise ValueError("--main-vision-temporal-scale must be finite")
+    if getattr(args, "metric_geometry_inject", False) and not getattr(
+        args, "dino_dense_metric", False
+    ):
+        raise ValueError("--metric-geometry-inject requires --dino-dense-metric")
+    dino_roi_checkpoint = getattr(args, "dino_roi_checkpoint", None)
+    dino_roi_alpha = getattr(args, "dino_roi_alpha", None)
+    if dino_roi_checkpoint is None:
+        if dino_roi_alpha is not None:
+            raise ValueError("--dino-roi-alpha requires --dino-roi-checkpoint")
+    else:
+        if not getattr(args, "dino_dense_metric", False):
+            raise ValueError("--dino-roi-checkpoint requires --dino-dense-metric")
+        if not dino_roi_checkpoint.expanduser().is_file():
+            raise FileNotFoundError(
+                f"DINO ROI checkpoint does not exist: {dino_roi_checkpoint}"
+            )
+        if dino_roi_alpha is None or not math.isfinite(dino_roi_alpha) or not 0.0 <= dino_roi_alpha <= 1.0:
+            raise ValueError(
+                "--dino-roi-checkpoint requires finite --dino-roi-alpha in [0,1]"
+            )
     roi_checkpoint = getattr(args, "mtvj_roi_checkpoint", None)
     roi_alpha = getattr(args, "mtvj_roi_alpha", None)
     if roi_checkpoint is None and roi_alpha is not None:
@@ -5572,6 +5700,40 @@ def save_checkpoint(
                 "main_vision_tokens": getattr(
                     config, "main_vision_tokens", None
                 ),
+                "main_vision_temporal": bool(
+                    getattr(config, "main_vision_temporal", False)
+                ),
+                "main_vision_temporal_scale": float(
+                    getattr(config, "main_vision_temporal_scale", 1.0)
+                ),
+                "dino_base_vision_contract": (
+                    "full_frame_major_grid_tokens_with_dense_kv_additive"
+                    if getattr(config, "dino_dense_metric", False)
+                    else "main_vision_tokens"
+                ),
+                "metric_geometry_inject": bool(
+                    getattr(config, "metric_geometry_inject", False)
+                ),
+                "metric_geometry_dim": int(
+                    getattr(config, "metric_geometry_dim", 8)
+                ),
+                "task35_metric_role_contract": (
+                    TASK35_METRIC_ROLE_CONTRACT
+                    if getattr(config, "dino_dense_metric", False)
+                    else None
+                ),
+                "dino_roi_enabled": roi_head is not None
+                and getattr(args, "dino_roi_checkpoint", None) is not None,
+                "dino_roi_alpha": (
+                    float(args.dino_roi_alpha)
+                    if getattr(args, "dino_roi_checkpoint", None) is not None
+                    else None
+                ),
+                "dino_roi_contract": (
+                    DINO_METRIC_ROI_CONTRACT
+                    if getattr(args, "dino_roi_checkpoint", None) is not None
+                    else None
+                ),
                 "main_vision_checkpoint_sha256": getattr(
                     args, "main_vision_checkpoint_sha256", None
                 ),
@@ -5605,7 +5767,22 @@ def save_checkpoint(
             )
             payload["training_contract"]["wam_joint"] = True
             payload["training_contract"]["wam_contract_version"] = 1
-    if roi_head is not None:
+    if (
+        roi_head is not None
+        and getattr(args, "dino_roi_checkpoint", None) is not None
+    ):
+        payload["dino_roi_checkpoint_identity"] = dict(
+            getattr(roi_head, "_dino_roi_identity", {})
+        )
+        if not payload["dino_roi_checkpoint_identity"].get("sha256"):
+            raise ValueError("saving DINO ROI policy requires a verified ROI identity")
+    if (
+        roi_head is not None
+        and getattr(args, "dino_roi_checkpoint", None) is None
+    ):
+        # Legacy MT-VJ ROI checkpoints embed their head/config/identity directly.
+        # Keep this behavior for programmatic callers that pass a validated
+        # ``roi_head`` without reconstructing the CLI namespace.
         roi_config = getattr(roi_head, "_mtvj_roi_config", None)
         roi_identity = getattr(roi_head, "_mtvj_roi_checkpoint_identity", None)
         roi_coarse_identity = getattr(roi_head, "_mtvj_roi_coarse_identity", None)
@@ -5736,6 +5913,52 @@ class SAM(torch.optim.Optimizer):
                     continue
                 norm += p.grad.norm() ** 2
         return norm.sqrt()
+
+
+def _validate_dino_roi_resume_contract(
+    resume_checkpoint: dict | None,
+    *,
+    runtime_checkpoint: Path | None,
+    runtime_alpha: float | None,
+    runtime_identity: dict | None = None,
+) -> bool:
+    """Fail fast when a resumed DINO policy changes its ROI distribution.
+
+    Returns whether the saved policy used DINO ROI. Identity is checked after
+    the runtime artifact has been loaded, while path/alpha checks can run first.
+    """
+    if resume_checkpoint is None:
+        return False
+    training_contract = resume_checkpoint.get("training_contract") or {}
+    resume_dino_roi = training_contract.get("dino_roi_enabled") is True
+    if not resume_dino_roi:
+        return False
+    if runtime_checkpoint is None:
+        raise ValueError(
+            "resume checkpoint requires --dino-roi-checkpoint; refusing to "
+            "silently continue on a different geometry distribution"
+        )
+    saved_alpha = training_contract.get("dino_roi_alpha")
+    if saved_alpha is None or runtime_alpha is None or float(saved_alpha) != float(
+        runtime_alpha
+    ):
+        raise ValueError(
+            "--dino-roi-alpha must exactly match resume training: "
+            f"policy={saved_alpha!r}, runtime={runtime_alpha!r}"
+        )
+    if runtime_identity is None:
+        return True
+    expected_identity = resume_checkpoint.get("dino_roi_checkpoint_identity")
+    if not isinstance(expected_identity, dict):
+        raise ValueError("resume checkpoint declares DINO ROI but lacks its identity")
+    mismatches = {
+        key: (expected_identity.get(key), runtime_identity.get(key))
+        for key in ("sha256", "size_bytes", "contract")
+        if expected_identity.get(key) != runtime_identity.get(key)
+    }
+    if mismatches:
+        raise ValueError(f"DINO ROI checkpoint identity mismatch on resume: {mismatches}")
+    return True
 
 
 def main() -> None:
@@ -5871,6 +6094,7 @@ def main() -> None:
                 ),
                 include_frames=(
                     args.dino_feature_cache is None
+                    or getattr(args, "dino_roi_checkpoint", None) is not None
                 ),
             )
             print(
@@ -6308,6 +6532,29 @@ def main() -> None:
                 else None
             ),
         )
+        resume_dino_roi = _validate_dino_roi_resume_contract(
+            preloaded_resume_ckpt,
+            runtime_checkpoint=args.dino_roi_checkpoint,
+            runtime_alpha=args.dino_roi_alpha,
+        )
+        if args.dino_roi_checkpoint is not None:
+            roi_head = load_dino_metric_roi_checkpoint(
+                args.dino_roi_checkpoint, device
+            )
+            if resume_dino_roi:
+                _validate_dino_roi_resume_contract(
+                    preloaded_resume_ckpt,
+                    runtime_checkpoint=args.dino_roi_checkpoint,
+                    runtime_alpha=args.dino_roi_alpha,
+                    runtime_identity=getattr(roi_head, "_dino_roi_identity", {}),
+                )
+            print(
+                "dino-metric: frozen task35 ROI refinement active during policy "
+                f"training (alpha={args.dino_roi_alpha}, "
+                f"contract={DINO_METRIC_ROI_CONTRACT}, "
+                f"roles={TASK35_METRIC_ROLE_CONTRACT})",
+                flush=True,
+            )
     if args.metric_visual_checkpoint is not None:
         policy_contract = (
             (preloaded_resume_ckpt.get("training_contract") or {})
@@ -6741,25 +6988,43 @@ def main() -> None:
                     state = {key: value for key, value in state.items()
                              if key not in mismatched}
                 missing, unexpected = model.load_state_dict(state, strict=False)
+                allowed_new_missing: set[str] = set()
                 if (
                     config.action_vision_backbone != "none"
                     and resume_config.get("action_vision_backbone", "none") == "none"
                 ):
-                    allowed_action_missing = {
+                    allowed_new_missing.update(
                         key
                         for key in model.state_dict()
                         if key.startswith("action_dense_evidence_proj.")
                         or ".action_dense_" in key
-                    }
-                    forbidden_missing = set(missing) - allowed_action_missing
+                    )
+                if config.metric_geometry_inject and not resume_config.get(
+                    "metric_geometry_inject", False
+                ):
+                    allowed_new_missing.update(
+                        key
+                        for key in model.state_dict()
+                        if key.startswith("geometry_projection.")
+                    )
+                if config.main_vision_temporal and not resume_config.get(
+                    "main_vision_temporal", False
+                ):
+                    allowed_new_missing.update(
+                        key
+                        for key in model.state_dict()
+                        if key.startswith("main_vision_frame_embedding.")
+                    )
+                if allowed_new_missing:
+                    forbidden_missing = set(missing) - allowed_new_missing
                     if forbidden_missing:
                         raise ValueError(
-                            "action-vision migration has unrelated missing keys: "
+                            "architecture migration has unrelated missing keys: "
                             f"{sorted(forbidden_missing)[:8]}"
                         )
                     if unexpected:
                         raise ValueError(
-                            "action-vision migration has unexpected checkpoint keys: "
+                            "architecture migration has unexpected checkpoint keys: "
                             f"{sorted(unexpected)[:8]}"
                         )
                 if missing or unexpected:
@@ -6977,13 +7242,19 @@ def main() -> None:
                     )
                     batch["vision_tokens"] = vision_tokens
                     mtvj_dense_evidence = dense_evidence
-                    mtvj_metric_tokens = _dino_metric_tokens(
+                    mtvj_metric_tokens, mtvj_metric_g = _dino_metric_tokens(
                         metric_head,
                         relation_encoder,
                         dense_evidence,
                         batch,
                         device,
                         train_metric_head=args.mtvj_train_metric_head,
+                        roi_head=roi_head,
+                        roi_backbone=main_vision_backbone,
+                        roi_frames=batch.get("frames"),
+                        roi_alpha=(
+                            float(args.dino_roi_alpha) if roi_head is not None else 0.0
+                        ),
                     )
                 else:
                     batch["vision_tokens"] = _dino_main_encode_from_cache(
@@ -7013,13 +7284,19 @@ def main() -> None:
                     )
                     batch["vision_tokens"] = vision_tokens
                     mtvj_dense_evidence = dense_evidence
-                    mtvj_metric_tokens = _dino_metric_tokens(
+                    mtvj_metric_tokens, mtvj_metric_g = _dino_metric_tokens(
                         metric_head,
                         relation_encoder,
                         dense_evidence,
                         batch,
                         device,
                         train_metric_head=args.mtvj_train_metric_head,
+                        roi_head=roi_head,
+                        roi_backbone=main_vision_backbone,
+                        roi_frames=batch.get("frames"),
+                        roi_alpha=(
+                            float(args.dino_roi_alpha) if roi_head is not None else 0.0
+                        ),
                     )
                 else:
                     batch["vision_tokens"] = _dino_main_online_encode(
@@ -7031,6 +7308,9 @@ def main() -> None:
                         window=config.main_vision_frames,
                     )
                 batch.pop("frames", None)
+            # Cache+ROI keeps raw frames only until the crop refinement above.
+            # Remove the large CPU array before generic device collation.
+            batch.pop("frames", None)
         if args.live_vjepa:
             # Stage B：在线 V-JEPA 编码（frames 仍为 CPU numpy；编码在 GPU 上，
             # 输出 [B, T, 288, D] 与 ST288 同构，替换进 batch）。
@@ -7215,10 +7495,25 @@ def main() -> None:
                 else:
                     predicted_velocity, action_conditions = rollout
                 if model.config.direct_head:
-                    # C²-VA Stage A：Direct Head 回归归一化 executed 动作标签
-                    # （v5 数据：一个执行动作 ↔ 一个标签）。pair 是 flow 专属
-                    # 损失（共享噪声/中点探针），direct 模式跳过（打印 pair=0）。
-                    flow_loss = F.smooth_l1_loss(predicted_velocity, batch["actions"])
+                    # Deterministic H6 baseline uses the exact same validity masks as FM.
+                    # Reusing the masked reducer prevents settle/post-success targets from
+                    # entering the direct loss merely because its decoder is deterministic.
+                    absolute_error = F.smooth_l1_loss(
+                        predicted_velocity,
+                        batch["actions"],
+                        reduction="none",
+                    )
+                    validity = torch.ones_like(absolute_error)
+                    for key in ACTION_MASK_KEYS:
+                        mask_value = batch.get(key)
+                        if mask_value is not None:
+                            validity = validity * _expand_action_mask(
+                                mask_value, absolute_error, key
+                            )
+                    denominator = validity.sum()
+                    if not bool(denominator > 0):
+                        raise ValueError("direct loss has zero valid action elements")
+                    flow_loss = (absolute_error * validity).sum() / denominator
                     _, flow_prefix_loss, flow_tail_loss = masked_flow_matching_loss(
                         predicted_velocity,
                         batch["actions"],

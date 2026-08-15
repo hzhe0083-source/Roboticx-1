@@ -247,6 +247,7 @@ def _collect_episode_inner(env, policy, task_name: str, rng: np.random.Generator
         "action_supervision_valid": action_supervision_valid,
         "recovery_mask": recovery_mask,
         "perturbed": perturb_event is not None,
+        "n_perturb_events": int(perturb_event is not None),
         "perturb_start": None if perturb_event is None else perturb_event["start"],
         "perturb_end": None if perturb_event is None else perturb_event["end"],
         "perturb_kind": None if perturb_event is None else perturb_event["kind"],
@@ -325,6 +326,12 @@ def main() -> None:
         ep = collect_episode(env, policy, args.task, rng, perturb=not args.no_perturb)
         if ep is None:
             continue
+        if not args.no_perturb and not ep["perturbed"]:
+            # Recovery 文件描述的是实际观察到的扰动恢复，不是仅配置了随机
+            # 闸门。若 5% 闸门在成功前未触发，则丢弃并重试，禁止 nominal
+            # episode 静默混入 recovery 分层。
+            print("  skip nominal episode: recovery collection requires >=1 perturb event")
+            continue
         episodes.append(ep)
         lens = [len(e["frames"]) for e in episodes]
         print(f"  ep {len(episodes)}: len={len(ep['frames'])} "
@@ -332,6 +339,16 @@ def main() -> None:
               f"(mean_len={np.mean(lens):.0f})")
     if not episodes:
         raise SystemExit("no successful episodes collected")
+    if len(episodes) != args.episodes:
+        raise SystemExit(
+            f"collected only {len(episodes)}/{args.episodes} contract-valid episodes "
+            f"after {attempts} attempts"
+        )
+    if args.no_perturb:
+        if any(ep["perturbed"] or ep["n_perturb_events"] for ep in episodes):
+            raise RuntimeError("clean collection contains a perturbation event")
+    elif any(not ep["perturbed"] or ep["n_perturb_events"] < 1 for ep in episodes):
+        raise RuntimeError("recovery collection contains a nominal episode")
     env.close()
 
     # ---- 统一归一化：继承 fullframe executed 的 q01/q99（Codex：禁止单独算） ----
@@ -362,6 +379,11 @@ def main() -> None:
             "perturbation_enabled": not args.no_perturb,
             "perturbation_mode": (
                 "disabled_by_no_perturb" if args.no_perturb else "single_random_pre_success"
+            ),
+            "perturbation_data_present": any(ep["perturbed"] for ep in episodes),
+            "episode_perturbation_contract": (
+                "clean: n_perturb_events=0 for every episode; "
+                "recovery: n_perturb_events>=1 for every episode"
             ),
             "perturb_mm": list(PERTURB_MM),
             "perturb_settle_steps": PERTURB_SETTLE_STEPS,

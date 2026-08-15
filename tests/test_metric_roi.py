@@ -36,6 +36,17 @@ def test_plan_selects_visibility_pair_and_dynamic_size():
     torch.testing.assert_close(selection.roi[:, 2], torch.tensor([96.0, 96.0]))
 
 
+def test_task35_can_force_peghead_hole_pair() -> None:
+    p, vis = _coarse()
+    selection = plan_metric_roi(p, vis, 384, forced_pair_index=1)
+    assert selection.pair_index.tolist() == [1, 1]
+    assert selection.pair_roles.tolist() == [[3, 2], [3, 2]]
+    assert selection.role_mask.tolist() == [
+        [False, False, True, True],
+        [False, False, True, True],
+    ]
+
+
 def test_dynamic_crop_reaches_max_and_training_jitter_is_bounded():
     p, vis = _coarse()
     selection = plan_metric_roi(

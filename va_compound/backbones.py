@@ -243,6 +243,14 @@ VJEPA21_CHECKPOINT_URL = (
     "https://dl.fbaipublicfiles.com/vjepa2/" + VJEPA21_CHECKPOINT_NAME
 )
 
+# OpenVLA / Prismatic action-vision contract: DINOv2 ViT-L/14 with four
+# register tokens at 224px.  The wrapper maps selected timm blocks to the
+# repository's canonical {5, 11} mid/final evidence keys.
+DINOV2_ACTION_MODEL_ID = "vit_large_patch14_reg4_dinov2.lvd142m"
+DINOV2_ACTION_IMAGE_SIZE = 224
+DINOV2_ACTION_DIM = 1024
+DINOV2_ACTION_LAYERS = (11, 23)
+
 
 def _dtype(name: str | torch.dtype) -> torch.dtype:
     if isinstance(name, torch.dtype):
@@ -1099,6 +1107,125 @@ class VJEPA21Backbone(nn.Module):
         """One V-JEPA forward producing both A (flat) and B (spatial) features."""
         tokens = self._encode(pixel_values_videos)
         return self._pool(tokens, "flat"), self._pool(tokens, "spatial")
+
+
+class TimmActionVisionBackbone(nn.Module):
+    """Frozen timm ViT tower returning patch-only two-level evidence."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        *,
+        model_id: str = DINOV2_ACTION_MODEL_ID,
+        image_size: int = DINOV2_ACTION_IMAGE_SIZE,
+        feature_dim: int = DINOV2_ACTION_DIM,
+        output_layers: tuple[int, int] = DINOV2_ACTION_LAYERS,
+    ) -> None:
+        super().__init__()
+        if not model_id or image_size < 1 or feature_dim < 1:
+            raise ValueError("model_id, image_size, and feature_dim must be valid")
+        if len(output_layers) != 2 or output_layers[0] >= output_layers[1]:
+            raise ValueError("output_layers must be two increasing block indices")
+        self.model = model
+        self.model_id = model_id
+        self.image_size = image_size
+        self.feature_dim = feature_dim
+        self.output_layers = output_layers
+        self.freeze_all()
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        *,
+        device: str | torch.device = "cuda",
+        dtype: str | torch.dtype = "bfloat16",
+        model_id: str = DINOV2_ACTION_MODEL_ID,
+        image_size: int = DINOV2_ACTION_IMAGE_SIZE,
+        feature_dim: int = DINOV2_ACTION_DIM,
+        output_layers: tuple[int, int] = DINOV2_ACTION_LAYERS,
+        checkpoint_path: str | Path | None = None,
+        local_files_only: bool = False,
+    ) -> "TimmActionVisionBackbone":
+        import timm
+        from timm.models.vision_transformer import checkpoint_filter_fn
+
+        if local_files_only and checkpoint_path is None:
+            raise FileNotFoundError(
+                "local_files_only=True requires checkpoint_path for timm weights"
+            )
+        model = timm.create_model(
+            model_id,
+            pretrained=checkpoint_path is None,
+            img_size=image_size,
+            num_classes=0,
+        )
+        if checkpoint_path is not None:
+            path = Path(checkpoint_path).expanduser()
+            if not path.is_file():
+                raise FileNotFoundError(f"action-vision checkpoint is missing: {path}")
+            timm.models.load_checkpoint(
+                model,
+                str(path),
+                strict=True,
+                filter_fn=checkpoint_filter_fn,
+            )
+        model.to(device=device, dtype=_dtype(dtype))
+        return cls(
+            model=model,
+            model_id=model_id,
+            image_size=image_size,
+            feature_dim=feature_dim,
+            output_layers=output_layers,
+        )
+
+    def freeze_all(self) -> None:
+        self.model.requires_grad_(False)
+        super().train(False)
+
+    def train(self, mode: bool = True) -> "TimmActionVisionBackbone":
+        super().train(False)
+        self.model.eval()
+        return self
+
+    @torch.no_grad()
+    def forward_hierarchical_dense(self, images: Tensor) -> dict[int, Tensor]:
+        if images.ndim != 4 or images.shape[1] != 3:
+            raise ValueError("action-vision images must have shape [batch, 3, H, W]")
+        if tuple(images.shape[-2:]) != (self.image_size, self.image_size):
+            raise ValueError(
+                f"action-vision images must be {self.image_size}x{self.image_size}, "
+                f"got {tuple(images.shape[-2:])}"
+            )
+        parameter = next(self.model.parameters())
+        images = images.to(device=parameter.device, dtype=parameter.dtype)
+        outputs = self.model.forward_intermediates(
+            images,
+            indices=list(self.output_layers),
+            return_prefix_tokens=True,
+            norm=True,
+            output_fmt="NLC",
+            intermediates_only=True,
+        )
+        if not isinstance(outputs, list) or len(outputs) != 2:
+            raise RuntimeError("action-vision tower must return two intermediate levels")
+        patches: list[Tensor] = []
+        for output in outputs:
+            if not isinstance(output, tuple) or len(output) != 2:
+                raise RuntimeError(
+                    "timm ViT must return (patch_tokens, prefix_tokens) pairs"
+                )
+            patch_tokens, _prefix_tokens = output
+            if patch_tokens.ndim != 3 or patch_tokens.shape[-1] != self.feature_dim:
+                raise RuntimeError(
+                    "action-vision patch output has the wrong shape, got "
+                    f"{tuple(patch_tokens.shape)}"
+                )
+            patches.append(patch_tokens)
+        return {5: patches[0], 11: patches[1]}
+
+
+class DINOv2ActionBackbone(TimmActionVisionBackbone):
+    """Backward-compatible name for the default DINOv2 contract."""
 
 
 class QwenSemanticBackbone(nn.Module):

@@ -83,7 +83,7 @@ def main() -> None:
                 rows[:, None, :], cache, device, grid=config.main_vision_grid,
                 window=config.main_vision_frames, return_dense=True,
             )
-            metric_tokens_t = _dino_metric_tokens(
+            metric_tokens_t, metric_g_t = _dino_metric_tokens(
                 metric_head, relation_encoder, dense_t, batch, device,
                 train_metric_head=False,
             )
@@ -95,6 +95,7 @@ def main() -> None:
                 language_mask=batch["language_mask"],
                 dense_evidence={k: v[:, 0] for k, v in dense_t.items()},
                 metric_tokens=metric_tokens_t[:, 0],
+                metric_g=metric_g_t[:, 0],
             )
             noise = torch.randn(cond.shape[0], 48, 4, device=device)
             preds.append(model.decode_actions(cond, steps=8, noise=noise))

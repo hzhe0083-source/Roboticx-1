@@ -26,7 +26,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-ROOT = Path("/home/ryan/Documents/robot/ORA0")
+ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from va_compound.longtraj_frames import LongTrajFramesDataset  # noqa: E402

@@ -172,11 +172,21 @@ class VACompoundConfig:
     main_vision_grid: int = 8    # 每帧 16x16 patch 网格池化到 grid x grid
     main_vision_frames: int = 4  # 每决策消费的窗口帧数 [d-6,d-4,d-2,d]
     main_vision_tokens: int = 256  # = grid*grid*frames
+    # DINO 四帧显式时序：raw 1024-D patch token 进入 vision_projection 前，
+    # 按 frame-major 布局加 learned slot embedding。默认关闭使旧 checkpoint/路径
+    # 逐位不变；新 task35 run 开启，打破原来的四帧集合置换不变性。
+    main_vision_temporal: bool = False
+    main_vision_temporal_scale: float = 1.0
     # DINO-metric（2026-08-15 用户决策）：DINO-main 下接回 MT-VJ dense + metric
     # 全栈。dense evidence = DINO block11(g)/block23(d) 两帧 [d-2,d] patch
     # （2×16×16=512 token，1024 维）+ Δt；LanguageMetricField 以 h_dim=1024、
     # grid=16 从零训练。复用 dense_readout_mtvj 的逐层 dense K/V 机制。
     dino_dense_metric: bool = False
+    # 8-D ``p * visibility`` geometry 直接进入 state/action query 条件，绕过
+    # 512 dense + 2 metric token 的共享 softmax 稀释。Linear 严格 zero-init，
+    # 从旧架构迁移时初始行为等价；默认关闭保持旧 state_dict 键集合不变。
+    metric_geometry_inject: bool = False
+    metric_geometry_dim: int = 8
 
     def __post_init__(self) -> None:
         if self.hidden_dim % self.num_heads:
@@ -246,6 +256,21 @@ class VACompoundConfig:
                     "main_vision_tokens must equal grid*grid*frames, got "
                     f"{self.main_vision_tokens} vs {expected_tokens}"
                 )
+        if self.main_vision_temporal:
+            if self.main_vision_backbone == "vjepa":
+                raise ValueError(
+                    "main_vision_temporal requires a non-V-JEPA main vision backbone"
+                )
+            if not math.isfinite(self.main_vision_temporal_scale):
+                raise ValueError("main_vision_temporal_scale must be finite")
+        if self.metric_geometry_dim < 1:
+            raise ValueError("metric_geometry_dim must be positive")
+        if self.metric_geometry_inject and not (
+            self.dino_dense_metric or self.dense_readout_mtvj
+        ):
+            raise ValueError(
+                "metric_geometry_inject requires dino_dense_metric or dense_readout_mtvj"
+            )
         if self.dino_dense_metric:
             if self.main_vision_backbone == "vjepa":
                 raise ValueError(
@@ -1769,6 +1794,27 @@ class VACompoundPolicy(nn.Module):
         self.config = config
         self.vision_projection = nn.Linear(config.vision_dim, config.hidden_dim)
         self.state_projection = nn.Linear(config.proprio_dim + config.action_dim, config.hidden_dim)
+        # Optional treatment-only modules must not consume the parent RNG stream:
+        # otherwise a temporal/geometry ablation changes every common parameter
+        # constructed below it and ceases to be a matched initialization.  Their
+        # own weights are still deterministic under the caller's seed, while the
+        # RNG state seen by action_queries/VA/decoder is restored exactly.
+        with torch.random.fork_rng(devices=[]):
+            self.main_vision_frame_embedding = (
+                nn.Embedding(config.main_vision_frames, config.vision_dim)
+                if config.main_vision_temporal
+                else None
+            )
+            if self.main_vision_frame_embedding is not None:
+                nn.init.normal_(self.main_vision_frame_embedding.weight, std=0.02)
+            self.geometry_projection = (
+                nn.Linear(config.metric_geometry_dim, config.hidden_dim)
+                if config.metric_geometry_inject
+                else None
+            )
+            if self.geometry_projection is not None:
+                nn.init.zeros_(self.geometry_projection.weight)
+                nn.init.zeros_(self.geometry_projection.bias)
         self.action_queries = nn.Parameter(torch.empty(config.action_horizon, config.hidden_dim))
         nn.init.normal_(self.action_queries, std=0.02)
 
@@ -2094,6 +2140,7 @@ class VACompoundPolicy(nn.Module):
         dense_evidence: dict[int, Tensor] | None = None,
         metric_tokens: Tensor | None = None,
         action_dense_evidence: dict[int, Tensor] | None = None,
+        metric_g: Tensor | None = None,
     ) -> Tensor | tuple[Tensor, VisualMemory]:
         if (language_hidden is None) == (language_cache is None):
             raise ValueError("provide exactly one of language_hidden or language_cache")
@@ -2101,9 +2148,47 @@ class VACompoundPolicy(nn.Module):
             raise ValueError("vision_tokens must have shape [batch, tokens, vision_dim]")
 
         target_dtype = self.vision_projection.weight.dtype
-        vision = self.vision_projection(vision_tokens.to(dtype=target_dtype))
+        vision_input = vision_tokens.to(dtype=target_dtype)
+        if self.main_vision_frame_embedding is not None:
+            expected_tokens = (
+                self.config.main_vision_frames
+                * self.config.main_vision_grid
+                * self.config.main_vision_grid
+            )
+            if vision_input.shape[1] != expected_tokens:
+                raise ValueError(
+                    "temporal DINO main vision expects "
+                    f"{expected_tokens} frame-major tokens, got {vision_input.shape[1]}"
+                )
+            patches_per_frame = self.config.main_vision_grid ** 2
+            frame_ids = torch.arange(
+                self.config.main_vision_frames, device=vision_input.device
+            ).repeat_interleave(patches_per_frame)
+            frame_embedding = self.main_vision_frame_embedding(frame_ids).to(
+                dtype=target_dtype
+            )
+            vision_input = vision_input + (
+                float(self.config.main_vision_temporal_scale)
+                * frame_embedding.unsqueeze(0)
+            )
+        vision = self.vision_projection(vision_input)
         state = torch.cat((proprio, previous_action), dim=-1).to(dtype=target_dtype)
         state = self.state_projection(state)
+        if self.geometry_projection is not None:
+            if metric_g is None:
+                raise ValueError(
+                    "metric_geometry_inject=True requires metric_g for every decision"
+                )
+            expected = (vision.shape[0], self.config.metric_geometry_dim)
+            if metric_g.shape != expected:
+                raise ValueError(
+                    f"metric_g must have shape {expected}, got {tuple(metric_g.shape)}"
+                )
+            if not torch.isfinite(metric_g).all():
+                raise ValueError("metric_g must contain only finite values")
+            state = state + self.geometry_projection(
+                metric_g.to(device=state.device, dtype=target_dtype)
+            )
 
         if language_cache is None:
             language_cache = self.build_language_cache(language_hidden, language_mask)
@@ -2376,6 +2461,7 @@ class VACompoundPolicy(nn.Module):
         dense_evidence: dict[int, Tensor] | None = None,
         metric_tokens: Tensor | None = None,
         action_dense_evidence: dict[int, Tensor] | None = None,
+        metric_g: Tensor | None = None,
     ) -> Tensor | tuple[Tensor, VisualMemory]:
         encoded = self.encode_condition(
             vision_tokens,
@@ -2389,6 +2475,7 @@ class VACompoundPolicy(nn.Module):
             dense_evidence=dense_evidence,
             metric_tokens=metric_tokens,
             action_dense_evidence=action_dense_evidence,
+            metric_g=metric_g,
         )
         if return_visual_memory:
             action_condition, next_memory = encoded

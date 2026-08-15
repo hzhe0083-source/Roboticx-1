@@ -59,6 +59,9 @@ from va_compound.local_control_slots import (
     build_va_vision_input,
 )
 from va_compound.metric_roi import (
+    DINO_METRIC_ROI_CONTRACT,
+    TASK35_METRIC_ROLE_CONTRACT,
+    load_dino_metric_roi_checkpoint,
     load_metric_roi_checkpoint,
     metric_head_state_sha256,
     prepare_metric_roi_video,
@@ -656,56 +659,12 @@ def _load_dino_metric_from_policy(ckpt: dict, config, device):
 
 
 def _load_dino_roi_head(path: Path, device):
-    """DINO ROI 精修头（2026-08-16）：独立 artifact contract=dino_metric_roi_v1。
-
-    与 train_metric_roi_dino.py 保存格式一致：roi_metric_head 状态 +
-    ctor_config（grid=16 LanguageMetricField）+ ROI 几何配置。评测禁止
-    随机重建——缺键/合约不符即 fail-fast。``_mtvj_roi_config`` 由
-    refine_metric_roi_positions_dino 读取（canonical_image_size /
-    min_roi_size / max_roi_size / distance_scale / max_delta_px）。
-    """
-    from va_compound.metric_visual_head import LanguageMetricField
-
-    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-    if checkpoint.get("contract") != "dino_metric_roi_v1":
-        raise ValueError(
-            f"DINO ROI checkpoint contract={checkpoint.get('contract')!r} != "
-            "'dino_metric_roi_v1'"
-        )
-    state = checkpoint.get("roi_metric_head")
-    ctor_config = checkpoint.get("ctor_config")
-    if state is None or ctor_config is None:
-        raise ValueError("DINO ROI checkpoint 缺少 roi_metric_head / ctor_config")
-    if int(ctor_config.get("grid", -1)) != 16:
-        raise ValueError(
-            f"DINO ROI head grid={ctor_config.get('grid')!r} != 16（DINO 原生网格）"
-        )
-    roi_head = LanguageMetricField(
-        lang_dim=int(ctor_config["lang_dim"]),
-        h_dim=int(ctor_config["h_dim"]),
-        d_proj=int(ctor_config["d_proj"]),
-        n_roles=int(ctor_config["n_roles"]),
-        l2_norm=bool(ctor_config["l2_norm"]),
-        learnable_temp=bool(ctor_config["learnable_temp"]),
-        temp_init=float(ctor_config.get("temp_init", 10.0)),
-        freeze_bias=bool(ctor_config.get("freeze_bias", False)),
-        mode_readout=bool(ctor_config["mode_readout"]),
-        grid=int(ctor_config["grid"]),
-    ).to(device)
-    roi_head.load_state_dict(state, strict=True)
-    roi_head._mtvj_roi_config = {
-        "canonical_image_size": int(checkpoint.get("canonical_image_size", 224)),
-        "min_roi_size": float(checkpoint.get("min_roi_size", 96)),
-        "max_roi_size": float(checkpoint.get("max_roi_size", 192)),
-        "distance_scale": float(checkpoint.get("distance_scale", 2.0)),
-        "max_delta_px": float(checkpoint.get("max_delta_px", 32.0)),
-    }
-    roi_head.eval()
-    for parameter in roi_head.parameters():
-        parameter.requires_grad_(False)
+    """Strict task35 DINO ROI v2 loader shared with policy training."""
+    roi_head = load_dino_metric_roi_checkpoint(path, device)
     print(
-        f"eval: DINO ROI 精修头就绪（grid={roi_head.grid}, "
+        f"eval: task35 DINO ROI 精修头就绪（grid={roi_head.grid}, "
         f"params={sum(p.numel() for p in roi_head.parameters()):,}, "
+        f"contract={DINO_METRIC_ROI_CONTRACT}, roles={TASK35_METRIC_ROLE_CONTRACT}, "
         f"roi_config={roi_head._mtvj_roi_config}）",
         flush=True,
     )
@@ -839,6 +798,7 @@ def _decision_mtvj_context(
     dense_kwargs = {
         "dense_evidence": dense_evidence,
         "metric_tokens": metric_tokens,
+        "metric_g": (metric_g[None] if metric_g is not None else None),
     }
     return dense_kwargs, metric_g, vision_override, (
         metric_g if metric_g is not None else metric_g_prev
@@ -2225,9 +2185,15 @@ def main() -> None:
                 "禁止 --dense-readout-mtvj / --metric-visual-checkpoint "
                 "（V-JEPA 路径）混用"
             )
+    dino_roi_expected = policy_contract.get("dino_roi_enabled") is True
     if args.dino_roi_checkpoint is None:
         if args.dino_roi_alpha is not None:
             raise ValueError("--dino-roi-alpha requires --dino-roi-checkpoint")
+        if dino_roi_expected:
+            raise ValueError(
+                "checkpoint was trained with task35 DINO ROI; pass the exact "
+                "--dino-roi-checkpoint instead of silently disabling it"
+            )
     else:
         if not getattr(config, "dino_dense_metric", False):
             raise ValueError(
@@ -2241,6 +2207,13 @@ def main() -> None:
             raise ValueError(
                 "--dino-roi-checkpoint requires finite --dino-roi-alpha in [0,1]"
             )
+        if dino_roi_expected:
+            saved_alpha = policy_contract.get("dino_roi_alpha")
+            if saved_alpha is None or float(saved_alpha) != float(args.dino_roi_alpha):
+                raise ValueError(
+                    "--dino-roi-alpha must match policy training: "
+                    f"policy={saved_alpha!r}, runtime={args.dino_roi_alpha!r}"
+                )
     if checkpoint_uses_mtvj and not getattr(config, "dino_dense_metric", False) and not args.dense_readout_mtvj:
         args.dense_readout_mtvj = True
         print(
@@ -2513,6 +2486,18 @@ def main() -> None:
         coords_dino_metric = dense_coords(512, device=device)
         if args.dino_roi_checkpoint is not None:
             roi_head = _load_dino_roi_head(args.dino_roi_checkpoint, device)
+            expected_identity = ckpt.get("dino_roi_checkpoint_identity")
+            actual_identity = getattr(roi_head, "_dino_roi_identity", None)
+            if expected_identity is not None:
+                mismatches = {
+                    key: (expected_identity.get(key), actual_identity.get(key))
+                    for key in ("sha256", "size_bytes", "contract")
+                    if expected_identity.get(key) != actual_identity.get(key)
+                }
+                if mismatches:
+                    raise ValueError(
+                        f"DINO ROI checkpoint identity mismatch: {mismatches}"
+                    )
     if args.dense_readout_mtvj:
         mtvj_backbone = VJEPA21Backbone.from_pretrained(
             device=device,
@@ -3319,6 +3304,7 @@ def main() -> None:
                             dense_kwargs = {
                                 "dense_evidence": dino_dense_evidence,
                                 "metric_tokens": dino_metric_tokens,
+                                "metric_g": metric_g[None],
                             }
                         if args.dense_readout_mtvj:
                             # MT-VJ 在线 dense 解码（契约 §7，与训练 §6

@@ -61,13 +61,15 @@ def evaluate_split(indices: np.ndarray, split_name: str) -> None:
                 window=config.main_vision_frames, return_dense=True,
             )
             if metric_head is not None:
-                metric_tokens_t = _dino_metric_tokens(
+                metric_tokens_t, metric_g_t = _dino_metric_tokens(
                     metric_head, relation_encoder, dense_t, batch, device,
                     train_metric_head=False,
                 )
                 metric_tokens = metric_tokens_t[:, 0]
+                metric_g = metric_g_t[:, 0]
             else:
                 metric_tokens = None
+                metric_g = None
             tokens = tokens_t[:, 0]
             dense = {k: v[:, 0] for k, v in dense_t.items()}
             cond = model.encode_condition(
@@ -78,6 +80,7 @@ def evaluate_split(indices: np.ndarray, split_name: str) -> None:
                 language_mask=batch["language_mask"],
                 dense_evidence=dense,
                 metric_tokens=metric_tokens,
+                metric_g=metric_g,
             )
             # 固定噪声：两次解码同一 ε，消掉流采样随机性。
             noise = torch.randn(cond.shape[0], 48, 4, device=device)
@@ -96,6 +99,9 @@ def evaluate_split(indices: np.ndarray, split_name: str) -> None:
                 language_mask=batch["language_mask"],
                 dense_evidence=dense_zero,
                 metric_tokens=metric_zero,
+                metric_g=(
+                    torch.zeros_like(metric_g) if metric_g is not None else None
+                ),
             )
             pred_zero = model.decode_actions(cond_zero, steps=8, noise=noise)
             errs_zero_list.append((pred_zero - expert).abs())

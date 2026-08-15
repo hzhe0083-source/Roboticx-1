@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 import torch
 
-from va_compound.model import VACompoundConfig
+from va_compound.model import VACompoundConfig, VACompoundPolicy
 
 
 class FakeDinoBackbone:
@@ -65,6 +65,59 @@ def test_main_vision_config_validation() -> None:
         _dino_config(main_vision_frames=0)
     with pytest.raises(ValueError, match="main_vision_model_id"):
         _dino_config(main_vision_model_id="")
+
+
+def test_temporal_embedding_breaks_frame_permutation_invariance() -> None:
+    config = _dino_config(
+        language_dim=12,
+        vision_dim=1024,
+        hidden_dim=16,
+        num_layers=1,
+        num_heads=4,
+        action_horizon=3,
+        action_dim=4,
+        proprio_dim=5,
+        main_vision_grid=2,
+        main_vision_tokens=16,
+        main_vision_temporal=True,
+    )
+    torch.manual_seed(7)
+    model = VACompoundPolicy(config).eval()
+    # The four frame blocks contain distinct content.  Without an explicit frame
+    # code, reversing whole blocks is a pure token permutation to attention.
+    vision = torch.stack(
+        [torch.full((4, 1024), float(frame)) for frame in range(4)], dim=0
+    ).reshape(1, 16, 1024)
+    reversed_vision = vision.reshape(1, 4, 4, 1024).flip(1).reshape_as(vision)
+    language = torch.randn(1, 3, 12)
+    mask = torch.ones(1, 3, dtype=torch.bool)
+    cache = model.build_language_cache(language, mask)
+    kwargs = dict(
+        proprio=torch.zeros(1, 5),
+        previous_action=torch.zeros(1, 4),
+        language_cache=cache,
+    )
+    full = model.encode_condition(vision, **kwargs)
+    reversed_condition = model.encode_condition(reversed_vision, **kwargs)
+    assert not torch.allclose(full, reversed_condition, atol=1e-7, rtol=1e-7)
+
+
+def test_temporal_embedding_disabled_preserves_old_state_dict_contract() -> None:
+    config = _dino_config(
+        language_dim=12,
+        vision_dim=1024,
+        hidden_dim=16,
+        num_layers=1,
+        num_heads=4,
+        action_horizon=3,
+        action_dim=4,
+        proprio_dim=5,
+    )
+    model = VACompoundPolicy(config)
+    assert model.main_vision_frame_embedding is None
+    assert not any(
+        key.startswith("main_vision_frame_embedding.") for key in model.state_dict()
+    )
 
 
 def test_dino_main_pool_preserves_row_major_grid() -> None:
@@ -121,6 +174,9 @@ def test_main_vision_vision_dim_override_via_kwargs() -> None:
         dino_main_vision = True
         main_vision_grid = 4
         main_vision_frames = 4
+        main_vision_temporal = False
+        main_vision_temporal_scale = 1.0
+        dino_dense_metric = False
 
     kwargs = _main_vision_config_kwargs(Args())
     assert kwargs["main_vision_backbone"] == "dinov2_vitl14_reg4"

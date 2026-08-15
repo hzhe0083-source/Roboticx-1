@@ -209,6 +209,39 @@ def test_dataset_identity_rejects_changed_action_payload(tmp_path, changed_key: 
         )
 
 
+def test_exact_contract_tracks_dino_roi_identity() -> None:
+    _, optimizer = _model_and_optimizer()
+    args = parse_args(["--single-task"])
+    config = SimpleNamespace(num_layers=8, action_horizon=6)
+    roi_a = SimpleNamespace(
+        _dino_roi_identity={
+            "sha256": "a" * 64,
+            "size_bytes": 123,
+            "contract": "dino_metric_roi_task35_v2",
+            "path": "/ignored/a.pt",
+        },
+        _mtvj_roi_config={"canonical_image_size": 224},
+    )
+    roi_b = SimpleNamespace(
+        _dino_roi_identity={
+            "sha256": "b" * 64,
+            "size_bytes": 123,
+            "contract": "dino_metric_roi_task35_v2",
+            "path": "/ignored/b.pt",
+        },
+        _mtvj_roi_config={"canonical_image_size": 224},
+    )
+    baseline = build_exact_run_contract(
+        args, config, optimizer, _sampler(), roi_head=roi_a
+    )
+    changed = build_exact_run_contract(
+        args, config, optimizer, _sampler(), roi_head=roi_b
+    )
+    assert baseline["mtvj"]["roi_checkpoint_identity"]["sha256"] == "a" * 64
+    with pytest.raises(ValueError, match="roi_checkpoint_identity"):
+        validate_exact_run_contract(baseline, changed)
+
+
 @pytest.mark.parametrize(
     ("flag", "value", "field"),
     [

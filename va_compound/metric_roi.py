@@ -27,6 +27,8 @@ ROI_MIN_SIZE = 96.0
 ROI_MAX_SIZE = 192.0
 METRIC_ROI_CONTRACT = "mt_vj_metric_roi_v1"
 METRIC_ROI_CONTRACT_VERSION = 1
+DINO_METRIC_ROI_CONTRACT = "dino_metric_roi_task35_v2"
+TASK35_METRIC_ROLE_CONTRACT = "slots_tool_pegGrasp_hole_pegHead_v1"
 METRIC_ROI_HEAD_CONFIG_KEYS = (
     "lang_dim",
     "h_dim",
@@ -84,8 +86,14 @@ def plan_metric_roi(
     center_jitter_px: float = 0.0,
     size_jitter: float = 0.0,
     generator: torch.Generator | None = None,
+    forced_pair_index: int | None = None,
 ) -> MetricROI:
-    """Select the more visible role pair and plan one dynamic square crop.
+    """Select a role pair and plan one dynamic square crop.
+
+    By default the pair with the larger visibility product is selected.  A
+    forced pair is available for task-specific contracts; task35 deployment
+    fixes pair 1 = ``(pegHead, hole)`` so ROI capacity cannot be diverted to the
+    already-easy gripper/pegGrasp pair.
 
     Crop size is ``2 * max(|dy|, |dx|)`` in pixels, clipped to 96--192 by
     default.  Optional training jitter moves the center uniformly in pixels
@@ -131,7 +139,17 @@ def plan_metric_roi(
         ),
         dim=-1,
     )
-    pair_index = pair_scores.argmax(dim=-1)  # deterministic: first pair wins ties
+    if forced_pair_index is None:
+        pair_index = pair_scores.argmax(dim=-1)  # deterministic: first pair wins ties
+    else:
+        if forced_pair_index not in (0, 1):
+            raise ValueError("forced_pair_index must be 0, 1, or None")
+        pair_index = torch.full(
+            (coarse_p.shape[0],),
+            int(forced_pair_index),
+            device=device,
+            dtype=torch.long,
+        )
     pair_roles = pairs[pair_index]  # [B, 2]
     batch_index = torch.arange(coarse_p.shape[0], device=device)[:, None]
     pair_p = coarse_p[batch_index, pair_roles]  # [B, 2, 2], y/x
@@ -715,6 +733,68 @@ def refine_metric_roi_positions(
     )
 
 
+def load_dino_metric_roi_checkpoint(
+    path: str | Path,
+    device: torch.device | str,
+) -> nn.Module:
+    """Load the task35 DINO ROI artifact with strict role/geometry identity.
+
+    Unlike the legacy v1 artifact, v2 records the corrected role semantics and
+    is therefore safe to attach to a policy whose metric slots are
+    ``[tool, pegGrasp, hole, pegHead]``.  A legacy checkpoint is rejected rather
+    than silently reinterpreted under different labels.
+    """
+    from va_compound.metric_visual_head import LanguageMetricField
+
+    resolved = Path(path).expanduser().resolve(strict=True)
+    checkpoint = torch.load(resolved, map_location="cpu", weights_only=True)
+    if checkpoint.get("contract") != DINO_METRIC_ROI_CONTRACT:
+        raise ValueError(
+            f"DINO ROI contract={checkpoint.get('contract')!r} != "
+            f"{DINO_METRIC_ROI_CONTRACT!r}"
+        )
+    if checkpoint.get("metric_role_contract") != TASK35_METRIC_ROLE_CONTRACT:
+        raise ValueError(
+            "DINO ROI metric role contract mismatch: "
+            f"{checkpoint.get('metric_role_contract')!r} != "
+            f"{TASK35_METRIC_ROLE_CONTRACT!r}"
+        )
+    if checkpoint.get("role_order") != ["tool", "pegGrasp", "hole", "pegHead"]:
+        raise ValueError("DINO ROI role_order must be task35 aligned")
+    state = checkpoint.get("roi_metric_head")
+    ctor = checkpoint.get("ctor_config")
+    if not isinstance(state, Mapping) or not isinstance(ctor, dict):
+        raise ValueError("DINO ROI checkpoint lacks roi_metric_head/ctor_config")
+    if int(ctor.get("grid", -1)) != 16 or int(ctor.get("h_dim", -1)) != 1024:
+        raise ValueError("DINO ROI head must use grid=16 and h_dim=1024")
+    head = LanguageMetricField(
+        lang_dim=int(ctor["lang_dim"]),
+        h_dim=int(ctor["h_dim"]),
+        d_proj=int(ctor["d_proj"]),
+        n_roles=int(ctor["n_roles"]),
+        l2_norm=bool(ctor["l2_norm"]),
+        learnable_temp=bool(ctor["learnable_temp"]),
+        temp_init=float(ctor.get("temp_init", 10.0)),
+        freeze_bias=bool(ctor.get("freeze_bias", False)),
+        mode_readout=bool(ctor["mode_readout"]),
+        grid=int(ctor["grid"]),
+    ).to(device)
+    head.load_state_dict(state, strict=True)
+    head._mtvj_roi_config = {
+        "canonical_image_size": int(checkpoint.get("canonical_image_size", 224)),
+        "min_roi_size": float(checkpoint.get("min_roi_size", ROI_MIN_SIZE)),
+        "max_roi_size": float(checkpoint.get("max_roi_size", ROI_MAX_SIZE)),
+        "distance_scale": float(checkpoint.get("distance_scale", 2.0)),
+        "max_delta_px": float(checkpoint.get("max_delta_px", 32.0)),
+    }
+    head._dino_roi_identity = metric_roi_checkpoint_identity(resolved, checkpoint)
+    head._dino_metric_role_contract = checkpoint["metric_role_contract"]
+    head.eval()
+    for parameter in head.parameters():
+        parameter.requires_grad_(False)
+    return head
+
+
 def refine_metric_roi_positions_dino(
     coarse_p: Tensor,
     coarse_visibility: Tensor,
@@ -756,6 +836,12 @@ def refine_metric_roi_positions_dino(
         min_size=min_size,
         max_size=max_size,
         distance_scale=distance_scale,
+        forced_pair_index=(
+            1
+            if getattr(roi_head, "_dino_metric_role_contract", None)
+            == TASK35_METRIC_ROLE_CONTRACT
+            else None
+        ),
     )
     cropped = crop_metric_roi_video(
         raw_video, selection.roi, canonical_image_size=image_size

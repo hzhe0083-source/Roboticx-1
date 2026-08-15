@@ -12,6 +12,7 @@ import prepare_metaworld_metric as metric_data
 from prepare_metaworld_metric import (
     DIRECT_TOOL_TARGET_TASKS,
     SUPPORTED_TASKS,
+    TASK_ALIGNED_ROLE_SOURCES,
     _chronological_capture_offsets,
     _entity_aware_visibility,
     _randomize_nonrobot_articulation,
@@ -66,9 +67,12 @@ def test_each_metric_sample_randomizes_articulation_once() -> None:
     assert source.count("_randomize_nonrobot_articulation(env, rng)") == 1
 
 
-def test_all_49_tasks_follow_the_generic_role_contract() -> None:
+def test_all_49_tasks_follow_declared_role_contracts() -> None:
     assert SUPPORTED_TASKS == tuple(ENV_TO_TASK)
     assert len(SUPPORTED_TASKS) == 49
+    assert TASK_ALIGNED_ROLE_SOURCES == {
+        "peg-insert-side-v3": ("tcp_center", "pegGrasp", "hole", "pegHead")
+    }
 
     checked = []
     for task, env in _mt50_environments():
@@ -78,20 +82,45 @@ def test_all_49_tasks_follow_the_generic_role_contract() -> None:
             assert world.shape == (4, 3)
             assert np.isfinite(world).all()
             np.testing.assert_allclose(world[0], env.tcp_center)
-            np.testing.assert_allclose(world[2], env._target_pos)
-
-            entities = np.asarray(env._get_pos_objects()).reshape(-1, 3)
-            if task in DIRECT_TOOL_TARGET_TASKS:
-                np.testing.assert_allclose(world[1], world[0])
-                np.testing.assert_allclose(world[3], world[0])
+            if task == "peg-insert-side-v3":
+                np.testing.assert_allclose(world[1], env.data.site("pegGrasp").xpos)
+                np.testing.assert_allclose(world[2], env.data.site("hole").xpos)
+                np.testing.assert_allclose(world[3], env.data.site("pegHead").xpos)
+                assert not np.allclose(world[1], world[3])
+                assert not np.allclose(world[2], env._target_pos)
             else:
-                np.testing.assert_allclose(world[1], entities[0])
-                expected_progress = entities[1] if len(entities) > 1 else entities[0]
-                np.testing.assert_allclose(world[3], expected_progress)
+                np.testing.assert_allclose(world[2], env._target_pos)
+                entities = np.asarray(env._get_pos_objects()).reshape(-1, 3)
+                if task in DIRECT_TOOL_TARGET_TASKS:
+                    np.testing.assert_allclose(world[1], world[0])
+                    np.testing.assert_allclose(world[3], world[0])
+                else:
+                    np.testing.assert_allclose(world[1], entities[0])
+                    expected_progress = entities[1] if len(entities) > 1 else entities[0]
+                    np.testing.assert_allclose(world[3], expected_progress)
             checked.append(task)
         finally:
             env.close()
     assert tuple(checked) == SUPPORTED_TASKS
+
+
+def test_task35_aligned_roles_are_observable_and_distinct() -> None:
+    batch = make_metric_batch(
+        "peg-insert-side-v3", np.random.default_rng(35035), 32
+    )
+    # role order: [tool, pegGrasp, hole(target), pegHead(interface)].  The old
+    # contract produced target visibility 0 and object==interface; both are P0.
+    assert float(batch["visibility"][:, 2].mean()) >= 0.5
+    assert float(batch["visibility"][:, 3].mean()) >= 0.5
+    separation = np.linalg.norm(batch["world"][:, 1] - batch["world"][:, 3], axis=-1)
+    assert float(separation.min()) > 0.05
+    relation_error = batch["keypoints"][:, 3] - batch["keypoints"][:, 2]
+    np.testing.assert_allclose(
+        batch["relation"][:, 2:4], relation_error, atol=1e-7, rtol=1e-6
+    )
+    assert batch["meta"]["task_role_source"]["task_overrides"] == {
+        "peg-insert-side-v3": ["tcp_center", "pegGrasp", "hole", "pegHead"]
+    }
 
 
 def test_dual_entity_and_direct_tcp_families_have_correct_relations() -> None:
