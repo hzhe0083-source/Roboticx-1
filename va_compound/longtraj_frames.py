@@ -21,6 +21,7 @@ import torch
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parent.parent
+ACTION_MASK_KEYS = ("action_valid_mask", "horizon_mask")
 
 
 def mtvj_collate(batch: list[dict]) -> dict:
@@ -183,6 +184,9 @@ class LongTrajFramesDataset:
 
     def __getitem__(self, index: int) -> dict:
         item = {key: self.payload[key][index] for key in self.REQUIRED}
+        for key in ACTION_MASK_KEYS:
+            if key in self.payload:
+                item[key] = self.payload[key][index]
         if "language_mask" in self.payload:
             item["language_mask"] = self.payload["language_mask"][index]
         if self.cache_rows is not None:

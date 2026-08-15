@@ -25,6 +25,9 @@ def test_dino_cache_can_supply_exact_raw_roi_frames_without_jpeg_decode(
         "language_mask": torch.ones(1, 3, dtype=torch.bool),
         "instruction_id": torch.tensor([35]),
         "pair_id": torch.tensor([0]),
+        "action_valid_mask": torch.tensor(
+            [[[True] * 6, [True] * 6, [False] * 6, [True, False] * 3]]
+        ),
         "frame_refs": [("task35", 0, [[0, 1, 2, 3]] * 4)],
     }
     torch.save(payload, payload_path)
@@ -65,6 +68,7 @@ def test_dino_cache_can_supply_exact_raw_roi_frames_without_jpeg_decode(
         lambda *_: (_ for _ in ()).throw(AssertionError("JPEG decode must be skipped")),
     )
     item = dataset[0]
+    assert torch.equal(item["action_valid_mask"], payload["action_valid_mask"][0])
     assert item["frames"].shape == (4, 4, 480, 480, 3)
     assert item["frames"][:, :, 0, 0, 0].tolist() == [
         [0, 10, 20, 30],
