@@ -4,9 +4,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-FORCE=0
+FORCE=()
 if [[ "${1:-}" == "--force" ]]; then
-  FORCE=1
+  FORCE=(--force)
   shift
 fi
 CKPT=${1:?usage: $0 [--force] checkpoint.pt [name]}
@@ -16,7 +16,7 @@ DINO=/home/ryan/.cache/huggingface/hub/models--timm--vit_large_patch14_reg4_dino
 FEATURES=data/metaworld_longtraj_windows_h6_dino35_clean60_recovery30_v1.pt
 TRAINER_NEEDLE='train.py --task35-precision-contract'
 
-if [[ "$FORCE" -eq 0 ]] && pgrep -f "$TRAINER_NEEDLE" >/dev/null; then
+if [[ ${#FORCE[@]} -eq 0 ]] && pgrep -f "$TRAINER_NEEDLE" >/dev/null; then
   echo "FM trainer still running; refusing to take the GPU. Pass --force to override." >&2
   exit 3
 fi
@@ -37,4 +37,7 @@ fi
   --output "logs/${NAME}_metric_holdout2777.json"
 
 scripts/run_task35_h6_eval50.sh "$CKPT" "$NAME"
+if [[ "${TASK35_SKIP_CAUSAL:-0}" != "1" ]]; then
+  scripts/run_task35_h6_causal_suite.sh "${FORCE[@]}" "$CKPT" "$NAME"
+fi
 echo "post-train eval finished for $CKPT" >&2
