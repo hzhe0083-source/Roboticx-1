@@ -64,6 +64,16 @@ def select_best_task35_fm(candidates: list[dict]) -> dict:
         if item.get("validated") is False:
             rejected.append({"path": item.get("path"), "reason": "checkpoint not validated"})
             continue
+        archive_sha = item.get("sha256")
+        eval_sha = eval50.get("checkpoint_sha256")
+        if archive_sha and eval_sha and archive_sha != eval_sha:
+            rejected.append(
+                {
+                    "path": item.get("path"),
+                    "reason": "eval50 SHA does not match archived checkpoint",
+                }
+            )
+            continue
         step = infer_task35_step(item.get("path"), item.get("step"))
         if step is None:
             rejected.append({"path": item.get("path"), "reason": "unknown step"})

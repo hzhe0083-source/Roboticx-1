@@ -99,8 +99,20 @@ def test_selector_refuses_to_elect_without_eval50() -> None:
 def test_selector_ranks_by_closed_loop_successes() -> None:
     report = select_best_task35_fm(
         [
-            {"path": "a.pt", "step": 6000, "validated": True, "eval50": _payload(successes=8)},
-            {"path": "b.pt", "step": 15000, "validated": True, "eval50": _payload(successes=15)},
+            {
+                "path": "a.pt",
+                "step": 6000,
+                "sha256": "abc",
+                "validated": True,
+                "eval50": _payload(successes=8),
+            },
+            {
+                "path": "b.pt",
+                "step": 15000,
+                "sha256": "abc",
+                "validated": True,
+                "eval50": _payload(successes=15),
+            },
         ]
     )
     assert report["selected"]["path"] == "b.pt"
@@ -158,6 +170,21 @@ def test_eval50_launcher_skips_qwen_and_sets_cuda_allocator() -> None:
     assert "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True" in ablation
     assert "cached_task35_language" in encode
     assert "Encode one frame at a time" in encode
+
+
+def test_selector_rejects_eval50_sha_mismatch() -> None:
+    with pytest.raises(ValueError, match="no reproducible FM VA"):
+        select_best_task35_fm(
+            [
+                {
+                    "path": "checkpoints/x_step3000.pt",
+                    "step": 3000,
+                    "sha256": "archive",
+                    "validated": True,
+                    "eval50": _payload(successes=20),
+                }
+            ]
+        )
 
 
 def test_selector_rejects_1k_2k_even_with_eval50() -> None:

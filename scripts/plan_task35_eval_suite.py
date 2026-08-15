@@ -67,10 +67,18 @@ def plan_task35_eval_suite(
             continue
         eval50_path = _eval50_path(logs_dir, str(path))
         payload = _valid_eval50(eval50_path)
+        archive_sha = item.get("sha256")
+        if (
+            payload is not None
+            and archive_sha
+            and payload.get("checkpoint_sha256")
+            and payload.get("checkpoint_sha256") != archive_sha
+        ):
+            payload = None
         row = {
             "path": path,
             "step": step,
-            "sha256": item.get("sha256"),
+            "sha256": archive_sha,
             "eval50": str(eval50_path),
         }
         if payload is None:
