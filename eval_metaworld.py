@@ -273,6 +273,47 @@ def evaluation_episode_seed(global_task_id: int, trial: int) -> int:
     return 1000 * int(global_task_id) + int(trial)
 
 
+TASK35_EVAL50_SEEDS = tuple(range(35000, 35050))
+
+
+def validate_task35_eval50_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Fail-closed check for a 50-seed task35 closed-loop JSON."""
+    if payload.get("contract") != "metaworld_closed_loop_trials_v1":
+        raise ValueError("eval50 payload has the wrong contract")
+    trials = payload.get("trials") or []
+    seeds = [int(row["seed"]) for row in trials]
+    expected = list(TASK35_EVAL50_SEEDS)
+    requirements = {
+        "task35 only": payload.get("task_ids") == [35],
+        "50 completed trials": int(payload.get("completed_trials") or 0) == 50,
+        "50 trial records": len(trials) == 50,
+        "unique seeds": len(set(seeds)) == 50,
+        "paired seeds 35000-35049": seeds == expected,
+        "execute_steps 6": int(payload.get("execute_steps") or 0) == 6,
+        "horizon 500": int(payload.get("horizon") or 0) == 500,
+        "WAM off": payload.get("wam") == "off",
+        "success count matches": int(payload.get("successes") or 0)
+        == sum(bool(row.get("success")) for row in trials),
+    }
+    ablation = payload.get("task35_causal_ablation", "none")
+    if payload.get("task35_precision_contract"):
+        requirements["acceptance not ablated"] = ablation == "none"
+    elif ablation != "none":
+        requirements["diagnostic ablation"] = ablation in {
+            "temporal-reverse",
+            "geometry-zero",
+            "geometry-shuffle",
+            "roi-off",
+            "dense-zero",
+        }
+    else:
+        raise ValueError("eval50 payload is neither precision acceptance nor a causal diagnostic")
+    missing = [name for name, ok in requirements.items() if not ok]
+    if missing:
+        raise ValueError("task35 eval50 payload failed: " + ", ".join(missing))
+    return {"ok": True, "seeds": seeds, "successes": int(payload["successes"])}
+
+
 def task35_ablation_frames(
     frames: list[np.ndarray], ablation: str
 ) -> list[np.ndarray]:
@@ -3667,6 +3708,14 @@ def main() -> None:
             raise RuntimeError(
                 f"task35 precision evaluation completed {completed_trials} trials, expected 50"
             )
+        if [int(row["seed"]) for row in trial_records] != list(TASK35_EVAL50_SEEDS):
+            raise RuntimeError("task35 precision evaluation did not use seeds 35000-35049")
+        env_name = descriptions_to_env.get(expected_task_text)
+        if env_name != "peg-insert-side-v3":
+            raise RuntimeError(
+                "task35 precision evaluation mapped to "
+                f"{env_name!r}, expected peg-insert-side-v3"
+            )
     total = sum(per_task.values())
     trials = completed_trials
     if trials <= 0:
@@ -3733,8 +3782,13 @@ def main() -> None:
                 if args.dino_feature_cache is None
                 else str(args.dino_feature_cache.expanduser().resolve())
             ),
+            "env_name": descriptions_to_env.get(selected_tasks[0][1])
+            if len(selected_tasks) == 1
+            else None,
             "trials": trial_records,
         }
+        if args.task35_precision_contract or args.task35_causal_ablation != "none":
+            validate_task35_eval50_payload(result)
         args.output_json.parent.mkdir(parents=True, exist_ok=True)
         temporary = args.output_json.with_suffix(args.output_json.suffix + ".tmp")
         temporary.write_text(json.dumps(result, indent=2) + "\n")

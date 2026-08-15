@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from eval_metaworld import (
+    TASK35_EVAL50_SEEDS,
     evaluation_episode_seed,
     select_eval_tasks,
     task35_ablation_dense,
@@ -25,7 +26,7 @@ def test_subset_preserves_global_task_ids_and_seeds() -> None:
 
 def test_task35_paired_protocol_uses_seeds_35000_through_35049() -> None:
     assert [evaluation_episode_seed(35, trial) for trial in range(50)] == list(
-        range(35000, 35050)
+        TASK35_EVAL50_SEEDS
     )
 
 

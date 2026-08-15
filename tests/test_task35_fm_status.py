@@ -27,6 +27,7 @@ def test_status_markdown_mentions_planned_closed_loop() -> None:
             "generated_at": "now",
             "training": {"latest_step": 3000, "status": "RUNNING"},
             "closed_loop_complete": False,
+            "best": None,
             "candidates": [
                 {
                     "step": 3000,

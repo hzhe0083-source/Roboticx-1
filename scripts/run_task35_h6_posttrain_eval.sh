@@ -40,4 +40,6 @@ scripts/run_task35_h6_eval50.sh "${FORCE[@]}" "$CKPT" "$NAME"
 if [[ "${TASK35_SKIP_CAUSAL:-0}" != "1" ]]; then
   scripts/run_task35_h6_causal_suite.sh "${FORCE[@]}" "$CKPT" "$NAME"
 fi
+"$PY" -B scripts/select_task35_best_fm.py "logs/${NAME}_eval50.json" \
+  --output "logs/${NAME}_best.json"
 echo "post-train eval finished for $CKPT" >&2

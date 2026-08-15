@@ -4,7 +4,25 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from eval_metaworld import validate_task35_eval50_payload
+from scripts.select_task35_best_fm import select_best_task35_fm
+
+
+def _eval50_ok(payload: dict) -> bool:
+    try:
+        validate_task35_eval50_payload(payload)
+    except ValueError:
+        return False
+    return bool(payload.get("task35_precision_contract")) and payload.get(
+        "task35_causal_ablation", "none"
+    ) == "none"
 
 
 def load_json(path: Path) -> dict | None:
@@ -35,7 +53,12 @@ def evidence_row(candidate: dict) -> dict:
             "checkpoint_contract": "supported" if candidate.get("validated") else "planned",
             "slice_geometry": "partially supported" if slices else "planned",
             "holdout_metric": "supported" if holdout is not None else "planned",
-            "closed_loop": "supported" if eval50 is not None else "planned",
+            "closed_loop": (
+                "supported"
+                if eval50 is not None
+                and _eval50_ok(eval50)
+                else "planned"
+            ),
         },
     }
 
@@ -48,6 +71,7 @@ def render_md(payload: dict) -> str:
         f"- training_step: {payload['training'].get('latest_step')}",
         f"- training_status: {payload['training'].get('status')}",
         f"- closed_loop_complete: {payload['closed_loop_complete']}",
+        f"- best: {payload.get('best')}",
         "",
         "## candidates",
     ]
@@ -109,7 +133,25 @@ def main() -> None:
     candidates = load_json(args.candidates) or {"candidates": []}
     monitor = load_json(args.monitor) or {}
     rows = [evidence_row(item) for item in candidates.get("candidates") or []]
-    closed = all(row["closed_loop_trials"] == 50 for row in rows) and bool(rows)
+    closed = bool(rows) and all(row["labels"]["closed_loop"] == "supported" for row in rows)
+    best = None
+    best_error = None
+    selector_input = []
+    for item, row in zip(candidates.get("candidates") or [], rows):
+        eval50 = load_json(Path("logs") / f"{Path(item['path']).stem}_eval50.json")
+        selector_input.append(
+            {
+                "path": item.get("path"),
+                "step": item.get("step"),
+                "sha256": item.get("sha256"),
+                "validated": item.get("validated"),
+                "eval50": eval50,
+            }
+        )
+    try:
+        best = select_best_task35_fm(selector_input)
+    except ValueError as exc:
+        best_error = str(exc)
     payload = {
         "contract": "task35_fm_status_v1",
         "generated_at": datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds"),
@@ -120,6 +162,8 @@ def main() -> None:
         },
         "candidates": rows,
         "closed_loop_complete": closed,
+        "best": None if best is None else best.get("selected"),
+        "best_error": best_error,
         "note": "mechanism and provenance only until eval50 exists",
     }
     args.output_json.parent.mkdir(parents=True, exist_ok=True)

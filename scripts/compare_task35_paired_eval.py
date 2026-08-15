@@ -5,17 +5,21 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
 
 import numpy as np
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from eval_metaworld import validate_task35_eval50_payload
 
 
 def load(path: Path) -> tuple[dict, dict[int, dict]]:
     payload = json.loads(path.read_text())
-    if payload.get("contract") != "metaworld_closed_loop_trials_v1":
-        raise ValueError(f"unsupported result contract in {path}")
+    validate_task35_eval50_payload(payload)
     trials = {int(row["seed"]): row for row in payload["trials"]}
-    if len(trials) != int(payload["completed_trials"]):
-        raise ValueError(f"duplicate or missing trial seeds in {path}")
     return payload, trials
 
 
