@@ -47,9 +47,11 @@ if [[ ! -s "$DEST" || ! -s "${DEST}.sha256" ]]; then
 fi
 
 echo "trainer gone; archived $DEST" >&2
-scripts/wait_validate_task35_fm_milestone.sh 15000 "$STEM"
+for step in 1000 2000 3000 6000 9000 12000 15000; do
+  scripts/wait_validate_task35_fm_milestone.sh "$step" "$STEM"
+done
 CUDA_VISIBLE_DEVICES= "$PY" -B scripts/preflight_task35_posttrain.py \
   --checkpoint "$DEST" --expected-step 15000 \
   --output "logs/${NAME}_preflight.json"
-scripts/run_task35_h6_posttrain_eval.sh "$DEST" "$NAME"
-echo "finished post-train eval for $DEST" >&2
+scripts/run_task35_h6_eval_suite.sh "$STEM"
+echo "finished post-train eval suite; best ledger is logs/task35_best_fm.json" >&2
