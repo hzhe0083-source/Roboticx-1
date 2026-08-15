@@ -77,9 +77,9 @@ def test_dynamic_crop_reaches_max_and_training_jitter_is_bounded():
 
 def test_dino_v2_loader_requires_native_480_geometry_and_pair_contract(tmp_path) -> None:
     ctor = {
-        "lang_dim": 8,
+        "lang_dim": 2048,
         "h_dim": 1024,
-        "d_proj": 2,
+        "d_proj": 192,
         "n_roles": 4,
         "l2_norm": True,
         "learnable_temp": True,
@@ -97,6 +97,13 @@ def test_dino_v2_loader_requires_native_480_geometry_and_pair_contract(tmp_path)
         "raw_frame_contract": "true_simulator_render_480px_v1",
         "roi_geometry_size": 480,
         "canonical_image_size": 224,
+        "task": "peg-insert-side-v3",
+        "steps": 10,
+        "batch": 2,
+        "min_roi_size": 96.0,
+        "max_roi_size": 192.0,
+        "distance_scale": 2.0,
+        "max_delta_px": 32.0,
         "roi_metric_head": head.state_dict(),
         "ctor_config": ctor,
     }

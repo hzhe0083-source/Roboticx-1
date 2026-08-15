@@ -774,12 +774,47 @@ def load_dino_metric_roi_checkpoint(
         raise ValueError("DINO ROI must be trained from true 480px simulator renders")
     if int(checkpoint.get("roi_geometry_size", -1)) != 480:
         raise ValueError("DINO ROI geometry must be planned in 480px render space")
+    if int(checkpoint.get("canonical_image_size", -1)) != 224:
+        raise ValueError("DINO ROI encoder output must use canonical 224px inputs")
+    if checkpoint.get("task") != "peg-insert-side-v3":
+        raise ValueError("DINO ROI artifact must be trained only for task35")
+    if int(checkpoint.get("steps", 0)) <= 0 or int(checkpoint.get("batch", 0)) <= 0:
+        raise ValueError("DINO ROI artifact lacks a positive training budget")
     state = checkpoint.get("roi_metric_head")
     ctor = checkpoint.get("ctor_config")
     if not isinstance(state, Mapping) or not isinstance(ctor, dict):
         raise ValueError("DINO ROI checkpoint lacks roi_metric_head/ctor_config")
-    if int(ctor.get("grid", -1)) != 16 or int(ctor.get("h_dim", -1)) != 1024:
-        raise ValueError("DINO ROI head must use grid=16 and h_dim=1024")
+    expected_ctor = {
+        "lang_dim": 2048,
+        "h_dim": 1024,
+        "d_proj": 192,
+        "n_roles": 4,
+        "l2_norm": True,
+        "learnable_temp": True,
+        "freeze_bias": False,
+        "mode_readout": True,
+        "grid": 16,
+    }
+    mismatches = {
+        key: (ctor.get(key), expected)
+        for key, expected in expected_ctor.items()
+        if ctor.get(key) != expected
+    }
+    if mismatches:
+        raise ValueError(f"DINO ROI head constructor mismatch: {mismatches}")
+    geometry_contract = {
+        "min_roi_size": 96.0,
+        "max_roi_size": 192.0,
+        "distance_scale": 2.0,
+        "max_delta_px": 32.0,
+    }
+    geometry_mismatches = {
+        key: (checkpoint.get(key), expected)
+        for key, expected in geometry_contract.items()
+        if checkpoint.get(key) is None or float(checkpoint[key]) != expected
+    }
+    if geometry_mismatches:
+        raise ValueError(f"DINO ROI geometry contract mismatch: {geometry_mismatches}")
     head = LanguageMetricField(
         lang_dim=int(ctor["lang_dim"]),
         h_dim=int(ctor["h_dim"]),
