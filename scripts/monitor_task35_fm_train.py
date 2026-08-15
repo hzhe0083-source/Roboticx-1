@@ -315,6 +315,17 @@ def main() -> None:
     }
     atomic_write(args.json, json.dumps(payload, indent=2) + "\n")
     atomic_write(args.report, render_md(snapshot, trainer, timing))
+    try:
+        import subprocess
+
+        python = sys.executable
+        for script in (
+            ROOT / "scripts" / "list_task35_fm_candidates.py",
+            ROOT / "scripts" / "report_task35_fm_status.py",
+        ):
+            subprocess.run([python, "-B", str(script)], check=True, cwd=ROOT)
+    except Exception as exc:  # cron must keep writing the live loss report
+        print(f"status ledger refresh skipped: {exc}", flush=True)
     history_row = {
         "generated_at": payload["generated_at"],
         "step": payload["latest_step"],

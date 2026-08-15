@@ -25,4 +25,6 @@ if [[ ! -s "$SLICES" ]]; then
   CUDA_VISIBLE_DEVICES= "$PY" -B scripts/diag_task35_clean_recovery_slices.py \
     --checkpoint "$DEST" --batch 16 --output "$SLICES"
 fi
+"$PY" -B scripts/list_task35_fm_candidates.py >/dev/null
+"$PY" -B scripts/report_task35_fm_status.py >/dev/null
 echo "validated and sliced $DEST" >&2

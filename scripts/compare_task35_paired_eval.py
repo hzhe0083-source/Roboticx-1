@@ -19,16 +19,13 @@ def load(path: Path) -> tuple[dict, dict[int, dict]]:
     return payload, trials
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("baseline", type=Path)
-    parser.add_argument("candidates", type=Path, nargs="+")
-    parser.add_argument("--output", type=Path)
-    args = parser.parse_args()
-    base_payload, base = load(args.baseline)
+def compare_payloads(base_payload: dict, candidates: list[tuple[str, dict]]) -> dict:
+    base = {int(row["seed"]): row for row in base_payload["trials"]}
+    if len(base) != int(base_payload["completed_trials"]):
+        raise ValueError("duplicate or missing trial seeds in baseline")
     rows = []
-    for path in args.candidates:
-        payload, candidate = load(path)
+    for path, payload in candidates:
+        candidate = {int(row["seed"]): row for row in payload["trials"]}
         if set(candidate) != set(base):
             raise ValueError(f"seed set mismatch: {path}")
         seeds = sorted(base)
@@ -63,16 +60,28 @@ def main() -> None:
                 ),
             }
         )
-    result = {
+    return {
         "contract": "task35_paired_eval_comparison_v1",
         "baseline": {
-            "path": str(args.baseline),
+            "path": None,
             "checkpoint_sha256": base_payload["checkpoint_sha256"],
             "successes": int(sum(bool(row["success"]) for row in base.values())),
             "trials": len(base),
         },
         "comparisons": rows,
     }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("baseline", type=Path)
+    parser.add_argument("candidates", type=Path, nargs="+")
+    parser.add_argument("--output", type=Path)
+    args = parser.parse_args()
+    base_payload, _base = load(args.baseline)
+    loaded = [(str(path), load(path)[0]) for path in args.candidates]
+    result = compare_payloads(base_payload, loaded)
+    result["baseline"]["path"] = str(args.baseline)
     text = json.dumps(result, indent=2) + "\n"
     print(text, end="")
     if args.output is not None:
