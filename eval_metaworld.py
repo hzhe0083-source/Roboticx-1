@@ -2291,6 +2291,14 @@ def main() -> None:
             "four frames": getattr(config, "main_vision_frames", None) == 4,
             "temporal": getattr(config, "main_vision_temporal", False),
             "geometry": getattr(config, "metric_geometry_inject", False),
+            "visual auxiliary grounding": int(
+                policy_contract.get("mtvj_visual_aux_every", 0)
+            )
+            > 0,
+            "visual auxiliary raw pixels": policy_contract.get(
+                "mtvj_visual_aux_pixel_contract"
+            )
+            == "true_simulator_render_480_to_dino224_v1",
             "ROI": dino_roi_expected and args.dino_roi_checkpoint is not None,
             "ROI alpha 1": args.dino_roi_alpha == 1.0,
             "execute_steps 6": args.execute_steps == 6,

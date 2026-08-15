@@ -4810,6 +4810,8 @@ def validate_args(args: argparse.Namespace) -> None:
             and float(dino_roi_alpha) == 1.0,
             "--mtvj-train-metric-head": getattr(args, "mtvj_train_metric_head", False),
             "--mtvj-train-relation": getattr(args, "mtvj_train_relation", False),
+            "--mtvj-visual-aux-every > 0": args.mtvj_visual_aux_every > 0,
+            "--mtvj-visual-aux-batch > 0": args.mtvj_visual_aux_batch > 0,
             "--task-sampling weighted": args.task_sampling == "weighted",
             "--num-workers 0": args.num_workers == 0,
             "from scratch": args.resume is None
@@ -5696,6 +5698,20 @@ def save_checkpoint(
                 "metric_head_lr": (
                     args.lr_mtvj_metric_head
                     if metric_head is not None and args.mtvj_train_metric_head
+                    else None
+                ),
+                "mtvj_visual_aux_every": int(args.mtvj_visual_aux_every),
+                "mtvj_visual_aux_batch": int(args.mtvj_visual_aux_batch),
+                "mtvj_visual_aux_loc_lambda": float(
+                    args.mtvj_visual_aux_loc_lambda
+                ),
+                "mtvj_visual_aux_vis_lambda": float(
+                    args.mtvj_visual_aux_vis_lambda
+                ),
+                "mtvj_visual_aux_pixel_contract": (
+                    "true_simulator_render_480_to_dino224_v1"
+                    if getattr(config, "dino_dense_metric", False)
+                    and args.mtvj_visual_aux_every > 0
                     else None
                 ),
                 "action_vision_enabled": (

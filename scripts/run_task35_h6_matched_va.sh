@@ -44,7 +44,7 @@ COMMON=(
   --flow-prefix-steps 6 --flow-prefix-weight 1.0 --flow-tail-weight 1.0
   --mtvj-train-metric-head --lr-mtvj-metric-head 0.0003
   --mtvj-train-relation --lr-mtvj-relation 0.00002
-  --mtvj-visual-aux-every "${MTVJ_VISUAL_AUX_EVERY:-0}"
+  --mtvj-visual-aux-every "${MTVJ_VISUAL_AUX_EVERY:-10}"
   --mtvj-visual-aux-batch "${MTVJ_VISUAL_AUX_BATCH:-8}"
   --steps "$STEPS" --save-every 1000 --main-vision-encode-batch 16
   --save "$SAVE"

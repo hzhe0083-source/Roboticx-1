@@ -703,6 +703,10 @@ def test_task35_precision_contract_requires_complete_stack(tmp_path) -> None:
         "1",
         "--mtvj-train-metric-head",
         "--mtvj-train-relation",
+        "--mtvj-visual-aux-every",
+        "10",
+        "--mtvj-visual-aux-batch",
+        "8",
     ]
     args = parse_args(common)
     validate_args(args)
