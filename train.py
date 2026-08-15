@@ -8140,7 +8140,7 @@ def main() -> None:
             batch, batch["actions"]
         ).detach()
         print(
-            f"step={step} mode={args.mode} contract="
+            f"step={global_step} mode={args.mode} contract="
             f"{'e2e_single' if e2e_model is not None else ('single' if args.single_task else 'paired')} "
             f"task={task_log} action_valid={float(valid_fraction):.4f} "
             f"sequence={noisy_actions.shape[1]} "

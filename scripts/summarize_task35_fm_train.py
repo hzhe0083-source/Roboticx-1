@@ -14,6 +14,7 @@ STEP_RE = re.compile(
 )
 AUX_RE = re.compile(r"aux_rmse=(?P<rmse>[-+]?(?:\d+\.?\d*|\d*\.\d+)(?:[eE][-+]?\d+)?)px")
 SAVE_RE = re.compile(r"global_step=(?P<step>\d+)\s+periodic checkpoint saved")
+RESTORE_RE = re.compile(r"exact training state restored at global_step=(?P<step>\d+)")
 ARCHIVE_MILESTONES = (1000, 2000, 3000, 6000, 9000, 12000, 15000, 18000, 20000)
 
 
@@ -48,6 +49,13 @@ def summarize_task35_fm_log(
     for line in text.splitlines():
         if "OutOfMemoryError" in line or "CUDA out of memory" in line:
             alerts.append("oom")
+        restore = RESTORE_RE.search(line)
+        if restore:
+            restored = int(restore.group("step"))
+            rows = [(step, loss) for step, loss in rows if step <= restored]
+            aux = [(step, rmse) for step, rmse in aux if step <= restored]
+            saves = [step for step in saves if step <= restored]
+            continue
         save = SAVE_RE.search(line)
         if save:
             saves.append(int(save.group("step")))

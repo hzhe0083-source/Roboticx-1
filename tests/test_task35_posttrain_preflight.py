@@ -50,7 +50,9 @@ def test_readiness_expects_planned_waiters_and_acceptance_set() -> None:
     resume = Path(__file__).resolve().parent.parent / "scripts" / "continue_task35_h6_to_20k.sh"
     resume_text = resume.read_text()
     assert "--resume-exact" in resume_text
-    assert "--steps 5000" in resume_text
+    assert "--steps 14000" in resume_text
     assert "direct-head" not in resume_text
-    assert 'no archived global_step=15000' in resume_text
-    assert "Do not resume from the live file" in resume_text
+    assert "no archived global_step=6000" in resume_text
+    assert "6000 -> 20000" in resume_text
+    train_text = Path(__file__).resolve().parent.parent.joinpath("train.py").read_text()
+    assert "step={global_step}" in train_text

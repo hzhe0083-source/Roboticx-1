@@ -25,6 +25,25 @@ def test_task35_fm_summary_windows_and_save_events() -> None:
     assert summary["windows"][1]["loss"]["last"] == 0.5
 
 
+def test_summary_drops_pre_restore_steps_after_exact_resume() -> None:
+    lines = [
+        "step=5999 mode=bidir_va contract=single task=peg-insert-side-v3 loss=0.2 grad=1.0",
+        "step=6000 mode=bidir_va contract=single task=peg-insert-side-v3 loss=0.18 grad=1.0",
+        "step=6000 global_step=6000 periodic checkpoint saved to ckpt.pt",
+        "step=6300 mode=bidir_va contract=single task=peg-insert-side-v3 loss=0.99 grad=1.0",
+        "exact training state restored at global_step=6000",
+        "step=6001 mode=bidir_va contract=single task=peg-insert-side-v3 loss=0.17 grad=1.0",
+    ]
+    summary = summarize_task35_fm_log("\n".join(lines), total_steps=20000, window=1000)
+    assert summary["latest_step"] == 6001
+    assert summary["latest_loss"] == 0.17
+    assert 0.99 not in [
+        item["loss"]["last"]
+        for item in summary["windows"]
+        if item.get("loss")
+    ]
+
+
 def test_only_planned_archive_milestones_are_flagged(tmp_path: Path) -> None:
     lines = [
         f"step={step} mode=bidir_va contract=single task=peg-insert-side-v3 loss=0.2 grad=1.0"

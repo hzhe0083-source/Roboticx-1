@@ -78,8 +78,12 @@ def main() -> None:
     checks = {
         "trainer exclusive": len(trainers) == 1 and "direct-head" not in trainers[0]["cmd"],
         "save-every 1000": "--save-every 1000" in (trainers[0]["cmd"] if trainers else ""),
-        "steps 15000 or exact-resume 5000": (
+        "steps 15000 or exact-resume 14000": (
             "--steps 15000" in (trainers[0]["cmd"] if trainers else "")
+            or (
+                "--resume-exact" in (trainers[0]["cmd"] if trainers else "")
+                and "--steps 14000" in (trainers[0]["cmd"] if trainers else "")
+            )
             or (
                 "--resume-exact" in (trainers[0]["cmd"] if trainers else "")
                 and "--steps 5000" in (trainers[0]["cmd"] if trainers else "")

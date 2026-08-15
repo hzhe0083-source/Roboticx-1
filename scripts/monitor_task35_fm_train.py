@@ -32,6 +32,7 @@ STEP_RE = re.compile(
 )
 AUX_RE = re.compile(r"aux_rmse=(?P<rmse>[-+]?(?:\d+\.?\d*|\d*\.\d+)(?:[eE][-+]?\d+)?)px")
 SAVE_RE = re.compile(r"global_step=(?P<step>\d+)\s+periodic checkpoint saved")
+RESTORE_RE = re.compile(r"exact training state restored at global_step=(?P<step>\d+)")
 TRAINER_NEEDLE = "train.py --task35-precision-contract"
 DEFAULT_TOTAL_STEPS = 20000
 WAITER_NEEDLES = {
@@ -249,6 +250,13 @@ def parse_log(path: Path, total_steps: int) -> dict:
     alerts: list[str] = []
     with path.open("r", encoding="utf-8", errors="replace") as handle:
         for line in handle:
+            restore = RESTORE_RE.search(line)
+            if restore:
+                restored = int(restore.group("step"))
+                rows = [row for row in rows if int(row["step"]) <= restored]
+                aux_rows = [row for row in aux_rows if int(row["step"]) <= restored]
+                saves = [step for step in saves if step <= restored]
+                continue
             save = SAVE_RE.search(line)
             if save:
                 saves.append(int(save.group("step")))
@@ -316,7 +324,20 @@ def eta(snapshot: dict, trainer: dict) -> dict:
     step = int(snapshot["latest_step"])
     total = int(snapshot["total_steps"])
     remain = max(0, total - step)
-    sec_per_step = (elapsed / step) if elapsed and step > 0 else None
+    restored = None
+    log_path = snapshot.get("log")
+    if log_path:
+        try:
+            text = Path(log_path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        matches = re.findall(r"exact training state restored at global_step=(\d+)", text)
+        if matches:
+            restored = int(matches[-1])
+    local_steps = step - restored if restored is not None else step
+    if local_steps <= 0:
+        local_steps = snapshot.get("n_logged_steps") or 0
+    sec_per_step = (elapsed / local_steps) if elapsed and local_steps > 0 else None
     finish = None
     if sec_per_step is not None:
         finish = datetime.now(BJ) + timedelta(seconds=remain * sec_per_step)
