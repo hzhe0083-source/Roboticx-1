@@ -3,14 +3,20 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-ARM=${1:?usage: $0 direct|fm [steps] [batch] [run_tag]}
+ARM=${1:?usage: $0 fm [steps] [batch] [run_tag]}
 STEPS=${2:-15000}
 BATCH=${3:-6}
 RUN_TAG=${4:-${STEPS}}
 case "$ARM" in
-  direct) DECODER=(--direct-head);;
   fm) DECODER=();;
-  *) echo "ARM must be direct or fm" >&2; exit 2;;
+  direct)
+    if [[ "${TASK35_ALLOW_DIRECT:-0}" != "1" ]]; then
+      echo "Direct training is disabled for this task35 run. Set TASK35_ALLOW_DIRECT=1 to override." >&2
+      exit 2
+    fi
+    DECODER=(--direct-head)
+    ;;
+  *) echo "ARM must be fm (Direct is disabled unless TASK35_ALLOW_DIRECT=1)" >&2; exit 2;;
 esac
 
 PY=/home/ryan/.venvs/pytorch-gpu/bin/python

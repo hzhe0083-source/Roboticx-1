@@ -327,6 +327,7 @@ def validate_task35_eval50_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "execute_steps 6": int(payload.get("execute_steps") or 0) == 6,
         "horizon 500": int(payload.get("horizon") or 0) == 500,
         "WAM off": payload.get("wam") == "off",
+        "FM decoder": payload.get("action_decoder") == "conditional_flow_matching",
         "peg-insert-side-v3": payload.get("env_name") == "peg-insert-side-v3",
         "success count matches": int(payload.get("successes") or 0)
         == sum(bool(row.get("success")) for row in trials),
@@ -2415,6 +2416,7 @@ def main() -> None:
             "WAM off": args.wam == "off",
             "FM checkpoint": policy_contract.get("action_decoder")
             == "conditional_flow_matching",
+            "FM decoder not overridden": args.direct_head in {"auto", "off"},
             "DINO metric": getattr(config, "dino_dense_metric", False),
             "H6": ACTION_HORIZON == 6,
         }
@@ -2483,6 +2485,7 @@ def main() -> None:
             "task35 only": args.task_ids == "35",
             "stage telemetry": args.debug_stage_metrics,
             "WAM off": args.wam == "off",
+            "FM decoder not overridden": args.direct_head in {"auto", "off"},
         }
         missing = [name for name, enabled in requirements.items() if not enabled]
         if missing:
@@ -2528,6 +2531,17 @@ def main() -> None:
             )
             vision_pooling = "spatiotemporal"
     if args.direct_head != "auto":
+        if (
+            args.direct_head == "on"
+            and (
+                args.task35_precision_contract
+                or args.task35_causal_ablation != "none"
+            )
+        ):
+            raise ValueError(
+                "task35 FM evaluation refuses --direct-head on; "
+                "acceptance and causal diagnostics must stay on the FM decoder"
+            )
         config = dataclasses.replace(config, direct_head=args.direct_head == "on")
     if wam is not None and (
         getattr(config, "direct_head", False) or getattr(config, "c2_controller", False)
@@ -3815,6 +3829,15 @@ def main() -> None:
             "horizon": int(args.horizon),
             "flow_samples": int(args.flow_samples),
             "wam": args.wam,
+            "action_decoder": (
+                "c2_controller"
+                if config.c2_controller
+                else (
+                    "direct_head"
+                    if config.direct_head
+                    else "conditional_flow_matching"
+                )
+            ),
             "task35_precision_contract": bool(args.task35_precision_contract),
             "task35_causal_ablation": args.task35_causal_ablation,
             "dino_feature_cache": (

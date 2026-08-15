@@ -37,6 +37,7 @@ def _payload(
         "execute_steps": execute_steps,
         "horizon": 500,
         "wam": "off",
+        "action_decoder": "conditional_flow_matching",
         "env_name": "peg-insert-side-v3",
         "task35_precision_contract": precision,
         "task35_causal_ablation": ablation,
@@ -48,6 +49,13 @@ def test_eval50_accepts_paired_precision_payload() -> None:
     report = validate_task35_eval50_payload(_payload())
     assert report["ok"] is True
     assert report["successes"] == 12
+
+
+def test_eval50_rejects_direct_decoder_payload() -> None:
+    bad = _payload()
+    bad["action_decoder"] = "direct_head"
+    with pytest.raises(ValueError, match="FM decoder"):
+        validate_task35_eval50_payload(bad)
 
 
 def test_eval50_rejects_wrong_seeds_and_missing_trials() -> None:
