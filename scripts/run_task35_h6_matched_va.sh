@@ -3,9 +3,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-ARM=${1:?usage: $0 direct|fm [steps] [batch]}
+ARM=${1:?usage: $0 direct|fm [steps] [batch] [run_tag]}
 STEPS=${2:-15000}
-BATCH=${3:-8}
+BATCH=${3:-1}
+RUN_TAG=${4:-${STEPS}}
 case "$ARM" in
   direct) DECODER=(--direct-head);;
   fm) DECODER=();;
@@ -17,8 +18,8 @@ DINO=/home/ryan/.cache/huggingface/hub/models--timm--vit_large_patch14_reg4_dino
 DATA=data/metaworld_longtraj_windows_h6_dino35_clean60_recovery30_v1.pt
 CACHE=data/dino35_h6_clean60_recovery30_cache_v1
 ROI=checkpoints/dino_metric_roi_task35_v2_native480_seed777_1k.pt
-SAVE=checkpoints/task35_h6_dino_mtvj_${ARM}_${STEPS}.pt
-LOG=logs/task35_h6_dino_mtvj_${ARM}_${STEPS}.log
+SAVE=checkpoints/task35_h6_dino_mtvj_${ARM}_${RUN_TAG}.pt
+LOG=logs/task35_h6_dino_mtvj_${ARM}_${RUN_TAG}.log
 
 for path in "$DINO" "$DATA" "$ROI" "$CACHE/meta.json" "$CACHE/index.pkl" \
   "$CACHE/block11.npy" "$CACHE/block23.npy" "$CACHE/raw_frames.npy"; do
@@ -52,4 +53,5 @@ COMMON=(
 mkdir -p checkpoints logs
 set -o pipefail
 PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   "$PY" -u -B train.py "${COMMON[@]}" "${DECODER[@]}" 2>&1 | tee "$LOG"
