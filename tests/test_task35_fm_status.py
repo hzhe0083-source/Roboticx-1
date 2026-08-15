@@ -52,6 +52,15 @@ def test_status_markdown_mentions_planned_closed_loop() -> None:
     )
     assert "closed_loop_complete: False" in text
     assert "Closed-loop insertion remains planned" in text
+    assert "3k/6k/9k/12k/15k/18k/20k" in render_md(
+        {
+            "generated_at": "now",
+            "training": {"latest_step": 6000, "status": "RUNNING"},
+            "closed_loop_complete": False,
+            "best": None,
+            "candidates": [],
+        }
+    )
 
 
 def test_closed_loop_complete_ignores_1k_2k_and_requires_acceptance_set() -> None:

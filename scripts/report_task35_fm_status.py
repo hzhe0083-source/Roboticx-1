@@ -109,7 +109,7 @@ def render_md(payload: dict) -> str:
     lines.extend(
         [
             "",
-            "Closed-loop insertion remains planned until 3k/6k/9k/12k/15k each have a 50-seed eval50.",
+            "Closed-loop insertion remains planned until 3k/6k/9k/12k/15k/18k/20k each have a 50-seed eval50.",
             "1k/2k stay mechanism-only and cannot elect a winner.",
             "",
         ]
