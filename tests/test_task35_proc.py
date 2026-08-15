@@ -18,8 +18,10 @@ def test_archiver_follows_log_events_not_stdin() -> None:
     assert "tail -n 0 -F" in text
     assert "read -r -t 30 -u 3" in text
     assert "trainer gone before all milestones were archived" in text
-    assert "CUDA_VISIBLE_DEVICES=" in text
-    assert "flock 8" in text
+    assert "validate_task35_fm_checkpoint.py" not in text
+    waiter = Path("/home/ryan/Documents/robot/ORA0-task35-fullfix/scripts/wait_validate_task35_fm_milestone.sh").read_text()
+    assert "loaded_modules" in waiter
+    assert "CUDA_VISIBLE_DEVICES=" in waiter
 
 
 def test_find_processes_requires_all_markers() -> None:

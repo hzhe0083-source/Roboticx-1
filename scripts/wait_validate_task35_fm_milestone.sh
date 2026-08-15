@@ -24,8 +24,12 @@ LOCK=logs/${NAME}.lock
 mkdir -p logs
 exec 9>"$LOCK"
 flock 9
-# Prefer the archiver's CPU validator; only run it here if that report is absent.
-if [[ ! -s "$VALIDATE" ]]; then
+# Archiver only copies. This waiter owns full CPU validate/slice.
+need_validate=1
+if [[ -s "$VALIDATE" ]] && grep -q '"ok": true' "$VALIDATE" && grep -q '"loaded_modules": true' "$VALIDATE"; then
+  need_validate=0
+fi
+if [[ "$need_validate" -eq 1 ]]; then
   CUDA_VISIBLE_DEVICES= "$PY" -B scripts/validate_task35_fm_checkpoint.py \
     "$DEST" --expected-step "$STEP" --output "$VALIDATE"
 fi

@@ -14,7 +14,6 @@ fi
 [[ -f "$LOG" ]] || { echo "missing log: $LOG" >&2; exit 1; }
 mkdir -p "$(dirname "$CKPT")" logs
 PY=${PY:-/home/ryan/.venvs/pytorch-gpu/bin/python}
-VALIDATE=scripts/validate_task35_fm_checkpoint.py
 
 wanted() {
   local candidate=$1
@@ -25,24 +24,8 @@ wanted() {
   return 1
 }
 
-validate_destination() {
-  local destination=$1
-  local step=$2
-  local name
-  name=$(basename "${destination%.pt}")
-  local report=logs/${name}_validate.json
-  local lock=logs/${name}.lock
-  [[ -f "$VALIDATE" ]] || return 0
-  mkdir -p logs
-  (
-    flock 8
-    if [[ ! -s "$report" ]]; then
-      CUDA_VISIBLE_DEVICES= "$PY" -B "$VALIDATE" \
-        "$destination" --expected-step "$step" --output "$report"
-    fi
-  ) 8>"$lock"
-}
-
+# Copy + SHA only. Full CPU validate/slice stays in the milestone waiter so a
+# validate OOM or contract failure cannot abort the remaining 9k/12k/15k copies.
 archive_step() {
   local step=$1
   local stem=${CKPT%.pt}
@@ -61,7 +44,6 @@ archive_step() {
   mv "$temporary" "$destination"
   sha256sum "$destination" > "${destination}.sha256"
   echo "archived global_step=$step to $destination" >&2
-  validate_destination "$destination" "$step"
 }
 
 backfill_existing() {
