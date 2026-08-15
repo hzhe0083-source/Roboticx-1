@@ -497,11 +497,14 @@ def main() -> None:
             ROOT / "scripts" / "list_task35_fm_candidates.py",
             ROOT / "scripts" / "report_task35_fm_status.py",
         ):
+            env = dict(os.environ)
+            env["CUDA_VISIBLE_DEVICES"] = ""
             subprocess.run(
                 [python, "-B", str(script)],
                 check=True,
                 cwd=ROOT,
                 stdout=subprocess.DEVNULL,
+                env=env,
             )
     except Exception as exc:  # cron must keep writing the live loss report
         print(f"status ledger refresh skipped: {exc}", flush=True)

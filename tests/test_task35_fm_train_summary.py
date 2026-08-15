@@ -256,6 +256,14 @@ def test_pipeline_health_alerts_low_ram_and_extra_gpu(tmp_path: Path, monkeypatc
     assert "gpu_not_exclusive" in health["alerts"]
 
 
+def test_monitor_ledger_refresh_hides_cuda() -> None:
+    text = Path(
+        "/home/ryan/Documents/robot/ORA0-task35-fullfix/scripts/monitor_task35_fm_train.py"
+    ).read_text()
+    assert 'env["CUDA_VISIBLE_DEVICES"] = ""' in text
+    assert "status ledger refresh skipped" in text
+
+
 def test_monitor_markdown_does_not_repeat_pipeline_alerts() -> None:
     from scripts.monitor_task35_fm_train import render_md
 
