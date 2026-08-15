@@ -3728,6 +3728,11 @@ def main() -> None:
             "wam": args.wam,
             "task35_precision_contract": bool(args.task35_precision_contract),
             "task35_causal_ablation": args.task35_causal_ablation,
+            "dino_feature_cache": (
+                None
+                if args.dino_feature_cache is None
+                else str(args.dino_feature_cache.expanduser().resolve())
+            ),
             "trials": trial_records,
         }
         args.output_json.parent.mkdir(parents=True, exist_ok=True)

@@ -1,21 +1,51 @@
 #!/usr/bin/env bash
 # After the 15k trainer exits and the final archive exists, run post-train eval.
-# Never starts while the trainer still owns the GPU.
+# Never starts while the trainer still owns the GPU. A crash without step15000
+# is a hard failure, not an infinite wait.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 STEM=${1:-checkpoints/task35_h6_dino_mtvj_fm_full15k_b6_sdpa_aux10b8_v1}
 DEST=${STEM}_step15000.pt
+LIVE=${STEM}.pt
+LOG=logs/$(basename "$STEM").log
 TRAINER_NEEDLE='train.py --task35-precision-contract'
 NAME=$(basename "${DEST%.pt}")
+PY=${PY:-/home/ryan/.venvs/pytorch-gpu/bin/python}
 
 echo "waiting for trainer exit and $DEST" >&2
 while pgrep -f "$TRAINER_NEEDLE" >/dev/null; do
   sleep 30
 done
-while [[ ! -s "$DEST" || ! -s "${DEST}.sha256" ]]; do
+
+# Give the archiver a short window after the final save event.
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [[ -s "$DEST" && -s "${DEST}.sha256" ]] && break
   sleep 15
 done
+
+if [[ ! -s "$DEST" || ! -s "${DEST}.sha256" ]]; then
+  if [[ -s "$LIVE" ]]; then
+    echo "no 15000 archive; checking live checkpoint after trainer exit" >&2
+    if CUDA_VISIBLE_DEVICES= "$PY" -B scripts/validate_task35_fm_checkpoint.py \
+      "$LIVE" --expected-step 15000 --skip-module-load \
+      --output "logs/$(basename "$STEM")_live15000_validate.json"; then
+      cp --reflink=auto --sparse=always "$LIVE" "${DEST}.tmp"
+      mv "${DEST}.tmp" "$DEST"
+      sha256sum "$DEST" > "${DEST}.sha256"
+      echo "promoted live 15000 checkpoint to $DEST" >&2
+    fi
+  fi
+fi
+
+if [[ ! -s "$DEST" || ! -s "${DEST}.sha256" ]]; then
+  echo "trainer exited without a valid 15000 archive: $DEST" >&2
+  if [[ -f "$LOG" ]] && grep -E 'OutOfMemoryError|CUDA out of memory|Traceback \(most recent call last\)' "$LOG" >/dev/null; then
+    echo "training log contains a crash traceback or OOM" >&2
+  fi
+  exit 4
+fi
+
 echo "trainer gone; archived $DEST" >&2
 scripts/wait_validate_task35_fm_milestone.sh 15000 "$STEM"
 scripts/run_task35_h6_posttrain_eval.sh "$DEST" "$NAME"
