@@ -31,6 +31,7 @@ CUDA_VISIBLE_DEVICES= "$PY" -B scripts/diag_task35_clean_recovery_slices.py \
   --features "$FEATURES" \
   --output "logs/${NAME}_clean_recovery_slices.json"
 
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 "$PY" -u -B scripts/eval_dino_metric_policy_task35.py \
   --checkpoint "$CKPT" \
   --language-data "$FEATURES" \

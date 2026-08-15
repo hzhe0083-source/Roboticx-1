@@ -343,6 +343,33 @@ def cached_task35_language(
     return hidden_rows[:1].to(device=device), mask_rows[:1].to(device=device)
 
 
+def want_vjepa_dense_backbone(config: Any, args: Any) -> bool:
+    """Load frozen V-JEPA dense evidence only for non-DINO MT-VJ policies.
+
+    Task35 DINO-metric checkpoints keep ``dense_readout_mtvj=True`` because the
+    VA dense K/V layers exist, but those layers consume DINO block11/block23
+    tokens. Auto-enabling the V-JEPA tower would mix two evidence stacks and
+    OOM a 16 GiB laptop during eval50.
+    """
+    dino_metric = bool(getattr(config, "dino_dense_metric", False))
+    dino_main = getattr(config, "main_vision_backbone", "vjepa") != "vjepa"
+    cli_vjepa = bool(getattr(args, "dense_readout_mtvj", False))
+    has_metric_ckpt = getattr(args, "metric_visual_checkpoint", None) is not None
+    if dino_metric:
+        if cli_vjepa or has_metric_ckpt:
+            raise ValueError(
+                "DINO-metric checkpoint 的 dense/metric 栈由 DINO 特征驱动；"
+                "禁止 --dense-readout-mtvj / --metric-visual-checkpoint "
+                "（V-JEPA 路径）混用"
+            )
+        return False
+    if dino_main:
+        # DINO-main already forbids the V-JEPA CLI flags. Do not auto-enable
+        # a second tower just because the config still has dense_readout_mtvj.
+        return False
+    return cli_vjepa or bool(getattr(config, "dense_readout_mtvj", False))
+
+
 def validate_task35_eval50_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """Fail-closed check for a 50-seed task35 closed-loop JSON."""
     if payload.get("contract") != "metaworld_closed_loop_trials_v1":
@@ -2352,16 +2379,9 @@ def main() -> None:
             "--main-vision-checkpoint was provided but this policy uses the "
             "V-JEPA main vision backbone"
         )
-    checkpoint_uses_mtvj = bool(getattr(config, "dense_readout_mtvj", False))
+    checkpoint_uses_mtvj = want_vjepa_dense_backbone(config, args)
     # DINO-metric checkpoint 的 dense 层由 DINO block11/block23 证据驱动，
     # 不建 V-JEPA 骨干/路径（--dense-readout-mtvj CLI 保持关闭）。
-    if getattr(config, "dino_dense_metric", False):
-        if args.dense_readout_mtvj or args.metric_visual_checkpoint is not None:
-            raise ValueError(
-                "DINO-metric checkpoint 的 dense/metric 栈由 DINO 特征驱动；"
-                "禁止 --dense-readout-mtvj / --metric-visual-checkpoint "
-                "（V-JEPA 路径）混用"
-            )
     dino_roi_expected = policy_contract.get("dino_roi_enabled") is True
     if args.dino_roi_checkpoint is None:
         if args.dino_roi_alpha is not None:
@@ -2391,7 +2411,7 @@ def main() -> None:
                     "--dino-roi-alpha must match policy training: "
                     f"policy={saved_alpha!r}, runtime={args.dino_roi_alpha!r}"
                 )
-    if checkpoint_uses_mtvj and not getattr(config, "dino_dense_metric", False) and not args.dense_readout_mtvj:
+    if checkpoint_uses_mtvj and not args.dense_readout_mtvj:
         args.dense_readout_mtvj = True
         print(
             "eval: checkpoint config.dense_readout_mtvj=True；自动启用同构 MT-VJ "

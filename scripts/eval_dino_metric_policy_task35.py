@@ -34,6 +34,27 @@ from va_compound.longtraj_frames import LongTrajFramesDataset
 from va_compound.model import VACompoundConfig, dense_coords
 
 
+def encode_dino_frames_one_at_a_time(
+    backbone: TimmActionVisionBackbone, images: torch.Tensor
+) -> dict[int, torch.Tensor]:
+    """Encode ``[N, 3, H, W]`` DINO frames sequentially.
+
+    A batched 16-frame ViT-L/14 encode can spike past a 16 GiB laptop GPU
+    when holdout follows a large policy load. Per-frame encode is identical
+    in token order after concatenation.
+    """
+    if images.ndim != 4:
+        raise ValueError(f"DINO holdout images must be [N,3,H,W], got {tuple(images.shape)}")
+    parts = [
+        backbone.forward_hierarchical_dense(images[index : index + 1])
+        for index in range(int(images.shape[0]))
+    ]
+    return {
+        layer: torch.cat([part[layer] for part in parts], dim=0)
+        for layer in parts[0]
+    }
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -146,8 +167,8 @@ def main() -> None:
             antialias=True,
         )
         with torch.inference_mode():
-            hierarchical = backbone.forward_hierarchical_dense(
-                ((images - mean) / std).half()
+            hierarchical = encode_dino_frames_one_at_a_time(
+                backbone, ((images - mean) / std).half()
             )
             out = metric_head(
                 hierarchical[5].reshape(count, -1, 1024).float(),

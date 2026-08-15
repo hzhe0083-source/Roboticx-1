@@ -4,7 +4,11 @@ import pytest
 
 from pathlib import Path
 
-from eval_metaworld import TASK35_EVAL50_SEEDS, validate_task35_eval50_payload
+from eval_metaworld import (
+    TASK35_EVAL50_SEEDS,
+    validate_task35_eval50_payload,
+    want_vjepa_dense_backbone,
+)
 from scripts.select_task35_best_fm import select_best_task35_fm
 
 
@@ -103,6 +107,46 @@ def test_selector_ranks_by_closed_loop_successes() -> None:
     assert report["selected"]["successes"] == 15
     assert report["selected"]["step"] == 15000
     assert report["label"] == "supported"
+
+
+class _Cfg:
+    def __init__(self, **kwargs) -> None:
+        self.__dict__.update(kwargs)
+
+
+class _Args:
+    def __init__(self, **kwargs) -> None:
+        self.__dict__.update(kwargs)
+
+
+def test_dino_metric_does_not_autoload_vjepa_dense() -> None:
+    config = _Cfg(dino_dense_metric=True, dense_readout_mtvj=True)
+    args = _Args(dense_readout_mtvj=False, metric_visual_checkpoint=None)
+    assert want_vjepa_dense_backbone(config, args) is False
+    with pytest.raises(ValueError, match="禁止 --dense-readout-mtvj"):
+        want_vjepa_dense_backbone(
+            config, _Args(dense_readout_mtvj=True, metric_visual_checkpoint=None)
+        )
+
+
+def test_vjepa_metric_autoloads_dense_backbone() -> None:
+    config = _Cfg(
+        dino_dense_metric=False,
+        dense_readout_mtvj=True,
+        main_vision_backbone="vjepa",
+    )
+    args = _Args(dense_readout_mtvj=False, metric_visual_checkpoint=None)
+    assert want_vjepa_dense_backbone(config, args) is True
+
+
+def test_dino_main_does_not_autoload_vjepa_dense() -> None:
+    config = _Cfg(
+        dino_dense_metric=False,
+        dense_readout_mtvj=True,
+        main_vision_backbone="dinov2_vitl14_reg4",
+    )
+    args = _Args(dense_readout_mtvj=False, metric_visual_checkpoint=None)
+    assert want_vjepa_dense_backbone(config, args) is False
 
 
 def test_eval50_launcher_skips_qwen_and_sets_cuda_allocator() -> None:
