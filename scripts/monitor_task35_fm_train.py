@@ -21,8 +21,8 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.summarize_task35_fm_train import summarize_task35_fm_log
-from scripts.task35_proc import trainer_processes
+from scripts.summarize_task35_fm_train import ARCHIVE_MILESTONES, summarize_task35_fm_log
+from scripts.task35_proc import find_processes, trainer_processes
 
 BJ = timezone(timedelta(hours=8))
 STEP_RE = re.compile(
@@ -34,6 +34,15 @@ AUX_RE = re.compile(r"aux_rmse=(?P<rmse>[-+]?(?:\d+\.?\d*|\d*\.\d+)(?:[eE][-+]?\
 SAVE_RE = re.compile(r"global_step=(?P<step>\d+)\s+periodic checkpoint saved")
 TRAINER_NEEDLE = "train.py --task35-precision-contract"
 DEFAULT_TOTAL_STEPS = 15000
+WAITER_NEEDLES = {
+    "archiver": "archive_task35_fm_milestones.sh",
+    "tail": "tail -n 0 -F",
+    "wait_6000": "wait_validate_task35_fm_milestone.sh 6000",
+    "wait_9000": "wait_validate_task35_fm_milestone.sh 9000",
+    "wait_12000": "wait_validate_task35_fm_milestone.sh 12000",
+    "wait_15000": "wait_task35_fm_finished_eval.sh",
+}
+LOW_RAM_KB = 4 * 1024 * 1024
 
 
 def parse_args() -> argparse.Namespace:
@@ -78,6 +87,71 @@ def trainer_alive(needle: str) -> dict:
         "alive": bool(matches),
         "count": len(matches),
         "processes": matches,
+    }
+
+
+def mem_available_kb(meminfo: str | None = None) -> int | None:
+    text = Path("/proc/meminfo").read_text() if meminfo is None else meminfo
+    for line in text.splitlines():
+        if line.startswith("MemAvailable:"):
+            return int(line.split()[1])
+    return None
+
+
+def pipeline_health(
+    *,
+    trainer: dict,
+    checkpoint_stem: Path,
+    meminfo: str | None = None,
+    gpu_compute_pids: list[int] | None = None,
+) -> dict:
+    """Read-only health for waiters/RAM/GPU. Never starts or kills jobs."""
+    alerts: list[str] = []
+    present = {
+        name: bool(find_processes(needle))
+        for name, needle in WAITER_NEEDLES.items()
+    }
+    archived = {
+        step: Path(f"{checkpoint_stem}_step{step}.pt").is_file()
+        for step in ARCHIVE_MILESTONES
+    }
+    if trainer["alive"]:
+        if trainer["count"] != 1:
+            alerts.append(f"trainer_count_{trainer['count']}")
+        if not present["archiver"] or not present["tail"]:
+            alerts.append("archiver_missing")
+        if not present["wait_15000"]:
+            alerts.append("eval_waiter_missing")
+        for step, key in ((6000, "wait_6000"), (9000, "wait_9000"), (12000, "wait_12000")):
+            if not archived[step] and not present[key]:
+                alerts.append(f"waiter_{step}_missing")
+    available = mem_available_kb(meminfo)
+    if available is not None and available < LOW_RAM_KB:
+        alerts.append("low_ram")
+    trainer_pids = {int(row["pid"]) for row in trainer.get("processes") or []}
+    if gpu_compute_pids is None:
+        gpu_compute_pids = []
+        try:
+            import subprocess
+
+            raw = subprocess.check_output(
+                ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
+                text=True,
+            )
+            gpu_compute_pids = [
+                int(line.strip()) for line in raw.splitlines() if line.strip().isdigit()
+            ]
+        except (OSError, subprocess.CalledProcessError):
+            gpu_compute_pids = []
+    extra_gpu = sorted(pid for pid in gpu_compute_pids if pid not in trainer_pids)
+    if trainer["alive"] and extra_gpu:
+        alerts.append("gpu_not_exclusive")
+    return {
+        "waiters": present,
+        "archived": archived,
+        "mem_available_kb": available,
+        "gpu_compute_pids": gpu_compute_pids,
+        "alerts": alerts,
     }
 
 
@@ -209,8 +283,15 @@ def render_md(snapshot: dict, trainer: dict, timing: dict) -> str:
             f"({timing['sec_per_step']:.2f} s/step, "
             f"{timing['remain_steps']} steps left)"
         )
+    health = snapshot.get("pipeline") or {}
     alerts = ", ".join(snapshot["alerts"]) if snapshot["alerts"] else "none"
     saves = ", ".join(str(s) for s in snapshot["checkpoints_saved"]) or "none"
+    waiters = health.get("waiters") or {}
+    waiter_line = ", ".join(
+        f"{name}={'up' if ok else 'down'}" for name, ok in waiters.items()
+    ) or "n/a"
+    ram_kb = health.get("mem_available_kb")
+    ram_line = "n/a" if ram_kb is None else f"{ram_kb / (1024 * 1024):.1f} GiB"
     return "\n".join(
         [
             f"# task35 FM train monitor",
@@ -225,6 +306,8 @@ def render_md(snapshot: dict, trainer: dict, timing: dict) -> str:
             f"- latest aux RMSE: {aux_line}",
             f"- ETA: {eta_line}",
             f"- periodic saves: {saves}",
+            f"- waiters: {waiter_line}",
+            f"- MemAvailable: {ram_line}",
             f"- alerts: {alerts}",
             "",
             "## loss windows",
@@ -285,6 +368,15 @@ def main() -> None:
     snapshot["milestones"] = summary["windows"]
     trainer = trainer_alive(args.trainer_needle)
     timing = eta(snapshot, trainer)
+    checkpoint_stem = (
+        args.log.parent.parent
+        / "checkpoints"
+        / "task35_h6_dino_mtvj_fm_full15k_b6_sdpa_aux10b8_v1"
+    )
+    health = pipeline_health(trainer=trainer, checkpoint_stem=checkpoint_stem)
+    snapshot["pipeline"] = health
+    if health["alerts"]:
+        snapshot["alerts"] = sorted(set(snapshot["alerts"] + health["alerts"]))
     payload = {
         "contract": "task35_fm_train_monitor_v1",
         **snapshot,
@@ -295,6 +387,7 @@ def main() -> None:
             "elapsed_s": trainer["processes"][0]["elapsed_s"] if trainer["processes"] else None,
         },
         "timing": timing,
+        "pipeline": health,
     }
     atomic_write(args.json, json.dumps(payload, indent=2) + "\n")
     atomic_write(args.report, render_md(snapshot, trainer, timing))

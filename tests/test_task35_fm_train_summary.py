@@ -48,3 +48,76 @@ def test_only_planned_archive_milestones_are_flagged(tmp_path: Path) -> None:
     text = "\n".join(milestone_lines(summary["windows"]))
     assert "3001-4000" in text and "periodic-save" in text
     assert "missing-archive" not in text
+
+
+def test_pipeline_health_alerts_missing_6k_waiter(tmp_path: Path, monkeypatch) -> None:
+    from scripts import monitor_task35_fm_train as monitor
+
+    stem = tmp_path / "ckpt"
+    (tmp_path / "ckpt_step1000.pt").write_bytes(b"x")
+    (tmp_path / "ckpt_step2000.pt").write_bytes(b"x")
+    (tmp_path / "ckpt_step3000.pt").write_bytes(b"x")
+
+    def fake_find(needle: str, *, require: tuple[str, ...] = ()):
+        del require
+        present = {
+            "archive_task35_fm_milestones.sh": True,
+            "tail -n 0 -F": True,
+            "wait_task35_fm_finished_eval.sh": True,
+            "wait_validate_task35_fm_milestone.sh 9000": True,
+            "wait_validate_task35_fm_milestone.sh 12000": True,
+        }
+        return [{"pid": 1, "cmd": needle}] if present.get(needle) else []
+
+    monkeypatch.setattr(monitor, "find_processes", fake_find)
+    health = monitor.pipeline_health(
+        trainer={"alive": True, "count": 1, "processes": [{"pid": 303509}]},
+        checkpoint_stem=stem,
+        meminfo="MemAvailable: 8388608 kB\n",
+        gpu_compute_pids=[303509],
+    )
+    assert "waiter_6000_missing" in health["alerts"]
+    assert "archiver_missing" not in health["alerts"]
+    assert health["waiters"]["wait_6000"] is False
+
+
+def test_pipeline_health_alerts_low_ram_and_extra_gpu(tmp_path: Path, monkeypatch) -> None:
+    from scripts import monitor_task35_fm_train as monitor
+
+    monkeypatch.setattr(monitor, "find_processes", lambda needle, require=(): [{"pid": 2}])
+    health = monitor.pipeline_health(
+        trainer={"alive": True, "count": 1, "processes": [{"pid": 303509}]},
+        checkpoint_stem=tmp_path / "ckpt",
+        meminfo="MemAvailable: 1024 kB\n",
+        gpu_compute_pids=[303509, 999],
+    )
+    assert "low_ram" in health["alerts"]
+    assert "gpu_not_exclusive" in health["alerts"]
+
+
+def test_monitor_markdown_does_not_repeat_pipeline_alerts() -> None:
+    from scripts.monitor_task35_fm_train import render_md
+
+    snapshot = {
+        "generated_at": "t",
+        "task": "peg-insert-side-v3",
+        "latest_step": 1,
+        "total_steps": 15000,
+        "progress": 1 / 15000,
+        "latest_loss": 0.2,
+        "latest_grad": 1.0,
+        "latest_aux_rmse_px": 10.0,
+        "latest_aux_step": 1,
+        "checkpoints_saved": [1000],
+        "alerts": ["low_ram"],
+        "windows": {},
+        "aux_last_10": None,
+        "milestones": [],
+        "pipeline": {
+            "waiters": {"archiver": True},
+            "alerts": ["low_ram"],
+            "mem_available_kb": 1024,
+        },
+    }
+    text = render_md(snapshot, {"alive": True}, {"eta": None, "sec_per_step": None, "remain_steps": 0})
+    assert text.count("low_ram") == 1
