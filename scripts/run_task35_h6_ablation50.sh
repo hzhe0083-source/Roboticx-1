@@ -15,6 +15,7 @@ DINO=/home/ryan/.cache/huggingface/hub/models--timm--vit_large_patch14_reg4_dino
 FEATURES=data/metaworld_longtraj_windows_h6_dino35_clean60_recovery30_v1.pt
 ROI=checkpoints/dino_metric_roi_task35_v2_native480_seed777_1k.pt
 LOG=logs/${NAME}.log
+JSON=logs/${NAME}.json
 for path in "$CKPT" "$DINO" "$FEATURES" "$ROI"; do
   [[ -f "$path" ]] || { echo "missing $path" >&2; exit 1; }
 done
@@ -27,5 +28,6 @@ PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 \
   --dino-roi-checkpoint "$ROI" --dino-roi-alpha 1.0 \
   --task35-causal-ablation "$ABLATION" \
   --task-ids 35 --trials-per-task 50 --execute-steps 6 --horizon 500 \
+  --output-json "$JSON" \
   --wam off --direct-head auto --debug-stage-metrics --flow-samples 1 \
   --device cuda 2>&1 | tee "$LOG"

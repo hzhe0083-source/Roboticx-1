@@ -11,6 +11,7 @@ FEATURES=data/metaworld_longtraj_windows_h6_dino35_clean60_recovery30_v1.pt
 CACHE=data/dino35_h6_clean60_recovery30_cache_v1
 ROI=checkpoints/dino_metric_roi_task35_v2_native480_seed777_1k.pt
 LOG=logs/${NAME}_eval50.log
+JSON=logs/${NAME}_eval50.json
 for path in "$CKPT" "$DINO" "$FEATURES" "$ROI" "$CACHE/meta.json" \
   "$CACHE/block11.npy" "$CACHE/block23.npy"; do
   [[ -f "$path" ]] || { echo "missing $path" >&2; exit 1; }
@@ -25,5 +26,6 @@ PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 \
   --main-vision-checkpoint "$DINO" \
   --dino-roi-checkpoint "$ROI" --dino-roi-alpha 1.0 \
   --task-ids 35 --trials-per-task 50 --execute-steps 6 --horizon 500 \
+  --output-json "$JSON" \
   --wam off --direct-head auto --debug-stage-metrics --flow-samples 1 \
   --device cuda 2>&1 | tee "$LOG"

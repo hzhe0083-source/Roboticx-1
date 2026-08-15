@@ -950,6 +950,12 @@ def parse_args() -> argparse.Namespace:
         help="WAM 残差速度缩放系数（默认 1.0；0 = 名义动作，消融对照）。",
     )
     parser.add_argument("--trials-per-task", type=int, default=10)
+    parser.add_argument(
+        "--output-json",
+        type=Path,
+        default=None,
+        help="Atomically write per-trial success/stage telemetry and aggregate CI.",
+    )
     parser.add_argument("--max-tasks", type=int, default=49)
     parser.add_argument(
         "--task-ids",
@@ -2803,6 +2809,7 @@ def main() -> None:
     descriptions_to_env = {v: k for k, v in mw_config["TASK_DESCRIPTIONS"].items()}
 
     per_task = {}
+    trial_records: list[dict[str, Any]] = []
     completed_trials = 0
     for local_task_index, (global_task_index, task_text) in enumerate(selected_tasks):
         env_name = descriptions_to_env.get(task_text)
@@ -3614,6 +3621,23 @@ def main() -> None:
                     break
             wins += int(success)
             completed_trials += 1
+            record: dict[str, Any] = {
+                "task_id": int(global_task_index),
+                "task": task_text,
+                "trial": int(trial),
+                "seed": int(episode_seed),
+                "success": bool(success),
+            }
+            if args.debug_stage_metrics:
+                record["stage"] = {
+                    "near_object": float(stage_metrics["near_object"]),
+                    "grasp_success": float(stage_metrics["grasp_success"]),
+                    "grasp_reward": float(stage_metrics["grasp_reward"]),
+                    "in_place_reward": float(stage_metrics["in_place_reward"]),
+                    "min_obj_to_target": float(stage_metrics["obj_to_target"]),
+                    "best_obj_step": int(stage_metrics["best_obj_step"]),
+                }
+            trial_records.append(record)
             print(
                 f"trial task={global_task_index} trial={trial} seed={episode_seed} "
                 f"success={int(success)}"
@@ -3645,7 +3669,13 @@ def main() -> None:
             )
     total = sum(per_task.values())
     trials = completed_trials
+    if trials <= 0:
+        raise RuntimeError("closed-loop evaluation completed no trials")
     print(f"\nCLOSED-LOOP SUCCESS: {total}/{trials} = {total / trials:.1%}")
+    ci_kind = None
+    ci_estimate = None
+    ci_low = None
+    ci_high = None
     if per_task:
         scores = np.asarray([w / args.trials_per_task for w in per_task.values()])
         if len(scores) == 1:
@@ -3654,6 +3684,7 @@ def main() -> None:
             from stats_ci import binomial_wilson_ci
 
             est, lo, hi = binomial_wilson_ci(total, trials)
+            ci_kind, ci_estimate, ci_low, ci_high = "wilson", est, lo, hi
             print(
                 f"single-task success: {est:.1%} "
                 f"[95% Wilson CI: {lo:.1%}, {hi:.1%}] (n_trials={trials})"
@@ -3666,11 +3697,44 @@ def main() -> None:
             est, lo, hi = macro_bootstrap_ci(
                 scores, group_ids, n_boot=2000, seed=0
             )
+            ci_kind, ci_estimate, ci_low, ci_high = "task_bootstrap", est, lo, hi
             print(
                 f"macro (per-task avg): {est:.1%} "
                 f"[95% task-bootstrap CI: {lo:.1%}, {hi:.1%}] "
                 f"(n_tasks={len(scores)})"
             )
+    if args.output_json is not None:
+        import json
+
+        result = {
+            "contract": "metaworld_closed_loop_trials_v1",
+            "checkpoint": str(args.checkpoint.expanduser().resolve()),
+            "checkpoint_sha256": _sha256_file(args.checkpoint.expanduser().absolute()),
+            "features": str(args.features.expanduser().resolve()),
+            "task_ids": [int(index) for index, _ in selected_tasks],
+            "trials_per_task": int(args.trials_per_task),
+            "completed_trials": int(completed_trials),
+            "successes": int(total),
+            "success_rate": float(total / trials),
+            "ci": {
+                "kind": ci_kind,
+                "estimate": None if ci_estimate is None else float(ci_estimate),
+                "low_95": None if ci_low is None else float(ci_low),
+                "high_95": None if ci_high is None else float(ci_high),
+            },
+            "execute_steps": int(args.execute_steps),
+            "horizon": int(args.horizon),
+            "flow_samples": int(args.flow_samples),
+            "wam": args.wam,
+            "task35_precision_contract": bool(args.task35_precision_contract),
+            "task35_causal_ablation": args.task35_causal_ablation,
+            "trials": trial_records,
+        }
+        args.output_json.parent.mkdir(parents=True, exist_ok=True)
+        temporary = args.output_json.with_suffix(args.output_json.suffix + ".tmp")
+        temporary.write_text(json.dumps(result, indent=2) + "\n")
+        temporary.replace(args.output_json)
+        print(f"structured results saved: {args.output_json}", flush=True)
 
 
 if __name__ == "__main__":
