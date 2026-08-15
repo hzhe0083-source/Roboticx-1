@@ -39,7 +39,6 @@ from va_compound.model import VACompoundConfig, VACompoundPolicy  # noqa: E402
 
 DATA = REPO / "data/metaworld_longtraj_windows_h48_dino35_clean.pt"
 CACHE = REPO / "data/dino35_feature_cache"
-device = torch.device("cuda")
 
 
 def evaluate_split(indices: np.ndarray, split_name: str) -> None:
@@ -120,13 +119,15 @@ def evaluate_split(indices: np.ndarray, split_name: str) -> None:
 
 
 def main() -> None:
-    global model, metric_head, relation_encoder, config, dataset, cache
+    global model, metric_head, relation_encoder, config, dataset, cache, device
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path,
                         default=REPO / "checkpoints/e7_dino_main_p35_densemetric_15k.pt")
     parser.add_argument("--no-metric", action="store_true")
     parser.add_argument("--n-train", type=int, default=256)
+    parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
+    device = torch.device(args.device)
 
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     config = VACompoundConfig(**ckpt["config"])
