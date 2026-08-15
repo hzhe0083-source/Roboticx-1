@@ -9,7 +9,7 @@ shift 2
 if (( $# > 0 )); then
   STEPS=("$@")
 else
-  STEPS=(1000 3000 6000 9000 12000 15000)
+  STEPS=(1000 2000 3000 6000 9000 12000 15000)
 fi
 [[ -f "$LOG" ]] || { echo "missing log: $LOG" >&2; exit 1; }
 mkdir -p "$(dirname "$CKPT")"
