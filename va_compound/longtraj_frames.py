@@ -72,6 +72,17 @@ class LongTrajFramesDataset:
         self.refs = self.payload["frame_refs"]  # [(task_file, ep_idx, frame_idx[T,W])]
         if len(self.refs) != self.length:
             raise ValueError("frame_refs 长度与样本数不一致")
+        for key in ACTION_MASK_KEYS:
+            if key in self.payload:
+                value = self.payload[key]
+                if (
+                    not isinstance(value, torch.Tensor)
+                    or value.shape != self.payload["actions"].shape[:-1]
+                ):
+                    raise ValueError(
+                        f"{key} must have shape {tuple(self.payload['actions'].shape[:-1])}, "
+                        f"got {getattr(value, 'shape', None)}"
+                    )
         # 帧窗契约校验：每个决策点的帧窗必须是历史帧（决策点 d 用 d-(W-1)*stride..d）
         self._task_cache: dict[str, dict] = {}
         # 任务级预解码缓存（Codex P1-13 优化，2026-08-10）：locality sampler 下
