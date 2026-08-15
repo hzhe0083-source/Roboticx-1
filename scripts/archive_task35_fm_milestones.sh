@@ -112,7 +112,10 @@ while true; do
     if [[ "$line" =~ global_step=([0-9]+).*periodic\ checkpoint\ saved ]]; then
       step=${BASH_REMATCH[1]}
       if wanted "$step"; then
-        archive_step "$step"
+        # A failed 6k copy must not abort the 9k/12k/15k listener.
+        if ! archive_step "$step"; then
+          echo "archive_step failed for step=$step; keep listening for later milestones" >&2
+        fi
         all_done && exit 0
       fi
     fi

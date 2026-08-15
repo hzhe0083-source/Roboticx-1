@@ -30,17 +30,49 @@ LOCK=logs/${NAME}.lock
 mkdir -p logs
 exec 9>"$LOCK"
 flock 9
+
+wait_for_cpu_ram() {
+  # Validate/slice load a 1.6 GiB checkpoint on CPU. Do not start if the
+  # live trainer plus this job would thrash; wait instead of OOM-killing.
+  local avail_kb needed_kb=4194304
+  local waited=0
+  while true; do
+    avail_kb=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)
+    if [[ -n "$avail_kb" && "$avail_kb" -ge "$needed_kb" ]]; then
+      return 0
+    fi
+    echo "low MemAvailable=${avail_kb:-?} kB; waiting before CPU validate/slice" >&2
+    sleep 15
+    waited=$((waited + 15))
+    if (( waited >= 600 )); then
+      echo "MemAvailable stayed below 4 GiB for 10 min; refusing CPU validate" >&2
+      return 1
+    fi
+  done
+}
+
+run_cpu() {
+  if command -v ionice >/dev/null 2>&1; then
+    ionice -c 3 nice -n 10 "$@"
+  else
+    nice -n 10 "$@"
+  fi
+}
+
 # Archiver only copies. This waiter owns full CPU validate/slice.
 need_validate=1
 if [[ -s "$VALIDATE" ]] && grep -q '"ok": true' "$VALIDATE" && grep -q '"loaded_modules": true' "$VALIDATE"; then
   need_validate=0
 fi
+if [[ "$need_validate" -eq 1 || ! -s "$SLICES" ]]; then
+  wait_for_cpu_ram
+fi
 if [[ "$need_validate" -eq 1 ]]; then
-  CUDA_VISIBLE_DEVICES= "$PY" -B scripts/validate_task35_fm_checkpoint.py \
+  CUDA_VISIBLE_DEVICES= run_cpu "$PY" -B scripts/validate_task35_fm_checkpoint.py \
     "$DEST" --expected-step "$STEP" --output "$VALIDATE"
 fi
 if [[ ! -s "$SLICES" ]]; then
-  CUDA_VISIBLE_DEVICES= "$PY" -B scripts/diag_task35_clean_recovery_slices.py \
+  CUDA_VISIBLE_DEVICES= run_cpu "$PY" -B scripts/diag_task35_clean_recovery_slices.py \
     --checkpoint "$DEST" --batch 16 --output "$SLICES"
 fi
 # Compare against the previous archived slice if it exists.

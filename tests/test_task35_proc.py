@@ -23,10 +23,13 @@ def test_archiver_follows_log_events_not_stdin() -> None:
     assert "validate_task35_fm_checkpoint.py" not in text
     assert "verify_copy_sha" in text
     assert "archive SHA mismatch" in text
+    assert "keep listening for later milestones" in text
     waiter = Path("/home/ryan/Documents/robot/ORA0-task35-fullfix/scripts/wait_validate_task35_fm_milestone.sh").read_text()
     assert "loaded_modules" in waiter
     assert "CUDA_VISIBLE_DEVICES=" in waiter
     assert "milestone SHA mismatch" in waiter
+    assert "wait_for_cpu_ram" in waiter
+    assert "MemAvailable" in waiter
 
 
 def test_find_processes_requires_all_markers() -> None:
