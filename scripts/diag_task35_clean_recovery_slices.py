@@ -100,10 +100,20 @@ def slice_geometry(
             continue
         pair_visible = (vis[:, PEGHEAD] >= 0.5) & (vis[:, HOLE] >= 0.5)
         distance = np.linalg.norm(selected[:, PEGHEAD] - selected[:, HOLE], axis=-1) * 480.0
+        visible_points = selected[pair_visible]
+        role_std = {}
+        for index, role in enumerate(ROLE_NAMES):
+            pts = visible_points[:, index] * 480.0 if visible_points.size else np.empty((0, 2))
+            role_std[role] = {
+                "n": int(pts.shape[0]),
+                "std_x_px": None if pts.size == 0 else float(pts[:, 0].std()),
+                "std_y_px": None if pts.size == 0 else float(pts[:, 1].std()),
+            }
         out[name] = {
             "n": int(mask.sum()),
             "pair_visible_fraction": float(pair_visible.mean()),
             "pegHead_hole_px": summarize(distance[pair_visible]),
+            "role_std_px": role_std,
             "visibility_mean": {
                 role: float(vis[:, index].mean()) for index, role in enumerate(ROLE_NAMES)
             },

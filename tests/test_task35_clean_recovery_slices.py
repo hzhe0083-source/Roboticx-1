@@ -39,3 +39,5 @@ def test_slice_geometry_separates_clean_and_recovery_pair_distance() -> None:
     assert report["clean"]["pegHead_hole_px"]["n"] == 1
     assert report["clean"]["pegHead_hole_px"]["mean"] == pytest.approx(48.0)
     assert report["recovery"]["pegHead_hole_px"]["mean"] == pytest.approx(144.0)
+    assert report["clean"]["role_std_px"]["pegHead"]["n"] == 1
+    assert report["clean"]["role_std_px"]["pegHead"]["std_x_px"] == pytest.approx(0.0)
