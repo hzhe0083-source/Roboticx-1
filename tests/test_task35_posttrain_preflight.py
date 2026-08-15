@@ -1,5 +1,11 @@
-from eval_metaworld import require_task35_peg_insert_side, select_eval_tasks
+from pathlib import Path
+
 import pytest
+
+from eval_metaworld import require_task35_peg_insert_side, select_eval_tasks
+from scripts.check_task35_readiness import WAITER_NEEDLES
+from scripts.plan_task35_eval_suite import REQUIRED_MILESTONES
+from scripts.summarize_task35_fm_train import ARCHIVE_MILESTONES
 
 
 def test_preflight_mapping_helper_rejects_wrong_task() -> None:
@@ -13,3 +19,11 @@ def test_preflight_mapping_helper_rejects_wrong_task() -> None:
         require_task35_peg_insert_side(
             selected, {"Insert a peg sideways": "window-open-v3"}
         )
+
+
+def test_readiness_expects_planned_waiters_and_acceptance_set() -> None:
+    assert REQUIRED_MILESTONES == (3000, 6000, 9000, 12000, 15000)
+    assert ARCHIVE_MILESTONES[-1] == 15000
+    assert any("wait_task35_fm_finished_eval.sh" in needle for needle in WAITER_NEEDLES)
+    waiter = Path(__file__).resolve().parent.parent / "scripts" / "wait_task35_fm_finished_eval.sh"
+    assert waiter.read_text().count("run_task35_h6_eval_suite.sh") == 1

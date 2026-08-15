@@ -27,6 +27,7 @@ os.environ.setdefault("EGL_PLATFORM", "surfaceless")
 
 from eval_metaworld import _load_dino_metric_from_policy
 from prepare_metaworld_metric import make_metric_batch
+from scripts.task35_proc import trainer_processes
 from scripts.train_metric_roi_dino import CANONICAL, load_language
 from va_compound.backbones import TimmActionVisionBackbone
 from va_compound.longtraj_frames import LongTrajFramesDataset
@@ -39,6 +40,23 @@ def sha256_file(path: Path) -> str:
         for block in iter(lambda: stream.read(16 << 20), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def want_holdout_cuda(
+    *,
+    force: bool,
+    cuda_visible: str | None,
+    cuda_available: bool,
+    trainer_alive: bool,
+) -> bool:
+    """Refuse CUDA holdout while the FM trainer owns the GPU."""
+    want_cuda = bool(cuda_available) and cuda_visible != ""
+    if want_cuda and trainer_alive and not force:
+        raise SystemExit(
+            "FM trainer still running; refusing to take the GPU. "
+            "Pass --force or set CUDA_VISIBLE_DEVICES= to run on CPU."
+        )
+    return want_cuda
 
 
 def summarize(values: torch.Tensor) -> dict[str, float]:
@@ -61,10 +79,21 @@ def main() -> None:
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--seed", type=int, default=2777)
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow CUDA holdout while the FM trainer is still alive.",
+    )
     args = parser.parse_args()
     if args.samples < 1 or args.batch < 1:
         raise ValueError("samples and batch must be positive")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    want_cuda = want_holdout_cuda(
+        force=args.force,
+        cuda_visible=os.environ.get("CUDA_VISIBLE_DEVICES"),
+        cuda_available=torch.cuda.is_available(),
+        trainer_alive=bool(trainer_processes()),
+    )
+    device = torch.device("cuda" if want_cuda else "cpu")
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     config = VACompoundConfig(**checkpoint["config"])
     if not config.dino_dense_metric or config.main_vision_grid != 16:
