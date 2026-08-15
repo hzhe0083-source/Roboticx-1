@@ -12,6 +12,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from eval_metaworld import validate_task35_eval50_payload
+from scripts.plan_task35_eval_suite import REQUIRED_MILESTONES, SKIP_CLOSED_LOOP_STEPS
 from scripts.select_task35_best_fm import select_best_task35_fm
 
 
@@ -23,6 +24,15 @@ def _eval50_ok(payload: dict) -> bool:
     return bool(payload.get("task35_precision_contract")) and payload.get(
         "task35_causal_ablation", "none"
     ) == "none"
+
+
+def closed_loop_complete(rows: list[dict]) -> bool:
+    """True only when every acceptance milestone has a valid 50-seed eval50."""
+    by_step = {row.get("step"): row for row in rows}
+    return all(
+        (by_step.get(step) or {}).get("labels", {}).get("closed_loop") == "supported"
+        for step in REQUIRED_MILESTONES
+    )
 
 
 def load_json(path: Path) -> dict | None:
@@ -37,8 +47,9 @@ def evidence_row(candidate: dict) -> dict:
     holdout = load_json(
         Path("logs") / f"{Path(candidate['path']).stem}_metric_holdout2777.json"
     )
+    step = candidate.get("step")
     return {
-        "step": candidate.get("step"),
+        "step": step,
         "sha256": candidate.get("sha256"),
         "validated": bool(candidate.get("validated")),
         "geometry_l2": candidate.get("geometry_l2"),
@@ -49,15 +60,19 @@ def evidence_row(candidate: dict) -> dict:
         "holdout_rmse_px": None if holdout is None else (holdout.get("aggregate") or {}).get("rmse_px"),
         "closed_loop_successes": None if eval50 is None else eval50.get("successes"),
         "closed_loop_trials": None if eval50 is None else eval50.get("completed_trials"),
+        "acceptance_candidate": step not in SKIP_CLOSED_LOOP_STEPS,
         "labels": {
             "checkpoint_contract": "supported" if candidate.get("validated") else "planned",
             "slice_geometry": "partially supported" if slices else "planned",
             "holdout_metric": "supported" if holdout is not None else "planned",
             "closed_loop": (
-                "supported"
-                if eval50 is not None
-                and _eval50_ok(eval50)
-                else "planned"
+                "skipped"
+                if step in SKIP_CLOSED_LOOP_STEPS
+                else (
+                    "supported"
+                    if eval50 is not None and _eval50_ok(eval50)
+                    else "planned"
+                )
             ),
         },
     }
@@ -83,6 +98,7 @@ def render_md(payload: dict) -> str:
             f"rec_vis={row['recovery_visible']} rec_px={row['recovery_pair_px']} "
             f"holdout={row['holdout_rmse_px']} "
             f"eval50={row['closed_loop_successes']}/{row['closed_loop_trials']}"
+            f"{'' if row.get('acceptance_candidate', True) else ' (mechanism only)'}"
         )
         lines.append(
             f"  labels: contract={row['labels']['checkpoint_contract']}, "
@@ -93,7 +109,8 @@ def render_md(payload: dict) -> str:
     lines.extend(
         [
             "",
-            "Closed-loop insertion remains planned until a 50-seed eval50 JSON exists.",
+            "Closed-loop insertion remains planned until 3k/6k/9k/12k/15k each have a 50-seed eval50.",
+            "1k/2k stay mechanism-only and cannot elect a winner.",
             "",
         ]
     )
@@ -133,7 +150,7 @@ def main() -> None:
     candidates = load_json(args.candidates) or {"candidates": []}
     monitor = load_json(args.monitor) or {}
     rows = [evidence_row(item) for item in candidates.get("candidates") or []]
-    closed = bool(rows) and all(row["labels"]["closed_loop"] == "supported" for row in rows)
+    closed = closed_loop_complete(rows)
     best = None
     best_error = None
     selector_input = []

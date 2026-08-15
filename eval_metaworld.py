@@ -2412,6 +2412,7 @@ def main() -> None:
             "task35 only": args.task_ids == "35",
             "50 trials": args.trials_per_task == 50,
             "execute_steps 6": args.execute_steps == 6,
+            "horizon 500": args.horizon == 500,
             "stage telemetry": args.debug_stage_metrics,
             "WAM off": args.wam == "off",
             "FM checkpoint": policy_contract.get("action_decoder")
@@ -2481,6 +2482,7 @@ def main() -> None:
             "ROI": dino_roi_expected and args.dino_roi_checkpoint is not None,
             "ROI alpha 1": args.dino_roi_alpha == 1.0,
             "execute_steps 6": args.execute_steps == 6,
+            "horizon 500": args.horizon == 500,
             "50 trials": args.trials_per_task == 50,
             "task35 only": args.task_ids == "35",
             "stage telemetry": args.debug_stage_metrics,

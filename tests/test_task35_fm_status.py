@@ -1,4 +1,4 @@
-from scripts.report_task35_fm_status import evidence_row, render_md
+from scripts.report_task35_fm_status import closed_loop_complete, evidence_row, render_md
 
 
 def test_status_labels_closed_loop_as_planned_without_eval50() -> None:
@@ -52,3 +52,35 @@ def test_status_markdown_mentions_planned_closed_loop() -> None:
     )
     assert "closed_loop_complete: False" in text
     assert "Closed-loop insertion remains planned" in text
+
+
+def test_closed_loop_complete_ignores_1k_2k_and_requires_acceptance_set() -> None:
+    def row(step: int, label: str) -> dict:
+        return {"step": step, "labels": {"closed_loop": label}}
+
+    assert closed_loop_complete(
+        [
+            row(1000, "skipped"),
+            row(2000, "skipped"),
+            row(3000, "supported"),
+            row(6000, "supported"),
+            row(9000, "supported"),
+            row(12000, "supported"),
+            row(15000, "supported"),
+        ]
+    )
+    assert not closed_loop_complete(
+        [
+            row(1000, "skipped"),
+            row(2000, "skipped"),
+            row(3000, "supported"),
+        ]
+    )
+    assert evidence_row(
+        {
+            "path": "checkpoints/x_step1000.pt",
+            "step": 1000,
+            "validated": True,
+            "slices": {},
+        }
+    )["labels"]["closed_loop"] == "skipped"

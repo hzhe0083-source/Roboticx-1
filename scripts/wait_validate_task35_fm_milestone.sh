@@ -33,6 +33,22 @@ if [[ ! -s "$SLICES" ]]; then
   CUDA_VISIBLE_DEVICES= "$PY" -B scripts/diag_task35_clean_recovery_slices.py \
     --checkpoint "$DEST" --batch 16 --output "$SLICES"
 fi
+# Compare against the previous archived slice if it exists.
+PREV=""
+case "$STEP" in
+  2000) PREV=${STEM}_step1000 ;;
+  3000) PREV=${STEM}_step2000 ;;
+  6000) PREV=${STEM}_step3000 ;;
+  9000) PREV=${STEM}_step6000 ;;
+  12000) PREV=${STEM}_step9000 ;;
+  15000) PREV=${STEM}_step12000 ;;
+esac
+if [[ -n "$PREV" && -s "logs/$(basename "$PREV")_clean_recovery_slices.json" && -s "$SLICES" ]]; then
+  "$PY" -B scripts/compare_task35_slice_reports.py \
+    "logs/$(basename "$PREV")_clean_recovery_slices.json" \
+    "$SLICES" \
+    --output "logs/${NAME}_vs_$(basename "$PREV")_slices.json"
+fi
 "$PY" -B scripts/list_task35_fm_candidates.py >/dev/null
 "$PY" -B scripts/report_task35_fm_status.py >/dev/null
 echo "validated and sliced $DEST" >&2
