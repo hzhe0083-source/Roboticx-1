@@ -12,10 +12,16 @@ import json
 import math
 import os
 import re
-import time
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from statistics import mean
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.summarize_task35_fm_train import summarize_task35_fm_log
 
 BJ = timezone(timedelta(hours=8))
 STEP_RE = re.compile(
@@ -246,10 +252,34 @@ def render_md(snapshot: dict, trainer: dict, timing: dict) -> str:
             fmt_window("last_100"),
             fmt_window("since_1001"),
             "",
+            "## milestones",
+            *milestone_lines(snapshot.get("milestones") or []),
+            "",
             "This is FM flow-matching loss on peg-insert-side-v3, not closed-loop success.",
             "",
         ]
     )
+
+
+def milestone_lines(windows: list[dict]) -> list[str]:
+    lines = []
+    for item in windows:
+        loss = item.get("loss") or {}
+        aux = item.get("aux_rmse_px") or {}
+        archived = item.get("archived")
+        flag = ""
+        if archived is True:
+            flag = " archived"
+        elif archived is False:
+            flag = " missing-archive"
+        aux_txt = "n/a" if not aux else f"{aux['mean']:.1f}px"
+        if not loss:
+            continue
+        lines.append(
+            f"- {item['start']}-{item['end']}: loss_mean={loss['mean']:.4f} "
+            f"aux_mean={aux_txt}{flag}"
+        )
+    return lines or ["- n/a"]
 
 
 def atomic_write(path: Path, text: str) -> None:
@@ -262,6 +292,14 @@ def atomic_write(path: Path, text: str) -> None:
 def main() -> None:
     args = parse_args()
     snapshot = parse_log(args.log, args.total_steps)
+    summary = summarize_task35_fm_log(
+        args.log.read_text(encoding="utf-8", errors="replace"),
+        total_steps=args.total_steps,
+        checkpoint_stem=args.log.parent.parent
+        / "checkpoints"
+        / "task35_h6_dino_mtvj_fm_full15k_b6_sdpa_aux10b8_v1",
+    )
+    snapshot["milestones"] = summary["windows"]
     trainer = trainer_alive(args.trainer_needle)
     timing = eta(snapshot, trainer)
     payload = {
