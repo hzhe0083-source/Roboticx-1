@@ -253,6 +253,8 @@ def milestone_lines(windows: list[dict]) -> list[str]:
             flag = " archived"
         elif archived is False:
             flag = " missing-archive"
+        elif item.get("periodic_save_only"):
+            flag = " periodic-save"
         aux_txt = "n/a" if not aux else f"{aux['mean']:.1f}px"
         if not loss:
             continue

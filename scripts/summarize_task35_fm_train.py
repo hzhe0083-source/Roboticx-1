@@ -14,6 +14,7 @@ STEP_RE = re.compile(
 )
 AUX_RE = re.compile(r"aux_rmse=(?P<rmse>[-+]?(?:\d+\.?\d*|\d*\.\d+)(?:[eE][-+]?\d+)?)px")
 SAVE_RE = re.compile(r"global_step=(?P<step>\d+)\s+periodic checkpoint saved")
+ARCHIVE_MILESTONES = (1000, 2000, 3000, 6000, 9000, 12000, 15000)
 
 
 def parse_float(text: str) -> float:
@@ -70,21 +71,21 @@ def summarize_task35_fm_log(
         end = min(start + window - 1, latest_step)
         losses = [loss for step, loss in rows if start <= step <= end]
         aux_vals = [rmse for step, rmse in aux if start <= step <= end]
-        archived = None
-        if checkpoint_stem is not None:
-            archived = Path(f"{checkpoint_stem}_step{end}.pt").is_file() if end % window == 0 else None
-            if end == latest_step and end % window != 0:
-                archived = None
         item = {
             "start": start,
             "end": end,
             "loss": window_stats(losses),
             "aux_rmse_px": window_stats(aux_vals),
         }
-        if end % window == 0:
+        if end in ARCHIVE_MILESTONES:
             item["milestone"] = end
             if checkpoint_stem is not None:
                 item["archived"] = Path(f"{checkpoint_stem}_step{end}.pt").is_file()
+        elif end % window == 0:
+            # Live trainer overwrites the working checkpoint every 1000 steps.
+            # Only ARCHIVE_MILESTONES are copied aside; 4000/5000/7000/... are
+            # periodic saves, not missing archives.
+            item["periodic_save_only"] = True
         windows.append(item)
         if end == latest_step:
             break
