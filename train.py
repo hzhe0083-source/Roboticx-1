@@ -644,8 +644,12 @@ class TaskWeightedSampler(Sampler[list[int]]):
     per-sample 权重（instruction_id → MT50 难度：easy 0.5 / med 1.0 /
     hard 2.0 / vh 3.0，除以任务窗口数消除长度偏置，Codex P1-2）多项式抽样；
     每 epoch 有放回（replacement=True，实现困难任务过采样）抽取 n 个样本、
-    分批 yield，最后不足一批丢弃（等效 drop_last）。epoch 递增种子，
-    训练循环 StopIteration 重建 loader 时自动进入下一个 epoch。
+    分批 yield，最后不足一批丢弃（等效 drop_last）。
+
+    ``__iter__`` 不自行推进 cursor；只有优化器更新成功后由主循环调用
+    :meth:`advance`，使 DINO-main weighted 路径也能 exact-resume。
+    2026-08-16 的 6k 档案 ``sampler_state=None``：恢复时从 epoch=0 重开，
+    不根据 global_step 反推（6k→20k 续训本身就是从 epoch 0 重开的）。
     """
 
     def __init__(self, per_sample_weights: Tensor, batch_size: int, seed: int = 0) -> None:
@@ -657,19 +661,71 @@ class TaskWeightedSampler(Sampler[list[int]]):
         self.batch_size = int(batch_size)
         self.seed = int(seed)
         self.epoch = 0
+        self.batch_cursor = 0
+        self.dataset_content_identity: dict | None = None
 
     def __len__(self) -> int:
         return max(1, len(self.weights) // self.batch_size)
 
-    def __iter__(self) -> Iterator[list[int]]:
+    def _weights_fingerprint(self) -> str:
+        return hashlib.sha256(
+            self.weights.detach().cpu().contiguous().numpy().tobytes()
+        ).hexdigest()
+
+    def _build_epoch(self) -> list[list[int]]:
         generator = torch.Generator().manual_seed(self.seed + self.epoch)
-        self.epoch += 1
         n = len(self.weights)
         indices = torch.multinomial(
             self.weights, n, replacement=True, generator=generator
         ).tolist()
-        for start in range(0, len(indices) - self.batch_size + 1, self.batch_size):
-            yield indices[start:start + self.batch_size]
+        return [
+            indices[start : start + self.batch_size]
+            for start in range(0, len(indices) - self.batch_size + 1, self.batch_size)
+        ]
+
+    def __iter__(self) -> Iterator[list[int]]:
+        schedule = self._build_epoch()
+        yield from schedule[self.batch_cursor :]
+
+    def advance(self, batches: int = 1) -> None:
+        if batches < 0:
+            raise ValueError("batches must be non-negative")
+        total = self.batch_cursor + int(batches)
+        self.epoch += total // len(self)
+        self.batch_cursor = total % len(self)
+
+    def state_dict(self) -> dict:
+        return {
+            "sampler_kind": "task_weighted",
+            "sampler_contract_version": 1,
+            "epoch": self.epoch,
+            "batch_cursor": self.batch_cursor,
+            "seed": self.seed,
+            "batch_size": self.batch_size,
+            "n_weights": int(self.weights.numel()),
+            "weights_sha256": self._weights_fingerprint(),
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        expected = {
+            "sampler_kind": "task_weighted",
+            "sampler_contract_version": 1,
+            "seed": self.seed,
+            "batch_size": self.batch_size,
+            "n_weights": int(self.weights.numel()),
+            "weights_sha256": self._weights_fingerprint(),
+        }
+        for key, value in expected.items():
+            if state.get(key) != value:
+                raise ValueError(
+                    f"sampler state mismatch on {key}: {state.get(key)!r} != {value!r}"
+                )
+        epoch = int(state.get("epoch", -1))
+        cursor = int(state.get("batch_cursor", -1))
+        if epoch < 0 or not 0 <= cursor < len(self):
+            raise ValueError(f"invalid sampler epoch/cursor: {epoch}/{cursor}")
+        self.epoch = epoch
+        self.batch_cursor = cursor
 
 
 class TaskLocalityWeightedSampler(Sampler[list[int]]):
@@ -1090,7 +1146,7 @@ def build_exact_run_contract(
     args: argparse.Namespace,
     config,
     optimizer: torch.optim.Optimizer,
-    sampler: TaskLocalityWeightedSampler | None,
+    sampler: TaskLocalityWeightedSampler | TaskWeightedSampler | None,
     metric_head: nn.Module | None = None,
     roi_head: nn.Module | None = None,
 ) -> dict:
@@ -1315,7 +1371,7 @@ def restore_exact_optimizer_state(
 def build_exact_resume_state(
     optimizer: torch.optim.Optimizer,
     global_step: int,
-    sampler: TaskLocalityWeightedSampler | None,
+    sampler: TaskLocalityWeightedSampler | TaskWeightedSampler | None,
     exact_run_contract: dict,
 ) -> dict:
     """Build the training-state portion of an exact-resumable checkpoint."""
@@ -1339,7 +1395,7 @@ def build_exact_resume_state(
 def restore_exact_resume_state(
     checkpoint: dict,
     optimizer: torch.optim.Optimizer,
-    sampler: TaskLocalityWeightedSampler | None,
+    sampler: TaskLocalityWeightedSampler | TaskWeightedSampler | None,
     *,
     runtime_exact_run_contract: dict | None = None,
     restore_rng: bool = True,
@@ -1371,13 +1427,15 @@ def restore_exact_resume_state(
         )
     saved_sampler = checkpoint["sampler_state"]
     if saved_sampler is None:
-        if sampler is not None:
+        if isinstance(sampler, TaskLocalityWeightedSampler):
             raise ValueError(
                 "--resume-exact checkpoint has sampler_state=None but the "
                 "runtime built a sampler; refuse to invent locality state"
             )
+        # TaskWeightedSampler or no sampler: 6k / this 6k→20k run stored None.
+        # Keep epoch=0 rather than inferring a cursor from global_step.
     elif sampler is None:
-        raise ValueError("--resume-exact requires TaskLocalityWeightedSampler state")
+        raise ValueError("--resume-exact requires a checkpointed sampler state")
     restore_exact_optimizer_state(optimizer, checkpoint["optimizer_state"])
     if saved_sampler is not None:
         sampler.load_state_dict(saved_sampler)
@@ -4919,7 +4977,8 @@ def validate_args(args: argparse.Namespace) -> None:
         ):
             raise ValueError(
                 "--resume-exact currently requires the single-task weighted/balanced "
-                "MT-VJ or DINO-main data path (TaskLocalityWeightedSampler)"
+                "MT-VJ or DINO-main data path (TaskLocalityWeightedSampler or "
+                "TaskWeightedSampler)"
             )
         if args.fork_data is not None or args.perturb_data is not None or args.c2_controller:
             raise ValueError(
@@ -5590,7 +5649,7 @@ def save_checkpoint(
     roi_head=None,
     optimizer=None,
     global_step: int = 0,
-    sampler: TaskLocalityWeightedSampler | None = None,
+    sampler: TaskLocalityWeightedSampler | TaskWeightedSampler | None = None,
     exact_run_contract: dict | None = None,
 ) -> None:
     """原子保存 checkpoint（tmp 文件 + rename），供周期/最终保存复用。"""
@@ -6569,13 +6628,15 @@ def main() -> None:
                         generator=torch.Generator().manual_seed(args.seed),
                     )
                 else:
+                    sampler = TaskWeightedSampler(
+                        per_sample, effective_batch, args.seed
+                    )
                     loader = DataLoader(
                         dataset,
-                        batch_sampler=TaskWeightedSampler(
-                            per_sample, effective_batch, args.seed
-                        ),
+                        batch_sampler=sampler,
                         num_workers=args.num_workers,
                         persistent_workers=args.num_workers > 0,
+                        generator=torch.Generator().manual_seed(args.seed),
                     )
             else:
                 loader = DataLoader(
@@ -7370,7 +7431,9 @@ def main() -> None:
             # C² 3:1 混合：clean 部分（v5 + v6a 目标）+ recovery 部分（v6b）。
             batch = move_batch(next(clean_iter), device)
             rec_batch = move_batch(next(rec_iter), device)
-            consumed_locality_batch = isinstance(sampler, TaskLocalityWeightedSampler)
+            consumed_locality_batch = isinstance(
+                sampler, (TaskLocalityWeightedSampler, TaskWeightedSampler)
+            )
         elif iterator is None:
             batch = smoke_batch
         else:
@@ -7383,7 +7446,9 @@ def main() -> None:
                 except StopIteration:
                     iterator = iter(loader)
                     batch = next(iterator)
-                consumed_locality_batch = isinstance(sampler, TaskLocalityWeightedSampler)
+                consumed_locality_batch = isinstance(
+                    sampler, (TaskLocalityWeightedSampler, TaskWeightedSampler)
+                )
         if mtvj_backbone is not None:
             # MT-VJ（契约 §6）：在线 dense 编码——frames（live 数据集或合成冒烟）
             # → 冻结 V-JEPA forward_hierarchical_dense（fp16）→ {5,11} →

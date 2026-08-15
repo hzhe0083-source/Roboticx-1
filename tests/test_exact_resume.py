@@ -11,6 +11,7 @@ from torch import nn
 from train import (
     SAM,
     TaskLocalityWeightedSampler,
+    TaskWeightedSampler,
     build_dataset_content_identity,
     build_exact_resume_state,
     build_exact_run_contract,
@@ -130,6 +131,16 @@ def test_restore_allows_null_sampler_for_dino_weighted_checkpoints() -> None:
         restore_rng=False,
     )
     assert step == 6000
+    weighted = TaskWeightedSampler(torch.tensor([1.0, 2.0, 3.0, 4.0]), batch_size=2, seed=0)
+    restore_exact_resume_state(
+        payload,
+        optimizer,
+        weighted,
+        runtime_exact_run_contract=_contract(),
+        restore_rng=False,
+    )
+    assert weighted.epoch == 0
+    assert weighted.batch_cursor == 0
     with pytest.raises(ValueError, match="sampler_state=None"):
         restore_exact_resume_state(
             payload,
@@ -137,6 +148,25 @@ def test_restore_allows_null_sampler_for_dino_weighted_checkpoints() -> None:
             _sampler(),
             runtime_exact_run_contract=_contract(),
             restore_rng=False,
+        )
+
+
+def test_task_weighted_sampler_roundtrip_and_advance() -> None:
+    weights = torch.tensor([0.5, 1.0, 2.0, 3.0, 0.5, 1.0])
+    baseline = TaskWeightedSampler(weights, batch_size=2, seed=7)
+    first = next(iter(baseline))
+    baseline.advance()
+    second = next(iter(baseline))
+    resumed = TaskWeightedSampler(weights, batch_size=2, seed=7)
+    resumed.load_state_dict(baseline.state_dict())
+    assert next(iter(resumed)) == second
+    resumed.advance()
+    baseline.advance()
+    assert resumed.state_dict() == baseline.state_dict()
+    assert len(first) == 2
+    with pytest.raises(ValueError, match="weights_sha256"):
+        resumed.load_state_dict(
+            {**baseline.state_dict(), "weights_sha256": "deadbeef"}
         )
 
 
