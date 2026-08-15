@@ -292,6 +292,7 @@ def validate_task35_eval50_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "execute_steps 6": int(payload.get("execute_steps") or 0) == 6,
         "horizon 500": int(payload.get("horizon") or 0) == 500,
         "WAM off": payload.get("wam") == "off",
+        "peg-insert-side-v3": payload.get("env_name") == "peg-insert-side-v3",
         "success count matches": int(payload.get("successes") or 0)
         == sum(bool(row.get("success")) for row in trials),
     }

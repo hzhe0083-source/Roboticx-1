@@ -30,6 +30,14 @@ def test_task35_paired_protocol_uses_seeds_35000_through_35049() -> None:
     )
 
 
+def test_task35_metadata_index_maps_to_peg_insert_side() -> None:
+    tasks = [f"task-{index}" for index in range(49)]
+    tasks[35] = "Insert a peg sideways"
+    assert select_eval_tasks(tasks, "35", max_tasks=49) == [
+        (35, "Insert a peg sideways")
+    ]
+
+
 def test_default_selection_retains_metadata_indices() -> None:
     tasks = ["a", "b", "c"]
     assert select_eval_tasks(tasks, None, max_tasks=2) == [(0, "a"), (1, "b")]

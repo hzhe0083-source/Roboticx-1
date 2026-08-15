@@ -37,6 +37,7 @@ def _payload(
         "execute_steps": execute_steps,
         "horizon": 500,
         "wam": "off",
+        "env_name": "peg-insert-side-v3",
         "task35_precision_contract": precision,
         "task35_causal_ablation": ablation,
         "trials": trials,
