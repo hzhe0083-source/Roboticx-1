@@ -7,6 +7,8 @@ def test_inspector_command_lines_are_ignored() -> None:
     assert is_inspector("pgrep -f train.py --task35-precision-contract")
     assert is_inspector("python3 - <<'PY'\nneedles = ('train.py',)\nPY")
     assert is_inspector("/usr/bin/python -B scripts/task35_proc.py --check trainer")
+    assert is_inspector("python3 - <<'PY'\n'direct-head'\n'eval_metaworld.py'\nPY")
+    assert is_inspector("/usr/bin/python -B scripts/check_task35_readiness.py")
     assert not is_inspector(
         "/home/ryan/.venvs/pytorch-gpu/bin/python -u -B train.py "
         "--task35-precision-contract --direct-head"

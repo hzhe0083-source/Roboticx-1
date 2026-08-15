@@ -22,7 +22,7 @@ from eval_metaworld import (
 )
 from scripts.plan_task35_eval_suite import REQUIRED_MILESTONES, SKIP_CLOSED_LOOP_STEPS
 from scripts.summarize_task35_fm_train import ARCHIVE_MILESTONES
-from scripts.task35_proc import trainer_processes
+from scripts.task35_proc import is_inspector, trainer_processes
 
 FEATURES = ROOT / "data" / "metaworld_longtraj_windows_h6_dino35_clean60_recovery30_v1.pt"
 CACHE = ROOT / "data" / "dino35_h6_clean60_recovery30_cache_v1"
@@ -50,7 +50,7 @@ def _cmdlines() -> list[str]:
             )
         except OSError:
             continue
-        if cmd:
+        if cmd and not is_inspector(cmd):
             rows.append(cmd)
     return rows
 

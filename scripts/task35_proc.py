@@ -13,7 +13,13 @@ from pathlib import Path
 
 TRAINER_NEEDLE = "train.py --task35-precision-contract"
 TRAINER_MARKERS = ("python", "train.py")
-INSPECTOR_MARKERS = ("pgrep", "python3 - <<", "needles =", "task35_proc.py")
+INSPECTOR_MARKERS = (
+    "pgrep",
+    "python3 - <<",
+    "needles =",
+    "task35_proc.py",
+    "check_task35_readiness.py",
+)
 
 
 def iter_cmdlines() -> list[tuple[int, str]]:

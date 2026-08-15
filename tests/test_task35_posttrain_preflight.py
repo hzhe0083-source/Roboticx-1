@@ -21,6 +21,15 @@ def test_preflight_mapping_helper_rejects_wrong_task() -> None:
         )
 
 
+def test_readiness_ignores_inspector_direct_and_eval_needles() -> None:
+    from scripts.task35_proc import is_inspector
+
+    inspector = (
+        "python3 - <<'PY'\nneedles = ('train.py', 'direct-head', 'eval_metaworld.py')\nPY"
+    )
+    assert is_inspector(inspector)
+
+
 def test_readiness_expects_planned_waiters_and_acceptance_set() -> None:
     assert REQUIRED_MILESTONES == (3000, 6000, 9000, 12000, 15000)
     assert ARCHIVE_MILESTONES[-1] == 15000
