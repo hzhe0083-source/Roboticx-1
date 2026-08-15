@@ -118,6 +118,28 @@ def test_two_updates_equal_one_save_resume_one_with_weights_only_load(tmp_path) 
         )
 
 
+def test_restore_allows_null_sampler_for_dino_weighted_checkpoints() -> None:
+    _, optimizer = _model_and_optimizer()
+    payload = build_exact_resume_state(optimizer, 6000, None, _contract())
+    assert payload["sampler_state"] is None
+    step = restore_exact_resume_state(
+        payload,
+        optimizer,
+        None,
+        runtime_exact_run_contract=_contract(),
+        restore_rng=False,
+    )
+    assert step == 6000
+    with pytest.raises(ValueError, match="sampler_state=None"):
+        restore_exact_resume_state(
+            payload,
+            optimizer,
+            _sampler(),
+            runtime_exact_run_contract=_contract(),
+            restore_rng=False,
+        )
+
+
 def test_exact_resume_rejects_legacy_checkpoint() -> None:
     model, optimizer = _model_and_optimizer()
     del model

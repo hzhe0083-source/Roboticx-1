@@ -1370,10 +1370,17 @@ def restore_exact_resume_state(
             checkpoint["exact_run_contract"], runtime_exact_run_contract
         )
     saved_sampler = checkpoint["sampler_state"]
-    if sampler is None or saved_sampler is None:
+    if saved_sampler is None:
+        if sampler is not None:
+            raise ValueError(
+                "--resume-exact checkpoint has sampler_state=None but the "
+                "runtime built a sampler; refuse to invent locality state"
+            )
+    elif sampler is None:
         raise ValueError("--resume-exact requires TaskLocalityWeightedSampler state")
     restore_exact_optimizer_state(optimizer, checkpoint["optimizer_state"])
-    sampler.load_state_dict(saved_sampler)
+    if saved_sampler is not None:
+        sampler.load_state_dict(saved_sampler)
     global_step = int(checkpoint["global_step"])
     if global_step < 0:
         raise ValueError(f"invalid exact checkpoint global_step: {global_step}")
