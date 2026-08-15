@@ -3074,7 +3074,7 @@ def _dino_visual_aux_loss(
     """DINO 版视觉辅助批次（2026-08-16）：MT-VJ 高清头的真正训练信号。
 
     与 V-JEPA ``_mtvj_visual_aux_loss`` 同协议，仅编码器/网格不同：仿真真值
-    （make_metric_batch 定位/可见度）→ 冻结 DINO block11/block23 两帧
+    （make_metric_batch 定位/可见度 + true 480px raw_frames）→ 冻结 DINO block11/block23 两帧
     [d-2,d] 全 patch evidence（512 token）→ metric head（grid=16）→
     L_aux = λloc·(hinge + pos + offset，image_size=224) + λvis·BCE(visibility)。
     只反传 metric head（head_dtype fp32；DINO 冻结只读）。
@@ -3084,7 +3084,9 @@ def _dino_visual_aux_loss(
     from train_metric_visual import compute_losses
     from va_compound.model import dense_coords
 
-    sim = make_metric_batch(task, rng, aux_batch)
+    sim = make_metric_batch(
+        task, rng, aux_batch, include_raw_frames=True
+    )
     text = ENV_TO_TASK.get(task, task)
     if text not in lang_aux_cache:
         raise KeyError(
@@ -3095,11 +3097,13 @@ def _dino_visual_aux_loss(
     hid, mask = lang_aux_cache[text]
     lang_hidden = hid.repeat(aux_batch, 1, 1).to(device=device, dtype=head_dtype)
     lang_mask = mask.repeat(aux_batch, 1).to(device=device)
-    frames_np = np.asarray(sim["frames"])  # [B, 4, H, W, 3] uint8
-    if frames_np.ndim != 5 or frames_np.shape[1] != 4:
+    frames_np = np.asarray(
+        sim["raw_frames"]
+    )  # [B, 4, 480, 480, 3] true simulator renders
+    if frames_np.shape != (aux_batch, 4, 480, 480, 3) or frames_np.dtype != np.uint8:
         raise ValueError(
-            f"make_metric_batch frames 必须 [B,4,H,W,3] uint8，"
-            f"got {tuple(frames_np.shape)}"
+            "DINO visual aux raw_frames must be uint8 [B,4,480,480,3], "
+            f"got {tuple(frames_np.shape)}/{frames_np.dtype}"
         )
     # 帧 [d-2,d]（窗口索引 2,3）→ 与训练 DINO dense evidence 同一预处理。
     sel = np.ascontiguousarray(frames_np[:, (2, 3)])  # [B,2,H,W,3]

@@ -614,6 +614,59 @@ def test_rollout_legacy_vjepa_dense_still_uses_pool16(monkeypatch) -> None:
     assert torch.equal(observed[0], expected)
 
 
+def test_dino_visual_aux_uses_true_480px_raw_renders(monkeypatch) -> None:
+    import train as train_module
+    from va_compound.metric_visual_head import LanguageMetricField
+
+    seen = {}
+
+    def fake_batch(task, rng, batch, include_raw_frames=False):
+        seen["include_raw_frames"] = include_raw_frames
+        return {
+            "raw_frames": np.zeros((batch, 4, 480, 480, 3), dtype=np.uint8),
+            "frames": np.zeros((batch, 4, 384, 384, 3), dtype=np.uint8),
+            "keypoints": np.full((batch, 4, 2), 0.5, dtype=np.float32),
+            "visibility": np.ones((batch, 4), dtype=np.float32),
+        }
+
+    monkeypatch.setattr("prepare_metaworld_metric.make_metric_batch", fake_batch)
+    monkeypatch.setattr(
+        "scripts.build_longtraj_features.ENV_TO_TASK",
+        {"peg-insert-side-v3": "Insert a peg sideways"},
+    )
+    backbone = FakeDinoBackbone()
+    head = LanguageMetricField(
+        lang_dim=8,
+        h_dim=1024,
+        d_proj=8,
+        n_roles=4,
+        l2_norm=True,
+        learnable_temp=True,
+        mode_readout=True,
+        grid=16,
+    )
+    lang_cache = {
+        "Insert a peg sideways": (
+            torch.zeros(1, 3, 8),
+            torch.ones(1, 3, dtype=torch.bool),
+        )
+    }
+    loss, parts = train_module._dino_visual_aux_loss(
+        backbone,
+        head,
+        "peg-insert-side-v3",
+        np.random.default_rng(0),
+        2,
+        lang_cache,
+        torch.device("cpu"),
+        1.0,
+        0.5,
+    )
+    assert seen["include_raw_frames"] is True
+    assert torch.isfinite(loss)
+    assert np.isfinite(parts["rmse_px"])
+
+
 def test_task35_precision_contract_requires_complete_stack(tmp_path) -> None:
     from train import parse_args, validate_args
 
