@@ -43,6 +43,7 @@ def _payload(
         "env_name": "peg-insert-side-v3",
         "task35_precision_contract": precision,
         "task35_causal_ablation": ablation,
+        "language_source": "task35_features_cache",
         "trials": trials,
     }
 
@@ -71,6 +72,10 @@ def test_eval50_rejects_wrong_seeds_and_missing_trials() -> None:
     short["horizon"] = 400
     with pytest.raises(ValueError, match="horizon 500"):
         validate_task35_eval50_payload(short)
+    missing_lang = _payload()
+    missing_lang.pop("language_source")
+    with pytest.raises(ValueError, match="language source recorded"):
+        validate_task35_eval50_payload(missing_lang)
 
 
 def test_selector_refuses_to_elect_without_eval50() -> None:

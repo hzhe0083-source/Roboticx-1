@@ -317,23 +317,30 @@ def cached_task35_language(
     *,
     task_id: int = 35,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Use the training-cache language tokens instead of loading Qwen on GPU."""
+    """Use the training-cache language tokens instead of loading Qwen on GPU.
+
+    All matching rows must be identical. Silently taking the first row would
+    hide a mixed-instruction payload.
+    """
     if "language_hidden" not in features or "language_mask" not in features:
         raise ValueError("task35 features missing cached language_hidden/language_mask")
     if "instruction_id" not in features:
         raise ValueError("task35 features missing instruction_id")
     instruction_id = torch.as_tensor(features["instruction_id"]).reshape(-1)
-    rows = (instruction_id == int(task_id)).nonzero(as_tuple=False)
-    if rows.numel() == 0:
+    keep = instruction_id == int(task_id)
+    if not bool(keep.any()):
         raise ValueError(f"task35 features have no instruction_id={task_id} language cache")
-    row = int(rows[0, 0])
-    hidden = features["language_hidden"][row : row + 1].to(device=device)
-    mask = features["language_mask"][row : row + 1].to(device=device)
-    if hidden.ndim != 3 or mask.shape[:2] != hidden.shape[:2]:
+    hidden_rows = features["language_hidden"][keep]
+    mask_rows = features["language_mask"][keep]
+    if hidden_rows.ndim != 3 or mask_rows.shape[:2] != hidden_rows.shape[:2]:
         raise ValueError(
-            f"cached task35 language has unexpected shape {tuple(hidden.shape)} / {tuple(mask.shape)}"
+            f"cached task35 language has unexpected shape {tuple(hidden_rows.shape)} / {tuple(mask_rows.shape)}"
         )
-    return hidden, mask
+    if not torch.equal(hidden_rows, hidden_rows[:1].expand_as(hidden_rows)):
+        raise ValueError("task35 cached language_hidden is not identical across windows")
+    if not torch.equal(mask_rows, mask_rows[:1].expand_as(mask_rows)):
+        raise ValueError("task35 cached language_mask is not identical across windows")
+    return hidden_rows[:1].to(device=device), mask_rows[:1].to(device=device)
 
 
 def validate_task35_eval50_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -356,6 +363,8 @@ def validate_task35_eval50_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "peg-insert-side-v3": payload.get("env_name") == "peg-insert-side-v3",
         "success count matches": int(payload.get("successes") or 0)
         == sum(bool(row.get("success")) for row in trials),
+        "language source recorded": payload.get("language_source")
+        in {"task35_features_cache", "qwen_text_backbone"},
     }
     ablation = payload.get("task35_causal_ablation", "none")
     if payload.get("task35_precision_contract"):
@@ -3903,6 +3912,11 @@ def main() -> None:
             "env_name": descriptions_to_env.get(selected_tasks[0][1])
             if len(selected_tasks) == 1
             else None,
+            "language_source": (
+                "task35_features_cache"
+                if use_cached_task35_language
+                else "qwen_text_backbone"
+            ),
             "trials": trial_records,
         }
         if args.task35_precision_contract or args.task35_causal_ablation != "none":

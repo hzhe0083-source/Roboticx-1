@@ -73,16 +73,17 @@ def test_task35_temporal_ablation_reverses_only_frame_order() -> None:
     assert task35_ablation_frames(frames, "none") is frames
 
 
-def test_cached_task35_language_uses_first_instruction_row() -> None:
+def test_cached_task35_language_uses_identical_instruction_rows() -> None:
+    hidden = torch.zeros(2, 13, 2048)
+    hidden[:, 0, 0] = 3.5
     features = {
         "instruction_id": torch.tensor([35, 35]),
-        "language_hidden": torch.zeros(2, 13, 2048),
+        "language_hidden": hidden,
         "language_mask": torch.ones(2, 13, dtype=torch.bool),
     }
-    features["language_hidden"][0, 0, 0] = 3.5
-    hidden, mask = cached_task35_language(features, torch.device("cpu"))
-    assert tuple(hidden.shape) == (1, 13, 2048)
-    assert float(hidden[0, 0, 0]) == 3.5
+    cached, mask = cached_task35_language(features, torch.device("cpu"))
+    assert tuple(cached.shape) == (1, 13, 2048)
+    assert float(cached[0, 0, 0]) == 3.5
     assert bool(mask.all())
 
 
@@ -93,6 +94,20 @@ def test_cached_task35_language_rejects_missing_task() -> None:
                 "instruction_id": torch.tensor([0]),
                 "language_hidden": torch.zeros(1, 2, 4),
                 "language_mask": torch.ones(1, 2, dtype=torch.bool),
+            },
+            torch.device("cpu"),
+        )
+
+
+def test_cached_task35_language_rejects_mixed_rows() -> None:
+    hidden = torch.zeros(2, 2, 4)
+    hidden[1, 0, 0] = 1.0
+    with pytest.raises(ValueError, match="not identical"):
+        cached_task35_language(
+            {
+                "instruction_id": torch.tensor([35, 35]),
+                "language_hidden": hidden,
+                "language_mask": torch.ones(2, 2, dtype=torch.bool),
             },
             torch.device("cpu"),
         )
