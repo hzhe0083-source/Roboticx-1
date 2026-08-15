@@ -51,6 +51,24 @@ def main() -> None:
                     break
             if report is not None:
                 break
+        slice_path = Path("logs") / f"{path.stem}_clean_recovery_slices.json"
+        slices = json.loads(slice_path.read_text()) if slice_path.is_file() else None
+        slice_summary = None
+        if slices and slices.get("slices"):
+            slice_summary = {
+                layer: {
+                    "n": (slices["slices"].get(layer) or {}).get("n"),
+                    "pair_visible_fraction": (slices["slices"].get(layer) or {}).get(
+                        "pair_visible_fraction"
+                    ),
+                    "pegHead_hole_mean_px": (
+                        ((slices["slices"].get(layer) or {}).get("pegHead_hole_px") or {}).get(
+                            "mean"
+                        )
+                    ),
+                }
+                for layer in ("clean", "recovery")
+            }
         rows.append(
             {
                 "path": str(path),
@@ -58,6 +76,7 @@ def main() -> None:
                 "sha256": None if report is None else report.get("sha256") or sha,
                 "validated": bool(report and report.get("ok")),
                 "geometry_l2": None if report is None else report.get("geometry_l2"),
+                "slices": slice_summary,
             }
         )
     payload = {"contract": "task35_fm_candidates_v1", "candidates": rows}

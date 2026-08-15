@@ -14,8 +14,15 @@ while [[ ! -s "$DEST" || ! -s "${DEST}.sha256" ]]; do
   sleep 15
 done
 echo "found $DEST" >&2
-CUDA_VISIBLE_DEVICES= "$PY" -B scripts/validate_task35_fm_checkpoint.py \
-  "$DEST" --expected-step "$STEP" --output "logs/${NAME}_validate.json"
-CUDA_VISIBLE_DEVICES= "$PY" -B scripts/diag_task35_clean_recovery_slices.py \
-  --checkpoint "$DEST" --batch 16 --output "logs/${NAME}_clean_recovery_slices.json"
+VALIDATE=logs/${NAME}_validate.json
+SLICES=logs/${NAME}_clean_recovery_slices.json
+# Prefer the archiver's CPU validator; only run it here if that report is absent.
+if [[ ! -s "$VALIDATE" ]]; then
+  CUDA_VISIBLE_DEVICES= "$PY" -B scripts/validate_task35_fm_checkpoint.py \
+    "$DEST" --expected-step "$STEP" --output "$VALIDATE"
+fi
+if [[ ! -s "$SLICES" ]]; then
+  CUDA_VISIBLE_DEVICES= "$PY" -B scripts/diag_task35_clean_recovery_slices.py \
+    --checkpoint "$DEST" --batch 16 --output "$SLICES"
+fi
 echo "validated and sliced $DEST" >&2
