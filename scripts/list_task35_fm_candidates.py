@@ -15,6 +15,32 @@ def infer_step(path: Path) -> int | None:
     return None if match is None else int(match.group(1))
 
 
+def report_matches_archive(item: dict, *, sha: str | None, step: int | None) -> bool:
+    if not item.get("ok") or not item.get("loaded_modules"):
+        return False
+    if not sha or item.get("sha256") != sha:
+        return False
+    if step is None:
+        return False
+    try:
+        return int(item.get("global_step", -1)) == int(step)
+    except (TypeError, ValueError):
+        return False
+
+
+def slice_matches_archive(payload: dict | None, *, sha: str | None, step: int | None) -> bool:
+    if not payload or payload.get("contract") != "task35_clean_recovery_slice_v1":
+        return False
+    if not sha or payload.get("sha256") != sha:
+        return False
+    if step is None:
+        return False
+    try:
+        return int(payload.get("global_step", -1)) == int(step)
+    except (TypeError, ValueError):
+        return False
+
+
 def parse_args() -> argparse.Namespace:
     root = Path(__file__).resolve().parent.parent
     parser = argparse.ArgumentParser(description=__doc__)
@@ -43,6 +69,7 @@ def main() -> None:
             continue
         sidecar = Path(str(path) + ".sha256")
         sha = sidecar.read_text().split()[0] if sidecar.is_file() else None
+        step = infer_step(path)
         report = None
         search = [
             Path("logs") / f"{path.stem}_validate.json",
@@ -54,13 +81,15 @@ def main() -> None:
             payload = json.loads(report_path.read_text())
             items = payload.get("reports", [payload])
             for item in items:
-                if Path(item.get("path", "")).name == path.name or item.get("sha256") == sha:
+                if report_matches_archive(item, sha=sha, step=step):
                     report = item
                     break
             if report is not None:
                 break
         slice_path = Path("logs") / f"{path.stem}_clean_recovery_slices.json"
         slices = json.loads(slice_path.read_text()) if slice_path.is_file() else None
+        if not slice_matches_archive(slices, sha=sha, step=step):
+            slices = None
         slice_summary = None
         if slices and slices.get("slices"):
             slice_summary = {
@@ -80,12 +109,7 @@ def main() -> None:
         rows.append(
             {
                 "path": str(path),
-                "step": (
-                    None
-                    if report is None
-                    else report.get("global_step")
-                )
-                or infer_step(path),
+                "step": step,
                 "sha256": (None if report is None else report.get("sha256")) or sha,
                 "validated": bool(report and report.get("ok")),
                 "geometry_l2": None if report is None else report.get("geometry_l2"),
