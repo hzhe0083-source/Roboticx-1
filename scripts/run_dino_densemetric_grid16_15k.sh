@@ -23,7 +23,7 @@ PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 \
   --flow-steps 8 --flow-cond adaln --flow-layers 6 \
   --flow-prefix-steps 6 --flow-prefix-weight 1.0 --flow-tail-weight 0.036 \
   --va-layers 8 \
-  --mtvj-train-metric-head --lr-mtvj-metric-head 1e-6 \
+  --mtvj-train-metric-head --lr-mtvj-metric-head 3e-4 \
   --mtvj-train-relation --lr-mtvj-relation 2e-5 \
   --mtvj-visual-aux-every 50 --mtvj-visual-aux-batch 8 \
   --mtvj-visual-aux-loc-lambda 1.0 --mtvj-visual-aux-vis-lambda 0.5 \
