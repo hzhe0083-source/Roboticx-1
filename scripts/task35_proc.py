@@ -1,0 +1,88 @@
+#!/usr/bin/env python
+"""Exact /proc lookups for the task35 FM trainer and waiters.
+
+pgrep -f matches the inspector's own command line. These helpers only accept
+the real python trainer / named bash scripts.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+
+
+TRAINER_NEEDLE = "train.py --task35-precision-contract"
+TRAINER_MARKERS = ("python", "train.py")
+INSPECTOR_MARKERS = ("pgrep", "python3 - <<", "needles =", "task35_proc.py")
+
+
+def iter_cmdlines() -> list[tuple[int, str]]:
+    rows = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            raw = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        cmd = raw.replace(b"\x00", b" ").decode("utf-8", "replace").strip()
+        if cmd:
+            rows.append((int(entry.name), cmd))
+    return rows
+
+
+def is_inspector(cmd: str) -> bool:
+    return any(marker in cmd for marker in INSPECTOR_MARKERS)
+
+
+def find_processes(needle: str, *, require: tuple[str, ...] = ()) -> list[dict]:
+    matches = []
+    for pid, cmd in iter_cmdlines():
+        if needle not in cmd or is_inspector(cmd):
+            continue
+        if require and not all(token in cmd for token in require):
+            continue
+        elapsed_s = None
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text().split()
+            start_ticks = int(stat[21])
+            hertz = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+            boot = float(Path("/proc/uptime").read_text().split()[0])
+            elapsed_s = max(0.0, boot - start_ticks / hertz)
+        except OSError:
+            pass
+        matches.append({"pid": pid, "cmd": cmd, "elapsed_s": elapsed_s})
+    return matches
+
+
+def trainer_processes() -> list[dict]:
+    return find_processes(TRAINER_NEEDLE, require=TRAINER_MARKERS)
+
+
+def trainer_alive() -> bool:
+    return bool(trainer_processes())
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--check",
+        choices=("trainer",),
+        default="trainer",
+        help="process class to test",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if args.check == "trainer":
+        rows = trainer_processes()
+        for row in rows:
+            print(f"{row['pid']}\t{row['cmd'][:200]}")
+        return 0 if rows else 1
+    raise SystemExit(f"unknown check {args.check}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -13,8 +13,11 @@ def test_plan_lists_validated_milestones_without_eval50(tmp_path: Path) -> None:
         ],
         logs_dir=tmp_path,
     )
-    assert [row["step"] for row in plan["to_eval"]] == [1000]
-    assert plan["skipped"][0]["reason"] == "not validated"
+    assert [row["step"] for row in plan["to_eval"]] == []
+    assert [row["reason"] for row in plan["skipped"]] == [
+        "early milestone kept for mechanism only",
+        "not validated",
+    ]
     assert plan["already_done"] == []
 
 
@@ -38,11 +41,22 @@ def test_plan_require_all_accepts_complete_validated_set(tmp_path: Path) -> None
     ]
     plan = plan_task35_eval_suite(candidates, logs_dir=tmp_path, require_all=True)
     assert [row["step"] for row in plan["to_eval"]] == [
-        1000,
-        2000,
         3000,
         6000,
         9000,
         12000,
         15000,
     ]
+    assert [row["step"] for row in plan["skipped"]] == [1000, 2000]
+
+
+def test_plan_skips_early_milestones_for_closed_loop(tmp_path: Path) -> None:
+    plan = plan_task35_eval_suite(
+        [
+            {"path": "checkpoints/a_step1000.pt", "step": 1000, "validated": True},
+            {"path": "checkpoints/a_step3000.pt", "step": 3000, "validated": True},
+        ],
+        logs_dir=tmp_path,
+    )
+    assert [row["step"] for row in plan["to_eval"]] == [3000]
+    assert plan["skipped"][0]["reason"] == "early milestone kept for mechanism only"

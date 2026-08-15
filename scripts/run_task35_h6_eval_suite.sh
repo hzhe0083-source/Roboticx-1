@@ -11,9 +11,8 @@ if [[ "${1:-}" == "--force" ]]; then
 fi
 STEM=${1:-checkpoints/task35_h6_dino_mtvj_fm_full15k_b6_sdpa_aux10b8_v1}
 PY=${PY:-/home/ryan/.venvs/pytorch-gpu/bin/python}
-TRAINER_NEEDLE='train.py --task35-precision-contract'
 
-if [[ ${#FORCE[@]} -eq 0 ]] && pgrep -f "$TRAINER_NEEDLE" >/dev/null; then
+if [[ ${#FORCE[@]} -eq 0 ]] && "$PY" -B scripts/task35_proc.py --check trainer >/dev/null; then
   echo "FM trainer still running; refusing to take the GPU. Pass --force to override." >&2
   exit 3
 fi

@@ -16,7 +16,8 @@ if str(ROOT) not in sys.path:
 
 from eval_metaworld import validate_task35_eval50_payload
 
-REQUIRED_MILESTONES = (1000, 2000, 3000, 6000, 9000, 12000, 15000)
+REQUIRED_MILESTONES = (3000, 6000, 9000, 12000, 15000)
+SKIP_CLOSED_LOOP_STEPS = (1000, 2000)
 
 
 def _eval50_path(logs_dir: Path, checkpoint: str) -> Path:
@@ -53,6 +54,15 @@ def plan_task35_eval_suite(
         step = item.get("step")
         if not item.get("validated"):
             skipped.append({"path": path, "step": step, "reason": "not validated"})
+            continue
+        if step in SKIP_CLOSED_LOOP_STEPS:
+            skipped.append(
+                {
+                    "path": path,
+                    "step": step,
+                    "reason": "early milestone kept for mechanism only",
+                }
+            )
             continue
         eval50_path = _eval50_path(logs_dir, str(path))
         payload = _valid_eval50(eval50_path)

@@ -11,11 +11,19 @@ NAME=$(basename "${DEST%.pt}")
 
 echo "waiting for $DEST" >&2
 while [[ ! -s "$DEST" || ! -s "${DEST}.sha256" ]]; do
+  if ! "$PY" -B scripts/task35_proc.py --check trainer >/dev/null; then
+    echo "trainer gone before milestone $STEP appeared: $DEST" >&2
+    exit 4
+  fi
   sleep 15
 done
 echo "found $DEST" >&2
 VALIDATE=logs/${NAME}_validate.json
 SLICES=logs/${NAME}_clean_recovery_slices.json
+LOCK=logs/${NAME}.lock
+mkdir -p logs
+exec 9>"$LOCK"
+flock 9
 # Prefer the archiver's CPU validator; only run it here if that report is absent.
 if [[ ! -s "$VALIDATE" ]]; then
   CUDA_VISIBLE_DEVICES= "$PY" -B scripts/validate_task35_fm_checkpoint.py \

@@ -10,8 +10,8 @@ if [[ "${1:-}" == "--force" ]]; then
 fi
 CKPT=${1:?usage: $0 [--force] checkpoint.pt [name]}
 NAME=${2:-$(basename "$CKPT" .pt)}
-TRAINER_NEEDLE='train.py --task35-precision-contract'
-if [[ ${#FORCE[@]} -eq 0 ]] && pgrep -f "$TRAINER_NEEDLE" >/dev/null; then
+PY=${PY:-/home/ryan/.venvs/pytorch-gpu/bin/python}
+if [[ ${#FORCE[@]} -eq 0 ]] && "$PY" -B scripts/task35_proc.py --check trainer >/dev/null; then
   echo "FM trainer still running; refusing to take the GPU. Pass --force to override." >&2
   exit 3
 fi

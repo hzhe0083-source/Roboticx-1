@@ -21,10 +21,9 @@ DINO=/home/ryan/.cache/huggingface/hub/models--timm--vit_large_patch14_reg4_dino
 FEATURES=data/metaworld_longtraj_windows_h6_dino35_clean60_recovery30_v1.pt
 CACHE=data/dino35_h6_clean60_recovery30_cache_v1
 ROI=checkpoints/dino_metric_roi_task35_v2_native480_seed777_1k.pt
-TRAINER_NEEDLE='train.py --task35-precision-contract'
 LOG=logs/${NAME}.log
 JSON=logs/${NAME}.json
-if [[ "$FORCE" -eq 0 ]] && pgrep -f "$TRAINER_NEEDLE" >/dev/null; then
+if [[ "$FORCE" -eq 0 ]] && "$PY" -B scripts/task35_proc.py --check trainer >/dev/null; then
   echo "FM trainer still running; refusing to take the GPU. Pass --force to override." >&2
   exit 3
 fi

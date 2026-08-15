@@ -22,6 +22,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.summarize_task35_fm_train import summarize_task35_fm_log
+from scripts.task35_proc import trainer_processes
 
 BJ = timezone(timedelta(hours=8))
 STEP_RE = re.compile(
@@ -71,28 +72,8 @@ def parse_float(text: str) -> float:
 
 
 def trainer_alive(needle: str) -> dict:
-    proc = Path("/proc")
-    matches = []
-    for entry in proc.iterdir():
-        if not entry.name.isdigit():
-            continue
-        cmdline_path = entry / "cmdline"
-        try:
-            raw = cmdline_path.read_bytes()
-        except OSError:
-            continue
-        cmd = raw.replace(b"\x00", b" ").decode("utf-8", "replace")
-        if needle not in cmd:
-            continue
-        try:
-            stat = (entry / "stat").read_text().split()
-            start_ticks = int(stat[21])
-            hertz = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
-            boot = float(Path("/proc/uptime").read_text().split()[0])
-            elapsed_s = max(0.0, boot - start_ticks / hertz)
-        except OSError:
-            elapsed_s = None
-        matches.append({"pid": int(entry.name), "elapsed_s": elapsed_s, "cmd": cmd.strip()})
+    del needle
+    matches = trainer_processes()
     return {
         "alive": bool(matches),
         "count": len(matches),

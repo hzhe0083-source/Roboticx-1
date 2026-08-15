@@ -9,12 +9,11 @@ STEM=${1:-checkpoints/task35_h6_dino_mtvj_fm_full15k_b6_sdpa_aux10b8_v1}
 DEST=${STEM}_step15000.pt
 LIVE=${STEM}.pt
 LOG=logs/$(basename "$STEM").log
-TRAINER_NEEDLE='train.py --task35-precision-contract'
 NAME=$(basename "${DEST%.pt}")
 PY=${PY:-/home/ryan/.venvs/pytorch-gpu/bin/python}
 
 echo "waiting for trainer exit and $DEST" >&2
-while pgrep -f "$TRAINER_NEEDLE" >/dev/null; do
+while "$PY" -B scripts/task35_proc.py --check trainer >/dev/null; do
   sleep 30
 done
 

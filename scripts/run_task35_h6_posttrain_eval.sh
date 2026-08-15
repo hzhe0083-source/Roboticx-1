@@ -14,9 +14,8 @@ NAME=${2:-$(basename "$CKPT" .pt)}
 PY=${PY:-/home/ryan/.venvs/pytorch-gpu/bin/python}
 DINO=/home/ryan/.cache/huggingface/hub/models--timm--vit_large_patch14_reg4_dinov2.lvd142m/snapshots/f3c408e77602bb412aa65fb03dfa0d5f95cb3832/model.safetensors
 FEATURES=data/metaworld_longtraj_windows_h6_dino35_clean60_recovery30_v1.pt
-TRAINER_NEEDLE='train.py --task35-precision-contract'
 
-if [[ ${#FORCE[@]} -eq 0 ]] && pgrep -f "$TRAINER_NEEDLE" >/dev/null; then
+if [[ ${#FORCE[@]} -eq 0 ]] && "$PY" -B scripts/task35_proc.py --check trainer >/dev/null; then
   echo "FM trainer still running; refusing to take the GPU. Pass --force to override." >&2
   exit 3
 fi
