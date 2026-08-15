@@ -64,6 +64,24 @@ run_cpu() {
   fi
 }
 
+slice_matches_archive() {
+  "$PY" -B - "$SLICES" "$actual_sha" "$STEP" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text())
+sha = sys.argv[2]
+step = int(sys.argv[3])
+ok = (
+    payload.get("contract") == "task35_clean_recovery_slice_v1"
+    and payload.get("sha256") == sha
+    and int(payload.get("global_step", -1)) == step
+)
+raise SystemExit(0 if ok else 1)
+PY
+}
+
 report_matches_archive() {
   "$PY" -B - "$VALIDATE" "$actual_sha" "$STEP" <<'PY'
 import json
@@ -90,16 +108,20 @@ need_validate=1
 if [[ -s "$VALIDATE" ]] && report_matches_archive; then
   need_validate=0
 fi
-if [[ "$need_validate" -eq 1 || ! -s "$SLICES" ]]; then
+need_slices=1
+if [[ -s "$SLICES" ]] && slice_matches_archive; then
+  need_slices=0
+fi
+if [[ "$need_validate" -eq 1 || "$need_slices" -eq 1 ]]; then
   wait_for_cpu_ram
 fi
 if [[ "$need_validate" -eq 1 ]]; then
   CUDA_VISIBLE_DEVICES= run_cpu "$PY" -B scripts/validate_task35_fm_checkpoint.py \
     "$DEST" --expected-step "$STEP" --output "$VALIDATE"
 fi
-if [[ ! -s "$SLICES" ]]; then
+if [[ "$need_slices" -eq 1 ]]; then
   CUDA_VISIBLE_DEVICES= run_cpu "$PY" -B scripts/diag_task35_clean_recovery_slices.py \
-    --checkpoint "$DEST" --batch 16 --output "$SLICES"
+    --checkpoint "$DEST" --expected-step "$STEP" --batch 16 --output "$SLICES"
 fi
 # Compare against the previous archived slice if it exists.
 PREV=""

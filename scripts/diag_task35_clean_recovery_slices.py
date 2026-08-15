@@ -22,10 +22,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from eval_metaworld import _load_dino_metric_from_policy
+from scripts.peek_task35_checkpoint_step import peek_task35_checkpoint_step
 from scripts.validate_task35_fm_checkpoint import (
     EXPECTED_DATA_SHA256,
     EXPECTED_FEATURE_SHA256,
     EXPECTED_RAW_FRAMES_SHA256,
+    sha256_file,
 )
 from va_compound.longtraj_frames import LongTrajFramesDataset
 from va_compound.model import VACompoundConfig, dense_coords
@@ -138,6 +140,7 @@ def parse_args() -> argparse.Namespace:
         default=Path("data/dino35_h6_clean60_recovery30_cache_v1"),
     )
     parser.add_argument("--batch", type=int, default=32)
+    parser.add_argument("--expected-step", type=int)
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
@@ -145,7 +148,22 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     device = torch.device("cpu")
+    found_step = peek_task35_checkpoint_step(args.checkpoint)
+    if args.expected_step is not None and found_step != int(args.expected_step):
+        raise ValueError(
+            f"slice checkpoint global_step={found_step} != expected {args.expected_step}"
+        )
+    digest = sha256_file(args.checkpoint)
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+    loaded_step = int(checkpoint["global_step"])
+    if loaded_step != found_step:
+        raise ValueError(
+            f"pickle global_step={loaded_step} != peeked {found_step}"
+        )
+    if args.expected_step is not None and loaded_step != int(args.expected_step):
+        raise ValueError(
+            f"loaded global_step={loaded_step} != expected {args.expected_step}"
+        )
     config = VACompoundConfig(**checkpoint["config"])
     metric_head, _ = _load_dino_metric_from_policy(checkpoint, config, device)
     dataset = LongTrajFramesDataset(
@@ -175,6 +193,8 @@ def main() -> None:
     report = {
         "contract": "task35_clean_recovery_slice_v1",
         "checkpoint": str(args.checkpoint.resolve()),
+        "global_step": loaded_step,
+        "sha256": digest,
         "n_windows": int(len(dataset)),
         "n_clean": int((layers == 0).sum()),
         "n_recovery": int((layers == 1).sum()),

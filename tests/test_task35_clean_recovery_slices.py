@@ -3,6 +3,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from pathlib import Path
+
 from scripts.diag_task35_clean_recovery_slices import (
     assemble_last_decision_dense,
     slice_geometry,
@@ -41,3 +43,11 @@ def test_slice_geometry_separates_clean_and_recovery_pair_distance() -> None:
     assert report["recovery"]["pegHead_hole_px"]["mean"] == pytest.approx(144.0)
     assert report["clean"]["role_std_px"]["pegHead"]["n"] == 1
     assert report["clean"]["role_std_px"]["pegHead"]["std_x_px"] == pytest.approx(0.0)
+
+
+def test_slice_report_records_step_and_sha() -> None:
+    text = Path("scripts/diag_task35_clean_recovery_slices.py").read_text()
+    assert '"global_step": loaded_step' in text
+    assert '"sha256": digest' in text
+    assert "--expected-step" in text
+    assert "peek_task35_checkpoint_step" in text

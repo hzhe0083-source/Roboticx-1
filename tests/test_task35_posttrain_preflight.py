@@ -40,3 +40,6 @@ def test_readiness_expects_planned_waiters_and_acceptance_set() -> None:
     assert "for step in 3000 6000 9000 12000 15000; do" in text
     assert "for step in 1000 2000 3000 6000 9000 12000 15000; do" not in text
     assert "live 15000 promotion SHA mismatch" in text
+    assert "peek_task35_checkpoint_step.py" in text
+    assert "refuse to promote live global_step=" in text
+    assert "refuse to promote over" in text

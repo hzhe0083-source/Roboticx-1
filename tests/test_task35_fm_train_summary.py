@@ -193,7 +193,13 @@ def test_pipeline_health_alerts_missing_validate_after_6k_archive(
         )
     )
     (logs / "ckpt_step6000_clean_recovery_slices.json").write_text(
-        json.dumps({"contract": "task35_clean_recovery_slice_v1"})
+        json.dumps(
+            {
+                "contract": "task35_clean_recovery_slice_v1",
+                "global_step": 6000,
+                "sha256": "abc",
+            }
+        )
     )
     monkeypatch.setattr(monitor, "find_processes", fake_find)
     done = monitor.pipeline_health(

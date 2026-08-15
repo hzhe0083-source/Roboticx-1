@@ -37,6 +37,8 @@ def test_archiver_follows_log_events_not_stdin() -> None:
     assert "peek_task35_checkpoint_step.py" in waiter
     assert "archive global_step=" in waiter
     assert "report_matches_archive" in waiter
+    assert "slice_matches_archive" in waiter
+    assert "--expected-step" in waiter
 
 
 def test_find_processes_requires_all_markers() -> None:

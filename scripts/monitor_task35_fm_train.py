@@ -120,14 +120,18 @@ def validate_report_ok(path: Path, *, step: int | None = None) -> bool:
     return False
 
 
-def slice_report_ok(path: Path) -> bool:
+def slice_report_ok(path: Path, *, step: int | None = None) -> bool:
     if not path.is_file():
         return False
     try:
         payload = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
         return False
-    return payload.get("contract") == "task35_clean_recovery_slice_v1"
+    if payload.get("contract") != "task35_clean_recovery_slice_v1":
+        return False
+    if step is not None and payload.get("global_step") is not None:
+        return int(payload["global_step"]) == int(step)
+    return True
 
 
 def pipeline_health(
@@ -172,7 +176,9 @@ def pipeline_health(
             name = f"{checkpoint_stem.name}_step{step}"
             if not validate_report_ok(logs / f"{name}_validate.json", step=step) and not waiter_up:
                 alerts.append(f"missing_validate_{step}")
-            if not slice_report_ok(logs / f"{name}_clean_recovery_slices.json") and not waiter_up:
+            if not slice_report_ok(
+                logs / f"{name}_clean_recovery_slices.json", step=step
+            ) and not waiter_up:
                 alerts.append(f"missing_slice_{step}")
     available = mem_available_kb(meminfo)
     if available is not None and available < LOW_RAM_KB:
