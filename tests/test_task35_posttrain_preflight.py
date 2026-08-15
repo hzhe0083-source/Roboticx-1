@@ -26,4 +26,7 @@ def test_readiness_expects_planned_waiters_and_acceptance_set() -> None:
     assert ARCHIVE_MILESTONES[-1] == 15000
     assert any("wait_task35_fm_finished_eval.sh" in needle for needle in WAITER_NEEDLES)
     waiter = Path(__file__).resolve().parent.parent / "scripts" / "wait_task35_fm_finished_eval.sh"
-    assert waiter.read_text().count("run_task35_h6_eval_suite.sh") == 1
+    text = waiter.read_text()
+    assert text.count("run_task35_h6_eval_suite.sh") == 1
+    assert "for step in 3000 6000 9000 12000 15000; do" in text
+    assert "for step in 1000 2000 3000 6000 9000 12000 15000; do" not in text

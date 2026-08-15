@@ -4,7 +4,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
+
+STEP_RE = re.compile(r"_step(\d+)\.pt$")
+
+
+def infer_step(path: Path) -> int | None:
+    match = STEP_RE.search(path.name)
+    return None if match is None else int(match.group(1))
 
 
 def parse_args() -> argparse.Namespace:
@@ -72,8 +80,13 @@ def main() -> None:
         rows.append(
             {
                 "path": str(path),
-                "step": None if report is None else report.get("global_step"),
-                "sha256": None if report is None else report.get("sha256") or sha,
+                "step": (
+                    None
+                    if report is None
+                    else report.get("global_step")
+                )
+                or infer_step(path),
+                "sha256": (None if report is None else report.get("sha256")) or sha,
                 "validated": bool(report and report.get("ok")),
                 "geometry_l2": None if report is None else report.get("geometry_l2"),
                 "slices": slice_summary,

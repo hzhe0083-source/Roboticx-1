@@ -46,7 +46,8 @@ if [[ ! -s "$DEST" || ! -s "${DEST}.sha256" ]]; then
 fi
 
 echo "trainer gone; archived $DEST" >&2
-for step in 1000 2000 3000 6000 9000 12000 15000; do
+# 1k/2k stay mechanism-only; do not reload them before the 50-seed suite.
+for step in 3000 6000 9000 12000 15000; do
   scripts/wait_validate_task35_fm_milestone.sh "$step" "$STEM"
 done
 CUDA_VISIBLE_DEVICES= "$PY" -B scripts/preflight_task35_posttrain.py \
