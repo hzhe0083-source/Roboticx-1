@@ -923,6 +923,7 @@ def compute_losses(out, keypoints, visibility, relation, sigma_px: float = HEATM
                    alias_consistency_weight: float = ALIAS_CONSISTENCY_LAMBDA,
                    alias_coord_tolerance: float = ALIAS_COORD_TOL,
                    geometry_consistency_weight: float = GEOMETRY_CONSISTENCY_LAMBDA,
+                   image_size: int = IMAGE_SIZE,
                    ) -> tuple[torch.Tensor, dict]:
     """v4（2026-08-10，探针实证）：``hinge`` 用 max-margin 目标替代 CE——
     max(s_GT) 必须超过 max(其余 patch) 至少 ``hinge_margin``。CE 在近乎全平的
@@ -939,7 +940,11 @@ def compute_losses(out, keypoints, visibility, relation, sigma_px: float = HEATM
         raise ValueError("geometry_consistency_weight must be finite and non-negative")
     vis = visibility  # [B, R] float
     n_vis = vis.sum().clamp_min(1.0)
-    grid = HEATMAP_GRID
+    # DINO-metric（2026-08-16）：网格从输出 heatmap 推导（V-JEPA 24×24，DINO
+    # 16×16），不再写死 HEATMAP_GRID。
+    grid = int(out.heatmap.shape[-1])
+    if grid < 2 or out.heatmap.shape[-2] != grid:
+        raise ValueError(f"heatmap 必须 [B,R,grid,grid]，got {tuple(out.heatmap.shape)}")
     yi = torch.clamp(torch.floor(keypoints[..., 0] * grid).long(), 0, grid - 1)
     xi = torch.clamp(torch.floor(keypoints[..., 1] * grid).long(), 0, grid - 1)
     idx = yi * grid + xi  # [B, R]（片内位置；两片坐标相同）
@@ -960,7 +965,9 @@ def compute_losses(out, keypoints, visibility, relation, sigma_px: float = HEATM
         parts["hinge"] = loss_hinge.item()
         loss_cls = loss_hinge
     else:
-        targets = gaussian_targets(keypoints, sigma_px=sigma_px)
+        targets = gaussian_targets(
+            keypoints, sigma_px=sigma_px, grid=grid, image_size=image_size
+        )
         ce_per = -(targets * out.log_heatmap).sum(dim=(-2, -1))  # [B, R]
         loss_cls = (ce_per * vis).sum() / n_vis
         parts["ce"] = loss_cls.item()

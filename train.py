@@ -2989,6 +2989,105 @@ def _mtvj_visual_aux_loss(
     return loss_aux, parts
 
 
+def _dino_visual_aux_loss(
+    main_backbone,
+    metric_head,
+    task: str,
+    rng: np.random.Generator,
+    aux_batch: int,
+    lang_aux_cache: dict,
+    device: torch.device,
+    loc_lambda: float,
+    vis_lambda: float,
+    sigma_px: float = 4.0,
+    hinge_margin: float = 0.1,
+) -> tuple[Tensor, dict]:
+    """DINO 版视觉辅助批次（2026-08-16）：MT-VJ 高清头的真正训练信号。
+
+    与 V-JEPA ``_mtvj_visual_aux_loss`` 同协议，仅编码器/网格不同：仿真真值
+    （make_metric_batch 定位/可见度）→ 冻结 DINO block11/block23 两帧
+    [d-2,d] 全 patch evidence（512 token）→ metric head（grid=16）→
+    L_aux = λloc·(hinge + pos + offset，image_size=224) + λvis·BCE(visibility)。
+    只反传 metric head（head_dtype fp32；DINO 冻结只读）。
+    """
+    from prepare_metaworld_metric import make_metric_batch
+    from scripts.build_longtraj_features import ENV_TO_TASK
+    from train_metric_visual import compute_losses
+    from va_compound.model import dense_coords
+
+    sim = make_metric_batch(task, rng, aux_batch)
+    text = ENV_TO_TASK.get(task, task)
+    if text not in lang_aux_cache:
+        raise KeyError(
+            f"visual aux: 语言缓存缺少 {text!r}（instruction_id 映射不一致）；"
+            f"任务 {task!r} 无法取预计算 hidden"
+        )
+    head_dtype = next(metric_head.parameters()).dtype
+    hid, mask = lang_aux_cache[text]
+    lang_hidden = hid.repeat(aux_batch, 1, 1).to(device=device, dtype=head_dtype)
+    lang_mask = mask.repeat(aux_batch, 1).to(device=device)
+    frames_np = np.asarray(sim["frames"])  # [B, 4, H, W, 3] uint8
+    if frames_np.ndim != 5 or frames_np.shape[1] != 4:
+        raise ValueError(
+            f"make_metric_batch frames 必须 [B,4,H,W,3] uint8，"
+            f"got {tuple(frames_np.shape)}"
+        )
+    # 帧 [d-2,d]（窗口索引 2,3）→ 与训练 DINO dense evidence 同一预处理。
+    sel = np.ascontiguousarray(frames_np[:, (2, 3)])  # [B,2,H,W,3]
+    b, s = sel.shape[:2]
+    images = (
+        torch.from_numpy(sel.reshape(b * s, *sel.shape[2:]))
+        .permute(0, 3, 1, 2)
+        .float()
+        .div_(255.0)
+        .to(device)
+    )
+    if tuple(images.shape[-2:]) != (main_backbone.image_size, main_backbone.image_size):
+        images = F.interpolate(
+            images,
+            size=(main_backbone.image_size, main_backbone.image_size),
+            mode="bicubic",
+            align_corners=False,
+            antialias=True,
+        )
+    mean = torch.tensor((0.485, 0.456, 0.406), device=device).view(1, 3, 1, 1)
+    std = torch.tensor((0.229, 0.224, 0.225), device=device).view(1, 3, 1, 1)
+    with torch.no_grad():
+        hierarchical = main_backbone.forward_hierarchical_dense(
+            ((images - mean) / std).half()
+        )
+    flat = {
+        layer: tokens.reshape(b, -1, tokens.shape[-1]).float().to(dtype=head_dtype)
+        for layer, tokens in hierarchical.items()
+    }  # {5, 11}: [B, 512, 1024]
+    coords = dense_coords(512, device=device, dtype=head_dtype)
+    out = metric_head(flat[5], flat[11], lang_hidden, lang_mask, coords)
+    keypoints = torch.from_numpy(sim["keypoints"]).to(device=device, dtype=head_dtype)
+    visibility = torch.from_numpy(sim["visibility"]).to(device=device, dtype=head_dtype)
+    loc_total, parts = compute_losses(
+        out, keypoints, visibility, torch.zeros_like(out.p),
+        sigma_px=sigma_px, loc_only=True, offset_supervision=True,
+        hinge=True, hinge_margin=hinge_margin, image_size=main_backbone.image_size,
+    )
+    vis_loss = F.binary_cross_entropy_with_logits(
+        out.visibility_logits, visibility, reduction="mean"
+    )
+    radial_error_px = (out.p - keypoints).norm(dim=-1) * float(main_backbone.image_size)
+    rmse_px = torch.sqrt(
+        (radial_error_px.square() * visibility).sum() / visibility.sum().clamp_min(1.0)
+    )
+    loss_aux = loc_lambda * loc_total + vis_lambda * vis_loss
+    parts.update(
+        {
+            "loc": loc_total.item(),
+            "vis": vis_loss.item(),
+            "rmse_px": rmse_px.item(),
+            "total": loss_aux.item(),
+        }
+    )
+    return loss_aux, parts
+
+
 def _mtvj_visual_aux_sample(
     task_descriptions: list[str],
     task_weights: Tensor,
@@ -4527,12 +4626,16 @@ def validate_args(args: argparse.Namespace) -> None:
             )
         if args.main_vision_encode_batch < 1:
             raise ValueError("--main-vision-encode-batch must be positive")
-        if getattr(args, "dino_dense_metric", False):
-            if getattr(args, "mtvj_visual_aux_every", 0) > 0:
+        # DINO 视觉辅助 loss（2026-08-16 已移植）：--mtvj-visual-aux-every 在
+        # --dino-dense-metric 下走 _dino_visual_aux_loss（仿真真值 → DINO dense
+        # evidence → grid-16 metric head），不再报错。
+        if getattr(args, "dino_dense_metric", False) and getattr(
+            args, "mtvj_visual_aux_every", 0
+        ) > 0:
+            if not getattr(args, "mtvj_train_metric_head", False):
                 raise ValueError(
-                    "--dino-dense-metric: --mtvj-visual-aux-every 的在线仿真辅助 "
-                    "loss 尚未移植到 DINO 特征（V-JEPA 编码器绑定）；当前 metric "
-                    "head 由动作 loss 联合微调（--mtvj-train-metric-head/relation）"
+                    "--dino-dense-metric + --mtvj-visual-aux-every 要求 "
+                    "--mtvj-train-metric-head（辅助 loss 反传目标是 metric head）"
                 )
         if args.dino_feature_cache is not None:
             cache_dir = args.dino_feature_cache.expanduser()
@@ -4823,13 +4926,15 @@ def validate_args(args: argparse.Namespace) -> None:
         if train_metric_head and getattr(args, "lr_mtvj_metric_head", 1e-6) <= 0.0:
             raise ValueError("--lr-mtvj-metric-head must be positive")
         if getattr(args, "mtvj_visual_aux_every", 0) > 0:
-            if not args.dense_readout_mtvj:
+            if not (args.dense_readout_mtvj or dino_joint):
                 raise ValueError(
                     "--mtvj-visual-aux-every requires --dense-readout-mtvj"
+                    "（或 --dino-dense-metric 的 DINO 版辅助 loss）"
                 )
-            if args.metric_visual_checkpoint is None:
+            if args.metric_visual_checkpoint is None and not dino_joint:
                 raise ValueError(
                     "--mtvj-visual-aux-every requires --metric-visual-checkpoint"
+                    "（--dino-dense-metric 从零 metric 栈除外）"
                 )
             if not train_metric_head:
                 raise ValueError(
@@ -5960,31 +6065,30 @@ def main() -> None:
                 # 双数据流辅助批次（阶段 C）：任务文本 → 数据集预计算
                 # language_hidden/mask 缓存（metadata.tasks[tid] ↔ instruction_id=tid，
                 # 与 build_longtraj_features.task_language_t 同源）；辅助任务按
-                # 难度权重 raw_task_w 多项式采样。
+                # 难度权重 raw_task_w 多项式采样。单任务子集（2026-08-16）只缓存
+                # 数据里实际出现的任务。
                 lang_aux_cache: dict[str, tuple[Tensor, Tensor]] = {}
+                aux_tasks: list[str] = []
+                aux_weights: list[float] = []
                 if args.mtvj_visual_aux_every > 0:
                     hid_all = dataset.payload["language_hidden"]
                     mask_all = dataset.payload["language_mask"]
                     id_all = dataset.payload["instruction_id"]
                     for tid, text in enumerate(tasks):
-                        row = int((id_all == tid).nonzero()[0, 0])
+                        hits = (id_all == tid).nonzero()
+                        if hits.numel() == 0:
+                            continue
+                        row = int(hits[0, 0])
                         lang_aux_cache[text] = (
                             hid_all[row].float(),
                             mask_all[row],
                         )
-                    missing_text = [
-                        t
-                        for t in ENV_TO_TASK.values()
-                        if t not in lang_aux_cache
-                    ]
-                    if missing_text:
-                        raise ValueError(
-                            "visual aux: 语言缓存缺 "
-                            f"{len(missing_text)} 个任务文本（ENV_TO_TASK 与 "
-                            "metadata.tasks 不一致，样例 "
-                            f"{missing_text[:3]}）"
-                        )
-                    aux_task_w = raw_task_w / raw_task_w.sum()
+                        aux_tasks.append(text)
+                        aux_weights.append(float(raw_task_w[tid]))
+                    if not aux_tasks:
+                        raise ValueError("visual aux: 数据集没有任何活跃任务文本")
+                    aux_task_w = torch.tensor(aux_weights, dtype=torch.float64)
+                    aux_task_w = aux_task_w / aux_task_w.sum()
                     print(
                         "mtvj visual aux: 每 "
                         f"{args.mtvj_visual_aux_every} 步一个在线仿真视觉批次"
@@ -7373,23 +7477,38 @@ def main() -> None:
             and next_global_step % args.mtvj_visual_aux_every == 0
         ):
             aux_task, aux_rng = _mtvj_visual_aux_sample(
-                tasks,
+                aux_tasks,
                 aux_task_w,
                 env_by_description,
                 seed=args.seed,
                 global_step=next_global_step,
             )
-            aux_loss, aux_parts = _mtvj_visual_aux_loss(
-                mtvj_backbone,
-                metric_head,
-                aux_task,
-                aux_rng,
-                args.mtvj_visual_aux_batch,
-                lang_aux_cache,
-                device,
-                loc_lambda=args.mtvj_visual_aux_loc_lambda,
-                vis_lambda=args.mtvj_visual_aux_vis_lambda,
-            )
+            if getattr(args, "dino_main_vision", False):
+                # DINO 版视觉辅助（2026-08-16 移植）：仿真真值 → DINO dense
+                # evidence → metric head（grid=16）。V-JEPA 路径保持原样。
+                aux_loss, aux_parts = _dino_visual_aux_loss(
+                    main_vision_backbone,
+                    metric_head,
+                    aux_task,
+                    aux_rng,
+                    args.mtvj_visual_aux_batch,
+                    lang_aux_cache,
+                    device,
+                    loc_lambda=args.mtvj_visual_aux_loc_lambda,
+                    vis_lambda=args.mtvj_visual_aux_vis_lambda,
+                )
+            else:
+                aux_loss, aux_parts = _mtvj_visual_aux_loss(
+                    mtvj_backbone,
+                    metric_head,
+                    aux_task,
+                    aux_rng,
+                    args.mtvj_visual_aux_batch,
+                    lang_aux_cache,
+                    device,
+                    loc_lambda=args.mtvj_visual_aux_loc_lambda,
+                    vis_lambda=args.mtvj_visual_aux_vis_lambda,
+                )
             aux_loss.backward()
         if e2e_model is not None and args.semantic_adapter:
             scale_semantic_lora_grads(

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# DINO-metric grid16 训练（2026-08-16，P0 探针证据驱动：DINO patch 几何线性
-# 可读 5.9-9.1px，8-13px 门通过；根因 = 主视觉 8×8 池化碾掉定位信息）。
-# 变更：--main-vision-grid 16（全 16×16 patch，1024 token/决策）替代 8×8 池化；
-# dense+metric 不变；从零训练 15000 步（缓存已含全 patch 特征，无需重编码）。
+# DINO-metric grid16 + 视觉辅助训练（2026-08-16，P0 探针 + 用户决策：真正训练 MT-VJ）。
+# - 主视觉全 16×16 patch（grid=16，1024 token/决策，无池化）；
+# - dense+metric 保留；
+# - --mtvj-visual-aux-every 50：仿真真值视觉辅助 loss（_dino_visual_aux_loss，
+#   hinge+pos+offset+BCE(vis)，只反传 metric head）——MT-VJ 高清头的真正训练信号。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -16,7 +17,7 @@ PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 \
   --main-vision-grid 16 \
   --dino-feature-cache data/dino35_feature_cache \
   --data data/metaworld_longtraj_windows_h48_dino35_clean.pt \
-  --single-task --task-sampling balanced \
+  --single-task --task-sampling weighted \
   --batch-size 16 --sequence-length 4 --min-sequence-length 4 \
   --lr 0.0001 --seed 0 --device cuda \
   --flow-steps 8 --flow-cond adaln --flow-layers 6 \
@@ -24,6 +25,8 @@ PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 \
   --va-layers 8 \
   --mtvj-train-metric-head --lr-mtvj-metric-head 1e-6 \
   --mtvj-train-relation --lr-mtvj-relation 2e-5 \
+  --mtvj-visual-aux-every 50 --mtvj-visual-aux-batch 8 \
+  --mtvj-visual-aux-loc-lambda 1.0 --mtvj-visual-aux-vis-lambda 0.5 \
   --steps 15000 \
   --save checkpoints/e7_dino_main_p35_dm_grid16_15k.pt \
   --save-every 2000 \
