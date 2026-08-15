@@ -946,6 +946,12 @@ def parse_args() -> argparse.Namespace:
         help="打印首次决策的模型动作（与 --align-init 联用可对比数据专家动作）",
     )
     parser.add_argument(
+        "--task35-precision-contract",
+        action="store_true",
+        help="最终 task35 评测 fail-fast：H6/grid16/temporal/geometry/ROI、"
+        "execute=6、50 trials、stage telemetry、WAM off。",
+    )
+    parser.add_argument(
         "--debug-stage-metrics",
         action="store_true",
         help="逐 trial 汇报 MetaWorld 阶段指标（max near/grasp/in_place、min obj_to_target），"
@@ -2266,6 +2272,39 @@ def main() -> None:
     # 2026-08-09：ACTION_HORIZON 从 checkpoint config 读（E7 H=48），不再硬编码 8。
     global ACTION_HORIZON
     ACTION_HORIZON = int(getattr(config, "action_horizon", 8))
+    if args.task35_precision_contract:
+        expected_data_sha = policy_contract.get("task35_data_sha256")
+        actual_data_sha = _sha256_file(args.features.expanduser().absolute())
+        requirements = {
+            "checkpoint precision contract": policy_contract.get(
+                "task35_precision_contract"
+            )
+            is True,
+            "exact matched H6 features": bool(expected_data_sha)
+            and actual_data_sha == expected_data_sha,
+            "raw-frame identity recorded": bool(
+                policy_contract.get("task35_raw_frames_sha256")
+            ),
+            "H6": ACTION_HORIZON == 6,
+            "DINO metric": getattr(config, "dino_dense_metric", False),
+            "grid16": getattr(config, "main_vision_grid", None) == 16,
+            "four frames": getattr(config, "main_vision_frames", None) == 4,
+            "temporal": getattr(config, "main_vision_temporal", False),
+            "geometry": getattr(config, "metric_geometry_inject", False),
+            "ROI": dino_roi_expected and args.dino_roi_checkpoint is not None,
+            "ROI alpha 1": args.dino_roi_alpha == 1.0,
+            "execute_steps 6": args.execute_steps == 6,
+            "50 trials": args.trials_per_task == 50,
+            "task35 only": args.task_ids == "35",
+            "stage telemetry": args.debug_stage_metrics,
+            "WAM off": args.wam == "off",
+        }
+        missing = [name for name, enabled in requirements.items() if not enabled]
+        if missing:
+            raise ValueError(
+                "--task35-precision-contract missing required settings: "
+                + ", ".join(missing)
+            )
     # Codex P0-4（2026-08-10）：flow Euler 步数从 training_contract 读
     # （train.py:2561 保存位置），不再硬编码 32 或误读顶层键。
     flow_steps = int(

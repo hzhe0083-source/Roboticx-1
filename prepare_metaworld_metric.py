@@ -92,7 +92,7 @@ PROJECTION_REFERENCE_TABLE: dict[str, dict[str, tuple]] = {
     "peg-insert-side-v3": {
         "object": ("body", "peg"),          # 被插的 peg（自由体）
         "target": ("site", "hole"),         # 插入目标：孔（可见；goal site 在方块内部不可见）
-        "interface": ("site", "pegGrasp"),  # 工具-物体接触界面：杆上的抓取点（投影在杆上，可见）
+        "interface": ("site", "pegHead"),   # 精插接口：真正进入 hole 的杆尖
     },
     "assembly-v3": {
         "object": ("body", "RoundNut"),     # 螺母（obs[4:7] 即 RoundNut-8 site，同体）

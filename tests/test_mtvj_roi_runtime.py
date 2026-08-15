@@ -156,6 +156,22 @@ def test_canonical_384_roi_is_scaled_before_raw_480_crop() -> None:
     assert crop[0, 0, 0, 192, 192].item() == pytest.approx(240.0 / 479.0, abs=0.003)
 
 
+def test_dino_480_geometry_keeps_96_source_pixels_before_224_resize() -> None:
+    x = torch.linspace(0.0, 1.0, 480).view(1, 1, 1, 1, 480)
+    raw = x.expand(1, 2, 3, 480, 480).contiguous()
+    roi_480 = torch.tensor([[240.0, 240.0, 96.0]])
+    crop = crop_metric_roi_video(
+        raw,
+        roi_480,
+        canonical_image_size=224,
+        roi_geometry_size=480,
+    )
+    assert crop.shape == (1, 2, 3, 224, 224)
+    # Native 480 geometry: 96 source pixels span approximately x=192..288.
+    assert crop[0, 0, 0, 112, 0].item() == pytest.approx(192.0 / 479.0, abs=0.004)
+    assert crop[0, 0, 0, 112, 112].item() == pytest.approx(240.0 / 479.0, abs=0.004)
+
+
 def test_policy_checkpoint_saves_roi_state_config_and_identity(tmp_path) -> None:
     roi_path = tmp_path / "roi.pt"
     external = _roi_artifact(roi_path)

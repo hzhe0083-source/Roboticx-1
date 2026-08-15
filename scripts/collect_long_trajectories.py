@@ -42,11 +42,11 @@ PERTURB_MM = (2.0, 8.0)  # 接触相位扰动幅度
 PERTURB_KINDS = ("eef_lateral", "eef_height", "object", "peg_hole_relative")
 PERTURB_SETTLE_STEPS = 12  # 扰动注入后的物理 settle 步数（进入时间轴，Codex P0-2）
 OUT_DIR = ROOT / "data"
-JPEG_QUALITY = 90  # 帧压缩：uint8 384×384×3 ≈ 440KB → ~40KB，49 任务 ≈ 12GB（2026-08-09 磁盘止损）
+JPEG_QUALITY = 90  # 帧压缩：当前 env.render() 原生 480×480 RGB → JPEG
 
 
 def compress_frames(frames: np.ndarray) -> list[bytes]:
-    """[T,384,384,3] uint8 → JPEG bytes 列表（训练时解压，对齐 parquet PNG 解码路径）。"""
+    """[T,H,W,3] uint8 render frames → JPEG bytes（保持原始像素尺寸）。"""
     out = []
     for i in range(len(frames)):
         buf = io.BytesIO()

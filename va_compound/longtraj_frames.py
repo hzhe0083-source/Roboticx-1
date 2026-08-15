@@ -85,6 +85,7 @@ class LongTrajFramesDataset:
         self.feature_cache = Path(feature_cache) if feature_cache else None
         self.include_frames = bool(include_frames)
         self.cache_rows: np.ndarray | None = None
+        self.cached_raw_frames: np.ndarray | None = None
         if self.feature_cache is not None:
             import pickle
 
@@ -103,6 +104,32 @@ class LongTrajFramesDataset:
                             )
                         rows[i, t, w] = cache_index[key]
             self.cache_rows = rows
+            raw_path = self.feature_cache / "raw_frames.npy"
+            if self.include_frames and raw_path.is_file():
+                import json
+
+                meta_path = self.feature_cache / "meta.json"
+                meta = json.loads(meta_path.read_text()) if meta_path.is_file() else {}
+                if (
+                    meta.get("raw_frame_contract")
+                    != "exact_decoded_longtraj_jpeg_480_v1"
+                    or meta.get("raw_frame_shape")
+                    != [len(cache_index), 480, 480, 3]
+                    or meta.get("raw_frame_dtype") != "uint8"
+                    or not meta.get("raw_frames_sha256")
+                ):
+                    raise ValueError(
+                        "cached raw frames lack exact 480px identity metadata"
+                    )
+                cached_raw = np.load(raw_path, mmap_mode="r")
+                if cached_raw.shape != (len(cache_index), 480, 480, 3):
+                    raise ValueError(
+                        "cached raw frames must have shape "
+                        f"[{len(cache_index)},480,480,3], got {cached_raw.shape}"
+                    )
+                if cached_raw.dtype != np.uint8:
+                    raise ValueError("cached raw frames must be uint8")
+                self.cached_raw_frames = cached_raw
 
     def _decode_task(self, task_file: str) -> list[list[np.ndarray]]:
         cached = self._decoded.get(task_file)
@@ -162,6 +189,11 @@ class LongTrajFramesDataset:
             # DINO 特征缓存模式：返回帧窗行号（缓存读取代在线编码）。
             item["frame_cache_rows"] = self.cache_rows[index]
             if not self.include_frames:
+                return item
+            if self.cached_raw_frames is not None:
+                item["frames"] = np.asarray(
+                    self.cached_raw_frames[self.cache_rows[index]], dtype=np.uint8
+                )
                 return item
         task_file, ep_idx, fidx = self.refs[index]
         ep_frames = self._decode_task(task_file)[ep_idx]  # 已解码 ndarray

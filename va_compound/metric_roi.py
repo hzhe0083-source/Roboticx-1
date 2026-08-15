@@ -600,12 +600,14 @@ def crop_metric_roi_video(
     roi: Tensor,
     *,
     canonical_image_size: int,
+    roi_geometry_size: int | None = None,
 ) -> Tensor:
-    """Crop raw render pixels and resample directly into canonical resolution.
+    """Crop raw render pixels and resample into the encoder resolution.
 
-    ``roi`` is always expressed in the canonical (normally 384px) geometry.
-    It is scaled into the raw render geometry (normally 480px) before sampling,
-    while the returned crop is canonical-sized for the frozen V-JEPA.
+    ``roi`` is expressed in ``roi_geometry_size`` pixel coordinates. Legacy
+    V-JEPA artifacts omit it, so geometry and encoder output both use the
+    canonical 384px space. Task35 DINO v2 sets geometry=480 and output=224:
+    a 96px ROI then means exactly 96 source-render pixels, not 96*480/224.
     """
 
     if raw_video.ndim != 5 or raw_video.shape[2] != 3:
@@ -618,10 +620,15 @@ def crop_metric_roi_video(
         raise ValueError("MT-VJ ROI runtime requires square raw frames")
     if canonical_image_size <= 0:
         raise ValueError("canonical_image_size must be positive")
+    geometry_size = int(
+        canonical_image_size if roi_geometry_size is None else roi_geometry_size
+    )
+    if geometry_size <= 0:
+        raise ValueError("roi_geometry_size must be positive")
     roi = torch.as_tensor(roi, device=raw_video.device, dtype=raw_video.dtype)
     if roi.shape != (samples, 3) or not torch.isfinite(roi).all():
         raise ValueError(f"roi must be finite [{samples}, 3]")
-    raw_scale = height / float(canonical_image_size)
+    raw_scale = height / float(geometry_size)
     roi_raw = roi * raw_scale
     size = roi_raw[:, 2]
     if (size <= 0.0).any() or (size > height).any():
@@ -761,6 +768,12 @@ def load_dino_metric_roi_checkpoint(
         )
     if checkpoint.get("role_order") != ["tool", "pegGrasp", "hole", "pegHead"]:
         raise ValueError("DINO ROI role_order must be task35 aligned")
+    if checkpoint.get("role_pairs") != [[0, 1], [3, 2]]:
+        raise ValueError("DINO ROI role_pairs must encode pegHead-hole as pair 1")
+    if checkpoint.get("raw_frame_contract") != "true_simulator_render_480px_v1":
+        raise ValueError("DINO ROI must be trained from true 480px simulator renders")
+    if int(checkpoint.get("roi_geometry_size", -1)) != 480:
+        raise ValueError("DINO ROI geometry must be planned in 480px render space")
     state = checkpoint.get("roi_metric_head")
     ctor = checkpoint.get("ctor_config")
     if not isinstance(state, Mapping) or not isinstance(ctor, dict):
@@ -782,6 +795,7 @@ def load_dino_metric_roi_checkpoint(
     head.load_state_dict(state, strict=True)
     head._mtvj_roi_config = {
         "canonical_image_size": int(checkpoint.get("canonical_image_size", 224)),
+        "roi_geometry_size": int(checkpoint["roi_geometry_size"]),
         "min_roi_size": float(checkpoint.get("min_roi_size", ROI_MIN_SIZE)),
         "max_roi_size": float(checkpoint.get("max_roi_size", ROI_MAX_SIZE)),
         "distance_scale": float(checkpoint.get("distance_scale", 2.0)),
@@ -821,6 +835,11 @@ def refine_metric_roi_positions_dino(
     image_size = (
         int(config["canonical_image_size"]) if isinstance(config, dict) else 224
     )
+    geometry_size = (
+        int(config.get("roi_geometry_size", image_size))
+        if isinstance(config, dict)
+        else image_size
+    )
     min_size = float(config["min_roi_size"]) if isinstance(config, dict) else ROI_MIN_SIZE
     max_size = float(config["max_roi_size"]) if isinstance(config, dict) else ROI_MAX_SIZE
     distance_scale = (
@@ -832,7 +851,7 @@ def refine_metric_roi_positions_dino(
     selection = plan_metric_roi(
         coarse_p.detach().clamp(0.0, 1.0),
         coarse_visibility.detach().clamp(0.0, 1.0),
-        image_size,
+        geometry_size,
         min_size=min_size,
         max_size=max_size,
         distance_scale=distance_scale,
@@ -844,7 +863,10 @@ def refine_metric_roi_positions_dino(
         ),
     )
     cropped = crop_metric_roi_video(
-        raw_video, selection.roi, canonical_image_size=image_size
+        raw_video,
+        selection.roi,
+        canonical_image_size=image_size,
+        roi_geometry_size=geometry_size,
     )
     mean = cropped.new_tensor((0.485, 0.456, 0.406)).view(1, 1, 3, 1, 1)
     std = cropped.new_tensor((0.229, 0.224, 0.225)).view(1, 1, 3, 1, 1)
@@ -869,7 +891,7 @@ def refine_metric_roi_positions_dino(
         coarse_visibility,
         refined_pair,
         selection,
-        image_size,
+        geometry_size,
         alpha=alpha,
         max_delta_px=max_delta_px,
     )

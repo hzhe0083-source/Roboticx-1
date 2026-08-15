@@ -56,6 +56,11 @@ def main() -> None:
     parser.add_argument("--main-vision-checkpoint", type=Path, required=True)
     parser.add_argument("--chunk", type=int, default=32)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--store-raw-frames",
+        action="store_true",
+        help="also cache exact decoded 480px uint8 frames for train-time ROI crops",
+    )
     args = parser.parse_args()
 
     from train import _build_dino_main_backbone
@@ -100,6 +105,16 @@ def main() -> None:
                        shape=(n_frames, 256, 1024))
     fp11 = open_memmap(args.out / "block11.npy", mode="w+", dtype=np.float16,
                        shape=(n_frames, 256, 1024))
+    raw_frames = (
+        open_memmap(
+            args.out / "raw_frames.npy",
+            mode="w+",
+            dtype=np.uint8,
+            shape=(n_frames, 480, 480, 3),
+        )
+        if args.store_raw_frames
+        else None
+    )
 
     # 按行号取帧（首见顺序），chunk 批编码（与训练 encode_batch 同大小）。
     decoded_tasks: dict[str, list] = {}
@@ -111,6 +126,8 @@ def main() -> None:
             if task_file not in decoded_tasks:
                 decoded_tasks[task_file] = dataset._decode_task(task_file)
             frames[i] = decoded_tasks[task_file][ep_idx][frame_idx]
+        if raw_frames is not None:
+            raw_frames[start : start + len(chunk_keys)] = frames
         inputs = preprocess_batch(frames, torch.device(args.device))
         hierarchical = backbone.forward_hierarchical_dense(inputs.half())
         for i, row in enumerate(range(start, start + len(chunk_keys))):
@@ -121,6 +138,8 @@ def main() -> None:
                   f"({__import__('time').time()-t0:.0f}s)", flush=True)
     fp23.flush()
     fp11.flush()
+    if raw_frames is not None:
+        raw_frames.flush()
 
     # 位级一致性验证：抽 4 帧，用完全相同的预处理 + 塔在线重算 block 特征。
     rng = np.random.default_rng(0)
@@ -151,12 +170,26 @@ def main() -> None:
     with args.data.expanduser().open("rb") as fh:
         for block in iter(lambda: fh.read(1 << 20), b""):
             digest.update(block)
+    raw_sha256 = None
+    if raw_frames is not None:
+        raw_digest = hashlib.sha256()
+        with (args.out / "raw_frames.npy").open("rb") as fh:
+            for block in iter(lambda: fh.read(16 << 20), b""):
+                raw_digest.update(block)
+        raw_sha256 = raw_digest.hexdigest()
     meta = {
         "frames": n_frames,
         "dataset_sha256": digest.hexdigest(),
         "model_id": "vit_large_patch14_reg4_dinov2.lvd142m",
         "image_size": 224,
         "chunk": args.chunk,
+        "raw_frames": bool(raw_frames is not None),
+        "raw_frame_shape": [n_frames, 480, 480, 3] if raw_frames is not None else None,
+        "raw_frame_dtype": "uint8" if raw_frames is not None else None,
+        "raw_frame_contract": (
+            "exact_decoded_longtraj_jpeg_480_v1" if raw_frames is not None else None
+        ),
+        "raw_frames_sha256": raw_sha256,
         "grid": 8,
         "window": 4,
     }

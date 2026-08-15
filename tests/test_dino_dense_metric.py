@@ -326,6 +326,34 @@ def test_optional_temporal_geometry_modules_preserve_matched_common_initializati
         torch.testing.assert_close(value, treatment_state[key], rtol=0, atol=0)
 
 
+def test_direct_and_fm_share_bit_identical_common_initialization() -> None:
+    common = dict(
+        language_dim=12,
+        vision_dim=1024,
+        hidden_dim=16,
+        num_layers=1,
+        num_heads=4,
+        action_horizon=6,
+        action_dim=4,
+        proprio_dim=5,
+        main_vision_grid=2,
+        main_vision_tokens=16,
+        main_vision_temporal=True,
+        metric_geometry_inject=True,
+        flow_layers=2,
+    )
+    torch.manual_seed(20260818)
+    flow = VACompoundPolicy(_dino_dense_config(**common, direct_head=False))
+    torch.manual_seed(20260818)
+    direct = VACompoundPolicy(_dino_dense_config(**common, direct_head=True))
+    flow_state = flow.state_dict()
+    direct_state = direct.state_dict()
+    for key, value in flow_state.items():
+        assert key in direct_state
+        torch.testing.assert_close(value, direct_state[key], rtol=0, atol=0)
+    assert any(key.startswith("direct_head.") for key in direct_state if key not in flow_state)
+
+
 def test_feature_cache_read_matches_online_encode(tmp_path) -> None:
     """缓存读（含 8×8 池化 + 两帧 dense 组装）与在线编码逐位一致。"""
     import json
@@ -584,6 +612,55 @@ def test_rollout_legacy_vjepa_dense_still_uses_pool16(monkeypatch) -> None:
     assert len(observed) == 1
     assert observed[0].shape == (1, 16, 768)
     assert torch.equal(observed[0], expected)
+
+
+def test_task35_precision_contract_requires_complete_stack(tmp_path) -> None:
+    from train import parse_args, validate_args
+
+    dino = tmp_path / "dino.safetensors"
+    roi = tmp_path / "roi.pt"
+    cache = tmp_path / "cache"
+    dino.write_bytes(b"dino")
+    roi.write_bytes(b"roi")
+    cache.mkdir()
+    for name in ("meta.json", "index.pkl", "block23.npy", "block11.npy"):
+        (cache / name).write_bytes(b"cache")
+    common = [
+        "--task35-precision-contract",
+        "--data",
+        str(tmp_path / "data.pt"),
+        "--single-task",
+        "--task-sampling",
+        "weighted",
+        "--dino-main-vision",
+        "--dino-dense-metric",
+        "--dino-feature-cache",
+        str(tmp_path / "cache"),
+        "--main-vision-checkpoint",
+        str(dino),
+        "--main-vision-grid",
+        "16",
+        "--main-vision-frames",
+        "4",
+        "--main-vision-temporal",
+        "--metric-geometry-inject",
+        "--dino-roi-checkpoint",
+        str(roi),
+        "--dino-roi-alpha",
+        "1",
+        "--mtvj-train-metric-head",
+        "--mtvj-train-relation",
+    ]
+    args = parse_args(common)
+    validate_args(args)
+    with pytest.raises(ValueError, match="main-vision-temporal"):
+        validate_args(parse_args([arg for arg in common if arg != "--main-vision-temporal"]))
+    wrong_grid = list(common)
+    grid_index = wrong_grid.index("--main-vision-grid") + 1
+    wrong_grid[grid_index] = "8"
+    # The explicit precision contract rejects this before data/model construction.
+    with pytest.raises(ValueError, match="grid 16"):
+        validate_args(parse_args(wrong_grid))
 
 
 def test_main_vision_config_kwargs_dino_metric() -> None:

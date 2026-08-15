@@ -4180,7 +4180,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=None,
         help="DINO-main/DINO-metric 预计算特征缓存目录（scripts/"
-        "build_dino_feature_cache.py 生成；block11/block23 fp16 memmap）。"
+        "build_dino_feature_cache.py 生成；block11/block23 fp16 memmap；"
+        "task35 ROI 精插还要求 exact raw_frames.npy）。"
         "冻结塔在线编码占步时 84%，缓存读把 13000 步从 ~9.4h 降到 ~2.5h；"
         "位级一致性由预计算脚本内置 torch.equal 验证，eval 仍在线编码。",
     )
@@ -4212,6 +4213,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=None,
         help="task35 DINO ROI 有界残差融合系数 [0,1]。",
+    )
+    parser.add_argument(
+        "--task35-precision-contract",
+        action="store_true",
+        help="最终 task35 精插实验 fail-fast：要求 matched clean/recovery H6、"
+        "grid16 四帧 temporal、DINO MT-VJ、直接 8D geometry、ROI v2、WAM off。",
     )
     parser.add_argument(
         "--action-vision-only",
@@ -4781,6 +4788,35 @@ def validate_args(args: argparse.Namespace) -> None:
         if dino_roi_alpha is None or not math.isfinite(dino_roi_alpha) or not 0.0 <= dino_roi_alpha <= 1.0:
             raise ValueError(
                 "--dino-roi-checkpoint requires finite --dino-roi-alpha in [0,1]"
+            )
+    if getattr(args, "task35_precision_contract", False):
+        required = {
+            "--data": args.data is not None,
+            "--single-task": args.single_task,
+            "--dino-main-vision": dino_main_vision,
+            "--dino-dense-metric": getattr(args, "dino_dense_metric", False),
+            "--main-vision-grid 16": int(getattr(args, "main_vision_grid", 0)) == 16,
+            "--main-vision-frames 4": int(getattr(args, "main_vision_frames", 0)) == 4,
+            "--main-vision-temporal": getattr(args, "main_vision_temporal", False),
+            "--metric-geometry-inject": getattr(args, "metric_geometry_inject", False),
+            "--dino-feature-cache": getattr(args, "dino_feature_cache", None)
+            is not None,
+            "--dino-roi-checkpoint": dino_roi_checkpoint is not None,
+            "--dino-roi-alpha 1": dino_roi_alpha is not None
+            and float(dino_roi_alpha) == 1.0,
+            "--mtvj-train-metric-head": getattr(args, "mtvj_train_metric_head", False),
+            "--mtvj-train-relation": getattr(args, "mtvj_train_relation", False),
+            "--task-sampling weighted": args.task_sampling == "weighted",
+            "--num-workers 0": args.num_workers == 0,
+            "from scratch": args.resume is None
+            and getattr(args, "resume_exact", None) is None,
+            "WAM off": not getattr(args, "wam_joint", False),
+        }
+        missing = [name for name, enabled in required.items() if not enabled]
+        if missing:
+            raise ValueError(
+                "--task35-precision-contract missing required settings: "
+                + ", ".join(missing)
             )
     roi_checkpoint = getattr(args, "mtvj_roi_checkpoint", None)
     roi_alpha = getattr(args, "mtvj_roi_alpha", None)
@@ -5734,6 +5770,16 @@ def save_checkpoint(
                     if getattr(args, "dino_roi_checkpoint", None) is not None
                     else None
                 ),
+                "task35_precision_contract": bool(
+                    getattr(args, "task35_precision_contract", False)
+                ),
+                "task35_data_sha256": getattr(
+                    args, "task35_data_sha256", None
+                ),
+                "task35_raw_frames_sha256": getattr(
+                    args, "task35_raw_frames_sha256", None
+                ),
+                "wam_enabled": bool(getattr(args, "wam_joint", False)),
                 "main_vision_checkpoint_sha256": getattr(
                     args, "main_vision_checkpoint_sha256", None
                 ),
@@ -6150,6 +6196,87 @@ def main() -> None:
                 index: env_by_description.get(description, f"task-{index}")
                 for index, description in enumerate(descriptions)
             }
+        if getattr(args, "task35_precision_contract", False):
+            if int(dataset.payload["actions"].shape[-2]) != 6:
+                raise ValueError(
+                    "task35 DINO dense metric requires exact H6 action chunks"
+                )
+            metadata = dataset.payload.get("metadata") or {}
+            if (
+                metadata.get("contract")
+                != "task35_clean_recovery_h6_matched_va_v1"
+                or metadata.get("task") != "peg-insert-side-v3"
+                or metadata.get("task_role_order")
+                != ["tool", "pegGrasp", "hole", "pegHead"]
+                or metadata.get("roi_relation_pair") != ["pegHead", "hole"]
+                or int(metadata.get("n_clean_windows", 0)) <= 0
+                or int(metadata.get("n_recovery_windows", 0)) <= 0
+            ):
+                raise ValueError(
+                    "task35 precision training requires the strict matched "
+                    "clean/recovery H6 payload and role contract"
+                )
+            instruction_ids = dataset.payload["instruction_id"].unique().tolist()
+            if instruction_ids != [35]:
+                raise ValueError(
+                    "task35 precision payload must contain only instruction_id 35, "
+                    f"got {instruction_ids}"
+                )
+            if int(args.main_vision_frames) != 4:
+                raise ValueError(
+                    "task35 DINO dense metric requires exactly four frames "
+                    "[d-6,d-4,d-2,d]"
+                )
+            if int(args.main_vision_grid) != 16:
+                raise ValueError(
+                    "task35 DINO dense metric requires --main-vision-grid 16 "
+                    "(4*256=1024 base-vision tokens)"
+                )
+            if not getattr(args, "main_vision_temporal", False):
+                raise ValueError(
+                    "task35 DINO dense metric requires --main-vision-temporal"
+                )
+            if not getattr(args, "metric_geometry_inject", False):
+                raise ValueError(
+                    "task35 DINO dense metric requires --metric-geometry-inject"
+                )
+            if getattr(args, "dino_roi_checkpoint", None) is None:
+                raise ValueError(
+                    "task35 DINO dense metric requires a v2 --dino-roi-checkpoint"
+                )
+            if dataset.cached_raw_frames is None:
+                raise ValueError(
+                    "task35 precision training requires DINO cache raw_frames.npy "
+                    "to avoid mixed-container JPEG decode and lock ROI pixels"
+                )
+            cache_meta = json.loads(
+                (args.dino_feature_cache / "meta.json").read_text()
+            )
+            data_digest = hashlib.sha256()
+            with args.data.expanduser().open("rb") as stream:
+                for block in iter(lambda: stream.read(16 << 20), b""):
+                    data_digest.update(block)
+            args.task35_data_sha256 = data_digest.hexdigest()
+            if cache_meta.get("dataset_sha256") != args.task35_data_sha256:
+                raise ValueError(
+                    "task35 precision DINO cache was not built from the exact "
+                    "matched H6 payload"
+                )
+            raw_path = args.dino_feature_cache / "raw_frames.npy"
+            expected_raw_sha = cache_meta.get("raw_frames_sha256")
+            args.task35_raw_frames_sha256 = expected_raw_sha
+            if (
+                cache_meta.get("raw_frame_contract")
+                != "exact_decoded_longtraj_jpeg_480_v1"
+                or cache_meta.get("raw_frame_shape")
+                != [int(dataset.cached_raw_frames.shape[0]), 480, 480, 3]
+                or not expected_raw_sha
+                or _sha256_file(raw_path) != expected_raw_sha
+            ):
+                raise ValueError(
+                    "task35 precision DINO cache lacks the exact 480px raw-frame "
+                    "identity contract"
+                )
         dino_main_kwargs = _main_vision_config_kwargs(args)
         config = VACompoundConfig(
             language_dim=int(dataset.payload["language_hidden"].shape[-1]),
