@@ -18,6 +18,12 @@ while [[ ! -s "$DEST" || ! -s "${DEST}.sha256" ]]; do
   sleep 15
 done
 echo "found $DEST" >&2
+expected_sha=$(awk '{print $1}' "${DEST}.sha256")
+actual_sha=$(sha256sum "$DEST" | awk '{print $1}')
+if [[ -z "$expected_sha" || "$expected_sha" != "$actual_sha" ]]; then
+  echo "milestone SHA mismatch for $DEST expected=$expected_sha actual=$actual_sha" >&2
+  exit 4
+fi
 VALIDATE=logs/${NAME}_validate.json
 SLICES=logs/${NAME}_clean_recovery_slices.json
 LOCK=logs/${NAME}.lock

@@ -30,9 +30,16 @@ if [[ ! -s "$DEST" || ! -s "${DEST}.sha256" ]]; then
       "$LIVE" --expected-step 15000 --skip-module-load \
       --output "logs/$(basename "$STEM")_live15000_validate.json"; then
       cp --reflink=auto --sparse=always "$LIVE" "${DEST}.tmp"
-      mv "${DEST}.tmp" "$DEST"
-      sha256sum "$DEST" > "${DEST}.sha256"
-      echo "promoted live 15000 checkpoint to $DEST" >&2
+      live_sha=$(sha256sum "$LIVE" | awk '{print $1}')
+      dest_sha=$(sha256sum "${DEST}.tmp" | awk '{print $1}')
+      if [[ -z "$live_sha" || "$live_sha" != "$dest_sha" ]]; then
+        echo "live 15000 promotion SHA mismatch live=$live_sha tmp=$dest_sha" >&2
+        rm -f "${DEST}.tmp"
+      else
+        mv "${DEST}.tmp" "$DEST"
+        printf '%s  %s\n' "$dest_sha" "$DEST" > "${DEST}.sha256"
+        echo "promoted live 15000 checkpoint to $DEST" >&2
+      fi
     fi
   fi
 fi

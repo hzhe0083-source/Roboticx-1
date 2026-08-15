@@ -26,11 +26,25 @@ wanted() {
 
 # Copy + SHA only. Full CPU validate/slice stays in the milestone waiter so a
 # validate OOM or contract failure cannot abort the remaining 9k/12k/15k copies.
+verify_copy_sha() {
+  local source=$1
+  local destination=$2
+  local source_sha destination_sha
+  source_sha=$(sha256sum "$source" | awk '{print $1}')
+  destination_sha=$(sha256sum "$destination" | awk '{print $1}')
+  if [[ -z "$source_sha" || "$source_sha" != "$destination_sha" ]]; then
+    echo "archive SHA mismatch src=$source_sha dst=$destination_sha" >&2
+    return 1
+  fi
+  printf '%s  %s\n' "$destination_sha" "$destination"
+}
+
 archive_step() {
   local step=$1
   local stem=${CKPT%.pt}
   local destination="${stem}_step${step}.pt"
   local temporary="${destination}.tmp"
+  local sidecar attempt
   if [[ -e "$destination" ]]; then
     echo "milestone already exists: $destination" >&2
     return 0
@@ -39,11 +53,20 @@ archive_step() {
     echo "checkpoint missing after save event: $CKPT" >&2
     return 1
   }
+  for attempt in 1 2; do
+    rm -f "$temporary"
+    cp --reflink=auto --sparse=always "$CKPT" "$temporary"
+    if sidecar=$(verify_copy_sha "$CKPT" "$temporary"); then
+      mv "$temporary" "$destination"
+      printf '%s\n' "$sidecar" > "${destination}.sha256"
+      echo "archived global_step=$step to $destination" >&2
+      return 0
+    fi
+    echo "archive copy retry $attempt failed for step=$step" >&2
+  done
   rm -f "$temporary"
-  cp --reflink=auto --sparse=always "$CKPT" "$temporary"
-  mv "$temporary" "$destination"
-  sha256sum "$destination" > "${destination}.sha256"
-  echo "archived global_step=$step to $destination" >&2
+  echo "failed to archive an intact copy of step=$step" >&2
+  return 1
 }
 
 backfill_existing() {

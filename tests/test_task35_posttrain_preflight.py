@@ -30,3 +30,4 @@ def test_readiness_expects_planned_waiters_and_acceptance_set() -> None:
     assert text.count("run_task35_h6_eval_suite.sh") == 1
     assert "for step in 3000 6000 9000 12000 15000; do" in text
     assert "for step in 1000 2000 3000 6000 9000 12000 15000; do" not in text
+    assert "live 15000 promotion SHA mismatch" in text
