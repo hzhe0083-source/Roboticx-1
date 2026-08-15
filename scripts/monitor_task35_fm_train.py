@@ -98,10 +98,16 @@ def mem_available_kb(meminfo: str | None = None) -> int | None:
     return None
 
 
+def archive_complete(checkpoint_stem: Path, step: int) -> bool:
+    destination = Path(f"{checkpoint_stem}_step{step}.pt")
+    return destination.is_file() and Path(str(destination) + ".sha256").is_file()
+
+
 def pipeline_health(
     *,
     trainer: dict,
     checkpoint_stem: Path,
+    latest_step: int | None = None,
     meminfo: str | None = None,
     gpu_compute_pids: list[int] | None = None,
 ) -> dict:
@@ -112,8 +118,7 @@ def pipeline_health(
         for name, needle in WAITER_NEEDLES.items()
     }
     archived = {
-        step: Path(f"{checkpoint_stem}_step{step}.pt").is_file()
-        for step in ARCHIVE_MILESTONES
+        step: archive_complete(checkpoint_stem, step) for step in ARCHIVE_MILESTONES
     }
     if trainer["alive"]:
         if trainer["count"] != 1:
@@ -125,6 +130,10 @@ def pipeline_health(
         for step, key in ((6000, "wait_6000"), (9000, "wait_9000"), (12000, "wait_12000")):
             if not archived[step] and not present[key]:
                 alerts.append(f"waiter_{step}_missing")
+        if latest_step is not None:
+            for step in ARCHIVE_MILESTONES:
+                if int(latest_step) >= int(step) and not archived[step]:
+                    alerts.append(f"missing_archive_{step}")
     available = mem_available_kb(meminfo)
     if available is not None and available < LOW_RAM_KB:
         alerts.append("low_ram")
@@ -373,7 +382,11 @@ def main() -> None:
         / "checkpoints"
         / "task35_h6_dino_mtvj_fm_full15k_b6_sdpa_aux10b8_v1"
     )
-    health = pipeline_health(trainer=trainer, checkpoint_stem=checkpoint_stem)
+    health = pipeline_health(
+        trainer=trainer,
+        checkpoint_stem=checkpoint_stem,
+        latest_step=int(snapshot["latest_step"]),
+    )
     snapshot["pipeline"] = health
     if health["alerts"]:
         snapshot["alerts"] = sorted(set(snapshot["alerts"] + health["alerts"]))

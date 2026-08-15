@@ -80,7 +80,8 @@ def summarize_task35_fm_log(
         if end in ARCHIVE_MILESTONES:
             item["milestone"] = end
             if checkpoint_stem is not None:
-                item["archived"] = Path(f"{checkpoint_stem}_step{end}.pt").is_file()
+                dest = Path(f"{checkpoint_stem}_step{end}.pt")
+                item["archived"] = dest.is_file() and Path(str(dest) + ".sha256").is_file()
         elif end % window == 0:
             # Live trainer overwrites the working checkpoint every 1000 steps.
             # Only ARCHIVE_MILESTONES are copied aside; 4000/5000/7000/... are

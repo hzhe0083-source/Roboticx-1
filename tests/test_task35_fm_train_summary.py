@@ -32,7 +32,9 @@ def test_only_planned_archive_milestones_are_flagged(tmp_path: Path) -> None:
     lines.append("step=4000 global_step=4000 periodic checkpoint saved to ckpt.pt")
     stem = tmp_path / "ckpt"
     for step in (1000, 2000, 3000):
-        (tmp_path / f"ckpt_step{step}.pt").write_bytes(b"x")
+        dest = tmp_path / f"ckpt_step{step}.pt"
+        dest.write_bytes(b"x")
+        dest.with_name(dest.name + ".sha256").write_text(f"abc  {dest}\n")
     summary = summarize_task35_fm_log(
         "\n".join(lines),
         total_steps=15000,
@@ -48,6 +50,17 @@ def test_only_planned_archive_milestones_are_flagged(tmp_path: Path) -> None:
     text = "\n".join(milestone_lines(summary["windows"]))
     assert "3001-4000" in text and "periodic-save" in text
     assert "missing-archive" not in text
+    dest4000 = tmp_path / "ckpt_step4000.pt"
+    dest4000.write_bytes(b"x")
+    summary_no_sha = summarize_task35_fm_log(
+        "\n".join(lines),
+        total_steps=15000,
+        window=1000,
+        checkpoint_stem=stem,
+    )
+    by_end_no_sha = {item["end"]: item for item in summary_no_sha["windows"]}
+    assert by_end_no_sha[3000]["archived"] is True
+    assert by_end_no_sha[4000]["periodic_save_only"] is True
 
 
 def test_pipeline_health_alerts_missing_6k_waiter(tmp_path: Path, monkeypatch) -> None:
@@ -79,6 +92,25 @@ def test_pipeline_health_alerts_missing_6k_waiter(tmp_path: Path, monkeypatch) -
     assert "waiter_6000_missing" in health["alerts"]
     assert "archiver_missing" not in health["alerts"]
     assert health["waiters"]["wait_6000"] is False
+    late = monitor.pipeline_health(
+        trainer={"alive": True, "count": 1, "processes": [{"pid": 303509}]},
+        checkpoint_stem=stem,
+        latest_step=6500,
+        meminfo="MemAvailable: 8388608 kB\n",
+        gpu_compute_pids=[303509],
+    )
+    assert "missing_archive_6000" in late["alerts"]
+    assert "missing_archive_3000" in late["alerts"]  # files exist but no sha256
+    (tmp_path / "ckpt_step3000.pt.sha256").write_text("abc\n")
+    late_ok = monitor.pipeline_health(
+        trainer={"alive": True, "count": 1, "processes": [{"pid": 303509}]},
+        checkpoint_stem=stem,
+        latest_step=6500,
+        meminfo="MemAvailable: 8388608 kB\n",
+        gpu_compute_pids=[303509],
+    )
+    assert "missing_archive_3000" not in late_ok["alerts"]
+    assert "missing_archive_6000" in late_ok["alerts"]
 
 
 def test_pipeline_health_alerts_low_ram_and_extra_gpu(tmp_path: Path, monkeypatch) -> None:

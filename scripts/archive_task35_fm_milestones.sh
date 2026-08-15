@@ -39,15 +39,24 @@ verify_copy_sha() {
   printf '%s  %s\n' "$destination_sha" "$destination"
 }
 
+archive_complete() {
+  local destination=$1
+  [[ -s "$destination" && -s "${destination}.sha256" ]]
+}
+
 archive_step() {
   local step=$1
   local stem=${CKPT%.pt}
   local destination="${stem}_step${step}.pt"
   local temporary="${destination}.tmp"
   local sidecar attempt
-  if [[ -e "$destination" ]]; then
+  if archive_complete "$destination"; then
     echo "milestone already exists: $destination" >&2
     return 0
+  fi
+  if [[ -e "$destination" && ! -s "${destination}.sha256" ]]; then
+    echo "incomplete archive $destination missing sha256; recopying" >&2
+    rm -f "$destination"
   fi
   [[ -f "$CKPT" ]] || {
     echo "checkpoint missing after save event: $CKPT" >&2
@@ -76,7 +85,7 @@ backfill_existing() {
       step=${BASH_REMATCH[1]}
       if wanted "$step"; then
         local destination="${CKPT%.pt}_step${step}.pt"
-        if [[ -e "$destination" ]]; then
+        if archive_complete "$destination"; then
           echo "backfill skip existing $destination" >&2
         else
           echo "backfill cannot copy historical step=$step without that exact file" >&2
@@ -90,7 +99,7 @@ all_done() {
   local step destination
   for step in "${STEPS[@]}"; do
     destination="${CKPT%.pt}_step${step}.pt"
-    [[ -e "$destination" ]] || return 1
+    archive_complete "$destination" || return 1
   done
   return 0
 }
