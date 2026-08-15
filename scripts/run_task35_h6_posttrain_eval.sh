@@ -36,7 +36,7 @@ fi
   --samples 100 --batch 8 --seed 2777 \
   --output "logs/${NAME}_metric_holdout2777.json"
 
-scripts/run_task35_h6_eval50.sh "$CKPT" "$NAME"
+scripts/run_task35_h6_eval50.sh "${FORCE[@]}" "$CKPT" "$NAME"
 if [[ "${TASK35_SKIP_CAUSAL:-0}" != "1" ]]; then
   scripts/run_task35_h6_causal_suite.sh "${FORCE[@]}" "$CKPT" "$NAME"
 fi
