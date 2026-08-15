@@ -24,6 +24,11 @@ fi
 "$PY" -B scripts/validate_task35_fm_checkpoint.py "$CKPT" \
   --output "logs/${NAME}_validate.json"
 
+"$PY" -B scripts/diag_task35_clean_recovery_slices.py \
+  --checkpoint "$CKPT" \
+  --features "$FEATURES" \
+  --output "logs/${NAME}_clean_recovery_slices.json"
+
 "$PY" -u -B scripts/eval_dino_metric_policy_task35.py \
   --checkpoint "$CKPT" \
   --language-data "$FEATURES" \
