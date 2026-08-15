@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # After FM training finishes: validate, held-out metric, then 50-seed closed loop.
-# Refuses to start while the 15k trainer still owns the GPU unless --force.
+# Refuses to start while the 20k trainer still owns the GPU unless --force.
+# Does not elect a winner: the suite selects only after every 3k–20k eval50 exists.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -20,11 +21,22 @@ if [[ ${#FORCE[@]} -eq 0 ]] && "$PY" -B scripts/task35_proc.py --check trainer >
   exit 3
 fi
 
+STEP=""
+if [[ "$(basename "$CKPT")" =~ _step([0-9]+)\.pt$ ]]; then
+  STEP=${BASH_REMATCH[1]}
+fi
+PREFLIGHT_STEP=()
+VALIDATE_STEP=()
+if [[ -n "$STEP" ]]; then
+  PREFLIGHT_STEP=(--expected-step "$STEP")
+  VALIDATE_STEP=(--expected-step "$STEP")
+fi
+
 CUDA_VISIBLE_DEVICES= "$PY" -B scripts/preflight_task35_posttrain.py \
-  --checkpoint "$CKPT" --output "logs/${NAME}_preflight.json"
+  --checkpoint "$CKPT" "${PREFLIGHT_STEP[@]}" --output "logs/${NAME}_preflight.json"
 
 CUDA_VISIBLE_DEVICES= "$PY" -B scripts/validate_task35_fm_checkpoint.py "$CKPT" \
-  --output "logs/${NAME}_validate.json"
+  "${VALIDATE_STEP[@]}" --output "logs/${NAME}_validate.json"
 
 CUDA_VISIBLE_DEVICES= "$PY" -B scripts/diag_task35_clean_recovery_slices.py \
   --checkpoint "$CKPT" \
@@ -43,6 +55,4 @@ scripts/run_task35_h6_eval50.sh "${FORCE[@]}" "$CKPT" "$NAME"
 if [[ "${TASK35_SKIP_CAUSAL:-0}" != "1" ]]; then
   scripts/run_task35_h6_causal_suite.sh "${FORCE[@]}" "$CKPT" "$NAME"
 fi
-"$PY" -B scripts/select_task35_best_fm.py "logs/${NAME}_eval50.json" \
-  --output "logs/${NAME}_best.json"
-echo "post-train eval finished for $CKPT" >&2
+echo "post-train eval finished for $CKPT; winner election stays in the suite" >&2

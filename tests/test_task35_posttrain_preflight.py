@@ -59,3 +59,10 @@ def test_readiness_expects_planned_waiters_and_acceptance_set() -> None:
     assert "trainer exited 0 but 20k archive is still missing" in resume_text
     train_text = Path(__file__).resolve().parent.parent.joinpath("train.py").read_text()
     assert "step={global_step}" in train_text
+    posttrain = Path(__file__).resolve().parent.parent / "scripts" / "run_task35_h6_posttrain_eval.sh"
+    posttrain_text = posttrain.read_text()
+    assert "select_task35_best_fm.py" not in posttrain_text
+    assert "--expected-step" in posttrain_text
+    assert "winner election stays in the suite" in posttrain_text
+    suite = Path(__file__).resolve().parent.parent / "scripts" / "run_task35_h6_eval_suite.sh"
+    assert suite.read_text().count("select_task35_best_fm.py") == 1
