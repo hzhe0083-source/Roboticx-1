@@ -2,7 +2,24 @@
 import numpy as np
 import pytest
 
-from stats_ci import bootstrap_ci, fmt_ci, macro_bootstrap_ci
+from stats_ci import binomial_wilson_ci, bootstrap_ci, fmt_ci, macro_bootstrap_ci
+
+
+def test_binomial_wilson_ci_single_task_is_non_degenerate():
+    est, lo, hi = binomial_wilson_ci(1, 10)
+    assert est == pytest.approx(0.1)
+    assert lo == pytest.approx(0.017876, abs=1e-6)
+    assert hi == pytest.approx(0.404150, abs=1e-6)
+    assert lo < est < hi
+
+
+def test_binomial_wilson_ci_rejects_invalid_counts():
+    with pytest.raises(ValueError):
+        binomial_wilson_ci(-1, 10)
+    with pytest.raises(ValueError):
+        binomial_wilson_ci(11, 10)
+    with pytest.raises(ValueError):
+        binomial_wilson_ci(0, 0)
 
 
 def test_bootstrap_ci_covers_true_mean():

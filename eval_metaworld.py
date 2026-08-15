@@ -986,6 +986,19 @@ def parse_args() -> argparse.Namespace:
         help="打印首次决策的模型动作（与 --align-init 联用可对比数据专家动作）",
     )
     parser.add_argument(
+        "--debug-stage-metrics",
+        action="store_true",
+        help="逐 trial 汇报 MetaWorld 阶段指标（max near/grasp/in_place、min obj_to_target），"
+        "只读诊断，不改变动作或成功判定。",
+    )
+    parser.add_argument(
+        "--flow-samples",
+        type=int,
+        default=1,
+        help="每次决策独立采样 K 个 flow action chunk 后取均值（默认 1，原行为）；"
+        "仅用于诊断 FM 采样方差。",
+    )
+    parser.add_argument(
         "--memory-reset-every",
         type=int,
         default=0,
@@ -2096,6 +2109,8 @@ def build_plan_language_cache(
 
 def main() -> None:
     args = parse_args()
+    if args.flow_samples < 1:
+        raise ValueError("--flow-samples must be >= 1")
     torch.manual_seed(0)  # 固定 flow 采样噪声（口径要求：重跑可复现，2026-08-05 审查补充）
     device = torch.device(args.device)
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
@@ -2725,6 +2740,14 @@ def main() -> None:
             memory = None
             metric_g_prev = None  # MT-VJ：上一决策的 g_t（ν_t = g_t − g_{t−1}，每 trial 重置）
             success = False
+            stage_metrics = {
+                "near_object": 0.0,
+                "grasp_success": 0.0,
+                "grasp_reward": 0.0,
+                "in_place_reward": 0.0,
+                "obj_to_target": float("inf"),
+                "best_obj_step": -1,
+            }
             decision_count = 0  # 2026-08-06：--memory-reset-every 的决策计数器
             plan_step = None  # C²/伺服：上次规划的原始步
             c2_token = 0  # C²/伺服：自规划以来消费的 token 索引
@@ -3063,10 +3086,26 @@ def main() -> None:
                                     _wam_geo8_from_metric(servo_metric_g, device),
                                     args.wam_alpha,
                                 )
-                            chunk = model.decode_actions(
-                                cond, steps=flow_steps, semantic_context=semantic_ctx,
-                                **decode_kwargs,
-                            )[0].cpu().numpy()
+                            if args.flow_samples == 1:
+                                decoded = model.decode_actions(
+                                    cond,
+                                    steps=flow_steps,
+                                    semantic_context=semantic_ctx,
+                                    **decode_kwargs,
+                                )
+                            else:
+                                decoded = torch.stack(
+                                    [
+                                        model.decode_actions(
+                                            cond,
+                                            steps=flow_steps,
+                                            semantic_context=semantic_ctx,
+                                            **decode_kwargs,
+                                        )
+                                        for _ in range(args.flow_samples)
+                                    ]
+                                ).mean(dim=0)
+                            chunk = decoded[0].cpu().numpy()
                         plan_step = step
                         c2_token = 0
                     if correction_due and c2_token < ACTION_HORIZON and chunk is not None:
@@ -3359,10 +3398,26 @@ def main() -> None:
                                 _wam_geo8_from_metric(metric_g, device),
                                 args.wam_alpha,
                             )
-                        chunk = model.decode_actions(
-                            cond, steps=flow_steps, semantic_context=semantic_ctx,
-                            **decode_kwargs,
-                        )[0].cpu().numpy()
+                        if args.flow_samples == 1:
+                            decoded = model.decode_actions(
+                                cond,
+                                steps=flow_steps,
+                                semantic_context=semantic_ctx,
+                                **decode_kwargs,
+                            )
+                        else:
+                            decoded = torch.stack(
+                                [
+                                    model.decode_actions(
+                                        cond,
+                                        steps=flow_steps,
+                                        semantic_context=semantic_ctx,
+                                        **decode_kwargs,
+                                    )
+                                    for _ in range(args.flow_samples)
+                                ]
+                            ).mean(dim=0)
+                        chunk = decoded[0].cpu().numpy()
                         chunk_start_step = step
                         if args.debug_first_action and not _DEBUG_FA_DONE.get("x"):
                             _DEBUG_FA_DONE["x"] = True
@@ -3391,6 +3446,21 @@ def main() -> None:
                 action = norm_action * (aq99 - aq01) / 2 + (aq99 + aq01) / 2
                 obs, reward, terminated, truncated, info = env.step(action)
                 last_norm = norm_action
+                if args.debug_stage_metrics:
+                    for metric_name in (
+                        "near_object",
+                        "grasp_success",
+                        "grasp_reward",
+                        "in_place_reward",
+                    ):
+                        value = float(info.get(metric_name, 0.0))
+                        stage_metrics[metric_name] = max(
+                            stage_metrics[metric_name], value
+                        )
+                    obj_to_target = float(info.get("obj_to_target", float("inf")))
+                    if obj_to_target < stage_metrics["obj_to_target"]:
+                        stage_metrics["obj_to_target"] = obj_to_target
+                        stage_metrics["best_obj_step"] = step
                 if info.get("success"):
                     success = True
                     break
@@ -3401,6 +3471,17 @@ def main() -> None:
                 f"trial task={global_task_index} trial={trial} seed={episode_seed} "
                 f"success={int(success)}"
             )
+            if args.debug_stage_metrics:
+                print(
+                    f"stage task={global_task_index} trial={trial} "
+                    f"near={stage_metrics['near_object']:.3f} "
+                    f"grasp={stage_metrics['grasp_success']:.3f} "
+                    f"grasp_reward={stage_metrics['grasp_reward']:.3f} "
+                    f"in_place={stage_metrics['in_place_reward']:.3f} "
+                    f"min_obj_to_target={stage_metrics['obj_to_target']:.4f} "
+                    f"best_step={stage_metrics['best_obj_step']}",
+                    flush=True,
+                )
         per_task[task_text[:40]] = wins
         print(f"task {task_text[:40]}: {wins}/{args.trials_per_task}")
         env.close()
@@ -3409,16 +3490,30 @@ def main() -> None:
     trials = len(per_task) * args.trials_per_task
     print(f"\nCLOSED-LOOP SUCCESS: {total}/{trials} = {total / trials:.1%}")
     if per_task:
-        # 宏平均 + 任务级 bootstrap 95% CI（固定种子，规格 P1 口径）
-        from stats_ci import macro_bootstrap_ci
-
         scores = np.asarray([w / args.trials_per_task for w in per_task.values()])
-        group_ids = np.arange(len(scores))
-        est, lo, hi = macro_bootstrap_ci(scores, group_ids, n_boot=2000, seed=0)
-        print(
-            f"macro (per-task avg): {est:.1%} [95% CI: {lo:.1%}, {hi:.1%}] "
-            f"(n_tasks={len(scores)})"
-        )
+        if len(scores) == 1:
+            # 单任务无法按 task bootstrap：唯一 task 被重复抽样只会产生 [p,p]
+            # 的伪窄区间。此时不确定性单位应是独立 trial，使用 Wilson 区间。
+            from stats_ci import binomial_wilson_ci
+
+            est, lo, hi = binomial_wilson_ci(total, trials)
+            print(
+                f"single-task success: {est:.1%} "
+                f"[95% Wilson CI: {lo:.1%}, {hi:.1%}] (n_trials={trials})"
+            )
+        else:
+            # 多任务宏平均：以 task 为有放回重采样单元（固定种子）。
+            from stats_ci import macro_bootstrap_ci
+
+            group_ids = np.arange(len(scores))
+            est, lo, hi = macro_bootstrap_ci(
+                scores, group_ids, n_boot=2000, seed=0
+            )
+            print(
+                f"macro (per-task avg): {est:.1%} "
+                f"[95% task-bootstrap CI: {lo:.1%}, {hi:.1%}] "
+                f"(n_tasks={len(scores)})"
+            )
 
 
 if __name__ == "__main__":
