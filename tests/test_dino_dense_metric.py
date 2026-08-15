@@ -287,6 +287,55 @@ def test_feature_cache_rows_contract(tmp_path) -> None:
     assert item["frame_cache_rows"][0].tolist() == [2, 3, 4, 5]
 
 
+def test_grid16_cache_online_eval_equivalence(tmp_path) -> None:
+    """grid=16（全 patch，无池化损失）：缓存读 = 在线编码 = 评测编码 逐位一致。"""
+    import json
+    import pickle
+
+    from train import (
+        DinoFeatureCache,
+        _dino_main_encode_from_cache,
+        _dino_main_online_encode,
+    )
+    from eval_metaworld import _main_vision_encode_window
+
+    n_frames = 12
+    base = torch.zeros(n_frames, 256, 1024)
+    base[..., 0] = torch.arange(256).view(1, 256)
+    block11 = (base + 1.0).numpy().astype(np.float16)
+    block23 = (base + 11.0).numpy().astype(np.float16)
+    np.save(tmp_path / "block11.npy", block11)
+    np.save(tmp_path / "block23.npy", block23)
+    index = {("peg-insert-side-v3", 0, i): i for i in range(n_frames)}
+    with (tmp_path / "index.pkl").open("wb") as fh:
+        pickle.dump(index, fh)
+    with (tmp_path / "meta.json").open("w") as fh:
+        json.dump({"frames": n_frames, "model_id": "m", "image_size": 224,
+                   "chunk": 32, "grid": 8, "window": 4}, fh)
+    cache = DinoFeatureCache(tmp_path)
+    rows = torch.tensor([[[0, 1, 2, 3]]], dtype=torch.int64)
+    tok_c, dense_c = _dino_main_encode_from_cache(
+        rows, cache, torch.device("cpu"), grid=16, window=4, return_dense=True
+    )
+    assert tuple(tok_c.shape) == (1, 1, 1024, 1024)
+    frames = _frames(1, 1, 4)
+    tok_o, dense_o = _dino_main_online_encode(
+        frames, FakeDinoBackbone(), torch.device("cpu"),
+        encode_batch=2, grid=16, window=4, return_dense=True,
+    )
+    assert torch.equal(tok_c, tok_o)
+    for layer in (5, 11):
+        assert torch.equal(dense_c[layer], dense_o[layer])
+    frame_list = [frames[0, 0, i] for i in range(4)]
+    tok_e, dense_e = _main_vision_encode_window(
+        frame_list, FakeDinoBackbone(), torch.device("cpu"),
+        grid=16, window=4, return_dense=True,
+    )
+    assert torch.equal(tok_c[0, 0], tok_e[0])
+    for layer in (5, 11):
+        assert torch.equal(dense_c[layer][0, 0], dense_e[layer][0])
+
+
 def test_main_vision_config_kwargs_dino_metric() -> None:
     from train import _main_vision_config_kwargs
 
