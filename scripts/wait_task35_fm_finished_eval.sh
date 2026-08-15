@@ -21,8 +21,8 @@ while true; do
   if [[ ! -s "$DEST" ]] && ! "$PY" -B scripts/task35_proc.py --check pipeline >/dev/null; then
     missing_cycles=$((missing_cycles + 1))
     if (( missing_cycles >= 4 )); then
-      echo "pipeline gone without a 20000 archive: $DEST" >&2
-      exit 4
+      echo "pipeline gone without a 20000 archive; trying live promote" >&2
+      break
     fi
   else
     missing_cycles=0

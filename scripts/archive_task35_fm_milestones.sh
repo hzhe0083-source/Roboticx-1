@@ -162,12 +162,23 @@ while true; do
     echo "log follower died before all milestones were archived" >&2
     exit 4
   fi
-  if ! "$PY" -B scripts/task35_proc.py --check pipeline >/dev/null; then
+  if ! "$PY" -B scripts/task35_proc.py --check training >/dev/null; then
     if all_done; then
-      echo "pipeline gone; all requested milestones already archived" >&2
+      echo "training gone; all requested milestones already archived" >&2
       exit 0
     fi
-    echo "pipeline gone before all milestones were archived" >&2
+    if [[ -f "$CKPT" ]]; then
+      found=$(peek_step "$CKPT" || true)
+      if [[ -n "${found:-}" ]] && wanted "$found"; then
+        echo "training gone; last-chance archive of live global_step=$found" >&2
+        archive_step "$found" || true
+      fi
+    fi
+    if all_done; then
+      echo "training gone; last-chance archived remaining milestones" >&2
+      exit 0
+    fi
+    echo "training gone before all milestones were archived" >&2
     exit 4
   fi
 done

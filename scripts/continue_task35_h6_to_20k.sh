@@ -77,3 +77,18 @@ PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 \
   --mtvj-visual-aux-every 10 --mtvj-visual-aux-batch 8 \
   --steps 14000 --save-every 1000 --main-vision-encode-batch 16 \
   --save "$LIVE" 2>&1 | tee -a "$LOG"
+status=${PIPESTATUS[0]}
+# Keep the handoff process alive until the 20k archive exists so waiters do
+# not treat trainer-exit as "pipeline gone" while the archiver is still copying.
+if [[ "$status" -eq 0 ]]; then
+  for _ in $(seq 1 40); do
+    if [[ -s "${STEM}_step20000.pt" && -s "${STEM}_step20000.pt.sha256" ]]; then
+      echo "20k archive present after trainer exit" >&2
+      exit 0
+    fi
+    sleep 15
+  done
+  echo "trainer exited 0 but 20k archive is still missing" >&2
+  exit 4
+fi
+exit "$status"
