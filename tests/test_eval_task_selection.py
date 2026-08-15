@@ -38,6 +38,23 @@ def test_task35_metadata_index_maps_to_peg_insert_side() -> None:
     ]
 
 
+def test_require_task35_peg_insert_side_is_fail_closed() -> None:
+    from eval_metaworld import require_task35_peg_insert_side
+
+    mapping = {"Insert a peg sideways": "peg-insert-side-v3"}
+    assert (
+        require_task35_peg_insert_side([(35, "Insert a peg sideways")], mapping)
+        == "peg-insert-side-v3"
+    )
+    with pytest.raises(ValueError, match="exactly --task-ids 35"):
+        require_task35_peg_insert_side([(0, "Insert a peg sideways")], mapping)
+    with pytest.raises(ValueError, match="expected peg-insert-side-v3"):
+        require_task35_peg_insert_side(
+            [(35, "Insert a peg sideways")],
+            {"Insert a peg sideways": "peg-unplug-side-v3"},
+        )
+
+
 def test_default_selection_retains_metadata_indices() -> None:
     tasks = ["a", "b", "c"]
     assert select_eval_tasks(tasks, None, max_tasks=2) == [(0, "a"), (1, "b")]

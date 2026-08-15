@@ -268,6 +268,41 @@ def select_eval_tasks(
     return [(index, all_tasks[index]) for index in indices]
 
 
+METAWORLD_TASK_CONFIG = Path(
+    "/home/ryan/Documents/robot/Evoagent/Evo-1/evo1_lerobot/lerobot/envs/metaworld_config.json"
+)
+
+
+def load_metaworld_description_to_env(path: Path = METAWORLD_TASK_CONFIG) -> dict[str, str]:
+    import json
+
+    resolved = Path(path).expanduser()
+    if not resolved.is_file():
+        raise ValueError(f"MetaWorld task config missing: {resolved}")
+    config = json.loads(resolved.read_text())
+    descriptions = config.get("TASK_DESCRIPTIONS")
+    if not isinstance(descriptions, dict) or not descriptions:
+        raise ValueError(f"{resolved} has no TASK_DESCRIPTIONS")
+    return {str(value): str(key) for key, value in descriptions.items()}
+
+
+def require_task35_peg_insert_side(
+    selected_tasks: list[tuple[int, str]],
+    descriptions_to_env: dict[str, str],
+) -> str:
+    """Fail before GPU work if --task-ids 35 is not peg-insert-side-v3."""
+    if len(selected_tasks) != 1 or selected_tasks[0][0] != 35:
+        raise ValueError("task35 evaluation must select exactly --task-ids 35")
+    task_text = selected_tasks[0][1]
+    env_name = descriptions_to_env.get(task_text)
+    if env_name != "peg-insert-side-v3":
+        raise ValueError(
+            "task35 evaluation mapped "
+            f"{task_text!r} -> {env_name!r}, expected peg-insert-side-v3"
+        )
+    return env_name
+
+
 def evaluation_episode_seed(global_task_id: int, trial: int) -> int:
     """Stable seed independent of task subset/order."""
     return 1000 * int(global_task_id) + int(trial)
@@ -2592,6 +2627,16 @@ def main() -> None:
     )
 
     features = torch.load(args.features, map_location="cpu", weights_only=True)
+    if args.task35_precision_contract or args.task35_causal_ablation != "none":
+        all_tasks = features["metadata"]["tasks"]
+        selected_early = select_eval_tasks(all_tasks, args.task_ids, args.max_tasks)
+        descriptions_to_env = load_metaworld_description_to_env()
+        env_name = require_task35_peg_insert_side(selected_early, descriptions_to_env)
+        print(
+            f"eval: preflight task35 -> {env_name} "
+            f"(id=35, text={selected_early[0][1]!r})",
+            flush=True,
+        )
     sq01 = features["normalization"]["state_q01"].numpy()
     sq99 = features["normalization"]["state_q99"].numpy()
     scale_s = np.where(np.abs(sq99 - sq01) < 1e-6, 1.0, sq99 - sq01)
@@ -2842,13 +2887,7 @@ def main() -> None:
 
     # 任务映射：数据 metadata.tasks 是任务描述（TASK_DESCRIPTIONS 的 value），
     # 反查 lerobot 采集同款 env_name（metaworld_config.json，与 Evoagent 封装一致）
-    import json
-
-    config_path = (
-        Path("/home/ryan/Documents/robot/Evoagent/Evo-1/evo1_lerobot/lerobot/envs/metaworld_config.json")
-    )
-    mw_config = json.load(open(config_path))
-    descriptions_to_env = {v: k for k, v in mw_config["TASK_DESCRIPTIONS"].items()}
+    descriptions_to_env = load_metaworld_description_to_env()
 
     per_task = {}
     trial_records: list[dict[str, Any]] = []

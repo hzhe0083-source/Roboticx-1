@@ -48,5 +48,8 @@ fi
 
 echo "trainer gone; archived $DEST" >&2
 scripts/wait_validate_task35_fm_milestone.sh 15000 "$STEM"
+CUDA_VISIBLE_DEVICES= "$PY" -B scripts/preflight_task35_posttrain.py \
+  --checkpoint "$DEST" --expected-step 15000 \
+  --output "logs/${NAME}_preflight.json"
 scripts/run_task35_h6_posttrain_eval.sh "$DEST" "$NAME"
 echo "finished post-train eval for $DEST" >&2

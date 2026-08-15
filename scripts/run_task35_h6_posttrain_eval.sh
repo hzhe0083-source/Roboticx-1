@@ -21,6 +21,9 @@ if [[ ${#FORCE[@]} -eq 0 ]] && pgrep -f "$TRAINER_NEEDLE" >/dev/null; then
   exit 3
 fi
 
+CUDA_VISIBLE_DEVICES= "$PY" -B scripts/preflight_task35_posttrain.py \
+  --checkpoint "$CKPT" --output "logs/${NAME}_preflight.json"
+
 "$PY" -B scripts/validate_task35_fm_checkpoint.py "$CKPT" \
   --output "logs/${NAME}_validate.json"
 
