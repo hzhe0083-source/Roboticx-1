@@ -11,8 +11,8 @@ NAME=$(basename "${DEST%.pt}")
 
 echo "waiting for $DEST" >&2
 while [[ ! -s "$DEST" || ! -s "${DEST}.sha256" ]]; do
-  if ! "$PY" -B scripts/task35_proc.py --check trainer >/dev/null; then
-    echo "trainer gone before milestone $STEP appeared: $DEST" >&2
+  if ! "$PY" -B scripts/task35_proc.py --check pipeline >/dev/null; then
+    echo "pipeline gone before milestone $STEP appeared: $DEST" >&2
     exit 4
   fi
   sleep 15
@@ -132,6 +132,8 @@ case "$STEP" in
   9000) PREV=${STEM}_step6000 ;;
   12000) PREV=${STEM}_step9000 ;;
   15000) PREV=${STEM}_step12000 ;;
+  18000) PREV=${STEM}_step15000 ;;
+  20000) PREV=${STEM}_step18000 ;;
 esac
 if [[ -n "$PREV" && -s "logs/$(basename "$PREV")_clean_recovery_slices.json" && -s "$SLICES" ]]; then
   "$PY" -B scripts/compare_task35_slice_reports.py \

@@ -31,15 +31,26 @@ def test_readiness_ignores_inspector_direct_and_eval_needles() -> None:
 
 
 def test_readiness_expects_planned_waiters_and_acceptance_set() -> None:
-    assert REQUIRED_MILESTONES == (3000, 6000, 9000, 12000, 15000)
-    assert ARCHIVE_MILESTONES[-1] == 15000
+    assert REQUIRED_MILESTONES == (3000, 6000, 9000, 12000, 15000, 18000, 20000)
+    assert ARCHIVE_MILESTONES[-1] == 20000
     assert any("wait_task35_fm_finished_eval.sh" in needle for needle in WAITER_NEEDLES)
+    assert any("continue_task35_h6_to_20k.sh" in needle for needle in WAITER_NEEDLES)
+    assert any(needle.endswith(" 15000") for needle in WAITER_NEEDLES)
+    assert any(needle.endswith(" 18000") for needle in WAITER_NEEDLES)
     waiter = Path(__file__).resolve().parent.parent / "scripts" / "wait_task35_fm_finished_eval.sh"
     text = waiter.read_text()
     assert text.count("run_task35_h6_eval_suite.sh") == 1
-    assert "for step in 3000 6000 9000 12000 15000; do" in text
-    assert "for step in 1000 2000 3000 6000 9000 12000 15000; do" not in text
-    assert "live 15000 promotion SHA mismatch" in text
+    assert "for step in 3000 6000 9000 12000 15000 18000 20000; do" in text
+    assert "for step in 3000 6000 9000 12000 15000; do" not in text
+    assert "live 20000 promotion SHA mismatch" in text
     assert "peek_task35_checkpoint_step.py" in text
     assert "refuse to promote live global_step=" in text
     assert "refuse to promote over" in text
+    assert "pipeline gone without a 20000 archive" in text
+    resume = Path(__file__).resolve().parent.parent / "scripts" / "continue_task35_h6_to_20k.sh"
+    resume_text = resume.read_text()
+    assert "--resume-exact" in resume_text
+    assert "--steps 5000" in resume_text
+    assert "direct-head" not in resume_text
+    assert 'no archived global_step=15000' in resume_text
+    assert "Do not resume from the live file" in resume_text

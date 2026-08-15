@@ -33,14 +33,17 @@ STEP_RE = re.compile(
 AUX_RE = re.compile(r"aux_rmse=(?P<rmse>[-+]?(?:\d+\.?\d*|\d*\.\d+)(?:[eE][-+]?\d+)?)px")
 SAVE_RE = re.compile(r"global_step=(?P<step>\d+)\s+periodic checkpoint saved")
 TRAINER_NEEDLE = "train.py --task35-precision-contract"
-DEFAULT_TOTAL_STEPS = 15000
+DEFAULT_TOTAL_STEPS = 20000
 WAITER_NEEDLES = {
     "archiver": "archive_task35_fm_milestones.sh",
     "tail": "tail -n 0 -F",
     "wait_6000": "wait_validate_task35_fm_milestone.sh 6000",
     "wait_9000": "wait_validate_task35_fm_milestone.sh 9000",
     "wait_12000": "wait_validate_task35_fm_milestone.sh 12000",
-    "wait_15000": "wait_task35_fm_finished_eval.sh",
+    "wait_15000": "wait_validate_task35_fm_milestone.sh 15000",
+    "wait_18000": "wait_validate_task35_fm_milestone.sh 18000",
+    "wait_20000": "wait_task35_fm_finished_eval.sh",
+    "continue_20k": "continue_task35_h6_to_20k.sh",
 }
 LOW_RAM_KB = 4 * 1024 * 1024
 
@@ -157,9 +160,17 @@ def pipeline_health(
             alerts.append(f"trainer_count_{trainer['count']}")
         if not present["archiver"] or not present["tail"]:
             alerts.append("archiver_missing")
-        if not present["wait_15000"]:
+        if not present["wait_20000"]:
             alerts.append("eval_waiter_missing")
-        for step, key in ((6000, "wait_6000"), (9000, "wait_9000"), (12000, "wait_12000")):
+        if not present["continue_20k"]:
+            alerts.append("continue_20k_missing")
+        for step, key in (
+            (6000, "wait_6000"),
+            (9000, "wait_9000"),
+            (12000, "wait_12000"),
+            (15000, "wait_15000"),
+            (18000, "wait_18000"),
+        ):
             if not archived[step] and not present[key]:
                 alerts.append(f"waiter_{step}_missing")
         if latest_step is not None:
@@ -167,8 +178,14 @@ def pipeline_health(
                 if int(latest_step) >= int(step) and not archived[step]:
                     alerts.append(f"missing_archive_{step}")
         logs = Path(logs_dir) if logs_dir is not None else checkpoint_stem.parent.parent / "logs"
-        waiter_by_step = {6000: "wait_6000", 9000: "wait_9000", 12000: "wait_12000"}
-        for step in (3000, 6000, 9000, 12000):
+        waiter_by_step = {
+            6000: "wait_6000",
+            9000: "wait_9000",
+            12000: "wait_12000",
+            15000: "wait_15000",
+            18000: "wait_18000",
+        }
+        for step in (3000, 6000, 9000, 12000, 15000, 18000):
             if not archived[step]:
                 continue
             waiter_key = waiter_by_step.get(step)

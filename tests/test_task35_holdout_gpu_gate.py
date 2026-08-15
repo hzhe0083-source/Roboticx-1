@@ -74,6 +74,8 @@ def test_posttrain_holdout_sets_cuda_allocator() -> None:
     ).read_text()
 
 
-def test_15000_is_a_planned_archive_milestone() -> None:
+def test_20000_is_a_planned_archive_milestone() -> None:
     assert 15000 in ARCHIVE_MILESTONES
+    assert 18000 in ARCHIVE_MILESTONES
+    assert 20000 in ARCHIVE_MILESTONES
     assert 4000 not in ARCHIVE_MILESTONES

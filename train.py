@@ -4837,8 +4837,7 @@ def validate_args(args: argparse.Namespace) -> None:
             "--va-attention-backend auto": args.va_attention_backend == "auto",
             "--task-sampling weighted": args.task_sampling == "weighted",
             "--num-workers 0": args.num_workers == 0,
-            "from scratch": args.resume is None
-            and getattr(args, "resume_exact", None) is None,
+            "no ordinary resume": args.resume is None,
             "WAM off": not getattr(args, "wam_joint", False),
         }
         missing = [name for name, enabled in required.items() if not enabled]
@@ -4906,11 +4905,14 @@ def validate_args(args: argparse.Namespace) -> None:
             args.data is not None
             and args.single_task
             and args.task_sampling in {"weighted", "balanced"}
-            and args.dense_readout_mtvj
+            and (
+                args.dense_readout_mtvj
+                or getattr(args, "dino_main_vision", False)
+            )
         ):
             raise ValueError(
                 "--resume-exact currently requires the single-task weighted/balanced "
-                "MT-VJ data path (TaskLocalityWeightedSampler)"
+                "MT-VJ or DINO-main data path (TaskLocalityWeightedSampler)"
             )
         if args.fork_data is not None or args.perturb_data is not None or args.c2_controller:
             raise ValueError(

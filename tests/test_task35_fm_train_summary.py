@@ -78,8 +78,11 @@ def test_pipeline_health_alerts_missing_6k_waiter(tmp_path: Path, monkeypatch) -
             "archive_task35_fm_milestones.sh": True,
             "tail -n 0 -F": True,
             "wait_task35_fm_finished_eval.sh": True,
+            "continue_task35_h6_to_20k.sh": True,
             "wait_validate_task35_fm_milestone.sh 9000": True,
             "wait_validate_task35_fm_milestone.sh 12000": True,
+            "wait_validate_task35_fm_milestone.sh 15000": True,
+            "wait_validate_task35_fm_milestone.sh 18000": True,
         }
         return [{"pid": 1, "cmd": needle}] if present.get(needle) else []
 
@@ -144,8 +147,11 @@ def test_pipeline_health_alerts_missing_validate_after_6k_archive(
             "archive_task35_fm_milestones.sh": True,
             "tail -n 0 -F": True,
             "wait_task35_fm_finished_eval.sh": True,
+            "continue_task35_h6_to_20k.sh": True,
             "wait_validate_task35_fm_milestone.sh 9000": True,
             "wait_validate_task35_fm_milestone.sh 12000": True,
+            "wait_validate_task35_fm_milestone.sh 15000": True,
+            "wait_validate_task35_fm_milestone.sh 18000": True,
         }
         return [{"pid": 1, "cmd": needle}] if present.get(needle) else []
 
@@ -167,9 +173,12 @@ def test_pipeline_health_alerts_missing_validate_after_6k_archive(
             "archive_task35_fm_milestones.sh": True,
             "tail -n 0 -F": True,
             "wait_task35_fm_finished_eval.sh": True,
+            "continue_task35_h6_to_20k.sh": True,
             "wait_validate_task35_fm_milestone.sh 6000": True,
             "wait_validate_task35_fm_milestone.sh 9000": True,
             "wait_validate_task35_fm_milestone.sh 12000": True,
+            "wait_validate_task35_fm_milestone.sh 15000": True,
+            "wait_validate_task35_fm_milestone.sh 18000": True,
         }
         return [{"pid": 1, "cmd": needle}] if present.get(needle) else []
 

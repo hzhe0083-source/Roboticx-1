@@ -67,6 +67,8 @@ def test_closed_loop_complete_ignores_1k_2k_and_requires_acceptance_set() -> Non
             row(9000, "supported"),
             row(12000, "supported"),
             row(15000, "supported"),
+            row(18000, "supported"),
+            row(20000, "supported"),
         ]
     )
     assert not closed_loop_complete(

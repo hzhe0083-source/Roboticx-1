@@ -37,7 +37,7 @@ def test_plan_require_all_accepts_complete_validated_set(tmp_path: Path) -> None
             "step": step,
             "validated": True,
         }
-        for step in (1000, 2000, 3000, 6000, 9000, 12000, 15000)
+        for step in (1000, 2000, 3000, 6000, 9000, 12000, 15000, 18000, 20000)
     ]
     plan = plan_task35_eval_suite(candidates, logs_dir=tmp_path, require_all=True)
     assert [row["step"] for row in plan["to_eval"]] == [
@@ -46,10 +46,12 @@ def test_plan_require_all_accepts_complete_validated_set(tmp_path: Path) -> None
         9000,
         12000,
         15000,
+        18000,
+        20000,
     ]
     assert [row["step"] for row in plan["skipped"]] == [1000, 2000]
     assert plan["eval50_paths"] == []
-    assert len(plan["planned_eval50_paths"]) == 5
+    assert len(plan["planned_eval50_paths"]) == 7
 
 
 def test_plan_require_eval50_refuses_missing_jsons(tmp_path: Path) -> None:
@@ -59,7 +61,7 @@ def test_plan_require_eval50_refuses_missing_jsons(tmp_path: Path) -> None:
             "step": step,
             "validated": True,
         }
-        for step in (1000, 2000, 3000, 6000, 9000, 12000, 15000)
+        for step in (1000, 2000, 3000, 6000, 9000, 12000, 15000, 18000, 20000)
     ]
     with pytest.raises(ValueError, match="missing valid 50-seed eval50"):
         plan_task35_eval_suite(

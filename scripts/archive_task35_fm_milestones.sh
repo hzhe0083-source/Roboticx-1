@@ -9,7 +9,7 @@ shift 2
 if (( $# > 0 )); then
   STEPS=("$@")
 else
-  STEPS=(1000 2000 3000 6000 9000 12000 15000)
+  STEPS=(1000 2000 3000 6000 9000 12000 15000 18000 20000)
 fi
 [[ -f "$LOG" ]] || { echo "missing log: $LOG" >&2; exit 1; }
 mkdir -p "$(dirname "$CKPT")" logs
@@ -162,12 +162,12 @@ while true; do
     echo "log follower died before all milestones were archived" >&2
     exit 4
   fi
-  if ! "$PY" -B scripts/task35_proc.py --check trainer >/dev/null; then
+  if ! "$PY" -B scripts/task35_proc.py --check pipeline >/dev/null; then
     if all_done; then
-      echo "trainer gone; all requested milestones already archived" >&2
+      echo "pipeline gone; all requested milestones already archived" >&2
       exit 0
     fi
-    echo "trainer gone before all milestones were archived" >&2
+    echo "pipeline gone before all milestones were archived" >&2
     exit 4
   fi
 done

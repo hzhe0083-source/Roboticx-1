@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""CPU-only readiness check for the remaining FM 15k + 50-seed path.
+"""CPU-only readiness check for the remaining FM 20k + 50-seed path.
 
 This never starts eval and never claims closed-loop success.
 """
@@ -34,9 +34,19 @@ WAITER_NEEDLES = (
     "wait_validate_task35_fm_milestone.sh 6000",
     "wait_validate_task35_fm_milestone.sh 9000",
     "wait_validate_task35_fm_milestone.sh 12000",
+    "wait_validate_task35_fm_milestone.sh 15000",
+    "wait_validate_task35_fm_milestone.sh 18000",
     "wait_task35_fm_finished_eval.sh",
+    "continue_task35_h6_to_20k.sh",
     "tail -n 0 -F",
 )
+STEP_WAITERS = {
+    "wait_validate_task35_fm_milestone.sh 6000": 6000,
+    "wait_validate_task35_fm_milestone.sh 9000": 9000,
+    "wait_validate_task35_fm_milestone.sh 12000": 12000,
+    "wait_validate_task35_fm_milestone.sh 15000": 15000,
+    "wait_validate_task35_fm_milestone.sh 18000": 18000,
+}
 
 
 def _cmdlines() -> list[str]:
@@ -68,9 +78,17 @@ def main() -> None:
     checks = {
         "trainer exclusive": len(trainers) == 1 and "direct-head" not in trainers[0]["cmd"],
         "save-every 1000": "--save-every 1000" in (trainers[0]["cmd"] if trainers else ""),
-        "steps 15000": "--steps 15000" in (trainers[0]["cmd"] if trainers else ""),
-        "15000 is archive milestone": 15000 in ARCHIVE_MILESTONES,
-        "acceptance set is 3k+": REQUIRED_MILESTONES == (3000, 6000, 9000, 12000, 15000),
+        "steps 15000 or exact-resume 5000": (
+            "--steps 15000" in (trainers[0]["cmd"] if trainers else "")
+            or (
+                "--resume-exact" in (trainers[0]["cmd"] if trainers else "")
+                and "--steps 5000" in (trainers[0]["cmd"] if trainers else "")
+            )
+            or "--steps 20000" in (trainers[0]["cmd"] if trainers else "")
+        ),
+        "20000 is archive milestone": 20000 in ARCHIVE_MILESTONES,
+        "acceptance set is 3k+": REQUIRED_MILESTONES
+        == (3000, 6000, 9000, 12000, 15000, 18000, 20000),
         "1k/2k skipped": SKIP_CLOSED_LOOP_STEPS == (1000, 2000),
         "features exist": FEATURES.is_file(),
         "ROI exist": ROI.is_file(),
@@ -81,8 +99,19 @@ def main() -> None:
         ),
         "no eval job": not any("eval_metaworld.py" in cmd for cmd in cmds),
     }
+    archived = {
+        step: (
+            Path(f"{STEM}_step{step}.pt").is_file()
+            and Path(f"{STEM}_step{step}.pt.sha256").is_file()
+        )
+        for step in ARCHIVE_MILESTONES
+    }
     for needle in WAITER_NEEDLES:
-        checks[f"waiter {needle}"] = any(needle in cmd for cmd in cmds)
+        step = STEP_WAITERS.get(needle)
+        if step is not None and archived.get(step):
+            checks[f"waiter {needle}"] = True
+        else:
+            checks[f"waiter {needle}"] = any(needle in cmd for cmd in cmds)
     import torch
 
     features = torch.load(FEATURES, map_location="cpu", weights_only=True)
@@ -91,10 +120,6 @@ def main() -> None:
         selected, load_metaworld_description_to_env()
     )
     checks["task35 maps to peg-insert-side-v3"] = env_name == "peg-insert-side-v3"
-    archived = {
-        step: (Path(f"{STEM}_step{step}.pt").is_file() and Path(f"{STEM}_step{step}.pt.sha256").is_file())
-        for step in ARCHIVE_MILESTONES
-    }
     payload = {
         "contract": "task35_readiness_v1",
         "ok": all(checks.values()),

@@ -13,6 +13,7 @@ from pathlib import Path
 
 TRAINER_NEEDLE = "train.py --task35-precision-contract"
 TRAINER_MARKERS = ("python", "train.py")
+CONTINUE_20K_NEEDLE = "continue_task35_h6_to_20k.sh"
 INSPECTOR_MARKERS = (
     "pgrep",
     "python3 - <<",
@@ -69,11 +70,20 @@ def trainer_alive() -> bool:
     return bool(trainer_processes())
 
 
+def continue_20k_processes() -> list[dict]:
+    return find_processes(CONTINUE_20K_NEEDLE)
+
+
+def pipeline_alive() -> bool:
+    """True while the 15k trainer or the 15k→20k exact-resume handoff is live."""
+    return trainer_alive() or bool(continue_20k_processes())
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--check",
-        choices=("trainer",),
+        choices=("trainer", "pipeline", "continue"),
         default="trainer",
         help="process class to test",
     )
@@ -84,10 +94,15 @@ def main() -> int:
     args = parse_args()
     if args.check == "trainer":
         rows = trainer_processes()
-        for row in rows:
-            print(f"{row['pid']}\t{row['cmd'][:200]}")
-        return 0 if rows else 1
-    raise SystemExit(f"unknown check {args.check}")
+    elif args.check == "continue":
+        rows = continue_20k_processes()
+    elif args.check == "pipeline":
+        rows = trainer_processes() + continue_20k_processes()
+    else:
+        raise SystemExit(f"unknown check {args.check}")
+    for row in rows:
+        print(f"{row['pid']}\t{row['cmd'][:200]}")
+    return 0 if rows else 1
 
 
 if __name__ == "__main__":

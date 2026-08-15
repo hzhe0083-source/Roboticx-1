@@ -14,7 +14,7 @@ STEP_RE = re.compile(
 )
 AUX_RE = re.compile(r"aux_rmse=(?P<rmse>[-+]?(?:\d+\.?\d*|\d*\.\d+)(?:[eE][-+]?\d+)?)px")
 SAVE_RE = re.compile(r"global_step=(?P<step>\d+)\s+periodic checkpoint saved")
-ARCHIVE_MILESTONES = (1000, 2000, 3000, 6000, 9000, 12000, 15000)
+ARCHIVE_MILESTONES = (1000, 2000, 3000, 6000, 9000, 12000, 15000, 18000, 20000)
 
 
 def parse_float(text: str) -> float:
@@ -37,7 +37,7 @@ def window_stats(values: list[float]) -> dict | None:
 def summarize_task35_fm_log(
     text: str,
     *,
-    total_steps: int = 15000,
+    total_steps: int = 20000,
     window: int = 1000,
     checkpoint_stem: Path | None = None,
 ) -> dict:
@@ -122,7 +122,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=root / "logs" / "task35_fm_train_summary.json",
     )
-    parser.add_argument("--total-steps", type=int, default=15000)
+    parser.add_argument("--total-steps", type=int, default=20000)
     parser.add_argument("--window", type=int, default=1000)
     return parser.parse_args()
 

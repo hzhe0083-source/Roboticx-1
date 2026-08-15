@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 ARM=${1:?usage: $0 fm [steps] [batch] [run_tag]}
-STEPS=${2:-15000}
+STEPS=${2:-20000}
 BATCH=${3:-6}
 RUN_TAG=${4:-${STEPS}}
 case "$ARM" in
