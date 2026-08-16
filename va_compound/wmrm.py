@@ -173,10 +173,8 @@ class WAM4VA(nn.Module):
             nn.init.zeros_(self.dino_pred.weight)
             nn.init.zeros_(self.dino_pred.bias)
             self.token_readout = nn.Linear(dino_dim, world_dim)
-            self.map_reduce = nn.Conv2d(dino_dim, map_channels, kernel_size=1)
-            self.map_mix = nn.Conv2d(map_channels, map_channels, kernel_size=3, padding=1)
-            self.map_fuse = nn.Conv2d(map_frames * map_channels, map_channels, kernel_size=3, padding=1)
-            self.map_out = nn.Conv2d(map_channels, map_channels, kernel_size=1)
+            # Spatial compressor is parameter-free avg-pool. Only the residual
+            # 1x1 on the 18x18 map is trained.
             self.map_pred = nn.Conv2d(map_channels, map_channels, kernel_size=1)
             nn.init.zeros_(self.map_pred.weight)
             nn.init.zeros_(self.map_pred.bias)
@@ -189,10 +187,6 @@ class WAM4VA(nn.Module):
             self.cond_to_dino = None
             self.dino_pred = None
             self.token_readout = None
-            self.map_reduce = None
-            self.map_mix = None
-            self.map_fuse = None
-            self.map_out = None
             self.map_pred = None
             self.cond_to_map = None
             self.map_readout = None
@@ -296,9 +290,9 @@ class WAM4VA(nn.Module):
         return fused_sum / max(n_spans, 1), z_spans, progress, belief_pool
 
     def encode_dino_map(self, dino_tokens: Tensor) -> Tensor | None:
-        """CNN: frame-major DINO patches → [B, C, map_size, map_size]."""
+        """Untrained avg-pool: frame-major DINO patches → [B, C, map_size, map_size]."""
         if (
-            self.map_reduce is None
+            self.dino_dim is None
             or dino_tokens.ndim != 3
             or dino_tokens.shape[1] != self.map_frames * self.map_grid * self.map_grid
             or dino_tokens.shape[-1] != self.dino_dim
@@ -306,18 +300,20 @@ class WAM4VA(nn.Module):
             return None
         batch = dino_tokens.shape[0]
         frames, grid, dim = self.map_frames, self.map_grid, self.dino_dim
-        patches = dino_tokens.to(dtype=self.map_reduce.weight.dtype)
-        spatial = patches.view(batch, frames, grid, grid, dim).permute(0, 1, 4, 2, 3)
-        reduced = self.map_reduce(spatial.reshape(batch * frames, dim, grid, grid))
-        mixed = F.gelu(self.map_mix(reduced))
-        fused = self.map_fuse(mixed.view(batch, frames * self.map_channels, grid, grid))
-        sized = F.interpolate(
-            F.gelu(fused),
-            size=(self.map_size, self.map_size),
-            mode="bilinear",
-            align_corners=False,
+        spatial = dino_tokens.view(batch, frames, grid, grid, dim).mean(dim=1)
+        pooled = F.adaptive_avg_pool2d(
+            spatial.permute(0, 3, 1, 2),
+            (self.map_size, self.map_size),
         )
-        return self.map_out(sized)
+        channels = self.map_channels
+        if dim == channels:
+            return pooled
+        if dim % channels == 0:
+            return pooled.view(batch, channels, dim // channels, self.map_size, self.map_size).mean(dim=2)
+        flat = pooled.flatten(2).transpose(1, 2)
+        return F.adaptive_avg_pool1d(flat, channels).transpose(1, 2).view(
+            batch, channels, self.map_size, self.map_size
+        )
 
     def predict_world(
         self,

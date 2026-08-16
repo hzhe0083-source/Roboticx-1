@@ -4247,7 +4247,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=18,
         dest="wmrm_map_size",
-        help="CNN 把 DINO patch 卷成 map_size×map_size 再预测（默认 18）",
+        help="无参平均池化把 DINO patch 压成 map_size×map_size 再预测（默认 18）",
     )
     parser.add_argument(
         "--wmrm-map-channels",

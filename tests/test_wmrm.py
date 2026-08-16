@@ -354,7 +354,7 @@ def test_dino_target_is_raw_tokens() -> None:
     assert got.shape == (2, 11, model.config.vision_dim)
 
 
-def test_dino_map_cnn_is_18x18_and_zero_init_copies() -> None:
+def test_dino_map_avgpool_is_18x18_and_zero_init_copies() -> None:
     block = WorldMediatedResidualModulation(
         32,
         world_dim=8,
