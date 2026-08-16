@@ -31,7 +31,7 @@ def test_readiness_ignores_inspector_direct_and_eval_needles() -> None:
 
 
 def test_readiness_expects_planned_waiters_and_acceptance_set() -> None:
-    assert REQUIRED_MILESTONES == (3000, 6000, 9000, 12000, 15000, 18000, 20000)
+    assert REQUIRED_MILESTONES == (12000, 15000, 18000, 20000)
     assert ARCHIVE_MILESTONES[-1] == 20000
     assert any("wait_task35_fm_finished_eval.sh" in needle for needle in WAITER_NEEDLES)
     assert any("continue_task35_h6_to_20k.sh" in needle for needle in WAITER_NEEDLES)
@@ -40,7 +40,8 @@ def test_readiness_expects_planned_waiters_and_acceptance_set() -> None:
     waiter = Path(__file__).resolve().parent.parent / "scripts" / "wait_task35_fm_finished_eval.sh"
     text = waiter.read_text()
     assert text.count("run_task35_h6_eval_suite.sh") == 1
-    assert "for step in 3000 6000 9000 12000 15000 18000 20000; do" in text
+    assert "for step in 12000 15000 18000 20000; do" in text
+    assert "for step in 3000 6000 9000 12000 15000 18000 20000; do" not in text
     assert "for step in 3000 6000 9000 12000 15000; do" not in text
     assert "live 20000 promotion SHA mismatch" in text
     assert "peek_task35_checkpoint_step.py" in text

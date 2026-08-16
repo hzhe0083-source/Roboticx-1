@@ -101,7 +101,7 @@ def test_selector_ranks_by_closed_loop_successes() -> None:
         [
             {
                 "path": "a.pt",
-                "step": 6000,
+                "step": 12000,
                 "sha256": "abc",
                 "validated": True,
                 "eval50": _payload(successes=8),
@@ -202,6 +202,32 @@ def test_selector_rejects_1k_2k_even_with_eval50() -> None:
                     "step": 2000,
                     "validated": True,
                     "eval50": _payload(successes=39),
+                },
+            ]
+        )
+
+
+def test_selector_rejects_3k_6k_9k_even_with_eval50() -> None:
+    with pytest.raises(ValueError, match="no reproducible FM VA"):
+        select_best_task35_fm(
+            [
+                {
+                    "path": "checkpoints/x_step3000.pt",
+                    "step": 3000,
+                    "validated": True,
+                    "eval50": _payload(successes=40),
+                },
+                {
+                    "path": "checkpoints/x_step6000.pt",
+                    "step": 6000,
+                    "validated": True,
+                    "eval50": _payload(successes=39),
+                },
+                {
+                    "path": "checkpoints/x_step9000.pt",
+                    "step": 9000,
+                    "validated": True,
+                    "eval50": _payload(successes=38),
                 },
             ]
         )

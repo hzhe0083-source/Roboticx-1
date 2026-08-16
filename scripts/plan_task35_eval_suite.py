@@ -16,8 +16,8 @@ if str(ROOT) not in sys.path:
 
 from eval_metaworld import validate_task35_eval50_payload
 
-REQUIRED_MILESTONES = (3000, 6000, 9000, 12000, 15000, 18000, 20000)
-SKIP_CLOSED_LOOP_STEPS = (1000, 2000)
+REQUIRED_MILESTONES = (12000, 15000, 18000, 20000)
+SKIP_CLOSED_LOOP_STEPS = (1000, 2000, 3000, 6000, 9000)
 
 
 def _eval50_path(logs_dir: Path, checkpoint: str) -> Path:

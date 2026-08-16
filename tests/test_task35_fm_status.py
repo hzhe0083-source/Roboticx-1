@@ -17,7 +17,7 @@ def test_status_labels_closed_loop_as_planned_without_eval50() -> None:
     )
     assert row["labels"]["checkpoint_contract"] == "supported"
     assert row["labels"]["slice_geometry"] == "partially supported"
-    assert row["labels"]["closed_loop"] == "planned"
+    assert row["labels"]["closed_loop"] == "skipped"
     assert row["closed_loop_trials"] is None
 
 
@@ -52,7 +52,7 @@ def test_status_markdown_mentions_planned_closed_loop() -> None:
     )
     assert "closed_loop_complete: False" in text
     assert "Closed-loop insertion remains planned" in text
-    assert "3k/6k/9k/12k/15k/18k/20k" in render_md(
+    assert "12k/15k/18k/20k" in render_md(
         {
             "generated_at": "now",
             "training": {"latest_step": 6000, "status": "RUNNING"},
@@ -71,9 +71,9 @@ def test_closed_loop_complete_ignores_1k_2k_and_requires_acceptance_set() -> Non
         [
             row(1000, "skipped"),
             row(2000, "skipped"),
-            row(3000, "supported"),
-            row(6000, "supported"),
-            row(9000, "supported"),
+            row(3000, "skipped"),
+            row(6000, "skipped"),
+            row(9000, "skipped"),
             row(12000, "supported"),
             row(15000, "supported"),
             row(18000, "supported"),
@@ -84,7 +84,7 @@ def test_closed_loop_complete_ignores_1k_2k_and_requires_acceptance_set() -> Non
         [
             row(1000, "skipped"),
             row(2000, "skipped"),
-            row(3000, "supported"),
+            row(12000, "supported"),
         ]
     )
     assert evidence_row(

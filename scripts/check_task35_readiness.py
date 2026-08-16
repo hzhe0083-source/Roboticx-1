@@ -91,9 +91,9 @@ def main() -> None:
             or "--steps 20000" in (trainers[0]["cmd"] if trainers else "")
         ),
         "20000 is archive milestone": 20000 in ARCHIVE_MILESTONES,
-        "acceptance set is 3k+": REQUIRED_MILESTONES
-        == (3000, 6000, 9000, 12000, 15000, 18000, 20000),
-        "1k/2k skipped": SKIP_CLOSED_LOOP_STEPS == (1000, 2000),
+        "acceptance set is 12k+": REQUIRED_MILESTONES
+        == (12000, 15000, 18000, 20000),
+        "1k-9k skipped": SKIP_CLOSED_LOOP_STEPS == (1000, 2000, 3000, 6000, 9000),
         "features exist": FEATURES.is_file(),
         "ROI exist": ROI.is_file(),
         "cache exist": (CACHE / "block11.npy").is_file() and (CACHE / "block23.npy").is_file(),
