@@ -9,6 +9,7 @@ from va_compound.model import VACompoundConfig, VACompoundPolicy
 from va_compound.wmrm import (
     WorldMediatedResidualModulation,
     action_dependency_scores,
+    matched_no_fixed_point_perm,
     wmrm_world_loss,
 )
 
@@ -159,12 +160,24 @@ def test_shared_eye_is_pre_va_projection() -> None:
     vision, proprio, previous, language, mask = _inputs(model.config)
     with torch.no_grad():
         projected = model.vision_projection(vision)
+        eye = model.project_shared_eye(vision)
+        torch.testing.assert_close(eye, projected)
         model.encode_condition(
             vision, proprio, previous, language_hidden=language, language_mask=mask
         )
+        evidence_a = model.last_wmrm.evidence.clone()
+        model.encode_condition(
+            vision + 1e-3,
+            proprio,
+            previous,
+            language_hidden=language,
+            language_mask=mask,
+        )
+        evidence_b = model.last_wmrm.evidence.clone()
     assert model.last_wmrm is not None
     # evidence is read from shared DINO/projection, not post-VA mixed vision
     assert model.last_wmrm.evidence.shape[0] == 2
+    assert not torch.allclose(evidence_a, evidence_b)
 
 
 def test_cli_mutex_direct_head() -> None:
@@ -246,7 +259,9 @@ def test_supervised_z_hat_is_broadcast_to_horizon() -> None:
 
 
 def test_span_ids_cover_horizon_when_not_divisible() -> None:
-    block = WorldMediatedResidualModulation(32, world_dim=8, rank=4, proprio_dim=9, n_spans=3)
+    block = WorldMediatedResidualModulation(
+        32, world_dim=8, rank=4, proprio_dim=9, n_spans=3, cycle_steps=8
+    )
     ids = block._span_ids(8, torch.device("cpu"))
     assert ids.tolist() == [0, 0, 0, 1, 1, 1, 2, 2]
     action = torch.randn(1, 8, 32)
@@ -284,3 +299,156 @@ def test_source_gates_and_span_heads_exist() -> None:
     assert block.source_gates.shape == (3,)
     assert len(block.span_heads) == 3
     assert block.ca_belief is not block.ca_geo
+
+
+def test_fm_condition_hinge_has_gate_grad_at_zero_init() -> None:
+    torch.manual_seed(0)
+    block = WorldMediatedResidualModulation(32, world_dim=8, rank=4, proprio_dim=9)
+    torch.testing.assert_close(
+        block.gate_proj.weight, torch.zeros_like(block.gate_proj.weight)
+    )
+    torch.testing.assert_close(
+        block.gate_proj.bias, torch.zeros_like(block.gate_proj.bias)
+    )
+    action = torch.randn(3, 5, 32)
+    vision = torch.randn(3, 6, 32)
+    proprio = torch.randn(3, 9)
+    norm = torch.nn.LayerNorm(32)
+    _, aux, _, _ = block(action, vision, proprio)
+    hinge = block.fm_condition_hinge(action, aux, norm, margin=0.05)
+    hinge.backward()
+    assert block.gate_proj.weight.grad is not None
+    assert float(block.gate_proj.weight.grad.norm()) > 0
+    assert float(hinge.item()) == pytest.approx(0.05)
+
+
+def test_fm_condition_hinge_disables_dropout() -> None:
+    torch.manual_seed(1)
+    block = WorldMediatedResidualModulation(
+        32, world_dim=8, rank=4, proprio_dim=9, mixer_dropout=0.9
+    )
+    block.train()
+    action = torch.randn(3, 5, 32)
+    vision = torch.randn(3, 6, 32)
+    proprio = torch.randn(3, 9)
+    norm = torch.nn.LayerNorm(32)
+    with torch.no_grad():
+        _, aux, _, _ = block(action, vision, proprio)
+        values = []
+        for _ in range(5):
+            torch.manual_seed(11)
+            values.append(block.fm_condition_hinge(action, aux, norm, margin=0.05))
+    stacked = torch.stack(values)
+    torch.testing.assert_close(stacked, stacked[:1].expand_as(stacked), rtol=0.0, atol=0.0)
+
+
+def test_dino_target_uses_project_shared_eye() -> None:
+    from train import wmrm_next_feature_target
+
+    model = VACompoundPolicy(_tiny_config(wmrm=True)).eval()
+    batch = {
+        "vision_tokens": torch.randn(2, 3, 11, model.config.vision_dim),
+    }
+    with torch.no_grad():
+        got = wmrm_next_feature_target(model, batch, 0)
+        expected = model.project_shared_eye(batch["vision_tokens"][:, 1]).mean(1)
+    torch.testing.assert_close(got, expected)
+
+
+def test_predict_world_ignores_action_tail() -> None:
+    torch.manual_seed(4)
+    block = WorldMediatedResidualModulation(
+        32, world_dim=8, rank=4, proprio_dim=9, cycle_steps=6
+    )
+    block.eval()
+    action = torch.randn(2, 12, 32)
+    proprio = torch.randn(2, 9)
+    belief = torch.randn(2, 8, 32)
+    task = torch.randn(2, 32)
+    with torch.no_grad():
+        z1, _, _ = block.predict_world(action, proprio, belief, task)
+        action2 = action.clone()
+        action2[:, 6:] += 10
+        z2, _, _ = block.predict_world(action2, proprio, belief, task)
+        action3 = action.clone()
+        action3[:, :6] += 1
+        z3, _, _ = block.predict_world(action3, proprio, belief, task)
+    torch.testing.assert_close(z1, z2)
+    assert not torch.allclose(z1, z3)
+
+
+def test_action_dep_hinge_zero_WA_has_grad() -> None:
+    torch.manual_seed(2)
+    block = WorldMediatedResidualModulation(
+        32, world_dim=8, rank=4, proprio_dim=9, cycle_steps=6
+    )
+    torch.nn.init.zeros_(block.world_from_action.weight)
+    torch.nn.init.zeros_(block.world_from_action.bias)
+    action = torch.randn(4, 8, 32)
+    proprio = torch.randn(4, 9)
+    belief = torch.randn(4, 8, 32)
+    task = torch.randn(4, 32)
+    z_hat, _, _ = block.predict_world(action, proprio, belief, task)
+    used = min(block.cycle_steps, action.shape[1])
+    action_shuf = action.clone()
+    perm = torch.randperm(action.shape[0])
+    action_shuf[:, :used] = action[perm, :used]
+    z_shuf, _, _ = block.predict_world(action_shuf, proprio, belief, task)
+    target = torch.randn_like(z_hat)
+    loss = block.action_dep_hinge(z_hat, z_shuf, target)
+    loss.backward()
+    assert block.world_from_action.weight.grad is not None
+    assert float(block.world_from_action.weight.grad.norm()) > 0
+
+
+def test_cli_mutex_vjepa_target_on_dino(tmp_path) -> None:
+    from train import parse_args, validate_args
+
+    data = tmp_path / "windows.pt"
+    ckpt = tmp_path / "dino.pt"
+    data.write_bytes(b"x")
+    ckpt.write_bytes(b"x")
+    args = parse_args(
+        [
+            "--wmrm",
+            "--dino-main-vision",
+            "--wmrm-target",
+            "vjepa",
+            "--data",
+            str(data),
+            "--main-vision-checkpoint",
+            str(ckpt),
+        ]
+    )
+    with pytest.raises(ValueError, match="vjepa"):
+        validate_args(args)
+
+
+def test_matched_no_fixed_point_perm_same_task() -> None:
+    task_id = torch.tensor([0, 0, 1, 1])
+    eye = torch.tensor([[0.0], [0.1], [10.0], [10.2]])
+    proprio = torch.zeros(4, 2)
+    perm = matched_no_fixed_point_perm(task_id, eye, proprio)
+    assert perm.tolist() == [1, 0, 3, 2]
+    assert (perm != torch.arange(4)).all()
+    assert task_id[perm].eq(task_id).all()
+    # Clustered B=3 must still be a derangement, not many-to-one nearest neighbor.
+    eye3 = torch.tensor([[0.0], [0.1], [0.11]])
+    perm3 = matched_no_fixed_point_perm(None, eye3, torch.zeros(3, 2))
+    assert sorted(perm3.tolist()) == [0, 1, 2]
+    assert (perm3 != torch.arange(3)).all()
+
+
+def test_wmrm_target_vjepa_rejected_on_dino_config() -> None:
+    with pytest.raises(ValueError, match="vjepa"):
+        _tiny_config(
+            wmrm=True,
+            wmrm_target="vjepa",
+            main_vision_backbone="dinov2_vitl14_reg4",
+            main_vision_model_id="vit_large_patch14_reg4_dinov2.lvd142m",
+            main_vision_image_size=224,
+            main_vision_dim=1024,
+            main_vision_grid=8,
+            main_vision_frames=4,
+            main_vision_tokens=256,
+        )

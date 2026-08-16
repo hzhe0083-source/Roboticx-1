@@ -31,6 +31,47 @@ if [[ ! -f "$DATA" ]]; then
 fi
 [[ ! -e "$SAVE" ]] || { echo "refusing to overwrite $SAVE" >&2; exit 1; }
 
+if [[ -f "$DATA" ]]; then
+  "$PY" - "$DATA" <<'PY'
+import sys
+import torch
+
+path = sys.argv[1]
+payload = torch.load(path, map_location="cpu", weights_only=True)
+md = payload.get("metadata") or {}
+errors = []
+if md.get("control_stride") != 6:
+    errors.append(f"metadata.control_stride={md.get('control_stride')!r} != 6")
+if md.get("action_horizon") != 48:
+    errors.append(f"metadata.action_horizon={md.get('action_horizon')!r} != 48")
+actions = payload["actions"]
+if int(actions.shape[-2]) != 48:
+    errors.append(f"actions chunk dim={actions.shape[-2]} != 48 (shape={tuple(actions.shape)})")
+seq = md.get("sequence_length")
+time_dim = int(actions.shape[1]) if seq is None else int(seq)
+if seq is not None and int(actions.shape[1]) != int(seq):
+    errors.append(
+        f"metadata.sequence_length={seq} != actions.shape[1]={int(actions.shape[1])}"
+    )
+if time_dim != 4:
+    errors.append(
+        f"actions time dim / sequence_length={time_dim} != 4 "
+        f"(actions.shape={tuple(actions.shape)})"
+    )
+ids = md.get("subset_task_ids")
+got = {int(x) for x in (ids or [])}
+if got != {0, 16}:
+    errors.append(f"metadata.subset_task_ids={ids!r} != {{0, 16}}")
+if errors:
+    raise SystemExit("WAM4VA data contract failed:\n  " + "\n  ".join(errors))
+print(
+    f"data contract ok: control_stride={md.get('control_stride')} "
+    f"action_horizon={md.get('action_horizon')} T={time_dim} "
+    f"subset_task_ids={sorted(got)}"
+)
+PY
+fi
+
 mkdir -p checkpoints logs
 set -o pipefail
 PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 \
@@ -44,6 +85,7 @@ PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 \
   --main-vision-encode-batch 8 \
   --metric-geometry-inject \
   --wam4va --wmrm-inject last --wmrm-target dino \
+  --wmrm-cycle-steps 6 \
   --single-task --task-sampling weighted --task-locality-block-batches 16 \
   --batch-size "$BATCH" --sequence-length 4 --min-sequence-length 4 \
   --num-workers 0 \

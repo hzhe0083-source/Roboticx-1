@@ -82,6 +82,7 @@ class WAM4VA(nn.Module):
         n_spans: int = 3,
         n_progress: int = 4,
         n_task_queries: int = 4,
+        cycle_steps: int = 6,
     ) -> None:
         super().__init__()
         if hidden_dim < 1:
@@ -98,6 +99,8 @@ class WAM4VA(nn.Module):
             raise ValueError("belief/evidence/span/progress sizes must be positive")
         if n_task_queries < 1:
             raise ValueError("n_task_queries must be positive")
+        if cycle_steps < 1:
+            raise ValueError("cycle_steps must be positive")
         self.hidden_dim = hidden_dim
         self.world_dim = world_dim
         self.rank = rank
@@ -108,6 +111,7 @@ class WAM4VA(nn.Module):
         self.n_spans = n_spans
         self.n_progress = n_progress
         self.n_task_queries = n_task_queries
+        self.cycle_steps = cycle_steps
 
         self.belief_tokens = nn.Parameter(torch.zeros(n_belief, hidden_dim))
         self.evidence_queries = nn.Parameter(torch.empty(n_evidence, hidden_dim))
@@ -174,6 +178,8 @@ class WAM4VA(nn.Module):
         ) // max(horizon, 1)
 
     def _segment_means(self, action: Tensor) -> list[Tensor]:
+        used = min(self.cycle_steps, action.shape[1])
+        action = action[:, :used]
         horizon = action.shape[1]
         ids = self._span_ids(horizon, action.device)
         spans = []
@@ -217,7 +223,11 @@ class WAM4VA(nn.Module):
         belief: Tensor,
         task_summary: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        """ẑ from (A,s,B,L) only. Used for matched action-shuffle probes."""
+        """ẑ from (A,s,B,L) only. Used for matched action-shuffle probes.
+
+        World heads see only the first ``min(cycle_steps, horizon)`` action
+        slots. Tail tokens after the executed cycle do not enter world heads.
+        """
         state = proprio.to(dtype=action.dtype)
         belief_pool = belief.mean(dim=1)
         task_cond = self.world_from_task(task_summary)
@@ -244,6 +254,8 @@ class WAM4VA(nn.Module):
         belief: Tensor,
         proprio: Tensor,
         progress: Tensor,
+        *,
+        apply_dropout: bool | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Return (mixed, gate, pi) using only supervised z_hat in the geo source."""
         horizon = action.shape[1]
@@ -273,7 +285,12 @@ class WAM4VA(nn.Module):
             self.basis(context).view(action.shape[0], horizon, self.rank, hidden),
             dim=-1,
         )
-        pi = self._pi(self._z_per_step(z_hat, horizon), action, task_summary)
+        pi = self._pi(
+            self._z_per_step(z_hat, horizon),
+            action,
+            task_summary,
+            apply_dropout=apply_dropout,
+        )
         mixed = (pi.unsqueeze(-1) * bases).sum(dim=2) + sourced
         gate = torch.tanh(self.gate_proj(z_hat))
         return mixed, gate, pi
@@ -286,29 +303,35 @@ class WAM4VA(nn.Module):
         *,
         margin: float = 0.05,
     ) -> Tensor:
-        """ReLU(m - ||LN(A+qM(z)) - LN(A+qM(z_shuf))||). Forces z into FM input."""
+        """Forces z into FM input; signed shift so q=0 has nonzero gate_proj grad."""
         perm = torch.randperm(aux.z_hat.shape[0], device=aux.z_hat.device)
+        z = aux.z_hat
+        z_shuf = aux.z_hat[perm]
         mixed, gate, _ = self.mixed_residual(
             action,
-            aux.z_hat,
+            z,
             aux.task_summary,
             aux.evidence,
             aux.belief,
             aux.proprio,
             aux.progress,
+            apply_dropout=False,
         )
         mixed_alt, gate_alt, _ = self.mixed_residual(
             action,
-            aux.z_hat[perm],
+            z_shuf,
             aux.task_summary,
             aux.evidence,
             aux.belief,
             aux.proprio,
             aux.progress,
+            apply_dropout=False,
         )
         cond = action_norm(action + gate.unsqueeze(-1) * mixed)
         cond_alt = action_norm(action + gate_alt.unsqueeze(-1) * mixed_alt)
-        shift = (cond - cond_alt).flatten(1).norm(dim=-1).mean()
+        delta_m = (mixed - mixed_alt).flatten(1)
+        d_m = (delta_m / (delta_m.norm(dim=-1, keepdim=True) + 1e-6)).detach()
+        shift = ((cond - cond_alt).flatten(1) * d_m).sum(dim=-1).mean()
         return torch.relu(cond.new_tensor(margin) - shift)
 
     def action_dep_hinge(
@@ -431,6 +454,69 @@ class WAM4VA(nn.Module):
 
 
 WorldMediatedResidualModulation = WAM4VA
+
+
+def matched_no_fixed_point_perm(
+    task_id: Tensor | None,
+    eye_mean: Tensor,
+    proprio: Tensor,
+) -> Tensor:
+    """Same-task nearest assignment: a derangement when B>=2.
+
+    Nearest-neighbor alone can map many rows onto one donor. This returns a
+    bijection with no fixed points, preferring low distance and same task.
+    """
+    if eye_mean.shape[0] != proprio.shape[0]:
+        raise ValueError("eye_mean and proprio batch sizes must match")
+    batch = int(eye_mean.shape[0])
+    device = eye_mean.device
+    if batch <= 1:
+        return torch.arange(batch, device=device, dtype=torch.long)
+    if task_id is not None and int(task_id.shape[0]) != batch:
+        raise ValueError("task_id batch size must match eye_mean")
+
+    eye_flat = eye_mean.reshape(batch, -1).to(dtype=torch.float32)
+    prop_flat = proprio.reshape(batch, -1).to(dtype=torch.float32)
+    feat = torch.cat(
+        (F.normalize(eye_flat, dim=-1), F.normalize(prop_flat, dim=-1)),
+        dim=-1,
+    )
+    cost = torch.cdist(feat, feat)
+    finite = cost.isfinite()
+    span = (
+        float(cost[finite].max().item() - cost[finite].min().item() + 1.0)
+        if bool(finite.any())
+        else 1.0
+    )
+    if task_id is not None:
+        same = task_id.reshape(batch, 1) == task_id.reshape(1, batch)
+        cost = cost + (~same).to(dtype=cost.dtype) * (10.0 * span)
+    cost.fill_diagonal_(float("inf"))
+
+    remaining = set(range(batch))
+    perm = [-1] * batch
+    # Most constrained rows first so isolated same-task pairs keep their partner.
+    n_finite = cost.isfinite().sum(dim=-1)
+    for index in torch.argsort(n_finite).tolist():
+        row = cost[index].clone()
+        for taken in range(batch):
+            if taken not in remaining:
+                row[taken] = float("inf")
+        partner = int(row.argmin().item())
+        if not torch.isfinite(row[partner]):
+            continue
+        perm[index] = partner
+        remaining.remove(partner)
+    leftover = list(remaining)
+    for index, partner in enumerate(perm):
+        if partner < 0:
+            perm[index] = leftover.pop(0)
+    for index, partner in enumerate(perm):
+        if partner != index:
+            continue
+        swap = 0 if index != 0 else 1
+        perm[index], perm[swap] = perm[swap], perm[index]
+    return torch.tensor(perm, device=device, dtype=torch.long)
 
 
 def wmrm_world_loss(z_hat: Tensor, z_future: Tensor) -> Tensor:
