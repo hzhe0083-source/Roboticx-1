@@ -93,6 +93,8 @@ class VACompoundConfig:
     # last = 单点末端调制（诚实默认）；all = 每层后握手；even = 奇数层。
     wmrm_inject: str = "last"
     wmrm_mixer_dropout: float = 0.3
+    # dino: 预测下一决策 DINO/投影 feature；vjepa: 下一决策 H11 池化；metric: 旧几何。
+    wmrm_target: str = "dino"
     # 顺序式 A→V→A 耦合（2026-08-07 审阅落地④）：每 N 层使用
     # proposal→reorganize→correction 三遍注意力；0 = 全层同步联合（旧行为）。
     sequential_coupling: int = 0
@@ -312,6 +314,8 @@ class VACompoundConfig:
             raise ValueError("wmrm_inject must be last|all|even")
         if not 0.0 <= self.wmrm_mixer_dropout < 1.0:
             raise ValueError("wmrm_mixer_dropout must be in [0, 1)")
+        if self.wmrm_target not in ("dino", "vjepa", "metric"):
+            raise ValueError("wmrm_target must be dino|vjepa|metric")
 
 
 @dataclass(frozen=True)
@@ -2272,6 +2276,7 @@ class VACompoundPolicy(nn.Module):
                 * frame_embedding.unsqueeze(0)
             )
         vision = self.vision_projection(vision_input)
+        shared_eye = vision
         state = torch.cat((proprio, previous_action), dim=-1).to(dtype=target_dtype)
         state = self.state_projection(state)
         if self.geometry_projection is not None:
@@ -2533,7 +2538,7 @@ class VACompoundPolicy(nn.Module):
                     language_keys = language_keys * mask.to(dtype=language_keys.dtype)[:, :, None]
                 action, aux, belief, prev_innovation = self.wmrm(
                     action,
-                    vision,
+                    shared_eye,
                     proprio.to(dtype=action.dtype),
                     belief=belief,
                     prev_innovation=prev_innovation,

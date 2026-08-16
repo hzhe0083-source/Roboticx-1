@@ -17,6 +17,33 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 
 from va_compound import VACompoundConfig, VACompoundPolicy
 from va_compound.wmrm import wmrm_world_loss
+
+
+def wmrm_next_feature_target(
+    model: VACompoundPolicy,
+    batch: dict[str, Tensor],
+    time_index: int,
+    *,
+    dense_evidence: dict[int, Tensor] | None = None,
+    metric_g: Tensor | None = None,
+) -> Tensor:
+    """Next VA-cycle visual feature. Target encoder is stop-grad (JEPA-style)."""
+    nxt = time_index + 1
+    kind = getattr(model.config, "wmrm_target", "dino")
+    if kind == "metric":
+        if metric_g is None:
+            raise ValueError("wmrm_target=metric requires metric_g")
+        return metric_g[:, nxt]
+    if kind == "vjepa":
+        if dense_evidence is None or 11 not in dense_evidence:
+            raise ValueError("wmrm_target=vjepa requires dense_evidence[11] (H11)")
+        return dense_evidence[11][:, nxt].mean(dim=1).detach()
+    vision_next = batch.get("vision_tokens")
+    if vision_next is None or nxt >= vision_next.shape[1]:
+        raise ValueError("wmrm_target=dino requires vision_tokens at t+1 (VA cycle)")
+    tokens = vision_next[:, nxt].to(dtype=model.vision_projection.weight.dtype)
+    with torch.no_grad():
+        return model.vision_projection(tokens).mean(dim=1)
 from va_compound.backbones import pool_flat_tokens, pool_mtvj_coarse_tokens
 from va_compound.metric_roi import (
     DINO_METRIC_ROI_CONTRACT,
@@ -1197,6 +1224,7 @@ def build_exact_run_contract(
         model_config.pop("wmrm_world_dim", None)
         model_config.pop("wmrm_inject", None)
         model_config.pop("wmrm_mixer_dropout", None)
+        model_config.pop("wmrm_target", None)
     contract = {
         "contract_version": EXACT_RUN_CONTRACT_VERSION,
         "data_identity": getattr(sampler, "dataset_content_identity", None),
@@ -3485,8 +3513,13 @@ def rollout_policy(
             **mtvj_kwargs,
         )
         if model.wmrm is not None and time_index + 1 < batch["actions"].shape[1]:
-            if metric_g is None:
-                raise ValueError("--wmrm/--wam4va requires metric_g for world supervision")
+            target = wmrm_next_feature_target(
+                model,
+                batch,
+                time_index,
+                dense_evidence=dense_evidence,
+                metric_g=metric_g,
+            )
             auxes = getattr(model, "last_wmrm_auxes", None) or (
                 [model.last_wmrm] if model.last_wmrm is not None else []
             )
@@ -3494,12 +3527,11 @@ def rollout_policy(
                 raise ValueError("WAM4VA produced no world predictions at a supervised step")
             pres = getattr(model, "last_wmrm_pre_actions", None) or []
             for inject_i, aux in enumerate(auxes):
-                if metric_g.shape[-1] != aux.z_hat.shape[-1]:
+                if target.shape[-1] != aux.z_hat.shape[-1]:
                     raise ValueError(
-                        "metric_g last dim must match z_hat: "
-                        f"{metric_g.shape[-1]} vs {aux.z_hat.shape[-1]}"
+                        "world target last dim must match z_hat: "
+                        f"{target.shape[-1]} vs {aux.z_hat.shape[-1]}"
                     )
-                target = metric_g[:, time_index + 1]
                 wmrm_world_terms.append(wmrm_world_loss(aux.z_hat, target))
                 if inject_i < len(pres):
                     perm = torch.randperm(aux.z_hat.shape[0], device=aux.z_hat.device)
@@ -4117,6 +4149,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         dest="wmrm",
         help="WAM4VA：同 --wmrm。WAM 向 VA 注入未来信息，动作仍由 VA 发出",
+    )
+    parser.add_argument(
+        "--wmrm-target",
+        choices=("dino", "vjepa", "metric"),
+        default="dino",
+        help="WAM 下一步监督：dino=下一决策 DINO 投影均值（与 VA 同周期）；"
+        "vjepa=下一决策 H11 均值（冻塔白得空间）；metric=旧几何",
     )
     parser.add_argument(
         "--wmrm-world-weight",
@@ -6337,6 +6376,16 @@ def main() -> None:
             wam_joint=args.wam_joint,
             wmrm=args.wmrm,
             wmrm_inject=args.wmrm_inject,
+            wmrm_target=getattr(args, "wmrm_target", "dino"),
+            wmrm_world_dim=(
+                768
+                if getattr(args, "wmrm_target", "dino") == "vjepa"
+                else (
+                    8
+                    if getattr(args, "wmrm_target", "dino") == "metric"
+                    else getattr(args, "hidden_dim", 512)
+                )
+            ),
             **_mtvj_config_kwargs(args),
         )
         if args.single_task:
@@ -6601,6 +6650,16 @@ def main() -> None:
             wam_joint=args.wam_joint,
             wmrm=args.wmrm,
             wmrm_inject=args.wmrm_inject,
+            wmrm_target=getattr(args, "wmrm_target", "dino"),
+            wmrm_world_dim=(
+                768
+                if getattr(args, "wmrm_target", "dino") == "vjepa"
+                else (
+                    8
+                    if getattr(args, "wmrm_target", "dino") == "metric"
+                    else getattr(args, "hidden_dim", 512)
+                )
+            ),
             local_slots=(args.local_slots_data is not None) or args.live_vjepa,
             local_slots_direct288=args.local_slots_direct288,
             local_slots_fixed_query=args.local_slots_fixed_query,
@@ -6874,6 +6933,16 @@ def main() -> None:
             wam_joint=args.wam_joint,
             wmrm=args.wmrm,
             wmrm_inject=args.wmrm_inject,
+            wmrm_target=getattr(args, "wmrm_target", "dino"),
+            wmrm_world_dim=(
+                768
+                if getattr(args, "wmrm_target", "dino") == "vjepa"
+                else (
+                    8
+                    if getattr(args, "wmrm_target", "dino") == "metric"
+                    else getattr(args, "hidden_dim", 512)
+                )
+            ),
             **_mtvj_config_kwargs(args),
         )
         smoke_batch = synthetic_sequence(
