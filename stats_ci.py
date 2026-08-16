@@ -1,22 +1,59 @@
-"""统计口径工具：宏平均 + bootstrap 95% CI（固定种子）。
+"""统计口径工具：单任务二项区间与多任务宏平均 bootstrap。
 
-口径约定（对应 VA_COMPOUND_REPORT.md §3.1 / 规格阶段 3）：
-- 宏平均：先对每个任务（group）取样本均值，再对任务取平均；样本数不均的
-  任务不会主导总体数字。
-- 95% CI：以任务为有放回重采样单元做 bootstrap（默认 B=2000、固定 seed
-  保证可复现），取百分位区间 [2.5%, 97.5%]。bootstrap 对分布不作正态假设，
-  二值成功率同样适用。
+口径约定：
+- 单任务成功率：独立 trial 是采样单位，使用 Wilson score interval；只有一个
+  task 时按 task bootstrap 会退化为伪窄的 ``[p, p]``，禁止这样报告。
+- 多任务宏平均：先对每个任务（group）取样本均值，再对任务取平均；以任务为
+  有放回重采样单元做 percentile bootstrap（默认 B=2000、固定 seed）。
 
 用法：
-    from stats_ci import macro_bootstrap_ci, fmt_ci
-    est, lo, hi = macro_bootstrap_ci(values, group_ids, n_boot=2000, seed=0)
-    print(fmt_ci(est, lo, hi))
+    from stats_ci import binomial_wilson_ci, macro_bootstrap_ci
+    est, lo, hi = binomial_wilson_ci(successes=1, trials=10)
+    macro, lo, hi = macro_bootstrap_ci(values, group_ids, seed=0)
 """
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
-__all__ = ["bootstrap_ci", "macro_bootstrap_ci", "fmt_ci"]
+__all__ = [
+    "binomial_wilson_ci",
+    "bootstrap_ci",
+    "macro_bootstrap_ci",
+    "fmt_ci",
+]
+
+
+def binomial_wilson_ci(
+    successes: int,
+    trials: int,
+    z: float = 1.959963984540054,
+) -> tuple[float, float, float]:
+    """Binomial proportion with a two-sided Wilson score interval.
+
+    Use this trial-level interval for a single task. Task-level bootstrap is
+    degenerate with one task and must not be presented as uncertainty there.
+    """
+    if isinstance(successes, bool) or isinstance(trials, bool):
+        raise ValueError("successes/trials must be integer counts")
+    if int(successes) != successes or int(trials) != trials:
+        raise ValueError("successes/trials must be integer counts")
+    successes, trials = int(successes), int(trials)
+    if trials <= 0:
+        raise ValueError("trials must be positive")
+    if not 0 <= successes <= trials:
+        raise ValueError("successes must be in [0, trials]")
+    p = successes / trials
+    z2 = z * z
+    denom = 1.0 + z2 / trials
+    center = (p + z2 / (2.0 * trials)) / denom
+    half = (
+        z
+        * math.sqrt(p * (1.0 - p) / trials + z2 / (4.0 * trials * trials))
+        / denom
+    )
+    return p, max(0.0, center - half), min(1.0, center + half)
 
 
 def bootstrap_ci(

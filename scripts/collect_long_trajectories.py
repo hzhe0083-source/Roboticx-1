@@ -42,11 +42,15 @@ PERTURB_MM = (2.0, 8.0)  # 接触相位扰动幅度
 PERTURB_KINDS = ("eef_lateral", "eef_height", "object", "peg_hole_relative")
 PERTURB_SETTLE_STEPS = 12  # 扰动注入后的物理 settle 步数（进入时间轴，Codex P0-2）
 OUT_DIR = ROOT / "data"
-JPEG_QUALITY = 90  # 帧压缩：uint8 384×384×3 ≈ 440KB → ~40KB，49 任务 ≈ 12GB（2026-08-09 磁盘止损）
+JPEG_QUALITY = 90  # 帧压缩：当前 env.render() 原生 480×480 RGB → JPEG
+# Same contract as eval_metaworld.TASK35_EVAL50_SEEDS. Kept local so this
+# CPU collector does not import the GPU eval module.
+TASK35_EVAL50_SEEDS = tuple(range(35000, 35050))
+DEFAULT_PINNED_ATTEMPTS = 10
 
 
 def compress_frames(frames: np.ndarray) -> list[bytes]:
-    """[T,384,384,3] uint8 → JPEG bytes 列表（训练时解压，对齐 parquet PNG 解码路径）。"""
+    """[T,H,W,3] uint8 render frames → JPEG bytes（保持原始像素尺寸）。"""
     out = []
     for i in range(len(frames)):
         buf = io.BytesIO()
@@ -88,8 +92,59 @@ def get_policy(task_name: str):
     return getattr(P, cls_name)()
 
 
-def collect_episode(env, policy, task_name: str, rng: np.random.Generator,
-                    perturb: bool = True) -> dict | None:
+def reset_eval_init(env, episode_seed: int):
+    """Recreate the eval50 init for ``episode_seed``.
+
+    MetaWorld v3 ``reset(seed=)`` is ignored by ``SawyerXYZEnv.reset``;
+    layout is drawn from the global NumPy RNG. Both lines are required.
+    """
+    seed = int(episode_seed)
+    np.random.seed(seed)
+    return env.reset(seed=seed)
+
+
+def resolve_perturb_kinds(kinds: list[str] | tuple[str, ...] | None) -> tuple[str, ...]:
+    resolved = tuple(PERTURB_KINDS if kinds is None else kinds)
+    unknown = [kind for kind in resolved if kind not in PERTURB_KINDS]
+    if unknown:
+        raise ValueError(f"unknown perturb kinds {unknown}; allowed={list(PERTURB_KINDS)}")
+    if not resolved:
+        raise ValueError("perturb kinds must be non-empty")
+    return resolved
+
+
+def blocked_eval50_seeds(seeds: list[int] | tuple[int, ...]) -> list[int]:
+    allowed = set(TASK35_EVAL50_SEEDS)
+    return [int(seed) for seed in seeds if int(seed) in allowed]
+
+
+def check_eval_seed_policy(seeds: list[int] | tuple[int, ...], allow_eval_seeds: bool) -> None:
+    blocked = blocked_eval50_seeds(seeds)
+    if blocked and not allow_eval_seeds:
+        raise ValueError(
+            "episode seeds overlap eval50 "
+            f"{TASK35_EVAL50_SEEDS[0]}-{TASK35_EVAL50_SEEDS[-1]}: {blocked}. "
+            "Pass --allow-eval-seeds to train on those inits, or pick other seeds."
+        )
+
+
+def planned_episode_seeds(seeds: list[int], variants_per_seed: int) -> list[int]:
+    if variants_per_seed < 1:
+        raise ValueError("variants-per-seed must be >= 1")
+    return [int(seed) for seed in seeds for _ in range(int(variants_per_seed))]
+
+
+def collect_episode(
+    env,
+    policy,
+    task_name: str,
+    rng: np.random.Generator,
+    perturb: bool = True,
+    *,
+    episode_seed: int | None = None,
+    force_perturb: bool = False,
+    perturb_kinds: list[str] | tuple[str, ...] | None = None,
+) -> dict | None:
     """跑一条长轨迹：完整任务 + 成功 hold + （可选）接触扰动恢复。
 
     返回 dict（帧/动作/状态均为原始值，后续统一归一化）或 None（失败）。
@@ -98,20 +153,41 @@ def collect_episode(env, policy, task_name: str, rng: np.random.Generator,
     任务进程（此前 20 实例并发时多次全灭，疑似 OOM/异常无兜底）。
     """
     try:
-        return _collect_episode_inner(env, policy, task_name, rng, perturb)
+        return _collect_episode_inner(
+            env,
+            policy,
+            task_name,
+            rng,
+            perturb,
+            episode_seed=episode_seed,
+            force_perturb=force_perturb,
+            perturb_kinds=perturb_kinds,
+        )
     except Exception as exc:  # noqa: BLE001
         print(f"  [collect_episode] 异常跳过本条: {type(exc).__name__}: {exc}")
         return None
 
 
-def _collect_episode_inner(env, policy, task_name: str, rng: np.random.Generator,
-                           perturb: bool = True) -> dict | None:
+def _collect_episode_inner(
+    env,
+    policy,
+    task_name: str,
+    rng: np.random.Generator,
+    perturb: bool = True,
+    *,
+    episode_seed: int | None = None,
+    force_perturb: bool = False,
+    perturb_kinds: list[str] | tuple[str, ...] | None = None,
+) -> dict | None:
     # MetaWorld v3 的 reset_model 仍从全局 NumPy RNG 取布局；仅传
     # env.reset(seed=...) 在部分版本不会控制它。两边同时设种子，保证同一个
     # collector seed 真正可复现，并把 episode_seed 写进样本供审计/去重。
-    episode_seed = int(rng.integers(0, 2**31))
-    np.random.seed(episode_seed)
-    obs, _ = env.reset(seed=episode_seed)
+    if episode_seed is None:
+        episode_seed = int(rng.integers(0, 2**31))
+    else:
+        episode_seed = int(episode_seed)
+    kinds = resolve_perturb_kinds(perturb_kinds)
+    obs, _ = reset_eval_init(env, episode_seed)
     frames: list[np.ndarray] = []
     actions: list[np.ndarray] = []
     states: list[np.ndarray] = []
@@ -173,9 +249,9 @@ def _collect_episode_inner(env, policy, task_name: str, rng: np.random.Generator
         # 接触扰动：成功前随机一步注入 2-8mm，之后继续 policy 恢复
         if (perturb and perturb_event is None and first_success is None
                 and not term and not trunc and policy_step > 20
-                and rng.random() < 0.05):
+                and (force_perturb or rng.random() < 0.05)):
             mag = rng.uniform(*PERTURB_MM) / 1000.0
-            kind = str(rng.choice(PERTURB_KINDS))
+            kind = str(rng.choice(kinds))
             applied = _apply_perturb(env, kind, mag, rng)
             if applied["applied"]:
                 # MuJoCo state changed outside env.step; refresh the proprio/object
@@ -247,6 +323,7 @@ def _collect_episode_inner(env, policy, task_name: str, rng: np.random.Generator
         "action_supervision_valid": action_supervision_valid,
         "recovery_mask": recovery_mask,
         "perturbed": perturb_event is not None,
+        "n_perturb_events": int(perturb_event is not None),
         "perturb_start": None if perturb_event is None else perturb_event["start"],
         "perturb_end": None if perturb_event is None else perturb_event["end"],
         "perturb_kind": None if perturb_event is None else perturb_event["kind"],
@@ -297,12 +374,40 @@ def _apply_perturb(env, kind: str, mag: float,
         return {"applied": True, "delta": delta.astype(np.float32)}
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task", required=True, help="MT1 任务名，如 peg-insert-side-v3")
     parser.add_argument("--episodes", type=int, default=30)
     parser.add_argument("--no-perturb", action="store_true", help="不注入接触扰动")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--episode-seeds",
+        type=int,
+        nargs="+",
+        help="Pin MetaWorld inits (np.random.seed + env.reset). Not the same as --seed.",
+    )
+    parser.add_argument(
+        "--variants-per-seed",
+        type=int,
+        default=1,
+        help="Accepted recovery variants per pinned episode seed (default 1)",
+    )
+    parser.add_argument(
+        "--force-perturb",
+        action="store_true",
+        help="Inject one perturb on the first eligible pre-success step (skip the 5% gate)",
+    )
+    parser.add_argument(
+        "--perturb-kinds",
+        nargs="+",
+        choices=list(PERTURB_KINDS),
+        help="Restrict perturb kinds; default is all four kinds",
+    )
+    parser.add_argument(
+        "--allow-eval-seeds",
+        action="store_true",
+        help="Allow episode seeds in 35000-35049 (eval50 inits). Default is forbid.",
+    )
     parser.add_argument(
         "--output", type=Path,
         help="新输出路径；默认使用带 clean/recovery、v2、seed 后缀的新文件",
@@ -311,27 +416,149 @@ def main() -> None:
         "--overwrite", action="store_true",
         help="显式允许覆盖 --output（默认拒绝覆盖任何现有数据）",
     )
-    args = parser.parse_args()
+    return parser
+
+
+def _accept_episode(ep: dict | None, *, recovery: bool) -> tuple[dict | None, str | None]:
+    if ep is None:
+        return None, "failed-or-no-success"
+    if recovery and not ep["perturbed"]:
+        return None, "nominal"
+    return ep, None
+
+
+def collect_requested_episodes(
+    env,
+    policy,
+    task_name: str,
+    rng: np.random.Generator,
+    *,
+    perturb: bool,
+    force_perturb: bool,
+    perturb_kinds: list[str] | tuple[str, ...] | None,
+    episode_seeds: list[int] | None,
+    n_episodes: int,
+    allow_eval_seeds: bool,
+) -> list[dict]:
+    recovery = perturb
+    if episode_seeds:
+        planned = planned_episode_seeds(episode_seeds, 1)
+        # variants are expanded by the caller so retries stay on one init.
+        check_eval_seed_policy(planned, allow_eval_seeds)
+        target = planned
+    else:
+        target = [None] * n_episodes
+
+    episodes: list[dict] = []
+    attempts = 0
+    max_attempts = max(len(target) * DEFAULT_PINNED_ATTEMPTS, n_episodes * 10)
+    seed_index = 0
+    while seed_index < len(target) and attempts < max_attempts:
+        attempts += 1
+        pinned = target[seed_index]
+        if pinned is None and not allow_eval_seeds:
+            # Peek the next random seed without consuming perturb RNG: draw, reject
+            # eval50 collisions, then collect with that exact seed.
+            candidate = int(rng.integers(0, 2**31))
+            if blocked_eval50_seeds([candidate]):
+                print(f"  skip eval50 seed {candidate}: pass --allow-eval-seeds to keep it")
+                continue
+            pinned = candidate
+        ep = collect_episode(
+            env,
+            policy,
+            task_name,
+            rng,
+            perturb=perturb,
+            episode_seed=pinned,
+            force_perturb=force_perturb,
+            perturb_kinds=perturb_kinds,
+        )
+        accepted, reason = _accept_episode(ep, recovery=recovery)
+        if accepted is None:
+            if reason == "nominal":
+                print("  skip nominal episode: recovery collection requires >=1 perturb event")
+            continue
+        if not allow_eval_seeds and blocked_eval50_seeds([accepted["episode_seed"]]):
+            print(
+                f"  skip eval50 seed {accepted['episode_seed']}: "
+                "pass --allow-eval-seeds to keep it"
+            )
+            continue
+        episodes.append(accepted)
+        seed_index += 1
+        lens = [len(e["frames"]) for e in episodes]
+        print(
+            f"  ep {len(episodes)}: seed={accepted['episode_seed']} "
+            f"len={len(accepted['frames'])} success@{accepted['success_frame']} "
+            f"perturbed={accepted['perturbed']} (mean_len={np.mean(lens):.0f})"
+        )
+    if not episodes:
+        raise SystemExit("no successful episodes collected")
+    if len(episodes) != len(target):
+        raise SystemExit(
+            f"collected only {len(episodes)}/{len(target)} contract-valid episodes "
+            f"after {attempts} attempts"
+        )
+    return episodes
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = build_parser().parse_args(argv)
+    if args.variants_per_seed < 1:
+        raise SystemExit("--variants-per-seed must be >= 1")
+    if args.no_perturb and args.force_perturb:
+        raise SystemExit("--force-perturb is incompatible with --no-perturb")
+    if args.episode_seeds:
+        pinned = planned_episode_seeds(args.episode_seeds, args.variants_per_seed)
+        check_eval_seed_policy(pinned, args.allow_eval_seeds)
+        n_episodes = len(pinned)
+    else:
+        pinned = None
+        n_episodes = args.episodes
 
     rng = np.random.default_rng(args.seed)
     env = make_env(args.task)
     policy = get_policy(args.task)
-    print(f"task={args.task} policy={type(policy).__name__} episodes={args.episodes}")
+    print(
+        f"task={args.task} policy={type(policy).__name__} episodes={n_episodes} "
+        f"force_perturb={args.force_perturb} allow_eval_seeds={args.allow_eval_seeds}"
+    )
 
-    episodes = []
-    attempts = 0
-    while len(episodes) < args.episodes and attempts < args.episodes * 10:
-        attempts += 1
-        ep = collect_episode(env, policy, args.task, rng, perturb=not args.no_perturb)
-        if ep is None:
-            continue
-        episodes.append(ep)
-        lens = [len(e["frames"]) for e in episodes]
-        print(f"  ep {len(episodes)}: len={len(ep['frames'])} "
-              f"success@{ep['success_frame']} perturbed={ep['perturbed']} "
-              f"(mean_len={np.mean(lens):.0f})")
-    if not episodes:
-        raise SystemExit("no successful episodes collected")
+    if pinned is None:
+        episodes = collect_requested_episodes(
+            env,
+            policy,
+            args.task,
+            rng,
+            perturb=not args.no_perturb,
+            force_perturb=args.force_perturb,
+            perturb_kinds=args.perturb_kinds,
+            episode_seeds=None,
+            n_episodes=n_episodes,
+            allow_eval_seeds=args.allow_eval_seeds,
+        )
+    else:
+        episodes = []
+        for seed in pinned:
+            batch = collect_requested_episodes(
+                env,
+                policy,
+                args.task,
+                rng,
+                perturb=not args.no_perturb,
+                force_perturb=args.force_perturb,
+                perturb_kinds=args.perturb_kinds,
+                episode_seeds=[seed],
+                n_episodes=1,
+                allow_eval_seeds=args.allow_eval_seeds,
+            )
+            episodes.extend(batch)
+    if args.no_perturb:
+        if any(ep["perturbed"] or ep["n_perturb_events"] for ep in episodes):
+            raise RuntimeError("clean collection contains a perturbation event")
+    elif any(not ep["perturbed"] or ep["n_perturb_events"] < 1 for ep in episodes):
+        raise RuntimeError("recovery collection contains a nominal episode")
     env.close()
 
     # ---- 统一归一化：继承 fullframe executed 的 q01/q99（Codex：禁止单独算） ----
@@ -361,7 +588,22 @@ def main() -> None:
             "perturbed": not args.no_perturb,
             "perturbation_enabled": not args.no_perturb,
             "perturbation_mode": (
-                "disabled_by_no_perturb" if args.no_perturb else "single_random_pre_success"
+                "disabled_by_no_perturb" if args.no_perturb
+                else "forced_single_pre_success" if args.force_perturb
+                else "single_random_pre_success"
+            ),
+            "perturbation_data_present": any(ep["perturbed"] for ep in episodes),
+            "eval_seed_policy": (
+                "allow-eval-seeds" if args.allow_eval_seeds else "forbid"
+            ),
+            "pinned_episode_seeds": (
+                None if args.episode_seeds is None else [int(s) for s in args.episode_seeds]
+            ),
+            "variants_per_seed": int(args.variants_per_seed),
+            "perturb_kinds": list(resolve_perturb_kinds(args.perturb_kinds)),
+            "episode_perturbation_contract": (
+                "clean: n_perturb_events=0 for every episode; "
+                "recovery: n_perturb_events>=1 for every episode"
             ),
             "perturb_mm": list(PERTURB_MM),
             "perturb_settle_steps": PERTURB_SETTLE_STEPS,
@@ -385,6 +627,13 @@ def main() -> None:
     out_path = args.output or (
         OUT_DIR / f"metaworld_longtraj_{args.task}_{mode}_v2_seed{args.seed}.pt"
     )
+    protected = {
+        (OUT_DIR / "metaworld_longtraj_windows_h6_dino35_clean60_recovery30_v1.pt").resolve(),
+        (OUT_DIR / "metaworld_longtraj_peg-insert-side-v3_clean_v2_seed350.pt").resolve(),
+        (OUT_DIR / "metaworld_longtraj_peg-insert-side-v3_recovery_v2_seed351.pt").resolve(),
+    }
+    if out_path.resolve() in protected:
+        raise FileExistsError(f"refusing to write elected/source dataset: {out_path}")
     if out_path.exists() and not args.overwrite:
         raise FileExistsError(
             f"refusing to overwrite existing data: {out_path}; choose --output or pass --overwrite"

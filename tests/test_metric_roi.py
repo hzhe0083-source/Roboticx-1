@@ -1,9 +1,13 @@
+import pytest
 import torch
+
+from va_compound.metric_visual_head import LanguageMetricField
 
 from va_compound.metric_roi import (
     crop_to_full,
     full_to_crop,
     gt_crop_visibility,
+    load_dino_metric_roi_checkpoint,
     merge_roi_refinement,
     plan_metric_roi,
 )
@@ -36,6 +40,17 @@ def test_plan_selects_visibility_pair_and_dynamic_size():
     torch.testing.assert_close(selection.roi[:, 2], torch.tensor([96.0, 96.0]))
 
 
+def test_task35_can_force_peghead_hole_pair() -> None:
+    p, vis = _coarse()
+    selection = plan_metric_roi(p, vis, 384, forced_pair_index=1)
+    assert selection.pair_index.tolist() == [1, 1]
+    assert selection.pair_roles.tolist() == [[3, 2], [3, 2]]
+    assert selection.role_mask.tolist() == [
+        [False, False, True, True],
+        [False, False, True, True],
+    ]
+
+
 def test_dynamic_crop_reaches_max_and_training_jitter_is_bounded():
     p, vis = _coarse()
     selection = plan_metric_roi(
@@ -58,6 +73,54 @@ def test_dynamic_crop_reaches_max_and_training_jitter_is_bounded():
     far[0, 0], far[0, 1] = torch.tensor([0.1, 0.1]), torch.tensor([0.9, 0.9])
     far_selection = plan_metric_roi(far, vis[:1], 384)
     assert far_selection.roi[0, 2].item() == 192.0
+
+
+def test_dino_v2_loader_requires_native_480_geometry_and_pair_contract(tmp_path) -> None:
+    ctor = {
+        "lang_dim": 2048,
+        "h_dim": 1024,
+        "d_proj": 192,
+        "n_roles": 4,
+        "l2_norm": True,
+        "learnable_temp": True,
+        "temp_init": 10.0,
+        "freeze_bias": False,
+        "mode_readout": True,
+        "grid": 16,
+    }
+    head = LanguageMetricField(**ctor)
+    payload = {
+        "contract": "dino_metric_roi_task35_v2",
+        "metric_role_contract": "slots_tool_pegGrasp_hole_pegHead_v1",
+        "role_order": ["tool", "pegGrasp", "hole", "pegHead"],
+        "role_pairs": [[0, 1], [3, 2]],
+        "raw_frame_contract": "true_simulator_render_480px_v1",
+        "roi_geometry_size": 480,
+        "canonical_image_size": 224,
+        "task": "peg-insert-side-v3",
+        "steps": 10,
+        "batch": 2,
+        "min_roi_size": 96.0,
+        "max_roi_size": 192.0,
+        "distance_scale": 2.0,
+        "max_delta_px": 32.0,
+        "roi_metric_head": head.state_dict(),
+        "ctor_config": ctor,
+    }
+    path = tmp_path / "roi.pt"
+    torch.save(payload, path)
+    loaded = load_dino_metric_roi_checkpoint(path, "cpu")
+    assert loaded._mtvj_roi_config["roi_geometry_size"] == 480
+    bad = dict(payload)
+    bad["role_pairs"] = [[0, 1], [2, 3]]
+    torch.save(bad, path)
+    with pytest.raises(ValueError, match="role_pairs"):
+        load_dino_metric_roi_checkpoint(path, "cpu")
+    bad = dict(payload)
+    bad["roi_geometry_size"] = 224
+    torch.save(bad, path)
+    with pytest.raises(ValueError, match="480px"):
+        load_dino_metric_roi_checkpoint(path, "cpu")
 
 
 def test_full_crop_coordinate_roundtrip_rectangular_image():

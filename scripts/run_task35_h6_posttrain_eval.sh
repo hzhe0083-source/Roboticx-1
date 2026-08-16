@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# After FM training finishes: validate, held-out metric, then 50-seed closed loop.
+# Refuses to start while the 20k trainer still owns the GPU unless --force.
+# Does not elect a winner: the suite selects only after every 3k–20k eval50 exists.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+FORCE=()
+if [[ "${1:-}" == "--force" ]]; then
+  FORCE=(--force)
+  shift
+fi
+CKPT=${1:?usage: $0 [--force] checkpoint.pt [name]}
+NAME=${2:-$(basename "$CKPT" .pt)}
+PY=${PY:-/home/ryan/.venvs/pytorch-gpu/bin/python}
+DINO=/home/ryan/.cache/huggingface/hub/models--timm--vit_large_patch14_reg4_dinov2.lvd142m/snapshots/f3c408e77602bb412aa65fb03dfa0d5f95cb3832/model.safetensors
+FEATURES=data/metaworld_longtraj_windows_h6_dino35_clean60_recovery30_v1.pt
+
+if [[ ${#FORCE[@]} -eq 0 ]] && "$PY" -B scripts/task35_proc.py --check trainer >/dev/null; then
+  echo "FM trainer still running; refusing to take the GPU. Pass --force to override." >&2
+  exit 3
+fi
+
+STEP=""
+if [[ "$(basename "$CKPT")" =~ _step([0-9]+)\.pt$ ]]; then
+  STEP=${BASH_REMATCH[1]}
+fi
+PREFLIGHT_STEP=()
+VALIDATE_STEP=()
+if [[ -n "$STEP" ]]; then
+  PREFLIGHT_STEP=(--expected-step "$STEP")
+  VALIDATE_STEP=(--expected-step "$STEP")
+fi
+
+CUDA_VISIBLE_DEVICES= "$PY" -B scripts/preflight_task35_posttrain.py \
+  --checkpoint "$CKPT" "${PREFLIGHT_STEP[@]}" --output "logs/${NAME}_preflight.json"
+
+CUDA_VISIBLE_DEVICES= "$PY" -B scripts/validate_task35_fm_checkpoint.py "$CKPT" \
+  "${VALIDATE_STEP[@]}" --output "logs/${NAME}_validate.json"
+
+CUDA_VISIBLE_DEVICES= "$PY" -B scripts/diag_task35_clean_recovery_slices.py \
+  --checkpoint "$CKPT" \
+  --features "$FEATURES" \
+  --output "logs/${NAME}_clean_recovery_slices.json"
+
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+"$PY" -u -B scripts/eval_dino_metric_policy_task35.py \
+  --checkpoint "$CKPT" \
+  --language-data "$FEATURES" \
+  --dino-checkpoint "$DINO" \
+  --samples 100 --batch 8 --seed 2777 \
+  --output "logs/${NAME}_metric_holdout2777.json"
+
+scripts/run_task35_h6_eval50.sh "${FORCE[@]}" "$CKPT" "$NAME"
+if [[ "${TASK35_SKIP_CAUSAL:-0}" != "1" ]]; then
+  scripts/run_task35_h6_causal_suite.sh "${FORCE[@]}" "$CKPT" "$NAME"
+fi
+echo "post-train eval finished for $CKPT; winner election stays in the suite" >&2

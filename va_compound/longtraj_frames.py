@@ -21,6 +21,7 @@ import torch
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parent.parent
+ACTION_MASK_KEYS = ("action_valid_mask", "horizon_mask")
 
 
 def mtvj_collate(batch: list[dict]) -> dict:
@@ -56,7 +57,9 @@ class LongTrajFramesDataset:
 
     def __init__(self, path: str | Path, longtraj_dir: str | Path | None = None,
                  min_sequence_length: int = 4,
-                 decode_cache_tasks: int = 1) -> None:
+                 decode_cache_tasks: int = 1,
+                 feature_cache: str | Path | None = None,
+                 include_frames: bool = True) -> None:
         self.path = Path(path)
         self.longtraj_dir = Path(longtraj_dir) if longtraj_dir else ROOT / "data"
         self.payload = torch.load(self.path, map_location="cpu", weights_only=True)
@@ -69,6 +72,17 @@ class LongTrajFramesDataset:
         self.refs = self.payload["frame_refs"]  # [(task_file, ep_idx, frame_idx[T,W])]
         if len(self.refs) != self.length:
             raise ValueError("frame_refs 长度与样本数不一致")
+        for key in ACTION_MASK_KEYS:
+            if key in self.payload:
+                value = self.payload[key]
+                if (
+                    not isinstance(value, torch.Tensor)
+                    or value.shape != self.payload["actions"].shape[:-1]
+                ):
+                    raise ValueError(
+                        f"{key} must have shape {tuple(self.payload['actions'].shape[:-1])}, "
+                        f"got {getattr(value, 'shape', None)}"
+                    )
         # 帧窗契约校验：每个决策点的帧窗必须是历史帧（决策点 d 用 d-(W-1)*stride..d）
         self._task_cache: dict[str, dict] = {}
         # 任务级预解码缓存（Codex P1-13 优化，2026-08-10）：locality sampler 下
@@ -76,6 +90,58 @@ class LongTrajFramesDataset:
         # 切换时解码一次（~60s/任务）；配合 num_workers=0 单 worker 防多份拷贝。
         self._decoded: dict[str, list[list[np.ndarray]]] = {}
         self.decode_cache_tasks = max(1, int(decode_cache_tasks))
+        # DINO 特征缓存（2026-08-15）：feature_cache 给定时每个样本返回其
+        # 帧窗在缓存中的行号（frame_cache_rows [T, W] int64），不再解 JPEG
+        # 帧（include_frames=False 时无 frames 键）——训练循环从预计算特征读，
+        # 跳过在线 ViT-L 编码（占步时 84%）。
+        self.feature_cache = Path(feature_cache) if feature_cache else None
+        self.include_frames = bool(include_frames)
+        self.cache_rows: np.ndarray | None = None
+        self.cached_raw_frames: np.ndarray | None = None
+        if self.feature_cache is not None:
+            import pickle
+
+            with (self.feature_cache / "index.pkl").open("rb") as fh:
+                cache_index: dict = pickle.load(fh)
+            rows = np.empty((self.length, len(self.refs[0][2]), len(self.refs[0][2][0])),
+                            dtype=np.int64)
+            for i, (task_file, ep_idx, fidx) in enumerate(self.refs):
+                for t, row in enumerate(fidx):
+                    for w, f in enumerate(row):
+                        key = (task_file, int(ep_idx), int(f))
+                        if key not in cache_index:
+                            raise KeyError(
+                                f"feature cache 缺少帧 {key}（样本 {i}）；"
+                                "缓存与数据集不匹配"
+                            )
+                        rows[i, t, w] = cache_index[key]
+            self.cache_rows = rows
+            raw_path = self.feature_cache / "raw_frames.npy"
+            if self.include_frames and raw_path.is_file():
+                import json
+
+                meta_path = self.feature_cache / "meta.json"
+                meta = json.loads(meta_path.read_text()) if meta_path.is_file() else {}
+                if (
+                    meta.get("raw_frame_contract")
+                    != "exact_decoded_longtraj_jpeg_480_v1"
+                    or meta.get("raw_frame_shape")
+                    != [len(cache_index), 480, 480, 3]
+                    or meta.get("raw_frame_dtype") != "uint8"
+                    or not meta.get("raw_frames_sha256")
+                ):
+                    raise ValueError(
+                        "cached raw frames lack exact 480px identity metadata"
+                    )
+                cached_raw = np.load(raw_path, mmap_mode="r")
+                if cached_raw.shape != (len(cache_index), 480, 480, 3):
+                    raise ValueError(
+                        "cached raw frames must have shape "
+                        f"[{len(cache_index)},480,480,3], got {cached_raw.shape}"
+                    )
+                if cached_raw.dtype != np.uint8:
+                    raise ValueError("cached raw frames must be uint8")
+                self.cached_raw_frames = cached_raw
 
     def _decode_task(self, task_file: str) -> list[list[np.ndarray]]:
         cached = self._decoded.get(task_file)
@@ -129,13 +195,26 @@ class LongTrajFramesDataset:
 
     def __getitem__(self, index: int) -> dict:
         item = {key: self.payload[key][index] for key in self.REQUIRED}
+        for key in ACTION_MASK_KEYS:
+            if key in self.payload:
+                item[key] = self.payload[key][index]
         if "language_mask" in self.payload:
             item["language_mask"] = self.payload["language_mask"][index]
+        if self.cache_rows is not None:
+            # DINO 特征缓存模式：返回帧窗行号（缓存读取代在线编码）。
+            item["frame_cache_rows"] = self.cache_rows[index]
+            if not self.include_frames:
+                return item
+            if self.cached_raw_frames is not None:
+                item["frames"] = np.asarray(
+                    self.cached_raw_frames[self.cache_rows[index]], dtype=np.uint8
+                )
+                return item
         task_file, ep_idx, fidx = self.refs[index]
         ep_frames = self._decode_task(task_file)[ep_idx]  # 已解码 ndarray
         frames = np.stack([
             np.stack([ep_frames[int(f)] for f in row])
             for row in fidx
-        ])  # [T, W, 384, 384, 3] uint8（零拷贝引用，与 phase2 契约一致）
+        ])  # [T, W, 480, 480, 3] uint8（零拷贝引用，与 phase2 契约一致）
         item["frames"] = frames
         return item

@@ -17,6 +17,12 @@
 覆盖本项目全部 49 个 MetaWorld 任务。reach 操作族直接控制 TCP，因此该族的
 object/interface 均取 tool；这是操作族语义，不是逐任务关键点映射。
 
+Task35 ``peg-insert-side-v3`` 使用任务对齐覆盖：固定四槽仍保持
+``[tool, object, target, interface]``，但实体为
+``[tcp, pegGrasp, hole, pegHead]``。因此第二关系对是
+``pegHead - hole``，且目标锚点是画面中真实可见的 ``hole`` site，而不是位于
+方块内部、视觉不可观测的 ``_target_pos``。
+
 投影（2026-08-09 实测验证，误差 <2px）：
     p_cam = R^T (p − cam_pos)，R = mju_quat2Mat(cam_quat) 列 = 相机轴
     x = W/2 + f·(x̂·v)/(−ẑ·v)，y = H/2 − f·(ŷ·v)/(−ẑ·v)，f = (H/2)/tan(fovy/2)
@@ -60,6 +66,11 @@ ROLE_NAMES = ("tool", "object", "target", "interface")
 SUPPORTED_TASKS = tuple(ENV_TO_TASK)
 # Reach 的成功量是 TCP→target；场景中的 dummy object 不参与任务。
 DIRECT_TOOL_TARGET_TASKS = frozenset(("reach-v3", "reach-wall-v3"))
+# Task35 的视觉成功几何不能用 generic achieved/target API：
+# _get_pos_objects() 只给 pegGrasp，而 _target_pos 位于孔块内部、不可见。
+TASK_ALIGNED_ROLE_SOURCES = {
+    "peg-insert-side-v3": ("tcp_center", "pegGrasp", "hole", "pegHead"),
+}
 CAMERA_NAME = "corner2"
 CAM_POS_DEFAULT = np.array([0.75, 0.075, 0.7])  # lerobot 采集同款 corner2
 RENDER_SIZE = 480  # metaworld env 渲染分辨率（square）
@@ -81,7 +92,7 @@ PROJECTION_REFERENCE_TABLE: dict[str, dict[str, tuple]] = {
     "peg-insert-side-v3": {
         "object": ("body", "peg"),          # 被插的 peg（自由体）
         "target": ("site", "hole"),         # 插入目标：孔（可见；goal site 在方块内部不可见）
-        "interface": ("site", "pegGrasp"),  # 工具-物体接触界面：杆上的抓取点（投影在杆上，可见）
+        "interface": ("site", "pegHead"),   # 精插接口：真正进入 hole 的杆尖
     },
     "assembly-v3": {
         "object": ("body", "RoundNut"),     # 螺母（obs[4:7] 即 RoundNut-8 site，同体）
@@ -172,35 +183,65 @@ def _resolve_projection_reference(env, spec: tuple) -> np.ndarray | None:
     raise ValueError(f"unknown keypoint spec {spec!r}")
 
 
+def _site_world_position(env, task: str, name: str) -> np.ndarray:
+    """Return a fresh MuJoCo site position with a strict 3-D contract."""
+    mujoco = _import_mujoco_metaworld()[0]
+    mujoco.mj_forward(env.model, env.data)
+    try:
+        point = np.asarray(env.data.site(name).xpos, dtype=float).reshape(-1)
+    except (KeyError, ValueError) as exc:
+        raise ValueError(f"{task}: required metric site {name!r} is missing") from exc
+    if point.shape != (3,):
+        raise ValueError(f"{task}: site {name!r} must have shape (3,), got {point.shape}")
+    return point.copy()
+
+
 def keypoint_world_positions(env, task: str) -> np.ndarray | None:
-    """统一 MetaWorld 四角色世界坐标 ``[tool, object, target, progress]``。
+    """统一 MetaWorld 四角色世界坐标 ``[tool, object, target, interface]``。
 
     ``_get_pos_objects`` 是 MetaWorld observation 的官方 achieved-entity
     接口。双实体任务（hammer/stick）用第二实体表示任务进度；其余任务的
-    progress 与 object 相同。直接控制 TCP 的 reach 操作族不使用场景 dummy
-    object。未知任务返回 ``None``，已声明支持的任务接口异常则立即报错。
+    interface/progress 与 object 相同。直接控制 TCP 的 reach 操作族不使用场景
+    dummy object。
+
+    ``peg-insert-side-v3`` 是经过实证的任务对齐例外：generic API 会生成
+    ``[tcp, pegGrasp, _target_pos, pegGrasp]``，其中两个角色坍缩且内部 target
+    在视觉上恒不可见。这里改为 ``[tcp, pegGrasp, hole, pegHead]``，保持固定
+    slot 语义（target=hole，interface=pegHead），让第二关系直接表示插入误差。
+    未知任务返回 ``None``，已声明支持的任务接口异常则立即报错。
     """
     if task not in SUPPORTED_TASKS:
         return None
     tool = np.asarray(env.tcp_center, dtype=float).reshape(-1)
-    objects = np.asarray(env._get_pos_objects(), dtype=float).reshape(-1)
-    target = np.asarray(getattr(env, "_target_pos", None), dtype=float).reshape(-1)
     if tool.shape != (3,):
         raise ValueError(f"{task}: tcp_center must have shape (3,), got {tool.shape}")
-    if objects.size < 3 or objects.size % 3:
-        raise ValueError(
-            f"{task}: _get_pos_objects must contain one or more 3D entities, "
-            f"got shape {objects.shape}"
+
+    if task in TASK_ALIGNED_ROLE_SOURCES:
+        world = np.stack(
+            (
+                tool,
+                _site_world_position(env, task, "pegGrasp"),
+                _site_world_position(env, task, "hole"),
+                _site_world_position(env, task, "pegHead"),
+            )
         )
-    if target.shape != (3,):
-        raise ValueError(f"{task}: _target_pos must have shape (3,), got {target.shape}")
-    entities = objects.reshape(-1, 3)
-    if task in DIRECT_TOOL_TARGET_TASKS:
-        obj = progress = tool
     else:
-        obj = entities[0]
-        progress = entities[1] if len(entities) > 1 else obj
-    world = np.stack((tool, obj, target, progress))
+        objects = np.asarray(env._get_pos_objects(), dtype=float).reshape(-1)
+        target = np.asarray(getattr(env, "_target_pos", None), dtype=float).reshape(-1)
+        if objects.size < 3 or objects.size % 3:
+            raise ValueError(
+                f"{task}: _get_pos_objects must contain one or more 3D entities, "
+                f"got shape {objects.shape}"
+            )
+        if target.shape != (3,):
+            raise ValueError(f"{task}: _target_pos must have shape (3,), got {target.shape}")
+        entities = objects.reshape(-1, 3)
+        if task in DIRECT_TOOL_TARGET_TASKS:
+            obj = progress = tool
+        else:
+            obj = entities[0]
+            progress = entities[1] if len(entities) > 1 else obj
+        world = np.stack((tool, obj, target, progress))
     if not np.isfinite(world).all():
         raise ValueError(f"{task}: non-finite metric role coordinates")
     return world
@@ -526,11 +567,13 @@ def _entity_aware_visibility(
     surface_visible: np.ndarray,
     in_frame: np.ndarray,
 ) -> np.ndarray:
-    """Augment only object/progress when the first ray hit is their own entity.
+    """Augment only object/interface when the first ray hit is their own entity.
 
     This recovers generic internal anchors (drawers, pegs, handles) without
     treating a robot or another scene entity as evidence for the semantic point.
-    Tool and target retain the strict depth-surface rule.
+    Tool and target retain the strict depth-surface rule.  For task35 this means
+    ``hole`` (target) is supervised only when the depth render honestly exposes
+    it, while ``pegHead`` (interface) may use same-peg surface evidence.
     """
     points = np.asarray(world, dtype=float)
     strict = np.asarray(surface_visible, dtype=np.float32)
@@ -823,7 +866,10 @@ def make_metric_batch(
             "contract": "mt_vj_metric_field_v1",
             "sample_rng_contract": SAMPLE_RNG_CONTRACT,
             "roles": list(ROLE_NAMES),
-            "interface_semantics": "progress anchor: second achieved entity when present, else object",
+            "interface_semantics": (
+                "progress anchor: second achieved entity when present, else object; "
+                "task35 override uses pegHead while target uses visible hole"
+            ),
             "keypoints_order": "y,x normalized 0-1",
             "relation_units": "normalized image coords (p_tool-p_object, p_progress-p_target)",
             "relation_aux_units": ["axis_alignment cos", "depth_m (z_progress-z_target)",
@@ -842,6 +888,10 @@ def make_metric_batch(
                 "tool": "env.tcp_center",
                 "object_and_progress": "env._get_pos_objects()",
                 "target": "env._target_pos",
+                "task_overrides": {
+                    name: list(sources)
+                    for name, sources in TASK_ALIGNED_ROLE_SOURCES.items()
+                },
                 "direct_tool_target_families": sorted(DIRECT_TOOL_TARGET_TASKS),
             },
             "language_text_source": "scripts/build_longtraj_features.ENV_TO_TASK",

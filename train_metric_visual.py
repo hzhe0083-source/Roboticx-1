@@ -923,6 +923,7 @@ def compute_losses(out, keypoints, visibility, relation, sigma_px: float = HEATM
                    alias_consistency_weight: float = ALIAS_CONSISTENCY_LAMBDA,
                    alias_coord_tolerance: float = ALIAS_COORD_TOL,
                    geometry_consistency_weight: float = GEOMETRY_CONSISTENCY_LAMBDA,
+                   image_size: int = IMAGE_SIZE,
                    ) -> tuple[torch.Tensor, dict]:
     """v4（2026-08-10，探针实证）：``hinge`` 用 max-margin 目标替代 CE——
     max(s_GT) 必须超过 max(其余 patch) 至少 ``hinge_margin``。CE 在近乎全平的
@@ -939,7 +940,32 @@ def compute_losses(out, keypoints, visibility, relation, sigma_px: float = HEATM
         raise ValueError("geometry_consistency_weight must be finite and non-negative")
     vis = visibility  # [B, R] float
     n_vis = vis.sum().clamp_min(1.0)
-    grid = HEATMAP_GRID
+    # DINO-metric（2026-08-16）：网格从输出推导（V-JEPA 24×24，DINO
+    # 16×16），不再写死 HEATMAP_GRID。旧训练/ROI 测试夹具可能只带
+    # log_heatmap，hinge-only 夹具则只带 2*grid^2 scores；三者语义等价。
+    heatmap = getattr(out, "heatmap", None)
+    log_heatmap = getattr(out, "log_heatmap", None)
+    scores = getattr(out, "scores", None)
+    if heatmap is not None:
+        grid = int(heatmap.shape[-1])
+        grid_shape = tuple(heatmap.shape)
+        square = heatmap.shape[-2] == grid
+    elif log_heatmap is not None:
+        grid = int(log_heatmap.shape[-1])
+        grid_shape = tuple(log_heatmap.shape)
+        square = log_heatmap.shape[-2] == grid
+    elif scores is not None:
+        per_frame = int(scores.shape[-1]) // 2
+        grid = math.isqrt(per_frame)
+        grid_shape = tuple(scores.shape)
+        square = scores.shape[-1] == 2 * grid * grid
+    else:
+        raise ValueError("metric output must provide heatmap, log_heatmap, or scores")
+    if grid < 2 or not square:
+        raise ValueError(
+            "metric output must encode a square spatial grid, "
+            f"got shape={grid_shape} inferred_grid={grid}"
+        )
     yi = torch.clamp(torch.floor(keypoints[..., 0] * grid).long(), 0, grid - 1)
     xi = torch.clamp(torch.floor(keypoints[..., 1] * grid).long(), 0, grid - 1)
     idx = yi * grid + xi  # [B, R]（片内位置；两片坐标相同）
@@ -960,7 +986,9 @@ def compute_losses(out, keypoints, visibility, relation, sigma_px: float = HEATM
         parts["hinge"] = loss_hinge.item()
         loss_cls = loss_hinge
     else:
-        targets = gaussian_targets(keypoints, sigma_px=sigma_px)
+        targets = gaussian_targets(
+            keypoints, sigma_px=sigma_px, grid=grid, image_size=image_size
+        )
         ce_per = -(targets * out.log_heatmap).sum(dim=(-2, -1))  # [B, R]
         loss_cls = (ce_per * vis).sum() / n_vis
         parts["ce"] = loss_cls.item()

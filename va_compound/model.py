@@ -64,6 +64,12 @@ class VACompoundConfig:
     # log N_s，使比较的是"平均证据"而非"token 数量 × 平均证据"——同一来源被复制/细分
     # 不再获得额外票数。flat = 原始共享 softmax（向后兼容）。
     attention_variant: str = "flat"  # "flat" | "smc"
+    # Memory-efficient fused SDPA for the shared VA attention.  ``auto`` uses
+    # SDPA only on the mathematically compatible flat/non-dual/no-debug path;
+    # ``manual`` preserves the legacy explicit FP32 score tensor.  The option
+    # is serialized because it changes floating-point reduction order even
+    # though the attention equation is unchanged.
+    va_attention_backend: str = "manual"  # "manual" | "auto"
     # Qwen-conditioned action queries（2026-08-06 GPT 方案 A）：语言摘要经 MLP 生成
     # 每 horizon 步的 action-query 偏移（zero-init，初始等价于静态 query）。Qwen 从
     # "被动被读的 K/V"升级为"决定动作查询找什么"的慢脑；VA 每步用视觉/状态修正。
@@ -80,6 +86,13 @@ class VACompoundConfig:
     future_predict: bool = False
     # E7 WAM v1：联合残差世界动作流（独立模块/权重，见 wam.py）
     wam_joint: bool = False
+    # WAM4VA：世界预测只调制 VA 动作流，禁止 Δv / 候选动作。CLI: --wam4va / --wmrm
+    wmrm: bool = False
+    wmrm_rank: int = 4
+    wmrm_world_dim: int = 8
+    # last = 单点末端调制（诚实默认）；all = 每层后握手；even = 奇数层。
+    wmrm_inject: str = "last"
+    wmrm_mixer_dropout: float = 0.3
     # 顺序式 A→V→A 耦合（2026-08-07 审阅落地④）：每 N 层使用
     # proposal→reorganize→correction 三遍注意力；0 = 全层同步联合（旧行为）。
     sequential_coupling: int = 0
@@ -153,6 +166,40 @@ class VACompoundConfig:
     # 初始输出与无 dense 路径逐位一致。与 local_slots/dense_readout 正交：
     # 直接消费 forward_hierarchical_dense 的 {5, 11} 证据，不经角色读出。
     dense_readout_mtvj: bool = False
+    # OpenVLA-style additive action vision：冻结 DINOv2 ViT-L/14-reg4 @224
+    # 提供独立 dense K/V，保留既有 V-JEPA base + MT-VJ 路径。每层独立
+    # action_dense_out 严格 zero-init，因此旧 E7 checkpoint 非严格恢复后
+    # 初始策略逐位不变。字符串同时作为 checkpoint 内的视觉塔契约。
+    action_vision_backbone: str = "none"  # e.g. "dinov2_vitl14_reg4"
+    action_vision_model_id: str = "vit_large_patch14_reg4_dinov2.lvd142m"
+    action_vision_dim: int = 1024
+    action_vision_image_size: int = 224
+    action_vision_layers: tuple[int, int] = (11, 23)
+    # DINO-main replacement（2026-08-14 用户决策）：冻结 DINOv2 REPLACES V-JEPA
+    # 作为 VA 主视觉骨干，VA/FM/投影从零可训练。V-JEPA/dense/metric 代码保留
+    # 在仓库中（flag 关闭即禁用，不删除）。默认 "vjepa" 使全部旧路径逐位不变。
+    main_vision_backbone: str = "vjepa"  # "vjepa" | "dinov2_vitl14_reg4"
+    main_vision_model_id: str = "vit_large_patch14_reg4_dinov2.lvd142m"
+    main_vision_image_size: int = 224
+    main_vision_dim: int = 1024
+    main_vision_grid: int = 8    # 每帧 16x16 patch 网格池化到 grid x grid
+    main_vision_frames: int = 4  # 每决策消费的窗口帧数 [d-6,d-4,d-2,d]
+    main_vision_tokens: int = 256  # = grid*grid*frames
+    # DINO 四帧显式时序：raw 1024-D patch token 进入 vision_projection 前，
+    # 按 frame-major 布局加 learned slot embedding。默认关闭使旧 checkpoint/路径
+    # 逐位不变；新 task35 run 开启，打破原来的四帧集合置换不变性。
+    main_vision_temporal: bool = False
+    main_vision_temporal_scale: float = 1.0
+    # DINO-metric（2026-08-15 用户决策）：DINO-main 下接回 MT-VJ dense + metric
+    # 全栈。dense evidence = DINO block11(g)/block23(d) 两帧 [d-2,d] patch
+    # （2×16×16=512 token，1024 维）+ Δt；LanguageMetricField 以 h_dim=1024、
+    # grid=16 从零训练。复用 dense_readout_mtvj 的逐层 dense K/V 机制。
+    dino_dense_metric: bool = False
+    # 8-D ``p * visibility`` geometry 直接进入 state/action query 条件，绕过
+    # 512 dense + 2 metric token 的共享 softmax 稀释。Linear 严格 zero-init，
+    # 从旧架构迁移时初始行为等价；默认关闭保持旧 state_dict 键集合不变。
+    metric_geometry_inject: bool = False
+    metric_geometry_dim: int = 8
 
     def __post_init__(self) -> None:
         if self.hidden_dim % self.num_heads:
@@ -163,6 +210,10 @@ class VACompoundConfig:
             raise ValueError(f"unsupported attention mode: {self.mode}")
         if self.attention_variant not in ("flat", "smc"):
             raise ValueError(f"unsupported attention variant: {self.attention_variant}")
+        if self.va_attention_backend not in ("manual", "auto"):
+            raise ValueError(
+                f"unsupported VA attention backend: {self.va_attention_backend}"
+            )
         if self.sequential_coupling < 0:
             raise ValueError("sequential_coupling must be >= 0")
         if self.flow_cond not in ("entry", "adaln"):
@@ -191,6 +242,74 @@ class VACompoundConfig:
             raise ValueError(
                 "multi_mode 与 local_slots_direct288 互斥：direct288 无角色读出路径"
             )
+        if not isinstance(self.action_vision_backbone, str) or not self.action_vision_backbone:
+            raise ValueError("action_vision_backbone must be a non-empty string")
+        if not isinstance(self.action_vision_model_id, str) or not self.action_vision_model_id:
+            raise ValueError("action_vision_model_id must be a non-empty string")
+        if self.action_vision_dim < 1:
+            raise ValueError("action_vision_dim must be positive")
+        if self.action_vision_image_size < 1:
+            raise ValueError("action_vision_image_size must be positive")
+        if (
+            len(self.action_vision_layers) != 2
+            or self.action_vision_layers[0] < 0
+            or self.action_vision_layers[0] >= self.action_vision_layers[1]
+        ):
+            raise ValueError("action_vision_layers must be two increasing block indices")
+        if self.main_vision_backbone != "vjepa":
+            if not self.main_vision_model_id:
+                raise ValueError("main_vision_model_id must be non-empty")
+            if self.main_vision_image_size < 1 or self.main_vision_dim < 1:
+                raise ValueError("main vision tower spec must be complete")
+            if not (1 <= self.main_vision_grid <= 16):
+                raise ValueError("main_vision_grid must be in [1, 16]")
+            if self.main_vision_frames < 1:
+                raise ValueError("main_vision_frames must be positive")
+            expected_tokens = (
+                self.main_vision_grid * self.main_vision_grid * self.main_vision_frames
+            )
+            if self.main_vision_tokens != expected_tokens:
+                raise ValueError(
+                    "main_vision_tokens must equal grid*grid*frames, got "
+                    f"{self.main_vision_tokens} vs {expected_tokens}"
+                )
+        if self.main_vision_temporal:
+            if self.main_vision_backbone == "vjepa":
+                raise ValueError(
+                    "main_vision_temporal requires a non-V-JEPA main vision backbone"
+                )
+            if not math.isfinite(self.main_vision_temporal_scale):
+                raise ValueError("main_vision_temporal_scale must be finite")
+        if self.metric_geometry_dim < 1:
+            raise ValueError("metric_geometry_dim must be positive")
+        if self.metric_geometry_inject and not (
+            self.dino_dense_metric or self.dense_readout_mtvj
+        ):
+            raise ValueError(
+                "metric_geometry_inject requires dino_dense_metric or dense_readout_mtvj"
+            )
+        if self.dino_dense_metric:
+            if self.main_vision_backbone == "vjepa":
+                raise ValueError(
+                    "dino_dense_metric requires main_vision_backbone != 'vjepa'"
+                )
+            if not self.dense_readout_mtvj:
+                raise ValueError(
+                    "dino_dense_metric requires dense_readout_mtvj "
+                    "（逐层 dense K/V 机制复用）"
+                )
+        if self.wmrm and self.wam_joint:
+            raise ValueError("wmrm is mutually exclusive with wam_joint (no Δv path)")
+        if self.wmrm and self.memory_split:
+            raise ValueError("wmrm is mutually exclusive with memory_split (P2 last-layer hook)")
+        if self.wmrm_rank < 1:
+            raise ValueError("wmrm_rank must be positive")
+        if self.wmrm_world_dim < 1:
+            raise ValueError("wmrm_world_dim must be positive")
+        if self.wmrm_inject not in ("last", "all", "even"):
+            raise ValueError("wmrm_inject must be last|all|even")
+        if not 0.0 <= self.wmrm_mixer_dropout < 1.0:
+            raise ValueError("wmrm_mixer_dropout must be in [0, 1)")
 
 
 @dataclass(frozen=True)
@@ -789,9 +908,11 @@ class VACouplingLayer(nn.Module):
         *,
         qk_norm: bool = False,
         attention_variant: str = "flat",
+        attention_backend: str = "manual",
         sequential: bool = False,
         dual_attention: bool = False,
         dense_readout_mtvj: bool = False,
+        action_dense_readout: bool = False,
     ) -> None:
         super().__init__()
         self.sequential = sequential
@@ -803,6 +924,9 @@ class VACouplingLayer(nn.Module):
         self.dropout = dropout
         self.qk_norm = qk_norm
         self.attention_variant = attention_variant
+        if attention_backend not in ("manual", "auto"):
+            raise ValueError(f"unsupported VA attention backend: {attention_backend}")
+        self.attention_backend = attention_backend
         # 双注意力（第二轮架构重构 2026-08-08）：仅非 sequential 层（policy
         # 构造时 sequential 层传 False）。动作 query 的 physical 更新不含语言列，
         # 语言列走独立 semantic 注意力；融合门 g_A = σ(G([A_mean, lang_mean]))。
@@ -870,6 +994,16 @@ class VACouplingLayer(nn.Module):
             nn.init.zeros_(self.dense_out.bias)
             self.metric_k = nn.Linear(hidden_dim, hidden_dim)
             self.metric_v = nn.Linear(hidden_dim, hidden_dim)
+        # DINOv2 action evidence is an independent additive residual. It does
+        # not replace or share parameters with the V-JEPA/MT-VJ dense branch.
+        self.action_dense_readout = action_dense_readout
+        if action_dense_readout:
+            self.action_dense_q = nn.Linear(hidden_dim, hidden_dim)
+            self.action_dense_k = nn.Linear(D_PROJ, hidden_dim)
+            self.action_dense_v = nn.Linear(3 * D_PROJ + _COORD_DIM, hidden_dim)
+            self.action_dense_out = nn.Linear(hidden_dim, hidden_dim)
+            nn.init.zeros_(self.action_dense_out.weight)
+            nn.init.zeros_(self.action_dense_out.bias)
 
     @staticmethod
     def _make_ffn(hidden_dim: int, dropout: float) -> nn.Sequential:
@@ -918,6 +1052,29 @@ class VACouplingLayer(nn.Module):
         z = self._from_heads(torch.matmul(weights, v))
         return self.dense_out(z)
 
+    def _action_dense_update(
+        self, action_norm: Tensor, dense_input: DenseReadoutInput
+    ) -> Tensor:
+        """DINOv2 action-only dense cross-attention residual.
+
+        The evidence layout matches ``DenseEvidenceProjector`` (two temporal
+        patch grids). No metric tokens are mixed into this independent tower.
+        """
+        d, g, t = dense_input.d, dense_input.g, dense_input.t
+        coord_raw, coord_k = dense_input.coord_raw, dense_input.coord_k
+        k_dense = self.action_dense_k(d) + coord_k[None]
+        v_dense = self.action_dense_v(
+            torch.cat((d, g, t, coord_raw[None].expand(d.shape[0], -1, -1)), dim=-1)
+        )
+        q = self._to_heads(self.action_dense_q(action_norm))
+        k = self._to_heads(k_dense)
+        v = self._to_heads(v_dense)
+        scores = torch.matmul(q.float(), k.float().transpose(-1, -2)) * self.scale
+        weights = torch.softmax(scores, dim=-1).to(dtype=v.dtype)
+        weights = F.dropout(weights, p=self.dropout, training=self.training)
+        z = self._from_heads(torch.matmul(weights, v))
+        return self.action_dense_out(z)
+
     def project_language(self, hidden: Tensor) -> LayerLanguageCache:
         hidden = hidden.to(dtype=self.norm_l.weight.dtype)
         hidden = self.norm_l(hidden)
@@ -955,6 +1112,7 @@ class VACouplingLayer(nn.Module):
         evidence: Tensor | None = None,
         state: Tensor | None = None,
         dense_input: DenseReadoutInput | None = None,
+        action_dense_input: DenseReadoutInput | None = None,
     ) -> tuple[Tensor, Tensor, Tensor | None]:
         visual_norm = self.norm_v_attn(visual)
         action_norm = self.norm_a_attn(action)
@@ -1023,63 +1181,98 @@ class VACouplingLayer(nn.Module):
         if self.qk_norm:
             query = F.rms_norm(query, (query.shape[-1],))
             key = F.rms_norm(key, (key.shape[-1],))
-        scores = torch.matmul(query.float(), key.float().transpose(-1, -2)) * self.scale
-        if self.attention_variant == "smc":
-            # SMC-Attn：源测度校正（2026-08-05 原创）。
-            # softmax 前对每个来源减去 log N_s → 来源总质量 ∝ 平均证据而非
-            # token 数量 × 平均证据；复制/细分同一来源不再稀释其他来源。
-            # 只作用于动作 query 行（视觉 query 保持 uni_a 语义），L 计数按
-            # 实际有效 mask 计算（padding 不计入）。
-            n_lang = key.shape[2] - (n_visual + n_memory + n_action + n_task + n_state)
-            log_n_v = math.log(max(1, n_visual))
-            log_n_m = math.log(max(1, n_memory))
-            log_n_a = math.log(max(1, n_action))
-            log_n_t = math.log(max(1, n_task))
-            log_n_s = math.log(max(1, n_state))
-            log_n_l = torch.log(
-                language_mask.to(scores.dtype).sum(-1).clamp(min=1.0)
-            )  # [B]
-            log_measure = torch.zeros(
-                (scores.shape[0], key.shape[2]),
-                device=scores.device,
-                dtype=scores.dtype,
-            )
-            off = 0
-            for n_group, log_n_group in (
-                (n_visual, log_n_v),
-                (n_memory, log_n_m),
-                (n_action, log_n_a),
-                (n_task, log_n_t),
-                (n_state, log_n_s),
-            ):
-                log_measure[:, off : off + n_group] = log_n_group
-                off += n_group
-            log_measure[:, off:] = log_n_l[:, None]
-            scores[:, :, n_visual:, :] -= log_measure[:, None, None, :]
-        scores = scores.masked_fill(~allowed, torch.finfo(scores.dtype).min)
-        self.last_max_logit = float(
-            scores.detach().masked_fill(~allowed, float("-inf")).amax()
+        # The task35 grid16 path has thousands of shared-attention queries per
+        # sample.  Materializing FP32 [B,H,Q,K] logits/weights dominates memory
+        # (hundreds of MiB per layer).  Fused SDPA evaluates the same flat
+        # masked attention without retaining that quadratic tensor.  SMC,
+        # dual-attention and attention capture need explicit logits and stay on
+        # the legacy path.  ``dropout_p`` must be zero in eval because SDPA
+        # applies dropout solely from its argument, independent of module mode.
+        use_sdpa = (
+            self.attention_backend == "auto"
+            and self.attention_variant == "flat"
+            and not self.dual_attention
+            and not self.save_attention
         )
-        if self.dual_attention:
-            weights, sem_update = self._dual_attention(
-                scores,
+        weights: Tensor | None
+        if use_sdpa:
+            update_heads = F.scaled_dot_product_attention(
                 query,
                 key,
                 value,
-                action,
-                language_mask,
-                n_visual,
-                n_memory,
-                n_action,
-                n_language,
-                n_task,
-                n_state,
+                attn_mask=allowed,
+                dropout_p=self.dropout if self.training else 0.0,
+                scale=self.scale,
             )
-        else:
-            weights = torch.softmax(scores, dim=-1).to(dtype=value.dtype)
+            # No production consumer reads this debug-only scalar.  Avoid a
+            # second quadratic QK matmul merely to populate it.
+            self.last_max_logit = None
+            weights = None
             sem_update = None
-        weights = F.dropout(weights, p=self.dropout, training=self.training)
-        update = self._from_heads(torch.matmul(weights, value))
+        else:
+            scores = (
+                torch.matmul(query.float(), key.float().transpose(-1, -2))
+                * self.scale
+            )
+            if self.attention_variant == "smc":
+                # SMC-Attn：源测度校正（2026-08-05 原创）。
+                # softmax 前对每个来源减去 log N_s → 来源总质量 ∝ 平均证据而非
+                # token 数量 × 平均证据；复制/细分同一来源不再稀释其他来源。
+                # 只作用于动作 query 行（视觉 query 保持 uni_a 语义），L 计数按
+                # 实际有效 mask 计算（padding 不计入）。
+                n_lang = key.shape[2] - (
+                    n_visual + n_memory + n_action + n_task + n_state
+                )
+                log_n_v = math.log(max(1, n_visual))
+                log_n_m = math.log(max(1, n_memory))
+                log_n_a = math.log(max(1, n_action))
+                log_n_t = math.log(max(1, n_task))
+                log_n_s = math.log(max(1, n_state))
+                log_n_l = torch.log(
+                    language_mask.to(scores.dtype).sum(-1).clamp(min=1.0)
+                )  # [B]
+                log_measure = torch.zeros(
+                    (scores.shape[0], key.shape[2]),
+                    device=scores.device,
+                    dtype=scores.dtype,
+                )
+                off = 0
+                for n_group, log_n_group in (
+                    (n_visual, log_n_v),
+                    (n_memory, log_n_m),
+                    (n_action, log_n_a),
+                    (n_task, log_n_t),
+                    (n_state, log_n_s),
+                ):
+                    log_measure[:, off : off + n_group] = log_n_group
+                    off += n_group
+                log_measure[:, off:] = log_n_l[:, None]
+                scores[:, :, n_visual:, :] -= log_measure[:, None, None, :]
+            scores = scores.masked_fill(~allowed, torch.finfo(scores.dtype).min)
+            self.last_max_logit = float(
+                scores.detach().masked_fill(~allowed, float("-inf")).amax()
+            )
+            if self.dual_attention:
+                weights, sem_update = self._dual_attention(
+                    scores,
+                    query,
+                    key,
+                    value,
+                    action,
+                    language_mask,
+                    n_visual,
+                    n_memory,
+                    n_action,
+                    n_language,
+                    n_task,
+                    n_state,
+                )
+            else:
+                weights = torch.softmax(scores, dim=-1).to(dtype=value.dtype)
+                sem_update = None
+            weights = F.dropout(weights, p=self.dropout, training=self.training)
+            update_heads = torch.matmul(weights, value)
+        update = self._from_heads(update_heads)
 
         n_query_v, n_query_a, n_query_t = n_visual, n_action, n_task
         if n_query_t:
@@ -1098,6 +1291,10 @@ class VACouplingLayer(nn.Module):
         if dense_input is not None:
             # MT-VJ：A_out = A_base + W_o·z（W_o 零初始化 → 初始严格等价）。
             action = action + self._dense_update(action_norm, dense_input)
+        if action_dense_input is not None:
+            action = action + self._action_dense_update(
+                action_norm, action_dense_input
+            )
         visual = visual + self.ffn_v(self.norm_v_ffn(visual))
         action = action + self.ffn_a(self.norm_a_ffn(action))
         task_out: Tensor | None = None
@@ -1106,6 +1303,8 @@ class VACouplingLayer(nn.Module):
             task = task + self.ffn_t(self.norm_t_ffn(task))
             task_out = task
         if self.save_attention:
+            if weights is None:
+                raise RuntimeError("attention capture unexpectedly used fused SDPA")
             self._last_attention = (
                 weights.detach().clone(),  # [B, heads, n_query, n_key]
                 n_visual,
@@ -1245,6 +1444,7 @@ class VACouplingLayer(nn.Module):
         evidence: Tensor | None = None,
         state: Tensor | None = None,
         dense_input: DenseReadoutInput | None = None,
+        action_dense_input: DenseReadoutInput | None = None,
     ) -> tuple[Tensor, Tensor, Tensor | None]:
         """Sequential A->V/T->A coupling (2026-08-07 审阅落地④).
 
@@ -1305,6 +1505,10 @@ class VACouplingLayer(nn.Module):
             # MT-VJ：dense readout 注入 Pass 3（correction）的 action 输出。
             action_new = action_new + self._dense_update(
                 self.norm_a_attn(action_half), dense_input
+            )
+        if action_dense_input is not None:
+            action_new = action_new + self._action_dense_update(
+                self.norm_a_attn(action_half), action_dense_input
             )
         action_new = action_new + self.ffn_a(self.norm_a_ffn(action_new))
         return visual_new, action_new, task_new
@@ -1660,6 +1864,44 @@ class VACompoundPolicy(nn.Module):
         self.config = config
         self.vision_projection = nn.Linear(config.vision_dim, config.hidden_dim)
         self.state_projection = nn.Linear(config.proprio_dim + config.action_dim, config.hidden_dim)
+        # Optional treatment-only modules must not consume the parent RNG stream:
+        # otherwise a temporal/geometry ablation changes every common parameter
+        # constructed below it and ceases to be a matched initialization.  Their
+        # own weights are still deterministic under the caller's seed, while the
+        # RNG state seen by action_queries/VA/decoder is restored exactly.
+        with torch.random.fork_rng(devices=[]):
+            self.main_vision_frame_embedding = (
+                nn.Embedding(config.main_vision_frames, config.vision_dim)
+                if config.main_vision_temporal
+                else None
+            )
+            if self.main_vision_frame_embedding is not None:
+                nn.init.normal_(self.main_vision_frame_embedding.weight, std=0.02)
+            self.geometry_projection = (
+                nn.Linear(config.metric_geometry_dim, config.hidden_dim)
+                if config.metric_geometry_inject
+                else None
+            )
+            if self.geometry_projection is not None:
+                nn.init.zeros_(self.geometry_projection.weight)
+                nn.init.zeros_(self.geometry_projection.bias)
+            self.wmrm = None
+        if config.wmrm:
+            from va_compound.wmrm import WAM4VA
+
+            with torch.random.fork_rng(devices=[]):
+                self.wmrm = WAM4VA(
+                    config.hidden_dim,
+                    world_dim=config.wmrm_world_dim,
+                    rank=config.wmrm_rank,
+                    proprio_dim=config.proprio_dim,
+                    mixer_dropout=config.wmrm_mixer_dropout,
+                    num_heads=config.num_heads,
+                )
+        else:
+            self.wmrm = None
+        self.last_wmrm = None
+        self.last_wmrm_pi_kl = None
         self.action_queries = nn.Parameter(torch.empty(config.action_horizon, config.hidden_dim))
         nn.init.normal_(self.action_queries, std=0.02)
 
@@ -1739,6 +1981,7 @@ class VACompoundPolicy(nn.Module):
                 mode=config.mode,
                 qk_norm=config.qk_norm,
                 attention_variant=config.attention_variant,
+                attention_backend=config.va_attention_backend,
                 sequential=(
                     config.sequential_coupling > 0
                     and (index + 1) % config.sequential_coupling == 0
@@ -1752,18 +1995,34 @@ class VACompoundPolicy(nn.Module):
                     )
                 ),
                 dense_readout_mtvj=config.dense_readout_mtvj,
+                action_dense_readout=(config.action_vision_backbone != "none"),
             )
             for index in range(config.num_layers)
         )
         # MT-VJ（2026-08-10 契约 §5）：dense evidence 共享投影（D/G/T：
         # 768 → 192 + 坐标嵌入投影），每层 dense K/V 复用其输出。
+        # DINO-metric（2026-08-15）：DINO-main 下同一投影器以
+        # vision_dim=main_vision_dim（1024）构造，消费 block11/block23
+        # 两帧 [d-2,d] patch evidence（512 token）。
         if config.dense_readout_mtvj:
+            projector_vision_dim = (
+                config.main_vision_dim
+                if config.main_vision_backbone != "vjepa"
+                else config.vision_dim
+            )
             self.dense_evidence_proj = DenseEvidenceProjector(
-                vision_dim=config.vision_dim,
+                vision_dim=projector_vision_dim,
                 hidden_dim=config.hidden_dim,
             )
         else:
             self.dense_evidence_proj = None
+        if config.action_vision_backbone != "none":
+            self.action_dense_evidence_proj = DenseEvidenceProjector(
+                vision_dim=config.action_vision_dim,
+                hidden_dim=config.hidden_dim,
+            )
+        else:
+            self.action_dense_evidence_proj = None
         if config.memory_split:
             self.evidence_init = nn.Parameter(
                 torch.empty(1, config.evidence_tokens, config.hidden_dim)
@@ -1955,6 +2214,15 @@ class VACompoundPolicy(nn.Module):
         relations = self.relation_tokens(slots, centers)
         return build_va_vision_input(coarse, slots, relations)  # [B, 25, D]
 
+    def _wmrm_inject_layers(self) -> set[int]:
+        n_layers = len(self.layers)
+        mode = self.config.wmrm_inject
+        if mode == "last":
+            return {n_layers - 1}
+        if mode == "all":
+            return set(range(n_layers))
+        return {index for index in range(n_layers) if index % 2 == 1 or index == n_layers - 1}
+
     def encode_condition(
         self,
         vision_tokens: Tensor,
@@ -1968,6 +2236,9 @@ class VACompoundPolicy(nn.Module):
         return_visual_memory: bool = False,
         dense_evidence: dict[int, Tensor] | None = None,
         metric_tokens: Tensor | None = None,
+        action_dense_evidence: dict[int, Tensor] | None = None,
+        metric_g: Tensor | None = None,
+        world_goal: Tensor | None = None,
     ) -> Tensor | tuple[Tensor, VisualMemory]:
         if (language_hidden is None) == (language_cache is None):
             raise ValueError("provide exactly one of language_hidden or language_cache")
@@ -1975,9 +2246,47 @@ class VACompoundPolicy(nn.Module):
             raise ValueError("vision_tokens must have shape [batch, tokens, vision_dim]")
 
         target_dtype = self.vision_projection.weight.dtype
-        vision = self.vision_projection(vision_tokens.to(dtype=target_dtype))
+        vision_input = vision_tokens.to(dtype=target_dtype)
+        if self.main_vision_frame_embedding is not None:
+            expected_tokens = (
+                self.config.main_vision_frames
+                * self.config.main_vision_grid
+                * self.config.main_vision_grid
+            )
+            if vision_input.shape[1] != expected_tokens:
+                raise ValueError(
+                    "temporal DINO main vision expects "
+                    f"{expected_tokens} frame-major tokens, got {vision_input.shape[1]}"
+                )
+            patches_per_frame = self.config.main_vision_grid ** 2
+            frame_ids = torch.arange(
+                self.config.main_vision_frames, device=vision_input.device
+            ).repeat_interleave(patches_per_frame)
+            frame_embedding = self.main_vision_frame_embedding(frame_ids).to(
+                dtype=target_dtype
+            )
+            vision_input = vision_input + (
+                float(self.config.main_vision_temporal_scale)
+                * frame_embedding.unsqueeze(0)
+            )
+        vision = self.vision_projection(vision_input)
         state = torch.cat((proprio, previous_action), dim=-1).to(dtype=target_dtype)
         state = self.state_projection(state)
+        if self.geometry_projection is not None:
+            if metric_g is None:
+                raise ValueError(
+                    "metric_geometry_inject=True requires metric_g for every decision"
+                )
+            expected = (vision.shape[0], self.config.metric_geometry_dim)
+            if metric_g.shape != expected:
+                raise ValueError(
+                    f"metric_g must have shape {expected}, got {tuple(metric_g.shape)}"
+                )
+            if not torch.isfinite(metric_g).all():
+                raise ValueError("metric_g must contain only finite values")
+            state = state + self.geometry_projection(
+                metric_g.to(device=state.device, dtype=target_dtype)
+            )
 
         if language_cache is None:
             language_cache = self.build_language_cache(language_hidden, language_mask)
@@ -2029,6 +2338,18 @@ class VACompoundPolicy(nn.Module):
             if not (5 in dense_evidence and 11 in dense_evidence):
                 raise ValueError("dense_evidence 必须包含 key 5（H5）与 11（H11）")
             dense_input = self.dense_evidence_proj(dense_evidence, metric_tokens)
+        action_dense_input = None
+        if (
+            self.config.action_vision_backbone != "none"
+            and action_dense_evidence is not None
+        ):
+            if not (5 in action_dense_evidence and 11 in action_dense_evidence):
+                raise ValueError(
+                    "action_dense_evidence 必须包含 canonical key 5（中层）与 11（末层）"
+                )
+            action_dense_input = self.action_dense_evidence_proj(
+                action_dense_evidence, None
+            )
 
         if visual_memory is not None:
             if self.config.memory_split:
@@ -2124,6 +2445,7 @@ class VACompoundPolicy(nn.Module):
                         task=task_hat,
                         state=state[:, None],
                         dense_input=dense_input,
+                        action_dense_input=action_dense_input,
                     )
                 else:
                     vision, action, task_hat = layer(
@@ -2135,6 +2457,7 @@ class VACompoundPolicy(nn.Module):
                         task=task_hat,
                         state=state[:, None],
                         dense_input=dense_input,
+                        action_dense_input=action_dense_input,
                     )
             # The VA layers propose a speculative task update; with EVSM it
             # goes to scratch (task_spec) and is only committed after evidence
@@ -2164,6 +2487,10 @@ class VACompoundPolicy(nn.Module):
             return action_condition
 
         next_memory = []
+        belief = None
+        prev_innovation = None
+        self.last_wmrm = None
+        self.last_wmrm_pi_kl = None
         for index, (layer, layer_cache) in enumerate(
             zip(self.layers, language_cache.layers, strict=True)
         ):
@@ -2176,6 +2503,7 @@ class VACompoundPolicy(nn.Module):
                     language_cache.attention_mask,
                     visual_memory=previous_visual,
                     dense_input=dense_input,
+                    action_dense_input=action_dense_input,
                 )
             else:
                 vision, action, _ = layer(
@@ -2185,8 +2513,31 @@ class VACompoundPolicy(nn.Module):
                     language_cache.attention_mask,
                     visual_memory=previous_visual,
                     dense_input=dense_input,
+                    action_dense_input=action_dense_input,
                 )
             next_memory.append(vision)
+            if self.wmrm is not None and index in self._wmrm_inject_layers():
+                pre_action = action
+                lang_key = layer_cache.key
+                language_keys = lang_key.transpose(1, 2).reshape(
+                    lang_key.shape[0], lang_key.shape[2], self.config.hidden_dim
+                )
+                mask = language_cache.attention_mask
+                if mask is not None:
+                    language_keys = language_keys * mask.to(dtype=language_keys.dtype)[:, :, None]
+                action, self.last_wmrm, belief, prev_innovation = self.wmrm(
+                    action,
+                    vision,
+                    proprio.to(dtype=action.dtype),
+                    belief=belief,
+                    prev_innovation=prev_innovation,
+                    language_keys=language_keys,
+                    world_goal=world_goal,
+                )
+                if self.training:
+                    self.last_wmrm_pi_kl = self.wmrm.pi_kl_from_aux(
+                        pre_action, self.last_wmrm
+                    )
         action_condition = self.action_norm(action)
         if return_visual_memory:
             return action_condition, VisualMemory(layers=tuple(next_memory))
@@ -2233,6 +2584,9 @@ class VACompoundPolicy(nn.Module):
         semantic_context: Tensor | None = None,
         dense_evidence: dict[int, Tensor] | None = None,
         metric_tokens: Tensor | None = None,
+        action_dense_evidence: dict[int, Tensor] | None = None,
+        metric_g: Tensor | None = None,
+        world_goal: Tensor | None = None,
     ) -> Tensor | tuple[Tensor, VisualMemory]:
         encoded = self.encode_condition(
             vision_tokens,
@@ -2245,6 +2599,9 @@ class VACompoundPolicy(nn.Module):
             return_visual_memory=return_visual_memory,
             dense_evidence=dense_evidence,
             metric_tokens=metric_tokens,
+            action_dense_evidence=action_dense_evidence,
+            metric_g=metric_g,
+            world_goal=world_goal,
         )
         if return_visual_memory:
             action_condition, next_memory = encoded

@@ -11,6 +11,7 @@ from torch import nn
 from train import (
     SAM,
     TaskLocalityWeightedSampler,
+    TaskWeightedSampler,
     build_dataset_content_identity,
     build_exact_resume_state,
     build_exact_run_contract,
@@ -118,6 +119,57 @@ def test_two_updates_equal_one_save_resume_one_with_weights_only_load(tmp_path) 
         )
 
 
+def test_restore_allows_null_sampler_for_dino_weighted_checkpoints() -> None:
+    _, optimizer = _model_and_optimizer()
+    payload = build_exact_resume_state(optimizer, 6000, None, _contract())
+    assert payload["sampler_state"] is None
+    step = restore_exact_resume_state(
+        payload,
+        optimizer,
+        None,
+        runtime_exact_run_contract=_contract(),
+        restore_rng=False,
+    )
+    assert step == 6000
+    weighted = TaskWeightedSampler(torch.tensor([1.0, 2.0, 3.0, 4.0]), batch_size=2, seed=0)
+    restore_exact_resume_state(
+        payload,
+        optimizer,
+        weighted,
+        runtime_exact_run_contract=_contract(),
+        restore_rng=False,
+    )
+    assert weighted.epoch == 0
+    assert weighted.batch_cursor == 0
+    with pytest.raises(ValueError, match="sampler_state=None"):
+        restore_exact_resume_state(
+            payload,
+            optimizer,
+            _sampler(),
+            runtime_exact_run_contract=_contract(),
+            restore_rng=False,
+        )
+
+
+def test_task_weighted_sampler_roundtrip_and_advance() -> None:
+    weights = torch.tensor([0.5, 1.0, 2.0, 3.0, 0.5, 1.0])
+    baseline = TaskWeightedSampler(weights, batch_size=2, seed=7)
+    first = next(iter(baseline))
+    baseline.advance()
+    second = next(iter(baseline))
+    resumed = TaskWeightedSampler(weights, batch_size=2, seed=7)
+    resumed.load_state_dict(baseline.state_dict())
+    assert next(iter(resumed)) == second
+    resumed.advance()
+    baseline.advance()
+    assert resumed.state_dict() == baseline.state_dict()
+    assert len(first) == 2
+    with pytest.raises(ValueError, match="weights_sha256"):
+        resumed.load_state_dict(
+            {**baseline.state_dict(), "weights_sha256": "deadbeef"}
+        )
+
+
 def test_exact_resume_rejects_legacy_checkpoint() -> None:
     model, optimizer = _model_and_optimizer()
     del model
@@ -176,6 +228,10 @@ def test_sam_roundtrip_uses_base_adamw_state() -> None:
 def test_resume_flags_are_mutually_exclusive() -> None:
     with pytest.raises(SystemExit):
         parse_args(["--resume", "legacy.pt", "--resume-exact", "exact.pt"])
+    with pytest.raises(SystemExit):
+        parse_args(["--resume-weights", "weights.pt", "--resume", "legacy.pt"])
+    with pytest.raises(SystemExit):
+        parse_args(["--resume-weights", "weights.pt", "--resume-exact", "exact.pt"])
 
 
 @pytest.mark.parametrize("changed_key", ["actions", "action_valid_mask"])
@@ -207,6 +263,39 @@ def test_dataset_identity_rejects_changed_action_payload(tmp_path, changed_key: 
             {**_contract(), "data_identity": baseline},
             {**_contract(), "data_identity": current},
         )
+
+
+def test_exact_contract_tracks_dino_roi_identity() -> None:
+    _, optimizer = _model_and_optimizer()
+    args = parse_args(["--single-task"])
+    config = SimpleNamespace(num_layers=8, action_horizon=6)
+    roi_a = SimpleNamespace(
+        _dino_roi_identity={
+            "sha256": "a" * 64,
+            "size_bytes": 123,
+            "contract": "dino_metric_roi_task35_v2",
+            "path": "/ignored/a.pt",
+        },
+        _mtvj_roi_config={"canonical_image_size": 224},
+    )
+    roi_b = SimpleNamespace(
+        _dino_roi_identity={
+            "sha256": "b" * 64,
+            "size_bytes": 123,
+            "contract": "dino_metric_roi_task35_v2",
+            "path": "/ignored/b.pt",
+        },
+        _mtvj_roi_config={"canonical_image_size": 224},
+    )
+    baseline = build_exact_run_contract(
+        args, config, optimizer, _sampler(), roi_head=roi_a
+    )
+    changed = build_exact_run_contract(
+        args, config, optimizer, _sampler(), roi_head=roi_b
+    )
+    assert baseline["mtvj"]["roi_checkpoint_identity"]["sha256"] == "a" * 64
+    with pytest.raises(ValueError, match="roi_checkpoint_identity"):
+        validate_exact_run_contract(baseline, changed)
 
 
 @pytest.mark.parametrize(

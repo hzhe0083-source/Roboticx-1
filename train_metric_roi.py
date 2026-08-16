@@ -160,19 +160,34 @@ def load_coarse_source(
                 "runtime metric checkpoint differs from the policy's saved external "
                 f"identity: {identity_mismatch}"
             )
-        constructor_keys = set(
-            inspect.signature(LanguageMetricField.__init__).parameters
-        ) - {"self"}
-        missing_policy_ctor = sorted(constructor_keys - set(policy_config))
-        missing_runtime_ctor = sorted(constructor_keys - set(runtime_config))
+        constructor_signature = inspect.signature(LanguageMetricField.__init__)
+        constructor_keys = set(constructor_signature.parameters) - {"self"}
+        required_constructor_keys = {
+            key
+            for key, parameter in constructor_signature.parameters.items()
+            if key != "self" and parameter.default is inspect.Parameter.empty
+        }
+        missing_policy_ctor = sorted(required_constructor_keys - set(policy_config))
+        missing_runtime_ctor = sorted(required_constructor_keys - set(runtime_config))
         if missing_policy_ctor or missing_runtime_ctor:
             raise ValueError(
                 "coarse policy/runtime metric constructor contract is incomplete: "
                 f"policy_missing={missing_policy_ctor}, "
                 f"runtime_missing={missing_runtime_ctor}"
             )
-        policy_ctor = {key: policy_config[key] for key in constructor_keys}
-        runtime_ctor = {key: runtime_config[key] for key in constructor_keys}
+        # Optional constructor fields added after legacy Stage-V artifacts (notably
+        # grid) inherit the class default. This preserves the documented V-JEPA
+        # grid24 compatibility while DINO v2 checkpoints still save grid=16.
+        defaults = {
+            key: constructor_signature.parameters[key].default
+            for key in constructor_keys
+        }
+        policy_ctor = {
+            key: policy_config.get(key, defaults[key]) for key in constructor_keys
+        }
+        runtime_ctor = {
+            key: runtime_config.get(key, defaults[key]) for key in constructor_keys
+        }
         if policy_ctor != runtime_ctor:
             raise ValueError(
                 "coarse policy metric-head constructor differs from runtime metric "

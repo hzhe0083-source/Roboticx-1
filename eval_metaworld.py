@@ -37,6 +37,7 @@ _DEBUG_FA_DONE: dict[str, bool] = {}
 _ALIGN_ACTS: list | None = None
 from va_compound.backbones import (
     QwenSemanticBackbone,
+    TimmActionVisionBackbone,
     VJEPA21Backbone,
     pool_mtvj_coarse_tokens,
 )
@@ -58,10 +59,14 @@ from va_compound.local_control_slots import (
     build_va_vision_input,
 )
 from va_compound.metric_roi import (
+    DINO_METRIC_ROI_CONTRACT,
+    TASK35_METRIC_ROLE_CONTRACT,
+    load_dino_metric_roi_checkpoint,
     load_metric_roi_checkpoint,
     metric_head_state_sha256,
     prepare_metric_roi_video,
     refine_metric_roi_positions,
+    refine_metric_roi_positions_dino,
 )
 
 IMAGE_MEAN = torch.tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1)
@@ -77,7 +82,10 @@ MTVJ_METRIC_HEAD_CONFIG_KEYS = (
     "temp_init",
     "freeze_bias",
     "mode_readout",
+    "grid",
 )
+# 缺省即向后兼容的构造键（旧 checkpoint 无此键 → 填默认值，不视为不完整）。
+_MTVJ_METRIC_HEAD_OPTIONAL_KEYS = frozenset({"grid"})
 _MTVJ_METRIC_HEAD_CONFIG_DEFAULTS = {
     "lang_dim": 2048,
     "h_dim": 768,
@@ -88,6 +96,7 @@ _MTVJ_METRIC_HEAD_CONFIG_DEFAULTS = {
     "temp_init": 10.0,
     "freeze_bias": False,
     "mode_readout": False,
+    "grid": 24,
 }
 MTVJ_METRIC_STATE_SOURCE = "p_times_visibility_flat"
 MTVJ_METRIC_CONTRACT_VERSION = 3
@@ -119,34 +128,52 @@ _mtvj_visibility_gated_positions = _mtvj_metric_positions
 
 
 def _wam_spatial16_from_h11(h11: torch.Tensor) -> torch.Tensor:
-    """E7 WAM M0：H11 dense evidence → 最后时间片 4×4 空间 token [B,16,768]。
+    """E7 WAM：H11 dense → 最后时间片 4×4 空间 token。
 
-    H11 dense 布局 [B,1152,768]（2 时间片 × 24×24，t→y→x 扁平）；最后时间片
-    [..., 576:, :] = [B,576,768] → 24×24 网格 → 6×6 块均值 → [B,4,4,768]
-    → flatten [B,16,768]（Task 5 wam_last_slice_pool 同构，见 wam.py 契约）。
+    与 ``va_compound.wam_cache.wam_last_slice_pool`` 同一实现，避免
+    eval avg_pool2d 与 cache view+mean 日后漂移。
     """
-    last = h11[..., 576:, :]  # [B,576,768]
-    batch = last.shape[0]
-    grid = last.reshape(batch, 24, 24, 768).permute(0, 3, 1, 2)  # [B,768,24,24]
-    pooled = F.avg_pool2d(grid, kernel_size=6, stride=6)  # [B,768,4,4]
-    return pooled.permute(0, 2, 3, 1).reshape(batch, 16, 768)  # [B,16,768]
+    from va_compound.wam_cache import wam_last_slice_pool
+
+    return wam_last_slice_pool(h11)
 
 
 def _make_wam_residual_fn(wam, memory, spatial16, geo8, wam_alpha):
     """E7 WAM M0 Task 4 闭包：decode_actions Euler 循环内 v += wam_alpha * wam(...)。
 
-    场景路径输入零张量（M0 仅动作残差通路，场景由独立训练器提供）；调用约定
-    与 va_compound/model.py 的 wam_residual_fn(cond, x_t, t_k) 钩子一致。
+    场景半边没有 GT 目标，走与训练相同的直线路径、目标取 0：
+    x_scene(τ) = (1-τ)·ε，ε 在本次 decode 内固定。每步重填 zeros 既不是
+    该路径，也会让 54 个场景 token 与 τ 脱节。
+    调用约定与 va_compound/model.py 的 wam_residual_fn(cond, x_t, t_k) 一致。
     """
+    if memory is None or len(getattr(memory, "layers", ())) == 0:
+        raise ValueError(
+            "WAM residual 需要非空 VA 记忆快照 layers；"
+            "memory_split 路径的 layers=() 不能接 WAM"
+        )
+    scene_eps = None
+    geo_eps = None
 
     def fn(cond, x_t, t_k):
+        nonlocal scene_eps, geo_eps
+        batch = x_t.shape[0]
+        flow_time = t_k.reshape(-1)
+        if flow_time.numel() == 1:
+            flow_time = flow_time.expand(batch)
+        if scene_eps is None:
+            scene_eps = torch.randn(batch, 3, 16, 768, device=x_t.device, dtype=x_t.dtype)
+            geo_eps = torch.randn(batch, 3, 2, 8, device=x_t.device, dtype=x_t.dtype)
+        tau = flow_time.to(dtype=x_t.dtype)
+        tau_s = tau[:, None, None, None]
+        x_scene = (1.0 - tau_s) * scene_eps
+        x_geo = (1.0 - tau_s) * geo_eps
         dv, _ = wam(  # noqa
             action_condition=cond, va_layers=memory.layers,
             spatial_tokens=spatial16, geo_tokens=geo8,
             noisy_actions=x_t,
-            noisy_scene_latents=torch.zeros(x_t.shape[0], 3, 16, 768, device=x_t.device),
-            noisy_scene_geo=torch.zeros(x_t.shape[0], 3, 2, 8, device=x_t.device),
-            flow_time=t_k.expand(x_t.shape[0]),
+            noisy_scene_latents=x_scene,
+            noisy_scene_geo=x_geo,
+            flow_time=tau,
         )
         return wam_alpha * dv
 
@@ -173,11 +200,39 @@ def _resolve_wam(ckpt: dict, args, config, device: torch.device):
                 "use auto/off"
             )
         return None
+    if getattr(config, "memory_split", False):
+        raise ValueError(
+            "WAM 需要 VA 层快照 layers；memory_split checkpoint 的 layers=() "
+            "不能启用 --wam"
+        )
+    if getattr(config, "direct_head", False) or getattr(config, "c2_controller", False):
+        raise ValueError(
+            "--wam 不支持 direct_head/c2_controller 解码"
+            "（WAM 残差只作用于 flow Euler 路径）"
+        )
+    if not (
+        getattr(config, "dense_readout_mtvj", False)
+        or getattr(args, "dense_readout_mtvj", False)
+    ):
+        raise ValueError(
+            "--wam 需要 dense_readout_mtvj（WAM spatial16 = H11 last-slice）"
+        )
+    if ckpt.get("mtvj_metric_head") is None:
+        raise ValueError(
+            "--wam 需要 mtvj metric head（WAM geo8 = p*visibility 8 维状态）"
+        )
+    training_contract = ckpt.get("training_contract", {}) or {}
+    if training_contract.get("metric_state_source") != MTVJ_METRIC_STATE_SOURCE:
+        raise ValueError(
+            "--wam 需要 v3 metric source（p_times_visibility_flat）；"
+            "legacy p_flat 与 WAM cache 的 geo8 契约不匹配"
+        )
     # Task 1（va_compound/wam.py）为并行交付：延迟导入，wam 不可用时
     # 不触碰该模块（import eval_metaworld 始终干净）。
-    from va_compound.wam import JointWorldActionFlow, WAMConfig
+    from va_compound.wam import JointWorldActionFlow, wam_config_from_state
 
-    wam_cfg = WAMConfig(
+    wam_cfg = wam_config_from_state(
+        ckpt.get("wam_config"),
         action_horizon=int(getattr(config, "action_horizon", ACTION_HORIZON)),
         action_dim=int(getattr(config, "action_dim", 4)),
         hidden_dim=int(getattr(config, "hidden_dim", 512)),
@@ -185,11 +240,14 @@ def _resolve_wam(ckpt: dict, args, config, device: torch.device):
     wam = JointWorldActionFlow(wam_cfg)
     wam.load_state_dict(wam_state)
     wam.to(device).eval()
+    for param in wam.parameters():
+        param.requires_grad_(False)
     print(
         f"eval: WAM enabled from checkpoint wam_model "
         f"(action_horizon={wam_cfg.action_horizon}, "
         f"action_dim={wam_cfg.action_dim}, "
-        f"hidden_dim={wam_cfg.hidden_dim}, alpha={args.wam_alpha})"
+        f"hidden_dim={wam_cfg.hidden_dim}, "
+        f"num_layers={wam_cfg.num_layers}, alpha={args.wam_alpha})"
     )
     return wam
 
@@ -210,9 +268,178 @@ def select_eval_tasks(
     return [(index, all_tasks[index]) for index in indices]
 
 
+METAWORLD_TASK_CONFIG = Path(
+    "/home/ryan/Documents/robot/Evoagent/Evo-1/evo1_lerobot/lerobot/envs/metaworld_config.json"
+)
+
+
+def load_metaworld_description_to_env(path: Path = METAWORLD_TASK_CONFIG) -> dict[str, str]:
+    import json
+
+    resolved = Path(path).expanduser()
+    if not resolved.is_file():
+        raise ValueError(f"MetaWorld task config missing: {resolved}")
+    config = json.loads(resolved.read_text())
+    descriptions = config.get("TASK_DESCRIPTIONS")
+    if not isinstance(descriptions, dict) or not descriptions:
+        raise ValueError(f"{resolved} has no TASK_DESCRIPTIONS")
+    return {str(value): str(key) for key, value in descriptions.items()}
+
+
+def require_task35_peg_insert_side(
+    selected_tasks: list[tuple[int, str]],
+    descriptions_to_env: dict[str, str],
+) -> str:
+    """Fail before GPU work if --task-ids 35 is not peg-insert-side-v3."""
+    if len(selected_tasks) != 1 or selected_tasks[0][0] != 35:
+        raise ValueError("task35 evaluation must select exactly --task-ids 35")
+    task_text = selected_tasks[0][1]
+    env_name = descriptions_to_env.get(task_text)
+    if env_name != "peg-insert-side-v3":
+        raise ValueError(
+            "task35 evaluation mapped "
+            f"{task_text!r} -> {env_name!r}, expected peg-insert-side-v3"
+        )
+    return env_name
+
+
 def evaluation_episode_seed(global_task_id: int, trial: int) -> int:
     """Stable seed independent of task subset/order."""
     return 1000 * int(global_task_id) + int(trial)
+
+
+TASK35_EVAL50_SEEDS = tuple(range(35000, 35050))
+
+
+def cached_task35_language(
+    features: dict[str, Any],
+    device: torch.device,
+    *,
+    task_id: int = 35,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Use the training-cache language tokens instead of loading Qwen on GPU.
+
+    All matching rows must be identical. Silently taking the first row would
+    hide a mixed-instruction payload.
+    """
+    if "language_hidden" not in features or "language_mask" not in features:
+        raise ValueError("task35 features missing cached language_hidden/language_mask")
+    if "instruction_id" not in features:
+        raise ValueError("task35 features missing instruction_id")
+    instruction_id = torch.as_tensor(features["instruction_id"]).reshape(-1)
+    keep = instruction_id == int(task_id)
+    if not bool(keep.any()):
+        raise ValueError(f"task35 features have no instruction_id={task_id} language cache")
+    hidden_rows = features["language_hidden"][keep]
+    mask_rows = features["language_mask"][keep]
+    if hidden_rows.ndim != 3 or mask_rows.shape[:2] != hidden_rows.shape[:2]:
+        raise ValueError(
+            f"cached task35 language has unexpected shape {tuple(hidden_rows.shape)} / {tuple(mask_rows.shape)}"
+        )
+    if not torch.equal(hidden_rows, hidden_rows[:1].expand_as(hidden_rows)):
+        raise ValueError("task35 cached language_hidden is not identical across windows")
+    if not torch.equal(mask_rows, mask_rows[:1].expand_as(mask_rows)):
+        raise ValueError("task35 cached language_mask is not identical across windows")
+    return hidden_rows[:1].to(device=device), mask_rows[:1].to(device=device)
+
+
+def want_vjepa_dense_backbone(config: Any, args: Any) -> bool:
+    """Load frozen V-JEPA dense evidence only for non-DINO MT-VJ policies.
+
+    Task35 DINO-metric checkpoints keep ``dense_readout_mtvj=True`` because the
+    VA dense K/V layers exist, but those layers consume DINO block11/block23
+    tokens. Auto-enabling the V-JEPA tower would mix two evidence stacks and
+    OOM a 16 GiB laptop during eval50.
+    """
+    dino_metric = bool(getattr(config, "dino_dense_metric", False))
+    dino_main = getattr(config, "main_vision_backbone", "vjepa") != "vjepa"
+    cli_vjepa = bool(getattr(args, "dense_readout_mtvj", False))
+    has_metric_ckpt = getattr(args, "metric_visual_checkpoint", None) is not None
+    if dino_metric:
+        if cli_vjepa or has_metric_ckpt:
+            raise ValueError(
+                "DINO-metric checkpoint 的 dense/metric 栈由 DINO 特征驱动；"
+                "禁止 --dense-readout-mtvj / --metric-visual-checkpoint "
+                "（V-JEPA 路径）混用"
+            )
+        return False
+    if dino_main:
+        # DINO-main already forbids the V-JEPA CLI flags. Do not auto-enable
+        # a second tower just because the config still has dense_readout_mtvj.
+        return False
+    return cli_vjepa or bool(getattr(config, "dense_readout_mtvj", False))
+
+
+def validate_task35_eval50_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Fail-closed check for a 50-seed task35 closed-loop JSON."""
+    if payload.get("contract") != "metaworld_closed_loop_trials_v1":
+        raise ValueError("eval50 payload has the wrong contract")
+    trials = payload.get("trials") or []
+    seeds = [int(row["seed"]) for row in trials]
+    expected = list(TASK35_EVAL50_SEEDS)
+    requirements = {
+        "task35 only": payload.get("task_ids") == [35],
+        "50 completed trials": int(payload.get("completed_trials") or 0) == 50,
+        "50 trial records": len(trials) == 50,
+        "unique seeds": len(set(seeds)) == 50,
+        "paired seeds 35000-35049": seeds == expected,
+        "execute_steps 6": int(payload.get("execute_steps") or 0) == 6,
+        "horizon 500": int(payload.get("horizon") or 0) == 500,
+        "WAM off": payload.get("wam") == "off",
+        "FM decoder": payload.get("action_decoder") == "conditional_flow_matching",
+        "peg-insert-side-v3": payload.get("env_name") == "peg-insert-side-v3",
+        "success count matches": int(payload.get("successes") or 0)
+        == sum(bool(row.get("success")) for row in trials),
+        "language source recorded": payload.get("language_source")
+        in {"task35_features_cache", "qwen_text_backbone"},
+    }
+    ablation = payload.get("task35_causal_ablation", "none")
+    if payload.get("task35_precision_contract"):
+        requirements["acceptance not ablated"] = ablation == "none"
+    elif ablation != "none":
+        requirements["diagnostic ablation"] = ablation in {
+            "temporal-reverse",
+            "geometry-zero",
+            "geometry-shuffle",
+            "roi-off",
+            "dense-zero",
+        }
+    else:
+        raise ValueError("eval50 payload is neither precision acceptance nor a causal diagnostic")
+    missing = [name for name, ok in requirements.items() if not ok]
+    if missing:
+        raise ValueError("task35 eval50 payload failed: " + ", ".join(missing))
+    return {"ok": True, "seeds": seeds, "successes": int(payload["successes"])}
+
+
+def task35_ablation_frames(
+    frames: list[np.ndarray], ablation: str
+) -> list[np.ndarray]:
+    """Apply the fixed frame permutation used by the task35 temporal diagnostic."""
+    return list(reversed(frames)) if ablation == "temporal-reverse" else frames
+
+
+def task35_ablation_dense(
+    dense_evidence: dict[int, torch.Tensor], ablation: str
+) -> dict[int, torch.Tensor]:
+    """Zero both DINO dense levels without changing their shape or dtype."""
+    if ablation != "dense-zero":
+        return dense_evidence
+    return {
+        layer: torch.zeros_like(evidence)
+        for layer, evidence in dense_evidence.items()
+    }
+
+
+def task35_ablation_geometry(metric_g: torch.Tensor, ablation: str) -> torch.Tensor:
+    """Ablate only the direct 8-D geometry route, preserving relation tokens."""
+    if ablation == "geometry-zero":
+        return torch.zeros_like(metric_g)
+    if ablation == "geometry-shuffle":
+        # Keep each role's (x,y) pair intact while swapping tool↔pegGrasp and
+        # hole↔pegHead.  This is deterministic and identical across trials.
+        return metric_g[:, [2, 3, 0, 1, 6, 7, 4, 5]]
+    return metric_g
 
 
 def _canonical_mtvj_metric_head_config(
@@ -222,7 +449,8 @@ def _canonical_mtvj_metric_head_config(
 ) -> dict:
     raw = dict(config or {})
     if require_complete:
-        missing = sorted(set(MTVJ_METRIC_HEAD_CONFIG_KEYS) - set(raw))
+        required = set(MTVJ_METRIC_HEAD_CONFIG_KEYS) - _MTVJ_METRIC_HEAD_OPTIONAL_KEYS
+        missing = sorted(required - set(raw))
         if missing:
             raise ValueError(
                 "主 checkpoint 缺少完整 mtvj_metric_head_config："
@@ -232,7 +460,7 @@ def _canonical_mtvj_metric_head_config(
         key: raw.get(key, default)
         for key, default in _MTVJ_METRIC_HEAD_CONFIG_DEFAULTS.items()
     }
-    for key in ("lang_dim", "h_dim", "d_proj", "n_roles"):
+    for key in ("lang_dim", "h_dim", "d_proj", "n_roles", "grid"):
         values[key] = int(values[key])
     for key in (
         "l2_norm",
@@ -257,6 +485,14 @@ def _mtvj_metric_checkpoint_identity(path: Path, checkpoint: dict) -> dict:
         "size_bytes": int(resolved.stat().st_size),
         "contract": checkpoint.get("contract"),
     }
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _mtvj_metric_identity_mismatches(saved: dict, current: dict) -> dict:
@@ -528,6 +764,82 @@ def _load_mtvj_metric_checkpoint(
     return metric_head, relation_encoder
 
 
+def _load_dino_metric_from_policy(ckpt: dict, config, device):
+    """DINO-metric（2026-08-15）：从主 checkpoint 严格重建 DINO metric 栈。
+
+    与训练 _build_dino_metric_stack 同构：LanguageMetricField 构造配置取
+    ckpt["mtvj_metric_head_config"]（h_dim=1024、grid=16），权重取
+    ckpt["mtvj_metric_head"]；RelationStateEncoder(state_dim=8,
+    d_model=config.hidden_dim) 取 ckpt["mtvj_relation_encoder"]。评测禁止
+    随机重建——缺失即 fail-fast。
+    """
+    from va_compound.metric_visual_head import LanguageMetricField, RelationStateEncoder
+
+    metric_state = ckpt.get("mtvj_metric_head")
+    metric_config = ckpt.get("mtvj_metric_head_config")
+    relation_state = ckpt.get("mtvj_relation_encoder")
+    if metric_state is None or metric_config is None or relation_state is None:
+        raise ValueError(
+            "DINO-metric checkpoint 缺少 mtvj_metric_head / "
+            "mtvj_metric_head_config / mtvj_relation_encoder；评测不能随机重建"
+        )
+    ctor_config = _canonical_mtvj_metric_head_config(metric_config, require_complete=True)
+    if int(ctor_config["h_dim"]) != int(config.main_vision_dim) or int(
+        ctor_config["grid"]
+    ) != 16:
+        raise ValueError(
+            "DINO-metric checkpoint 的 metric head 构造配置与 DINO 特征不兼容："
+            f"h_dim={ctor_config['h_dim']} (期望 {config.main_vision_dim}), "
+            f"grid={ctor_config['grid']} (期望 16)"
+        )
+    metric_head = LanguageMetricField(
+        lang_dim=int(ctor_config["lang_dim"]),
+        h_dim=int(ctor_config["h_dim"]),
+        d_proj=int(ctor_config["d_proj"]),
+        n_roles=int(ctor_config["n_roles"]),
+        l2_norm=bool(ctor_config["l2_norm"]),
+        learnable_temp=bool(ctor_config["learnable_temp"]),
+        temp_init=float(ctor_config["temp_init"]),
+        freeze_bias=bool(ctor_config["freeze_bias"]),
+        mode_readout=bool(ctor_config["mode_readout"]),
+        grid=int(ctor_config["grid"]),
+    ).to(device)
+    metric_head.load_state_dict(metric_state, strict=True)
+    metric_head._mtvj_metric_state_source = (
+        ckpt.get("training_contract", {}) or {}
+    ).get("metric_state_source", MTVJ_LEGACY_METRIC_STATE_SOURCE)
+    relation_encoder = RelationStateEncoder(
+        state_dim=8, d_model=int(config.hidden_dim)
+    ).to(device)
+    relation_encoder.load_state_dict(relation_state, strict=True)
+    for module in (metric_head, relation_encoder):
+        module.eval()
+        for parameter in module.parameters():
+            parameter.requires_grad_(False)
+    print(
+        f"eval: DINO-metric 冻结 metric head（grid={metric_head.grid}, "
+        f"dense_tokens={metric_head.dense_tokens}, "
+        f"params={sum(p.numel() for p in metric_head.parameters()):,}）+ "
+        f"relation encoder（params={sum(p.numel() for p in relation_encoder.parameters()):,}）"
+        " 从主 checkpoint 严格恢复",
+        flush=True,
+    )
+    return metric_head, relation_encoder
+
+
+def _load_dino_roi_head(path: Path, device):
+    """Strict task35 DINO ROI v2 loader shared with policy training."""
+    roi_head = load_dino_metric_roi_checkpoint(path, device)
+    print(
+        f"eval: task35 DINO ROI 精修头就绪（grid={roi_head.grid}, "
+        f"params={sum(p.numel() for p in roi_head.parameters()):,}, "
+        f"contract={DINO_METRIC_ROI_CONTRACT}, roles={TASK35_METRIC_ROLE_CONTRACT}, "
+        f"roi_config={roi_head._mtvj_roi_config}）",
+        flush=True,
+    )
+    return roi_head
+
+
 def _mtvj_metric_tokens(
     metric_head,
     relation_encoder,
@@ -542,6 +854,7 @@ def _mtvj_metric_tokens(
     roi_backbone: nn.Module | None = None,
     roi_video: torch.Tensor | None = None,
     roi_alpha: float = 0.0,
+    roi_dino: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """单决策 metric_tokens（与 train.py ``_mtvj_online_encode`` 的 metric 分支同构）。
 
@@ -560,17 +873,30 @@ def _mtvj_metric_tokens(
     if roi_head is not None and roi_alpha != 0.0:
         if roi_backbone is None or roi_video is None:
             raise ValueError("MT-VJ ROI runtime requires raw video and frozen backbone")
-        out.p, out.visibility = refine_metric_roi_positions(
-            out.p,
-            out.visibility,
-            roi_video,
-            roi_backbone,
-            roi_head,
-            language_hidden.to(device=device),
-            language_mask.to(device=device),
-            coords,
-            alpha=roi_alpha,
-        )
+        if roi_dino:
+            out.p, out.visibility = refine_metric_roi_positions_dino(
+                out.p,
+                out.visibility,
+                roi_video,
+                roi_backbone,
+                roi_head,
+                language_hidden.to(device=device),
+                language_mask.to(device=device),
+                coords,
+                alpha=roi_alpha,
+            )
+        else:
+            out.p, out.visibility = refine_metric_roi_positions(
+                out.p,
+                out.visibility,
+                roi_video,
+                roi_backbone,
+                roi_head,
+                language_hidden.to(device=device),
+                language_mask.to(device=device),
+                coords,
+                alpha=roi_alpha,
+            )
     # 与 train.py _mtvj_online_encode 完全同构：不可见角色坐标归零。
     g = _mtvj_metric_positions(
         out,
@@ -584,6 +910,77 @@ def _mtvj_metric_tokens(
     z_g, z_nu = relation_encoder(g[None], nu[None])
     metric_tokens = torch.stack((z_g, z_nu), dim=1)  # [1, 2, d_model]
     return metric_tokens, g.detach()
+
+
+def _decision_mtvj_context(
+    *,
+    frames,
+    clip: torch.Tensor,
+    mtvj_backbone,
+    metric_head,
+    relation_encoder,
+    language_hidden: torch.Tensor,
+    language_mask: torch.Tensor,
+    coords_mtvj: torch.Tensor | None,
+    metric_g_prev: torch.Tensor | None,
+    device,
+    local_slots: bool,
+    roi_head: nn.Module | None = None,
+    roi_alpha: float = 0.0,
+) -> tuple[dict, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    """One closed-loop decision of MT-VJ dense + metric + WAM geo8.
+
+    Returns ``(dense_kwargs, metric_g, vision_override, metric_g_prev_next)``.
+    ``vision_override`` is Pool16(H11) when local slots are off, else None
+    (caller keeps the slot / coarse vision already computed).
+    """
+    dense_evidence = mtvj_backbone.forward_hierarchical_dense(clip.unsqueeze(0))
+    dense_evidence = {layer: ev.float() for layer, ev in dense_evidence.items()}
+    vision_override = None
+    if not local_slots:
+        vision_override = pool_mtvj_coarse_tokens(dense_evidence[11])
+    metric_tokens = None
+    metric_g = None
+    if metric_head is not None:
+        roi_video = None
+        if roi_head is not None and roi_alpha != 0.0:
+            raw_window = np.stack(frames, axis=0)[None, None]
+            roi_video = prepare_metric_roi_video(
+                raw_window,
+                device,
+                image_size=None,
+            )
+        metric_tokens, metric_g = _mtvj_metric_tokens(
+            metric_head,
+            relation_encoder,
+            dense_evidence,
+            language_hidden,
+            language_mask,
+            coords_mtvj,
+            metric_g_prev,
+            device,
+            roi_head=roi_head,
+            roi_backbone=mtvj_backbone,
+            roi_video=roi_video,
+            roi_alpha=roi_alpha if roi_head is not None else 0.0,
+        )
+    dense_kwargs = {
+        "dense_evidence": dense_evidence,
+        "metric_tokens": metric_tokens,
+        "metric_g": (metric_g[None] if metric_g is not None else None),
+    }
+    return dense_kwargs, metric_g, vision_override, (
+        metric_g if metric_g is not None else metric_g_prev
+    )
+
+
+def _wam_geo8_from_metric(metric_g: torch.Tensor | None, device) -> torch.Tensor:
+    if metric_g is None:
+        return torch.zeros(1, 8, device=device)
+    if metric_g.ndim == 1:
+        return metric_g[None]
+    return metric_g
+
 
 VISION_WINDOW = 4
 DECISION_STRIDE = 6  # 80 FPS, decide every 6 frames (13.3 Hz), matches training
@@ -609,8 +1006,23 @@ def parse_args() -> argparse.Namespace:
         help="MT-VJ 在线 dense 解码路径（契约 §7，与训练 §6 同构）：每决策点同一 "
         "4 帧历史窗 [d-6, d-4, d-2, d] → 冻结 V-JEPA forward_hierarchical_dense "
         "→ dense_evidence 注入 encode_condition（config.dense_readout_mtvj 强制 "
-        "True；ckpt 无 dense 权重时零初始化初始等价）。v1 仅支持普通 flow/direct "
-        "部署（与 c2/servo 互斥）",
+        "True；ckpt 无 dense 权重时零初始化初始等价）。与 c2/recovery 部署互斥"
+        "（servo plan 分支已接同一 dense/metric/WAM 上下文）",
+    )
+    parser.add_argument(
+        "--action-vision-checkpoint",
+        type=Path,
+        default=None,
+        help="Local timm-compatible weights for a checkpoint-trained DINO "
+        "action tower. Required iff config.action_vision_backbone is enabled.",
+    )
+    parser.add_argument(
+        "--main-vision-checkpoint",
+        type=Path,
+        default=None,
+        help="DINO-main replacement（2026-08-14 用户决策）：本地 timm 权重。"
+        "Required iff config.main_vision_backbone != 'vjepa'（DINOv2 替换 "
+        "V-JEPA 作为 VA 主视觉；V-JEPA/dense/metric 路径保留但禁用）。",
     )
     parser.add_argument(
         "--metric-visual-checkpoint",
@@ -641,6 +1053,28 @@ def parse_args() -> argparse.Namespace:
         help="ROI 有界残差融合系数 [0,1]；启用 ROI checkpoint 时必须显式给出。",
     )
     parser.add_argument(
+        "--dino-roi-checkpoint",
+        type=Path,
+        default=None,
+        help="可选 DINO 原图 ROI 精修 checkpoint（contract=dino_metric_roi_v1）；"
+        "默认关闭。只对 dino_dense_metric 主 checkpoint 有效。",
+    )
+    parser.add_argument(
+        "--dino-roi-alpha",
+        type=float,
+        default=None,
+        help="DINO ROI 有界残差融合系数 [0,1]；启用 DINO ROI checkpoint 时"
+        "必须显式给出。",
+    )
+    parser.add_argument(
+        "--dino-feature-cache",
+        type=Path,
+        default=None,
+        help="task35 precision provenance check only: cache directory whose "
+        "block11/block23 SHA-256 identities must match the policy checkpoint; "
+        "closed-loop frames remain encoded online.",
+    )
+    parser.add_argument(
         "--wam",
         choices=("auto", "on", "off"),
         default="auto",
@@ -655,6 +1089,12 @@ def parse_args() -> argparse.Namespace:
         help="WAM 残差速度缩放系数（默认 1.0；0 = 名义动作，消融对照）。",
     )
     parser.add_argument("--trials-per-task", type=int, default=10)
+    parser.add_argument(
+        "--output-json",
+        type=Path,
+        default=None,
+        help="Atomically write per-trial success/stage telemetry and aggregate CI.",
+    )
     parser.add_argument("--max-tasks", type=int, default=49)
     parser.add_argument(
         "--task-ids",
@@ -687,6 +1127,33 @@ def parse_args() -> argparse.Namespace:
         "--debug-first-action",
         action="store_true",
         help="打印首次决策的模型动作（与 --align-init 联用可对比数据专家动作）",
+    )
+    parser.add_argument(
+        "--task35-precision-contract",
+        action="store_true",
+        help="最终 task35 评测 fail-fast：H6/grid16/temporal/geometry/ROI、"
+        "execute=6、50 trials、stage telemetry、WAM off。",
+    )
+    parser.add_argument(
+        "--debug-stage-metrics",
+        action="store_true",
+        help="逐 trial 汇报 MetaWorld 阶段指标（max near/grasp/in_place、min obj_to_target），"
+        "只读诊断，不改变动作或成功判定。",
+    )
+    parser.add_argument(
+        "--task35-causal-ablation",
+        choices=("none", "temporal-reverse", "geometry-zero", "geometry-shuffle", "roi-off", "dense-zero"),
+        default="none",
+        help="task35 FM causal diagnostic; changes exactly one inference signal while "
+        "keeping checkpoint and episode seeds fixed. Non-none runs are diagnostics, "
+        "not precision acceptance.",
+    )
+    parser.add_argument(
+        "--flow-samples",
+        type=int,
+        default=1,
+        help="每次决策独立采样 K 个 flow action chunk 后取均值（默认 1，原行为）；"
+        "仅用于诊断 FM 采样方差。",
     )
     parser.add_argument(
         "--memory-reset-every",
@@ -825,6 +1292,93 @@ def preprocess(image: np.ndarray, image_size: int) -> torch.Tensor:
             align_corners=False, antialias=True,  # 与 prepare_metaworld.py 管线一致
         )
     return (tensor - IMAGE_MEAN) / IMAGE_STD
+
+
+@torch.inference_mode()
+def _action_vision_encode_window(
+    frames: list[np.ndarray],
+    backbone: TimmActionVisionBackbone,
+    device: torch.device,
+) -> dict[int, torch.Tensor]:
+    """Encode ``[d-4,d]`` into the action tower's two temporal patch grids."""
+    if len(frames) != VISION_WINDOW:
+        raise ValueError(
+            f"action vision expects {VISION_WINDOW} history frames, got {len(frames)}"
+        )
+    images = torch.cat(
+        [
+            preprocess(frames[1], backbone.image_size),
+            preprocess(frames[3], backbone.image_size),
+        ],
+        dim=0,
+    ).to(device)
+    hierarchical = backbone.forward_hierarchical_dense(images)
+    return {
+        layer: tokens.reshape(1, -1, tokens.shape[-1])
+        for layer, tokens in hierarchical.items()
+    }
+
+
+@torch.inference_mode()
+def _main_vision_encode_window(
+    frames: list[np.ndarray],
+    backbone: TimmActionVisionBackbone,
+    device: torch.device,
+    *,
+    grid: int,
+    window: int,
+    return_dense: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, dict[int, torch.Tensor]]:
+    """DINO-main replacement: [1, window*grid*grid, dim] tokens per decision.
+
+    Mirrors train.py:_dino_main_online_encode exactly: the same complete
+    history window, the same bicubic resize and ImageNet normalization, the
+    same final-block patch-grid average pooling.
+
+    ``return_dense=True``（DINO-metric）：额外返回 dense evidence
+    ``{5: [1, 512, D], 11: [1, 512, D]}``（block11/block23 帧 [d-2,d] patch，
+    前 256 = d-2、后 256 = d，与训练同序）。
+    """
+    if len(frames) != VISION_WINDOW:
+        raise ValueError(
+            f"dino-main expects {VISION_WINDOW} history frames, got {len(frames)}"
+        )
+    # Encode one frame at a time so ViT-L/14-reg4 + VA + FM fit a 16 GiB laptop
+    # GPU. The per-frame contract is identical to a batched 4-frame encode.
+    hierarchical_parts = [
+        backbone.forward_hierarchical_dense(
+            preprocess(frames[i], backbone.image_size).to(device)
+        )
+        for i in range(window)
+    ]
+    hierarchical = {
+        layer: torch.cat([part[layer] for part in hierarchical_parts], dim=0)
+        for layer in hierarchical_parts[0]
+    }
+    tokens = hierarchical[11].float()  # [window, 256, D]
+    if tokens.shape[-2] != 256 or tokens.shape[-1] != backbone.feature_dim:
+        raise RuntimeError(
+            "dino-main expects 256 patch tokens per frame, got "
+            f"{tuple(tokens.shape)}"
+        )
+    dim = tokens.shape[-1]
+    tokens = tokens.reshape(window, 16, 16, dim).permute(0, 3, 1, 2)
+    tokens = F.adaptive_avg_pool2d(tokens, (grid, grid))
+    tokens = tokens.permute(0, 2, 3, 1).reshape(1, window * grid * grid, dim)
+    if not return_dense:
+        return tokens
+    # 帧 [d-2, d] = 窗口内索引 2, 3（时间升序 → 前 256 = d-2）。
+    dense_evidence = {
+        layer: torch.cat((ev[2], ev[3]), dim=0).float()[None]
+        for layer, ev in hierarchical.items()
+    }
+    for layer, evidence in dense_evidence.items():
+        if evidence.shape[-2] != 512:
+            raise RuntimeError(
+                f"dino-metric dense evidence {layer} must be 512 tokens, got "
+                f"{tuple(evidence.shape)}"
+            )
+    return tokens, dense_evidence
 
 
 def plan_refresh_due(decision_count: int, plan_refresh: int) -> bool:
@@ -1719,12 +2273,144 @@ def build_plan_language_cache(
 
 def main() -> None:
     args = parse_args()
+    if args.flow_samples < 1:
+        raise ValueError("--flow-samples must be >= 1")
     torch.manual_seed(0)  # 固定 flow 采样噪声（口径要求：重跑可复现，2026-08-05 审查补充）
     device = torch.device(args.device)
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     config = VACompoundConfig(**ckpt["config"])
     policy_contract = ckpt.get("training_contract", {}) or {}
-    checkpoint_uses_mtvj = bool(getattr(config, "dense_readout_mtvj", False))
+    action_vision_enabled = config.action_vision_backbone != "none"
+    if action_vision_enabled:
+        if args.action_vision_checkpoint is None:
+            raise ValueError(
+                "checkpoint requires an action vision tower; provide "
+                "--action-vision-checkpoint"
+            )
+        # Keep the HF cache symlink suffix so timm selects safetensors loading;
+        # ``resolve()`` would produce an extensionless blob path.
+        action_checkpoint = args.action_vision_checkpoint.expanduser().absolute()
+        if not action_checkpoint.is_file():
+            raise FileNotFoundError(
+                f"action vision checkpoint is missing: {action_checkpoint}"
+            )
+        expected_action_contract = {
+            "action_vision_backbone": config.action_vision_backbone,
+            "action_vision_model_id": config.action_vision_model_id,
+            "action_vision_image_size": config.action_vision_image_size,
+            "action_vision_feature_dim": config.action_vision_dim,
+            "action_vision_output_layers": list(config.action_vision_layers),
+            "action_vision_frame_indices": [1, 3],
+        }
+        mismatches = {
+            key: (policy_contract.get(key), expected)
+            for key, expected in expected_action_contract.items()
+            if policy_contract.get(key) != expected
+        }
+        if mismatches:
+            raise ValueError(
+                f"action vision checkpoint contract mismatch: {mismatches}"
+            )
+        expected_sha = policy_contract.get("action_vision_checkpoint_sha256")
+        actual_sha = _sha256_file(action_checkpoint)
+        if not expected_sha or actual_sha != expected_sha:
+            raise ValueError(
+                "action vision external-weight SHA mismatch: "
+                f"policy={expected_sha!r}, runtime={actual_sha!r}"
+            )
+    elif args.action_vision_checkpoint is not None:
+        raise ValueError(
+            "--action-vision-checkpoint was provided but this policy has no "
+            "trained action vision branch"
+        )
+    # DINO-main replacement contract（2026-08-14 用户决策）：冻结 DINOv2 替换
+    # V-JEPA 主视觉。V-JEPA/dense/metric 路径保留在代码中（flag 关闭即禁用）。
+    main_vision_dino = getattr(config, "main_vision_backbone", "vjepa") != "vjepa"
+    if main_vision_dino:
+        if args.main_vision_checkpoint is None:
+            raise ValueError(
+                "checkpoint uses a DINO main vision backbone; provide "
+                "--main-vision-checkpoint"
+            )
+        main_checkpoint = args.main_vision_checkpoint.expanduser().absolute()
+        if not main_checkpoint.is_file():
+            raise FileNotFoundError(
+                f"main vision checkpoint is missing: {main_checkpoint}"
+            )
+        expected_main_contract = {
+            "main_vision_model_id": getattr(config, "main_vision_model_id", None),
+            "main_vision_image_size": getattr(
+                config, "main_vision_image_size", None
+            ),
+            "main_vision_feature_dim": getattr(config, "main_vision_dim", None),
+            "main_vision_grid": getattr(config, "main_vision_grid", None),
+            "main_vision_frames": getattr(config, "main_vision_frames", None),
+            "main_vision_tokens": getattr(config, "main_vision_tokens", None),
+        }
+        main_mismatches = {
+            key: (policy_contract.get(key), expected)
+            for key, expected in expected_main_contract.items()
+            if policy_contract.get(key) != expected
+        }
+        if main_mismatches:
+            raise ValueError(
+                f"main vision checkpoint contract mismatch: {main_mismatches}"
+            )
+        expected_main_sha = policy_contract.get("main_vision_checkpoint_sha256")
+        actual_main_sha = _sha256_file(main_checkpoint)
+        if not expected_main_sha or actual_main_sha != expected_main_sha:
+            raise ValueError(
+                "main vision external-weight SHA mismatch: "
+                f"policy={expected_main_sha!r}, runtime={actual_main_sha!r}"
+            )
+        if (
+            args.dense_readout_mtvj
+            or args.metric_visual_checkpoint is not None
+            or args.mtvj_dense_only_ablation
+            or args.fovea
+        ):
+            raise ValueError(
+                "DINO-main replacement: V-JEPA dense/metric/fovea eval flags "
+                "must stay off (--dense-readout-mtvj/--metric-visual-checkpoint/"
+                "--mtvj-dense-only-ablation/--fovea)"
+            )
+    elif args.main_vision_checkpoint is not None:
+        raise ValueError(
+            "--main-vision-checkpoint was provided but this policy uses the "
+            "V-JEPA main vision backbone"
+        )
+    checkpoint_uses_mtvj = want_vjepa_dense_backbone(config, args)
+    # DINO-metric checkpoint 的 dense 层由 DINO block11/block23 证据驱动，
+    # 不建 V-JEPA 骨干/路径（--dense-readout-mtvj CLI 保持关闭）。
+    dino_roi_expected = policy_contract.get("dino_roi_enabled") is True
+    if args.dino_roi_checkpoint is None:
+        if args.dino_roi_alpha is not None:
+            raise ValueError("--dino-roi-alpha requires --dino-roi-checkpoint")
+        if dino_roi_expected:
+            raise ValueError(
+                "checkpoint was trained with task35 DINO ROI; pass the exact "
+                "--dino-roi-checkpoint instead of silently disabling it"
+            )
+    else:
+        if not getattr(config, "dino_dense_metric", False):
+            raise ValueError(
+                "--dino-roi-checkpoint 只对 dino_dense_metric 主 checkpoint 有效"
+            )
+        if (
+            args.dino_roi_alpha is None
+            or not np.isfinite(args.dino_roi_alpha)
+            or not 0.0 <= args.dino_roi_alpha <= 1.0
+        ):
+            raise ValueError(
+                "--dino-roi-checkpoint requires finite --dino-roi-alpha in [0,1]"
+            )
+        if dino_roi_expected:
+            saved_alpha = policy_contract.get("dino_roi_alpha")
+            if saved_alpha is None or float(saved_alpha) != float(args.dino_roi_alpha):
+                raise ValueError(
+                    "--dino-roi-alpha must match policy training: "
+                    f"policy={saved_alpha!r}, runtime={args.dino_roi_alpha!r}"
+                )
     if checkpoint_uses_mtvj and not args.dense_readout_mtvj:
         args.dense_readout_mtvj = True
         print(
@@ -1768,6 +2454,7 @@ def main() -> None:
         metric_expected
         and args.metric_visual_checkpoint is None
         and not args.mtvj_dense_only_ablation
+        and not getattr(config, "dino_dense_metric", False)
     ):
         raise ValueError(
             "checkpoint 训练时启用了 MT-VJ metric tokens；评测必须提供 "
@@ -1776,6 +2463,99 @@ def main() -> None:
     # 2026-08-09：ACTION_HORIZON 从 checkpoint config 读（E7 H=48），不再硬编码 8。
     global ACTION_HORIZON
     ACTION_HORIZON = int(getattr(config, "action_horizon", 8))
+    if args.task35_precision_contract and args.task35_causal_ablation != "none":
+        raise ValueError(
+            "--task35-precision-contract is acceptance-only; causal ablations must "
+            "run without it and be reported as diagnostics"
+        )
+    if args.task35_causal_ablation != "none":
+        ablation_requirements = {
+            "task35 only": args.task_ids == "35",
+            "50 trials": args.trials_per_task == 50,
+            "execute_steps 6": args.execute_steps == 6,
+            "horizon 500": args.horizon == 500,
+            "stage telemetry": args.debug_stage_metrics,
+            "WAM off": args.wam == "off",
+            "FM checkpoint": policy_contract.get("action_decoder")
+            == "conditional_flow_matching",
+            "FM decoder not overridden": args.direct_head in {"auto", "off"},
+            "DINO metric": getattr(config, "dino_dense_metric", False),
+            "H6": ACTION_HORIZON == 6,
+        }
+        missing_ablation = [
+            name for name, enabled in ablation_requirements.items() if not enabled
+        ]
+        if missing_ablation:
+            raise ValueError(
+                "task35 causal ablation missing fixed protocol: "
+                + ", ".join(missing_ablation)
+            )
+        print(
+            f"TASK35 CAUSAL ABLATION: {args.task35_causal_ablation} "
+            "(diagnostic only; not acceptance evidence)",
+            flush=True,
+        )
+    if args.task35_precision_contract:
+        expected_data_sha = policy_contract.get("task35_data_sha256")
+        actual_data_sha = _sha256_file(args.features.expanduser().absolute())
+        expected_feature_sha = policy_contract.get("task35_dino_feature_sha256") or {}
+        actual_feature_sha = {}
+        if args.dino_feature_cache is not None:
+            cache_root = args.dino_feature_cache.expanduser().absolute()
+            actual_feature_sha = {
+                name: _sha256_file(cache_root / name)
+                for name in ("block11.npy", "block23.npy")
+            }
+        requirements = {
+            "checkpoint precision contract": policy_contract.get(
+                "task35_precision_contract"
+            )
+            is True,
+            "exact matched H6 features": bool(expected_data_sha)
+            and actual_data_sha == expected_data_sha,
+            "raw-frame identity recorded": bool(
+                policy_contract.get("task35_raw_frames_sha256")
+            ),
+            "DINO feature cache provided": args.dino_feature_cache is not None,
+            "DINO feature identities match": set(expected_feature_sha)
+            == {"block11.npy", "block23.npy"}
+            and actual_feature_sha == expected_feature_sha,
+            "FM decoder": policy_contract.get("action_decoder")
+            == "conditional_flow_matching",
+            "fused VA attention": getattr(
+                config, "va_attention_backend", "manual"
+            )
+            == "auto",
+            "H6": ACTION_HORIZON == 6,
+            "DINO metric": getattr(config, "dino_dense_metric", False),
+            "grid16": getattr(config, "main_vision_grid", None) == 16,
+            "four frames": getattr(config, "main_vision_frames", None) == 4,
+            "temporal": getattr(config, "main_vision_temporal", False),
+            "geometry": getattr(config, "metric_geometry_inject", False),
+            "visual auxiliary grounding": int(
+                policy_contract.get("mtvj_visual_aux_every", 0)
+            )
+            > 0,
+            "visual auxiliary raw pixels": policy_contract.get(
+                "mtvj_visual_aux_pixel_contract"
+            )
+            == "true_simulator_render_480_to_dino224_v1",
+            "ROI": dino_roi_expected and args.dino_roi_checkpoint is not None,
+            "ROI alpha 1": args.dino_roi_alpha == 1.0,
+            "execute_steps 6": args.execute_steps == 6,
+            "horizon 500": args.horizon == 500,
+            "50 trials": args.trials_per_task == 50,
+            "task35 only": args.task_ids == "35",
+            "stage telemetry": args.debug_stage_metrics,
+            "WAM off": args.wam == "off",
+            "FM decoder not overridden": args.direct_head in {"auto", "off"},
+        }
+        missing = [name for name, enabled in requirements.items() if not enabled]
+        if missing:
+            raise ValueError(
+                "--task35-precision-contract missing required settings: "
+                + ", ".join(missing)
+            )
     # Codex P0-4（2026-08-10）：flow Euler 步数从 training_contract 读
     # （train.py:2561 保存位置），不再硬编码 32 或误读顶层键。
     flow_steps = int(
@@ -1814,7 +2594,26 @@ def main() -> None:
             )
             vision_pooling = "spatiotemporal"
     if args.direct_head != "auto":
+        if (
+            args.direct_head == "on"
+            and (
+                args.task35_precision_contract
+                or args.task35_causal_ablation != "none"
+            )
+        ):
+            raise ValueError(
+                "task35 FM evaluation refuses --direct-head on; "
+                "acceptance and causal diagnostics must stay on the FM decoder"
+            )
         config = dataclasses.replace(config, direct_head=args.direct_head == "on")
+    if wam is not None and (
+        getattr(config, "direct_head", False) or getattr(config, "c2_controller", False)
+    ):
+        # --direct-head on/off 强制换解码器发生在 WAM 决议之后，补一道 fail-fast。
+        raise ValueError(
+            "--wam 不支持 direct_head/c2_controller 解码"
+            "（WAM 残差只作用于 flow Euler 路径）"
+        )
     # MT-VJ（契约 §5/§7）：--dense-readout-mtvj 强制打开 model 的 dense 层
     # （与 train.py _mtvj_config_kwargs 同构）。ckpt 无 dense 权重时 W_o 零初始化
     # → 初始输出逐位等价（下方非严格加载 + 警告）。
@@ -1894,18 +2693,27 @@ def main() -> None:
             f"(ablation={args.servo_ablation}, fovea={args.fovea})"
         )
     if args.dense_readout_mtvj and (
-        config.c2_controller or servo_runtime is not None or args.c2_recovery_eval is not None
+        config.c2_controller or args.c2_recovery_eval is not None
     ):
         raise ValueError(
-            "--dense-readout-mtvj（MT-VJ §7）v1 仅支持普通 flow/direct 部署，"
-            "与 c2/servo 部署互斥"
+            "--dense-readout-mtvj（MT-VJ §7）与 c2/recovery 部署互斥"
         )
     print(
         f"eval: action decoder = "
-        f"{'c2_controller (ū/c̄/K contraction)' if config.c2_controller else ('direct_head (MLP->tanh)' if config.direct_head else 'flow_matching (Euler steps=32)')}"
+        f"{'c2_controller (ū/c̄/K contraction)' if config.c2_controller else ('direct_head (MLP->tanh)' if config.direct_head else f'flow_matching (Euler steps={flow_steps})')}"
     )
 
     features = torch.load(args.features, map_location="cpu", weights_only=True)
+    if args.task35_precision_contract or args.task35_causal_ablation != "none":
+        all_tasks = features["metadata"]["tasks"]
+        selected_early = select_eval_tasks(all_tasks, args.task_ids, args.max_tasks)
+        descriptions_to_env = load_metaworld_description_to_env()
+        env_name = require_task35_peg_insert_side(selected_early, descriptions_to_env)
+        print(
+            f"eval: preflight task35 -> {env_name} "
+            f"(id=35, text={selected_early[0][1]!r})",
+            flush=True,
+        )
     sq01 = features["normalization"]["state_q01"].numpy()
     sq99 = features["normalization"]["state_q99"].numpy()
     scale_s = np.where(np.abs(sq99 - sq01) < 1e-6, 1.0, sq99 - sq01)
@@ -1928,17 +2736,43 @@ def main() -> None:
             f"plan_stride={args.plan_stride} feedback_stride={args.feedback_stride} "
             f"oracle_ref={args.c2_oracle_ref} zero_gain={args.c2_zero_gain}"
         )
-    vision_backbone = VJEPA21Backbone.from_pretrained(
-        device=device,
-        dtype="float16",
-        max_tokens=144 if vision_pooling == "spatiotemporal" else 64,
-        local_files_only=True,
-    )
-    if ckpt.get("vjepa_state_dict"):
-        # e2e checkpoint：V-JEPA 被微调过，必须加载训练后权重（2026-08-06 P0 #4）
-        vision_backbone.model.load_state_dict(ckpt["vjepa_state_dict"])
-        print("eval: loaded vjepa_state_dict from checkpoint")
-    vision_backbone.freeze_all()
+    vision_backbone = None
+    main_vision_backbone = None
+    if main_vision_dino:
+        # DINO-main replacement（2026-08-14 用户决策）：冻结 DINOv2 替换 V-JEPA
+        # 主视觉（V-JEPA 路径保留未删除，flag 关闭即禁用）。
+        from va_compound.backbones import TimmActionVisionBackbone
+
+        main_vision_backbone = TimmActionVisionBackbone.from_pretrained(
+            device=device,
+            dtype="float16",
+            model_id=config.main_vision_model_id,
+            image_size=config.main_vision_image_size,
+            feature_dim=config.main_vision_dim,
+            output_layers=(11, 23),  # 与训练侧同一 canonical mid/final 契约
+            checkpoint_path=main_checkpoint,
+            local_files_only=True,
+        )
+        main_vision_backbone.freeze_all()
+        print(
+            f"eval: DINO-main frozen {config.main_vision_backbone} replaces "
+            f"V-JEPA ({config.main_vision_image_size}px, "
+            f"dim={config.main_vision_dim}, {config.main_vision_tokens} "
+            f"tokens/decision, params={sum(p.numel() for p in main_vision_backbone.parameters()):,})",
+            flush=True,
+        )
+    else:
+        vision_backbone = VJEPA21Backbone.from_pretrained(
+            device=device,
+            dtype="float16",
+            max_tokens=144 if vision_pooling == "spatiotemporal" else 64,
+            local_files_only=True,
+        )
+        if ckpt.get("vjepa_state_dict"):
+            # e2e checkpoint：V-JEPA 被微调过，必须加载训练后权重（2026-08-06 P0 #4）
+            vision_backbone.model.load_state_dict(ckpt["vjepa_state_dict"])
+            print("eval: loaded vjepa_state_dict from checkpoint")
+        vision_backbone.freeze_all()
     # --fovea：foveal 前缀编码器共享同一冻结 V-JEPA 实例（无新权重——
     # 显存纪律：1152 只读、V-JEPA 冻结）。
     fovea_encoder = FoveaPrefixEncoder(vision_backbone.model) if args.fovea else None
@@ -1946,10 +2780,35 @@ def main() -> None:
     # 与 train.py _maybe_build_mtvj_backbone 同构（不加载 vjepa_state_dict，
     # e2e checkpoint 的 dense 证据同样来自冻结原版权重，与训练一致）。
     mtvj_backbone = None
+    action_vision_backbone = None
     metric_head = None
     relation_encoder = None
     roi_head = None
     coords_mtvj = None
+    coords_dino_metric = None
+    if getattr(config, "dino_dense_metric", False):
+        # DINO-metric（2026-08-15）：metric 栈从主 checkpoint 严格重建
+        # （无外部 --metric-visual-checkpoint；V-JEPA metric 权重不兼容）。
+        from va_compound.model import dense_coords
+
+        metric_head, relation_encoder = _load_dino_metric_from_policy(
+            ckpt, config, device
+        )
+        coords_dino_metric = dense_coords(512, device=device)
+        if args.dino_roi_checkpoint is not None:
+            roi_head = _load_dino_roi_head(args.dino_roi_checkpoint, device)
+            expected_identity = ckpt.get("dino_roi_checkpoint_identity")
+            actual_identity = getattr(roi_head, "_dino_roi_identity", None)
+            if expected_identity is not None:
+                mismatches = {
+                    key: (expected_identity.get(key), actual_identity.get(key))
+                    for key in ("sha256", "size_bytes", "contract")
+                    if expected_identity.get(key) != actual_identity.get(key)
+                }
+                if mismatches:
+                    raise ValueError(
+                        f"DINO ROI checkpoint identity mismatch: {mismatches}"
+                    )
     if args.dense_readout_mtvj:
         mtvj_backbone = VJEPA21Backbone.from_pretrained(
             device=device,
@@ -2007,6 +2866,24 @@ def main() -> None:
                 "eval: MT-VJ dense-only benchmark（metric tokens disabled"
                 f"{'；这是主模型的显式消融' if args.mtvj_dense_only_ablation else ''}）"
             )
+    if action_vision_enabled:
+        action_vision_backbone = TimmActionVisionBackbone.from_pretrained(
+            device=device,
+            dtype="float16",
+            model_id=config.action_vision_model_id,
+            image_size=config.action_vision_image_size,
+            feature_dim=config.action_vision_dim,
+            output_layers=tuple(config.action_vision_layers),
+            checkpoint_path=action_checkpoint,
+            local_files_only=True,
+        )
+        action_vision_backbone.freeze_all()
+        print(
+            f"eval: action vision {config.action_vision_backbone} ready "
+            f"({config.action_vision_image_size}px, dim={config.action_vision_dim}, "
+            f"params={sum(p.numel() for p in action_vision_backbone.parameters()):,})",
+            flush=True,
+        )
     if args.c2_recovery_eval is not None:
         if not config.c2_controller:
             raise ValueError("--c2-recovery-eval requires a c2 checkpoint")
@@ -2026,7 +2903,8 @@ def main() -> None:
 
     # P0-3：统一恢复路径（普通 LoRA / semantic adapter 都按 training_contract
     # 构造并加载 qwen_state_dict / lora / semantic_gate）。
-    text_backbone = restore_text_backbone(ckpt, device, language_dtype="float16")
+    # task35 FM acceptance/causal can reuse the training language cache and
+    # skip Qwen entirely: the 15k checkpoint has no qwen/lora/plan weights.
     compiler = None
     if has_compile:
         from va_compound.backbones import SemanticCompiler
@@ -2048,15 +2926,32 @@ def main() -> None:
         raise ValueError("no tasks selected for evaluation")
     task_indices = [index for index, _ in selected_tasks]
     tasks = [text for _, text in selected_tasks]
-    if isinstance(text_backbone, QwenSemanticBackbone):
-        # P0-3：semantic adapter ckpt——语言 hidden 用 fused 嵌入
-        # （prior + g ⊙ (adapted − prior)），不是裸冻结先验。
-        with torch.no_grad():
-            prior, mask = text_backbone.encode_prior(tasks)
-            adapted, _ = text_backbone.encode_adapted(tasks)
-            hidden = text_backbone.fused_embedding(prior, adapted)
+    use_cached_task35_language = (
+        (args.task35_precision_contract or args.task35_causal_ablation != "none")
+        and not has_plan
+        and not ckpt.get("qwen_state_dict")
+        and not ckpt.get("lora")
+        and not config.scene_teacher
+        and selected_tasks == [(35, "Insert a peg sideways")]
+    )
+    text_backbone = None
+    if use_cached_task35_language:
+        hidden, mask = cached_task35_language(features, device)
+        print(
+            "eval: using cached task35 language_hidden; Qwen not loaded",
+            flush=True,
+        )
     else:
-        hidden, mask = text_backbone.encode(tasks)
+        text_backbone = restore_text_backbone(ckpt, device, language_dtype="float16")
+        if isinstance(text_backbone, QwenSemanticBackbone):
+            # P0-3：semantic adapter ckpt——语言 hidden 用 fused 嵌入
+            # （prior + g ⊙ (adapted − prior)），不是裸冻结先验。
+            with torch.no_grad():
+                prior, mask = text_backbone.encode_prior(tasks)
+                adapted, _ = text_backbone.encode_adapted(tasks)
+                hidden = text_backbone.fused_embedding(prior, adapted)
+        else:
+            hidden, mask = text_backbone.encode(tasks)
 
     scene_teacher = None
     if config.scene_teacher:
@@ -2074,32 +2969,34 @@ def main() -> None:
         # Plan-Cache：缓存按 episode 逐任务懒构建（首帧场景 → plan tokens），
         # --plan-refresh R 控制后续重建；Qwen 仅在 scene_teacher / compiler 下常驻。
         task_caches: list | None = [None] * len(tasks)
-        if not config.scene_teacher and compiler is None:
+        if text_backbone is not None and not config.scene_teacher and compiler is None:
             del text_backbone
+            text_backbone = None
     else:
         task_caches = [
             model.build_language_cache(hidden[i : i + 1].to(device), mask[i : i + 1].to(device))
             for i in range(len(tasks))
         ]
-        del text_backbone
+        if text_backbone is not None:
+            del text_backbone
+            text_backbone = None
 
     import metaworld
 
     # 任务映射：数据 metadata.tasks 是任务描述（TASK_DESCRIPTIONS 的 value），
     # 反查 lerobot 采集同款 env_name（metaworld_config.json，与 Evoagent 封装一致）
-    import json
-
-    config_path = (
-        Path("/home/ryan/Documents/robot/Evoagent/Evo-1/evo1_lerobot/lerobot/envs/metaworld_config.json")
-    )
-    mw_config = json.load(open(config_path))
-    descriptions_to_env = {v: k for k, v in mw_config["TASK_DESCRIPTIONS"].items()}
+    descriptions_to_env = load_metaworld_description_to_env()
 
     per_task = {}
+    trial_records: list[dict[str, Any]] = []
+    completed_trials = 0
     for local_task_index, (global_task_index, task_text) in enumerate(selected_tasks):
         env_name = descriptions_to_env.get(task_text)
         if env_name is None:
-            print(f"task {task_text[:40]}: SKIP (no env_name mapping)")
+            message = f"task {task_text[:40]} has no env_name mapping"
+            if args.task35_precision_contract:
+                raise ValueError(message)
+            print(f"{message}: SKIP")
             continue
         # 采集同款环境：MT1(env_name, seed=42)，corner2 相机位置修正，
         # 物体随机化不冻结（每次 reset 随机 init，与训练数据分布一致）
@@ -2132,7 +3029,16 @@ def main() -> None:
                         load_episode_rows(ep)[0]["observation.environment_state"],
                         dtype=float,
                     )
-                    align_objects(env, o0, env._get_obs())
+                    align_report = align_objects(env, o0, env._get_obs())
+                    # align_objects mutates MuJoCo state after reset.  Refresh
+                    # the observation and expose the alignment report so an
+                    # align-init diagnostic cannot silently run unaligned.
+                    obs = env._get_obs()
+                    print(
+                        f"align-init task={global_task_index} trial={trial}: "
+                        f"{align_report}",
+                        flush=True,
+                    )
                     if args.debug_first_action:
                         global _ALIGN_ACTS
                         feat = torch.load(args.features, map_location="cpu", weights_only=True)
@@ -2150,6 +3056,14 @@ def main() -> None:
             memory = None
             metric_g_prev = None  # MT-VJ：上一决策的 g_t（ν_t = g_t − g_{t−1}，每 trial 重置）
             success = False
+            stage_metrics = {
+                "near_object": 0.0,
+                "grasp_success": 0.0,
+                "grasp_reward": 0.0,
+                "in_place_reward": 0.0,
+                "obj_to_target": float("inf"),
+                "best_obj_step": -1,
+            }
             decision_count = 0  # 2026-08-06：--memory-reset-every 的决策计数器
             plan_step = None  # C²/伺服：上次规划的原始步
             c2_token = 0  # C²/伺服：自规划以来消费的 token 索引
@@ -2415,16 +3329,48 @@ def main() -> None:
                                     ),
                                     image_size=render_size,
                                 ).detach().cpu().float()
-                            cond, memory = model.encode_condition(
-                                vision_in,
-                                proprio[0],
-                                previous[0],
-                                language_cache=task_caches[local_task_index],
-                                visual_memory=memory,
-                                return_visual_memory=True,
-                            )
-                            # 训练侧 flow_semantic 时槽输出（vision_in）作为
-                            # flow head 逐层 cross-attn 语义上下文（同常规路径）。
+                            decode_kwargs = {}
+                            servo_dense_kwargs: dict = {}
+                            servo_metric_g = None
+                            if args.dense_readout_mtvj and mtvj_backbone is not None:
+                                (
+                                    servo_dense_kwargs,
+                                    servo_metric_g,
+                                    servo_vision,
+                                    metric_g_prev,
+                                ) = _decision_mtvj_context(
+                                    frames=frames,
+                                    clip=clip,
+                                    mtvj_backbone=mtvj_backbone,
+                                    metric_head=metric_head,
+                                    relation_encoder=relation_encoder,
+                                    language_hidden=hidden[
+                                        local_task_index : local_task_index + 1
+                                    ],
+                                    language_mask=mask[
+                                        local_task_index : local_task_index + 1
+                                    ],
+                                    coords_mtvj=coords_mtvj,
+                                    metric_g_prev=metric_g_prev,
+                                    device=device,
+                                    local_slots=bool(model.config.local_slots),
+                                    roi_head=roi_head,
+                                    roi_alpha=(
+                                        float(args.mtvj_roi_alpha)
+                                        if roi_head is not None
+                                        else 0.0
+                                    ),
+                                )
+                                if servo_vision is not None:
+                                    vision_in = servo_vision
+                            if action_vision_backbone is not None:
+                                servo_dense_kwargs["action_dense_evidence"] = (
+                                    _action_vision_encode_window(
+                                        frames, action_vision_backbone, device
+                                    )
+                                )
+                            # 训练侧 flow_semantic 时槽/Pool16 输出作为 flow
+                            # head 逐层 cross-attn 语义上下文（同常规路径）。
                             semantic_ctx = (
                                 vision_in
                                 if (
@@ -2433,24 +3379,49 @@ def main() -> None:
                                 )
                                 else None
                             )
-                            decode_kwargs = {}
+                            cond, memory = model.encode_condition(
+                                vision_in,
+                                proprio[0],
+                                previous[0],
+                                language_cache=task_caches[local_task_index],
+                                visual_memory=memory,
+                                return_visual_memory=True,
+                                **servo_dense_kwargs,
+                            )
                             if wam is not None:
-                                # E7 WAM M0 Task 4：servo 分支无 dense_evidence /
-                                # metric head 决策点读数，场景输入零张量（与 M0
-                                # 动作残差通路约定一致）。
-                                # M0 约定：servo 路径无 dense metric 上下文，WAM
-                                # 仅动作残差通路；E7 验收走普通分支。
+                                wam_dense = servo_dense_kwargs.get("dense_evidence")
+                                spatial16 = (
+                                    _wam_spatial16_from_h11(wam_dense[11])
+                                    if wam_dense is not None and 11 in wam_dense
+                                    else torch.zeros(1, 16, 768, device=device)
+                                )
                                 decode_kwargs["wam_residual_fn"] = _make_wam_residual_fn(
                                     wam,
                                     memory,
-                                    torch.zeros(1, 16, 768, device=device),
-                                    torch.zeros(1, 8, device=device),
+                                    spatial16,
+                                    _wam_geo8_from_metric(servo_metric_g, device),
                                     args.wam_alpha,
                                 )
-                            chunk = model.decode_actions(
-                                cond, steps=flow_steps, semantic_context=semantic_ctx,
-                                **decode_kwargs,
-                            )[0].cpu().numpy()
+                            if args.flow_samples == 1:
+                                decoded = model.decode_actions(
+                                    cond,
+                                    steps=flow_steps,
+                                    semantic_context=semantic_ctx,
+                                    **decode_kwargs,
+                                )
+                            else:
+                                decoded = torch.stack(
+                                    [
+                                        model.decode_actions(
+                                            cond,
+                                            steps=flow_steps,
+                                            semantic_context=semantic_ctx,
+                                            **decode_kwargs,
+                                        )
+                                        for _ in range(args.flow_samples)
+                                    ]
+                                ).mean(dim=0)
+                            chunk = decoded[0].cpu().numpy()
                         plan_step = step
                         c2_token = 0
                     if correction_due and c2_token < ACTION_HORIZON and chunk is not None:
@@ -2538,7 +3509,34 @@ def main() -> None:
                     # 与训练数据方向相反，V-JEPA 时序注意力对帧序敏感 → MW 闭环数字无效
                     clip = torch.cat([preprocess(f, 384) for f in frames], dim=0).to(device)
                     with torch.inference_mode():
-                        tokens = vision_backbone(clip.unsqueeze(0), pooling=vision_pooling)
+                        if main_vision_backbone is not None:
+                            # DINO-main replacement：冻结 DINOv2 特征替换 V-JEPA
+                            # 主视觉（与训练 _dino_main_online_encode 同构）。
+                            # DINO-metric：同一窗口附带 block11/block23 两帧
+                            # [d-2,d] patch evidence（与训练 return_dense 同构）。
+                            dino_dense_evidence = None
+                            if getattr(config, "dino_dense_metric", False):
+                                encode_frames = task35_ablation_frames(
+                                    frames, args.task35_causal_ablation
+                                )
+                                tokens, dino_dense_evidence = _main_vision_encode_window(
+                                    encode_frames,
+                                    main_vision_backbone,
+                                    device,
+                                    grid=config.main_vision_grid,
+                                    window=config.main_vision_frames,
+                                    return_dense=True,
+                                )
+                            else:
+                                tokens = _main_vision_encode_window(
+                                    frames,
+                                    main_vision_backbone,
+                                    device,
+                                    grid=config.main_vision_grid,
+                                    window=config.main_vision_frames,
+                                )
+                        else:
+                            tokens = vision_backbone(clip.unsqueeze(0), pooling=vision_pooling)
                     if has_plan and plan_refresh_due(decision_count, args.plan_refresh):
                         # Plan-Cache：用当前窗口场景（vision 全局均值）重建该任务缓存
                         scene_summary = tokens.mean(dim=1)  # [1, vision_dim]
@@ -2590,60 +3588,109 @@ def main() -> None:
                             model, tokens, task_caches[local_task_index]
                         )
                         dense_kwargs = {}
+                        metric_g = None
+                        if getattr(config, "dino_dense_metric", False):
+                            # DINO-metric 在线解码：dense evidence（本决策窗口
+                            # 已编码）+ metric tokens（g_t / ν_t，与训练
+                            # _dino_metric_tokens 同构；coords=512 两帧 16×16）。
+                            if dino_dense_evidence is None:
+                                raise RuntimeError(
+                                    "dino_dense_metric 已启用但本决策无 dense evidence"
+                                )
+                            dino_roi_video = None
+                            if roi_head is not None and args.dino_roi_alpha:
+                                # ROI 原图输入与训练同构：窗口帧 [d-2,d] 双时间片
+                                # [1,2,3,H,W] NCHW 0-1 未归一化（refine 内部做
+                                # ImageNet 归一化 + 裁剪上采样；crop 契约 NCHW）。
+                                dino_roi_video = (
+                                    torch.from_numpy(
+                                        np.stack(encode_frames[2:4], axis=0)[None]
+                                    )
+                                    .float()
+                                    .div_(255.0)
+                                    .permute(0, 1, 4, 2, 3)
+                                    .to(device)
+                                )
+                            metric_dense_evidence = task35_ablation_dense(
+                                dino_dense_evidence, args.task35_causal_ablation
+                            )
+                            dino_metric_tokens, metric_g = _mtvj_metric_tokens(
+                                metric_head,
+                                relation_encoder,
+                                metric_dense_evidence,
+                                hidden[local_task_index : local_task_index + 1],
+                                mask[local_task_index : local_task_index + 1],
+                                coords_dino_metric,
+                                metric_g_prev,
+                                device,
+                                roi_head=(
+                                    None
+                                    if args.task35_causal_ablation == "roi-off"
+                                    else roi_head
+                                ),
+                                roi_backbone=(
+                                    main_vision_backbone
+                                    if roi_head is not None
+                                    and args.task35_causal_ablation != "roi-off"
+                                    else None
+                                ),
+                                roi_video=dino_roi_video,
+                                roi_alpha=(
+                                    float(args.dino_roi_alpha)
+                                    if roi_head is not None
+                                    and args.task35_causal_ablation != "roi-off"
+                                    else 0.0
+                                ),
+                                roi_dino=True,
+                            )
+                            metric_g_prev = metric_g
+                            metric_g_policy = task35_ablation_geometry(
+                                metric_g[None], args.task35_causal_ablation
+                            )
+                            dense_kwargs = {
+                                "dense_evidence": metric_dense_evidence,
+                                "metric_tokens": dino_metric_tokens,
+                                "metric_g": metric_g_policy,
+                            }
                         if args.dense_readout_mtvj:
                             # MT-VJ 在线 dense 解码（契约 §7，与训练 §6
-                            # _mtvj_online_encode 同构）：同一 4 帧历史窗
-                            # [d-6, d-4, d-2, d] → 冻结 V-JEPA 多层未池化
-                            # evidence {5, 11}（fp32 交付，与训练一致）；
-                            # metric head（若 checkpoint 提供）→ metric_tokens
-                            # （g_t = out.p 四角色坐标展平，ν_t = g_t − g_{t−1}）。
-                            dense_evidence = mtvj_backbone.forward_hierarchical_dense(
-                                clip.unsqueeze(0)
+                            # _mtvj_online_encode 同构）：同一 4 帧历史窗。
+                            (
+                                dense_kwargs,
+                                metric_g,
+                                vision_override,
+                                metric_g_prev,
+                            ) = _decision_mtvj_context(
+                                frames=frames,
+                                clip=clip,
+                                mtvj_backbone=mtvj_backbone,
+                                metric_head=metric_head,
+                                relation_encoder=relation_encoder,
+                                language_hidden=hidden[
+                                    local_task_index : local_task_index + 1
+                                ],
+                                language_mask=mask[
+                                    local_task_index : local_task_index + 1
+                                ],
+                                coords_mtvj=coords_mtvj,
+                                metric_g_prev=metric_g_prev,
+                                device=device,
+                                local_slots=bool(model.config.local_slots),
+                                roi_head=roi_head,
+                                roi_alpha=(
+                                    float(args.mtvj_roi_alpha)
+                                    if roi_head is not None
+                                    else 0.0
+                                ),
                             )
-                            dense_evidence = {
-                                layer: ev.float()
-                                for layer, ev in dense_evidence.items()
-                            }
-                            if not model.config.local_slots:
-                                # Exact train/eval base-vision contract:
-                                # Pool16(H11), not final-layer flat64 tokens.
-                                vision_in = pool_mtvj_coarse_tokens(
-                                    dense_evidence[11]
+                            if vision_override is not None:
+                                vision_in = vision_override
+                        if action_vision_backbone is not None:
+                            dense_kwargs["action_dense_evidence"] = (
+                                _action_vision_encode_window(
+                                    frames, action_vision_backbone, device
                                 )
-                            metric_tokens = None
-                            if metric_head is not None:
-                                roi_video = None
-                                if roi_head is not None and args.mtvj_roi_alpha != 0.0:
-                                    raw_window = np.stack(frames, axis=0)[
-                                        None, None
-                                    ]
-                                    roi_video = prepare_metric_roi_video(
-                                        raw_window,
-                                        device,
-                                        image_size=None,
-                                    )
-                                metric_tokens, metric_g_prev = _mtvj_metric_tokens(
-                                    metric_head,
-                                    relation_encoder,
-                                    dense_evidence,
-                                    hidden[local_task_index : local_task_index + 1],
-                                    mask[local_task_index : local_task_index + 1],
-                                    coords_mtvj,
-                                    metric_g_prev,
-                                    device,
-                                    roi_head=roi_head,
-                                    roi_backbone=mtvj_backbone,
-                                    roi_video=roi_video,
-                                    roi_alpha=(
-                                        float(args.mtvj_roi_alpha)
-                                        if roi_head is not None
-                                        else 0.0
-                                    ),
-                                )
-                            dense_kwargs = {
-                                "dense_evidence": dense_evidence,
-                                "metric_tokens": metric_tokens,
-                            }
+                            )
                         cond, memory = model.encode_condition(
                             vision_in,
                             proprio[0],
@@ -2676,18 +3723,33 @@ def main() -> None:
                                 if wam_dense is not None and 11 in wam_dense
                                 else torch.zeros(1, 16, 768, device=device)
                             )
-                            geo8 = (
-                                metric_g_prev[None]
-                                if metric_g_prev is not None
-                                else torch.zeros(1, 8, device=device)
-                            )
                             decode_kwargs["wam_residual_fn"] = _make_wam_residual_fn(
-                                wam, memory, spatial16, geo8, args.wam_alpha,
+                                wam,
+                                memory,
+                                spatial16,
+                                _wam_geo8_from_metric(metric_g, device),
+                                args.wam_alpha,
                             )
-                        chunk = model.decode_actions(
-                            cond, steps=flow_steps, semantic_context=semantic_ctx,
-                            **decode_kwargs,
-                        )[0].cpu().numpy()
+                        if args.flow_samples == 1:
+                            decoded = model.decode_actions(
+                                cond,
+                                steps=flow_steps,
+                                semantic_context=semantic_ctx,
+                                **decode_kwargs,
+                            )
+                        else:
+                            decoded = torch.stack(
+                                [
+                                    model.decode_actions(
+                                        cond,
+                                        steps=flow_steps,
+                                        semantic_context=semantic_ctx,
+                                        **decode_kwargs,
+                                    )
+                                    for _ in range(args.flow_samples)
+                                ]
+                            ).mean(dim=0)
+                        chunk = decoded[0].cpu().numpy()
                         chunk_start_step = step
                         if args.debug_first_action and not _DEBUG_FA_DONE.get("x"):
                             _DEBUG_FA_DONE["x"] = True
@@ -2716,34 +3778,174 @@ def main() -> None:
                 action = norm_action * (aq99 - aq01) / 2 + (aq99 + aq01) / 2
                 obs, reward, terminated, truncated, info = env.step(action)
                 last_norm = norm_action
+                if args.debug_stage_metrics:
+                    for metric_name in (
+                        "near_object",
+                        "grasp_success",
+                        "grasp_reward",
+                        "in_place_reward",
+                    ):
+                        value = float(info.get(metric_name, 0.0))
+                        stage_metrics[metric_name] = max(
+                            stage_metrics[metric_name], value
+                        )
+                    obj_to_target = float(info.get("obj_to_target", float("inf")))
+                    if obj_to_target < stage_metrics["obj_to_target"]:
+                        stage_metrics["obj_to_target"] = obj_to_target
+                        stage_metrics["best_obj_step"] = step
                 if info.get("success"):
                     success = True
                     break
                 if terminated or truncated:
                     break
             wins += int(success)
+            completed_trials += 1
+            record: dict[str, Any] = {
+                "task_id": int(global_task_index),
+                "task": task_text,
+                "trial": int(trial),
+                "seed": int(episode_seed),
+                "success": bool(success),
+            }
+            if args.debug_stage_metrics:
+                record["stage"] = {
+                    "near_object": float(stage_metrics["near_object"]),
+                    "grasp_success": float(stage_metrics["grasp_success"]),
+                    "grasp_reward": float(stage_metrics["grasp_reward"]),
+                    "in_place_reward": float(stage_metrics["in_place_reward"]),
+                    "min_obj_to_target": float(stage_metrics["obj_to_target"]),
+                    "best_obj_step": int(stage_metrics["best_obj_step"]),
+                }
+            trial_records.append(record)
             print(
                 f"trial task={global_task_index} trial={trial} seed={episode_seed} "
                 f"success={int(success)}"
             )
+            if args.debug_stage_metrics:
+                print(
+                    f"stage task={global_task_index} trial={trial} "
+                    f"near={stage_metrics['near_object']:.3f} "
+                    f"grasp={stage_metrics['grasp_success']:.3f} "
+                    f"grasp_reward={stage_metrics['grasp_reward']:.3f} "
+                    f"in_place={stage_metrics['in_place_reward']:.3f} "
+                    f"min_obj_to_target={stage_metrics['obj_to_target']:.4f} "
+                    f"best_step={stage_metrics['best_obj_step']}",
+                    flush=True,
+                )
         per_task[task_text[:40]] = wins
         print(f"task {task_text[:40]}: {wins}/{args.trials_per_task}")
         env.close()
 
+    if args.task35_precision_contract:
+        expected_task_text = selected_tasks[0][1]
+        if len(selected_tasks) != 1 or set(per_task) != {expected_task_text[:40]}:
+            raise RuntimeError(
+                "task35 precision evaluation did not complete exactly one selected task"
+            )
+        if completed_trials != 50:
+            raise RuntimeError(
+                f"task35 precision evaluation completed {completed_trials} trials, expected 50"
+            )
+        if [int(row["seed"]) for row in trial_records] != list(TASK35_EVAL50_SEEDS):
+            raise RuntimeError("task35 precision evaluation did not use seeds 35000-35049")
+        env_name = descriptions_to_env.get(expected_task_text)
+        if env_name != "peg-insert-side-v3":
+            raise RuntimeError(
+                "task35 precision evaluation mapped to "
+                f"{env_name!r}, expected peg-insert-side-v3"
+            )
     total = sum(per_task.values())
-    trials = len(per_task) * args.trials_per_task
+    trials = completed_trials
+    if trials <= 0:
+        raise RuntimeError("closed-loop evaluation completed no trials")
     print(f"\nCLOSED-LOOP SUCCESS: {total}/{trials} = {total / trials:.1%}")
+    ci_kind = None
+    ci_estimate = None
+    ci_low = None
+    ci_high = None
     if per_task:
-        # 宏平均 + 任务级 bootstrap 95% CI（固定种子，规格 P1 口径）
-        from stats_ci import macro_bootstrap_ci
-
         scores = np.asarray([w / args.trials_per_task for w in per_task.values()])
-        group_ids = np.arange(len(scores))
-        est, lo, hi = macro_bootstrap_ci(scores, group_ids, n_boot=2000, seed=0)
-        print(
-            f"macro (per-task avg): {est:.1%} [95% CI: {lo:.1%}, {hi:.1%}] "
-            f"(n_tasks={len(scores)})"
-        )
+        if len(scores) == 1:
+            # 单任务无法按 task bootstrap：唯一 task 被重复抽样只会产生 [p,p]
+            # 的伪窄区间。此时不确定性单位应是独立 trial，使用 Wilson 区间。
+            from stats_ci import binomial_wilson_ci
+
+            est, lo, hi = binomial_wilson_ci(total, trials)
+            ci_kind, ci_estimate, ci_low, ci_high = "wilson", est, lo, hi
+            print(
+                f"single-task success: {est:.1%} "
+                f"[95% Wilson CI: {lo:.1%}, {hi:.1%}] (n_trials={trials})"
+            )
+        else:
+            # 多任务宏平均：以 task 为有放回重采样单元（固定种子）。
+            from stats_ci import macro_bootstrap_ci
+
+            group_ids = np.arange(len(scores))
+            est, lo, hi = macro_bootstrap_ci(
+                scores, group_ids, n_boot=2000, seed=0
+            )
+            ci_kind, ci_estimate, ci_low, ci_high = "task_bootstrap", est, lo, hi
+            print(
+                f"macro (per-task avg): {est:.1%} "
+                f"[95% task-bootstrap CI: {lo:.1%}, {hi:.1%}] "
+                f"(n_tasks={len(scores)})"
+            )
+    if args.output_json is not None:
+        import json
+
+        result = {
+            "contract": "metaworld_closed_loop_trials_v1",
+            "checkpoint": str(args.checkpoint.expanduser().resolve()),
+            "checkpoint_sha256": _sha256_file(args.checkpoint.expanduser().absolute()),
+            "features": str(args.features.expanduser().resolve()),
+            "task_ids": [int(index) for index, _ in selected_tasks],
+            "trials_per_task": int(args.trials_per_task),
+            "completed_trials": int(completed_trials),
+            "successes": int(total),
+            "success_rate": float(total / trials),
+            "ci": {
+                "kind": ci_kind,
+                "estimate": None if ci_estimate is None else float(ci_estimate),
+                "low_95": None if ci_low is None else float(ci_low),
+                "high_95": None if ci_high is None else float(ci_high),
+            },
+            "execute_steps": int(args.execute_steps),
+            "horizon": int(args.horizon),
+            "flow_samples": int(args.flow_samples),
+            "wam": args.wam,
+            "action_decoder": (
+                "c2_controller"
+                if config.c2_controller
+                else (
+                    "direct_head"
+                    if config.direct_head
+                    else "conditional_flow_matching"
+                )
+            ),
+            "task35_precision_contract": bool(args.task35_precision_contract),
+            "task35_causal_ablation": args.task35_causal_ablation,
+            "dino_feature_cache": (
+                None
+                if args.dino_feature_cache is None
+                else str(args.dino_feature_cache.expanduser().resolve())
+            ),
+            "env_name": descriptions_to_env.get(selected_tasks[0][1])
+            if len(selected_tasks) == 1
+            else None,
+            "language_source": (
+                "task35_features_cache"
+                if use_cached_task35_language
+                else "qwen_text_backbone"
+            ),
+            "trials": trial_records,
+        }
+        if args.task35_precision_contract or args.task35_causal_ablation != "none":
+            validate_task35_eval50_payload(result)
+        args.output_json.parent.mkdir(parents=True, exist_ok=True)
+        temporary = args.output_json.with_suffix(args.output_json.suffix + ".tmp")
+        temporary.write_text(json.dumps(result, indent=2) + "\n")
+        temporary.replace(args.output_json)
+        print(f"structured results saved: {args.output_json}", flush=True)
 
 
 if __name__ == "__main__":

@@ -27,6 +27,8 @@ ROI_MIN_SIZE = 96.0
 ROI_MAX_SIZE = 192.0
 METRIC_ROI_CONTRACT = "mt_vj_metric_roi_v1"
 METRIC_ROI_CONTRACT_VERSION = 1
+DINO_METRIC_ROI_CONTRACT = "dino_metric_roi_task35_v2"
+TASK35_METRIC_ROLE_CONTRACT = "slots_tool_pegGrasp_hole_pegHead_v1"
 METRIC_ROI_HEAD_CONFIG_KEYS = (
     "lang_dim",
     "h_dim",
@@ -84,8 +86,14 @@ def plan_metric_roi(
     center_jitter_px: float = 0.0,
     size_jitter: float = 0.0,
     generator: torch.Generator | None = None,
+    forced_pair_index: int | None = None,
 ) -> MetricROI:
-    """Select the more visible role pair and plan one dynamic square crop.
+    """Select a role pair and plan one dynamic square crop.
+
+    By default the pair with the larger visibility product is selected.  A
+    forced pair is available for task-specific contracts; task35 deployment
+    fixes pair 1 = ``(pegHead, hole)`` so ROI capacity cannot be diverted to the
+    already-easy gripper/pegGrasp pair.
 
     Crop size is ``2 * max(|dy|, |dx|)`` in pixels, clipped to 96--192 by
     default.  Optional training jitter moves the center uniformly in pixels
@@ -131,7 +139,17 @@ def plan_metric_roi(
         ),
         dim=-1,
     )
-    pair_index = pair_scores.argmax(dim=-1)  # deterministic: first pair wins ties
+    if forced_pair_index is None:
+        pair_index = pair_scores.argmax(dim=-1)  # deterministic: first pair wins ties
+    else:
+        if forced_pair_index not in (0, 1):
+            raise ValueError("forced_pair_index must be 0, 1, or None")
+        pair_index = torch.full(
+            (coarse_p.shape[0],),
+            int(forced_pair_index),
+            device=device,
+            dtype=torch.long,
+        )
     pair_roles = pairs[pair_index]  # [B, 2]
     batch_index = torch.arange(coarse_p.shape[0], device=device)[:, None]
     pair_p = coarse_p[batch_index, pair_roles]  # [B, 2, 2], y/x
@@ -582,12 +600,14 @@ def crop_metric_roi_video(
     roi: Tensor,
     *,
     canonical_image_size: int,
+    roi_geometry_size: int | None = None,
 ) -> Tensor:
-    """Crop raw render pixels and resample directly into canonical resolution.
+    """Crop raw render pixels and resample into the encoder resolution.
 
-    ``roi`` is always expressed in the canonical (normally 384px) geometry.
-    It is scaled into the raw render geometry (normally 480px) before sampling,
-    while the returned crop is canonical-sized for the frozen V-JEPA.
+    ``roi`` is expressed in ``roi_geometry_size`` pixel coordinates. Legacy
+    V-JEPA artifacts omit it, so geometry and encoder output both use the
+    canonical 384px space. Task35 DINO v2 sets geometry=480 and output=224:
+    a 96px ROI then means exactly 96 source-render pixels, not 96*480/224.
     """
 
     if raw_video.ndim != 5 or raw_video.shape[2] != 3:
@@ -600,10 +620,15 @@ def crop_metric_roi_video(
         raise ValueError("MT-VJ ROI runtime requires square raw frames")
     if canonical_image_size <= 0:
         raise ValueError("canonical_image_size must be positive")
+    geometry_size = int(
+        canonical_image_size if roi_geometry_size is None else roi_geometry_size
+    )
+    if geometry_size <= 0:
+        raise ValueError("roi_geometry_size must be positive")
     roi = torch.as_tensor(roi, device=raw_video.device, dtype=raw_video.dtype)
     if roi.shape != (samples, 3) or not torch.isfinite(roi).all():
         raise ValueError(f"roi must be finite [{samples}, 3]")
-    raw_scale = height / float(canonical_image_size)
+    raw_scale = height / float(geometry_size)
     roi_raw = roi * raw_scale
     size = roi_raw[:, 2]
     if (size <= 0.0).any() or (size > height).any():
@@ -712,4 +737,196 @@ def refine_metric_roi_positions(
         image_size,
         alpha=alpha,
         max_delta_px=float(config["max_delta_px"]),
+    )
+
+
+def load_dino_metric_roi_checkpoint(
+    path: str | Path,
+    device: torch.device | str,
+) -> nn.Module:
+    """Load the task35 DINO ROI artifact with strict role/geometry identity.
+
+    Unlike the legacy v1 artifact, v2 records the corrected role semantics and
+    is therefore safe to attach to a policy whose metric slots are
+    ``[tool, pegGrasp, hole, pegHead]``.  A legacy checkpoint is rejected rather
+    than silently reinterpreted under different labels.
+    """
+    from va_compound.metric_visual_head import LanguageMetricField
+
+    resolved = Path(path).expanduser().resolve(strict=True)
+    checkpoint = torch.load(resolved, map_location="cpu", weights_only=True)
+    if checkpoint.get("contract") != DINO_METRIC_ROI_CONTRACT:
+        raise ValueError(
+            f"DINO ROI contract={checkpoint.get('contract')!r} != "
+            f"{DINO_METRIC_ROI_CONTRACT!r}"
+        )
+    if checkpoint.get("metric_role_contract") != TASK35_METRIC_ROLE_CONTRACT:
+        raise ValueError(
+            "DINO ROI metric role contract mismatch: "
+            f"{checkpoint.get('metric_role_contract')!r} != "
+            f"{TASK35_METRIC_ROLE_CONTRACT!r}"
+        )
+    if checkpoint.get("role_order") != ["tool", "pegGrasp", "hole", "pegHead"]:
+        raise ValueError("DINO ROI role_order must be task35 aligned")
+    if checkpoint.get("role_pairs") != [[0, 1], [3, 2]]:
+        raise ValueError("DINO ROI role_pairs must encode pegHead-hole as pair 1")
+    if checkpoint.get("raw_frame_contract") != "true_simulator_render_480px_v1":
+        raise ValueError("DINO ROI must be trained from true 480px simulator renders")
+    if int(checkpoint.get("roi_geometry_size", -1)) != 480:
+        raise ValueError("DINO ROI geometry must be planned in 480px render space")
+    if int(checkpoint.get("canonical_image_size", -1)) != 224:
+        raise ValueError("DINO ROI encoder output must use canonical 224px inputs")
+    if checkpoint.get("task") != "peg-insert-side-v3":
+        raise ValueError("DINO ROI artifact must be trained only for task35")
+    if int(checkpoint.get("steps", 0)) <= 0 or int(checkpoint.get("batch", 0)) <= 0:
+        raise ValueError("DINO ROI artifact lacks a positive training budget")
+    state = checkpoint.get("roi_metric_head")
+    ctor = checkpoint.get("ctor_config")
+    if not isinstance(state, Mapping) or not isinstance(ctor, dict):
+        raise ValueError("DINO ROI checkpoint lacks roi_metric_head/ctor_config")
+    expected_ctor = {
+        "lang_dim": 2048,
+        "h_dim": 1024,
+        "d_proj": 192,
+        "n_roles": 4,
+        "l2_norm": True,
+        "learnable_temp": True,
+        "freeze_bias": False,
+        "mode_readout": True,
+        "grid": 16,
+    }
+    mismatches = {
+        key: (ctor.get(key), expected)
+        for key, expected in expected_ctor.items()
+        if ctor.get(key) != expected
+    }
+    if mismatches:
+        raise ValueError(f"DINO ROI head constructor mismatch: {mismatches}")
+    geometry_contract = {
+        "min_roi_size": 96.0,
+        "max_roi_size": 192.0,
+        "distance_scale": 2.0,
+        "max_delta_px": 32.0,
+    }
+    geometry_mismatches = {
+        key: (checkpoint.get(key), expected)
+        for key, expected in geometry_contract.items()
+        if checkpoint.get(key) is None or float(checkpoint[key]) != expected
+    }
+    if geometry_mismatches:
+        raise ValueError(f"DINO ROI geometry contract mismatch: {geometry_mismatches}")
+    head = LanguageMetricField(
+        lang_dim=int(ctor["lang_dim"]),
+        h_dim=int(ctor["h_dim"]),
+        d_proj=int(ctor["d_proj"]),
+        n_roles=int(ctor["n_roles"]),
+        l2_norm=bool(ctor["l2_norm"]),
+        learnable_temp=bool(ctor["learnable_temp"]),
+        temp_init=float(ctor.get("temp_init", 10.0)),
+        freeze_bias=bool(ctor.get("freeze_bias", False)),
+        mode_readout=bool(ctor["mode_readout"]),
+        grid=int(ctor["grid"]),
+    ).to(device)
+    head.load_state_dict(state, strict=True)
+    head._mtvj_roi_config = {
+        "canonical_image_size": int(checkpoint.get("canonical_image_size", 224)),
+        "roi_geometry_size": int(checkpoint["roi_geometry_size"]),
+        "min_roi_size": float(checkpoint.get("min_roi_size", ROI_MIN_SIZE)),
+        "max_roi_size": float(checkpoint.get("max_roi_size", ROI_MAX_SIZE)),
+        "distance_scale": float(checkpoint.get("distance_scale", 2.0)),
+        "max_delta_px": float(checkpoint.get("max_delta_px", 32.0)),
+    }
+    head._dino_roi_identity = metric_roi_checkpoint_identity(resolved, checkpoint)
+    head._dino_metric_role_contract = checkpoint["metric_role_contract"]
+    head.eval()
+    for parameter in head.parameters():
+        parameter.requires_grad_(False)
+    return head
+
+
+def refine_metric_roi_positions_dino(
+    coarse_p: Tensor,
+    coarse_visibility: Tensor,
+    raw_video: Tensor,
+    backbone: nn.Module,
+    roi_head: nn.Module,
+    language_hidden: Tensor,
+    language_mask: Tensor,
+    coords: Tensor,
+    *,
+    alpha: float,
+) -> tuple[Tensor, Tensor]:
+    """DINO 版 ROI 精修（2026-08-16）：与 refine_metric_roi_positions 同协议，
+    编码器为冻结 DINO（TimmActionVisionBackbone，224px，输入需预归一化——
+    调用方负责 (x-mean)/std 与 .half()；这里只做裁剪与合并）。
+
+    coarse_p/coarse_visibility：粗 metric 头输出（[B,4,2] 0-1 / [B,4]）；
+    raw_video：[B, 2, 3, 480, 480] 0-1 双时间片原图；roi_head 消费裁剪后的
+    block11/block23 证据 [B,512,1024] 与 dense_coords(512)。
+    """
+    if alpha == 0.0:
+        return coarse_p, coarse_visibility
+    config = getattr(roi_head, "_mtvj_roi_config", None)
+    image_size = (
+        int(config["canonical_image_size"]) if isinstance(config, dict) else 224
+    )
+    geometry_size = (
+        int(config.get("roi_geometry_size", image_size))
+        if isinstance(config, dict)
+        else image_size
+    )
+    min_size = float(config["min_roi_size"]) if isinstance(config, dict) else ROI_MIN_SIZE
+    max_size = float(config["max_roi_size"]) if isinstance(config, dict) else ROI_MAX_SIZE
+    distance_scale = (
+        float(config["distance_scale"]) if isinstance(config, dict) else 2.0
+    )
+    max_delta_px = float(config["max_delta_px"]) if isinstance(config, dict) else 32.0
+    if raw_video.shape[0] != coarse_p.shape[0]:
+        raise ValueError("raw ROI video and coarse metric batch sizes differ")
+    selection = plan_metric_roi(
+        coarse_p.detach().clamp(0.0, 1.0),
+        coarse_visibility.detach().clamp(0.0, 1.0),
+        geometry_size,
+        min_size=min_size,
+        max_size=max_size,
+        distance_scale=distance_scale,
+        forced_pair_index=(
+            1
+            if getattr(roi_head, "_dino_metric_role_contract", None)
+            == TASK35_METRIC_ROLE_CONTRACT
+            else None
+        ),
+    )
+    cropped = crop_metric_roi_video(
+        raw_video,
+        selection.roi,
+        canonical_image_size=image_size,
+        roi_geometry_size=geometry_size,
+    )
+    mean = cropped.new_tensor((0.485, 0.456, 0.406)).view(1, 1, 3, 1, 1)
+    std = cropped.new_tensor((0.229, 0.224, 0.225)).view(1, 1, 3, 1, 1)
+    inputs = (cropped - mean) / std
+    with torch.no_grad():
+        hierarchical = backbone.forward_hierarchical_dense(
+            inputs.reshape(-1, 3, image_size, image_size).half()
+        )
+        head_dtype = next(roi_head.parameters()).dtype
+        b = coarse_p.shape[0]
+        roi_out = roi_head(
+            hierarchical[5].reshape(b, -1, hierarchical[5].shape[-1]).to(dtype=head_dtype),
+            hierarchical[11].reshape(b, -1, hierarchical[11].shape[-1]).to(dtype=head_dtype),
+            language_hidden.to(device=coarse_p.device, dtype=head_dtype),
+            language_mask.to(device=coarse_p.device),
+            coords.to(device=coarse_p.device, dtype=head_dtype),
+        )
+        batch_index = torch.arange(b, device=coarse_p.device)[:, None]
+        refined_pair = roi_out.p[batch_index, selection.pair_roles]
+    return merge_roi_refinement(
+        coarse_p,
+        coarse_visibility,
+        refined_pair,
+        selection,
+        geometry_size,
+        alpha=alpha,
+        max_delta_px=max_delta_px,
     )
