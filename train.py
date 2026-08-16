@@ -949,6 +949,7 @@ _EXACT_RUN_OPERATIONAL_ARGS = {
     "save_every",
     "resume",
     "resume_exact",
+    "resume_weights",
     # Content/config identity is recorded separately, so an identical external
     # metric checkpoint copied to another filename is still the same input.
     "metric_visual_checkpoint",
@@ -4703,6 +4704,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         help="strictly continue model, AdamW, TaskLocality sampler, step, and RNG state",
     )
+    resume_group.add_argument(
+        "--resume-weights",
+        type=Path,
+        help=(
+            "load model/MT-VJ weights only; optimizer, sampler, RNG and step restart. "
+            "Allowed with --task35-precision-contract so a new data/cache SHA can be stamped"
+        ),
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--save", type=Path)
     parser.add_argument(
@@ -6733,7 +6742,13 @@ def main() -> None:
     metric_head = None
     relation_encoder = None
     roi_head = None
-    resume_path = args.resume_exact if args.resume_exact is not None else args.resume
+    resume_path = (
+        args.resume_exact
+        if args.resume_exact is not None
+        else args.resume
+        if args.resume is not None
+        else getattr(args, "resume_weights", None)
+    )
     preloaded_resume_ckpt = None
     if args.metric_visual_checkpoint is not None and resume_path is not None:
         # Metric head 的网络形状必须先由主 checkpoint 决定，再建 optimizer；
@@ -7356,9 +7371,17 @@ def main() -> None:
             resume_rng_state = resume_ckpt["rng_state"]
             print(f"exact training state restored at global_step={global_step}", flush=True)
         else:
-            # Metadata only: --resume intentionally does not restore optimizer,
-            # sampler, or RNG, but preserves the known update count when present.
-            global_step = int(resume_ckpt.get("global_step", 0))
+            # Metadata only: --resume does not restore optimizer/sampler/RNG.
+            # --resume-weights is a new run on possibly new data, so the update
+            # counter restarts. Ordinary --resume keeps the known update count.
+            if getattr(args, "resume_weights", None) is not None:
+                global_step = 0
+                print(
+                    "resume-weights: loaded model; optimizer/sampler/RNG/step restart",
+                    flush=True,
+                )
+            else:
+                global_step = int(resume_ckpt.get("global_step", 0))
     if args.c2_controller and recovery_loader is not None:
         # resume 之后再次注入 PCA：P 的权重恒取自当前 v6b 文件（冻结），
         # 与 ckpt 是否携带旧 P 权重无关。

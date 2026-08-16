@@ -228,6 +228,10 @@ def test_sam_roundtrip_uses_base_adamw_state() -> None:
 def test_resume_flags_are_mutually_exclusive() -> None:
     with pytest.raises(SystemExit):
         parse_args(["--resume", "legacy.pt", "--resume-exact", "exact.pt"])
+    with pytest.raises(SystemExit):
+        parse_args(["--resume-weights", "weights.pt", "--resume", "legacy.pt"])
+    with pytest.raises(SystemExit):
+        parse_args(["--resume-weights", "weights.pt", "--resume-exact", "exact.pt"])
 
 
 @pytest.mark.parametrize("changed_key", ["actions", "action_valid_mask"])

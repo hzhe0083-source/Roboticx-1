@@ -758,6 +758,7 @@ def test_task35_precision_contract_requires_complete_stack(tmp_path) -> None:
     args = parse_args(common)
     validate_args(args)
     validate_args(parse_args(common + ["--resume-exact", str(tmp_path / "exact.pt")]))
+    validate_args(parse_args(common + ["--resume-weights", str(tmp_path / "weights.pt")]))
     with pytest.raises(ValueError, match="no ordinary resume"):
         validate_args(parse_args(common + ["--resume", str(tmp_path / "legacy.pt")]))
     with pytest.raises(ValueError, match="main-vision-temporal"):
