@@ -8,6 +8,7 @@ import json
 import math
 from pathlib import Path
 import random
+import shutil
 
 import torch
 import numpy as np
@@ -4945,6 +4946,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="periodically overwrite --save every N steps (atomic tmp+rename); "
         "0 disables periodic saves (crash loses the whole run)",
     )
+    parser.add_argument(
+        "--save-step-copies",
+        action="store_true",
+        help="also write --save stem_s{step}.pt on each periodic save",
+    )
     return parser.parse_args(argv)
 
 
@@ -6306,6 +6312,11 @@ def save_checkpoint(
     tmp_path = args.save.with_suffix(args.save.suffix + ".tmp")
     torch.save(payload, tmp_path)
     tmp_path.replace(args.save)
+    if getattr(args, "save_step_copies", False) and global_step > 0:
+        step_path = args.save.with_name(
+            f"{args.save.stem}_s{int(global_step)}{args.save.suffix}"
+        )
+        shutil.copy2(args.save, step_path)
 
 
 class SAM(torch.optim.Optimizer):
