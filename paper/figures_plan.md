@@ -86,3 +86,11 @@ Sans SC, dpi 130 (existing scripts in artifacts/figures/).
 - Table 6: VLA-RL IL vs RL (per task + macro) — TODO.
 - Table 7: Stage A 四格（6k/20k 单步 + 闭环 5 任务）— TODO (NEW).
 - Table 8: Stage B V-JEPA 解冻 IL→闭环 — TODO (NEW).
+- Table 9: task35 peg-insert-side-v3 50-seed closed loop (12k/15k/18k/20k) — DONE (`paper/ora0_paper.tex` Tab.~\ref{tab:task35-cl}; source `logs/*_eval50.json`).
+- Table 10: task35 15k paired causal suite — DONE (`tab:task35-causal`; source `logs/*_step15000_causal_compare.json`).
+
+## Fig 14 — task35 closed-loop + causal (NEW)
+- Bars: 12k/15k/18k/20k success with Wilson CI; paired deltas for dense-zero / temporal-reverse / geometry / roi-off.
+- Data: `logs/task35_best_fm.json`, `logs/task35_h6_*_step15000_causal_compare.json`.
+- Script: not yet; numbers are in the paper tables.
+- Status: TABLES DONE; figure optional.

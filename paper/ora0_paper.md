@@ -1,6 +1,6 @@
 # Bidirectional Visual-Action Memory with Frozen Language Cache: Structural Language Grounding for Lightweight VLA Policies
 
-**Draft v0.1 — 2026-08-08 — work-in-progress (pending: L_m verdict, VLA-RL, LIBERO-100)**
+**Draft v0.2 — 2026-08-16 — work-in-progress (pending: L_m verdict, VLA-RL, LIBERO-100). Added §5.3.1 peg-insert-side-v3 50-seed result.**
 
 ---
 
@@ -629,6 +629,56 @@ pooling; the VA2 architecture (Sec. 3: causal-decomposed memory, sequential
 coupling, deep flow conditioning, 4× exposure, prev-contract fix) retests
 this chain (C² mainline closed-loop: logs/mw_v5_c2_full_closedloop.log,
 89/490 = 18.2%).
+
+### 5.3.1 Precision insertion on peg-insert-side-v3 (DINOv2 + MT-VJ + FM H6)
+
+This is a *scoped single-task* result, not an MT50 score. Language cache
+stays frozen/detached. Main vision is frozen DINOv2 ViT-L/14-reg4 (four
+frames `[d-6,d-4,d-2,d]`, 1024 tokens + learned frame embeddings). Dense
+MT-VJ from the last two frames is additive K/V only. Roles are locked to
+`(tool, pegGrasp, hole, pegHead)` with precision pair `(pegHead, hole)`.
+Decoder is conditional flow matching, execute 6, horizon 500, WAM off, no
+Direct head. Data: 1807 H6 windows (1119 clean / 688 recovery). Winner
+election uses only SHA-bound 50-seed JSONs on `{12k,15k,18k,20k}`;
+1k–9k stay mechanism-only (not evaluated closed-loop, by decision).
+
+Protocol: env `peg-insert-side-v3`, seeds 35000–35049, 50 trials, one
+flow sample, cached task-35 language.
+
+| step | successes | rate | Wilson 95% CI | SHA prefix |
+|---|---|---|---|---|
+| 12k | 15/50 | 30% | [19.1%, 43.8%] | `7da7e3db65c9118e` |
+| **15k** | **37/50** | **74%** | **[60.4%, 84.1%]** | `38885471fc09e15d` |
+| 18k | 25/50 | 50% | [36.6%, 63.4%] | `c917100070a9a613` |
+| 20k | 23/50 | 46% | [33.0%, 59.6%] | `a42a687c05b0644d` |
+
+Elected winner: 15k archive
+`checkpoints/task35_h6_dino_mtvj_fm_full15k_b6_sdpa_aux10b8_v1_step15000.pt`
+(SHA `38885471fc09e15dc97636dddd1a73557d15eb48bbd1d30db6ad2bcbfe2b3a44`).
+Later updates are worse. Sources:
+`logs/task35_best_fm.json`,
+`logs/task35_h6_dino_mtvj_fm_full15k_b6_sdpa_aux10b8_v1_step{12000,15000,18000,20000}_eval50.json`.
+Label: **supported**.
+
+Paired causal diagnostics on the 15k winner (same 50 seeds):
+
+| condition | successes | rate | Δ vs 37/50 |
+|---|---|---|---|
+| none (acceptance) | 37/50 | 74% | — |
+| dense-zero | 2/50 | 4% | −35 |
+| temporal-reverse | 8/50 | 16% | −29 |
+| geometry-zero | 29/50 | 58% | −8 |
+| geometry-shuffle | 32/50 | 64% | −5 |
+| roi-off | 39/50 | 78% | +2 |
+
+Dense last-decision evidence and four-frame order are necessary for
+insertion. Metric geometry helps but is not the main cause. Runtime ROI
+refinement is **not** the binding mechanism (`+2` is within binomial
+noise on n=50). Source:
+`logs/task35_h6_dino_mtvj_fm_full15k_b6_sdpa_aux10b8_v1_step15000_causal_compare.json`.
+Label: **supported** for dense-zero / temporal-reverse; **partially
+supported** for geometry (smaller paired deltas); ROI-off non-inferiority
+is **supported** only as “not required”, not as “ROI helps”.
 
 **Executed-action contract and direct head (pilot).** We rebuilt the
 action labels as the *executed* actions (the environment clips raw expert

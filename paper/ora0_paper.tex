@@ -106,6 +106,11 @@ deployment on a single consumer GPU, two-term loss
 MetaWorld to training-data coverage (samples cover only the first 0.33~s of
 each episode), verified by in-distribution tasks succeeding at ceiling.
 \todo{multi-start results}
+\item \textbf{Single-task precision insertion.} A DINOv2+MT-VJ H6 FM
+variant of the same frozen-cache VA reaches 37/50 (74\%, Wilson
+$[60.4\%,84.1\%]$) on \texttt{peg-insert-side-v3} at 15k updates
+(Sec.~\ref{sec:task35}). Dense MT-VJ and four-frame order are necessary;
+runtime ROI is not. This is not an MT50 result.
 \end{enumerate}
 
 We emphasize the scope of our claims: we do not argue that end-to-end VLA
@@ -376,6 +381,78 @@ the previous-action/visual-memory recurrence (Sec.~\ref{sec:mechanism}).
 Sec.~\ref{sec:rl} reports the VLA-RL fine-tuning that closes part of this
 gap; per-task numbers are in the supplementary logs.
 
+\subsection{Precision insertion on \texttt{peg-insert-side-v3}}
+\label{sec:task35}
+The MT50 macro average mixes short contact tasks with long-horizon insertion.
+To test whether the VA+FM policy can execute a single success-critical
+geometry---sideways peg insertion---we train a scoped variant on task~35
+only. The language cache remains frozen and detached. The main vision
+encoder is frozen DINOv2 ViT-L/14-reg4 (four frames at
+$[d{-}6,d{-}4,d{-}2,d]$, 1024 tokens with learned frame embeddings). Dense
+MT-VJ evidence from the last two frames is added as key/value only. Metric
+roles are locked to $(\mathrm{tool},\mathrm{pegGrasp},\mathrm{hole},\mathrm{pegHead})$
+with precision pair $(\mathrm{pegHead},\mathrm{hole})$. The action decoder is
+conditional flow matching with a six-step execute horizon (H6); WAM is off
+and no Direct head is trained. Training data are 1807 H6 windows (1119
+clean / 688 recovery). We elect a winner only from SHA-bound 50-seed
+closed-loop JSONs on the acceptance set $\{12\mathrm{k},15\mathrm{k},18\mathrm{k},20\mathrm{k}\}$;
+$1\mathrm{k}$--$9\mathrm{k}$ archives stay mechanism-only and were not
+used for election.
+
+Closed-loop protocol: environment \texttt{peg-insert-side-v3}, seeds
+$35000$--$35049$, 50 trials, execute 6, horizon 500, one flow sample,
+cached task-35 language. Table~\ref{tab:task35-cl} reports Wilson 95\%
+intervals. The elected checkpoint is the 15k archive
+(SHA~\texttt{38885471fc09e15d\ldots}): \textbf{37/50 = 74\%}
+$[60.4\%,84.1\%]$. Later updates are worse, not better
+(18k 25/50, 20k 23/50). This is a single-task result and is not a MetaWorld
+MT50 score.
+
+\begin{table}[t]
+\centering\small
+\caption{Closed-loop \texttt{peg-insert-side-v3} (50 paired seeds).
+Wilson 95\% CI. Winner elected from this set only.}
+\label{tab:task35-cl}
+\begin{tabular}{lccc}
+\toprule
+step & successes & rate & Wilson 95\% CI \\
+\midrule
+12k & 15/50 & 30\% & $[19.1\%,43.8\%]$ \\
+\textbf{15k} & \textbf{37/50} & \textbf{74\%} & $\mathbf{[60.4\%,84.1\%]}$ \\
+18k & 25/50 & 50\% & $[36.6\%,63.4\%]$ \\
+20k & 23/50 & 46\% & $[33.0\%,59.6\%]$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+On the 15k winner we rerun the same 50 seeds under five causal diagnostics
+(Table~\ref{tab:task35-causal}). Zeroing the dense MT-VJ stream collapses
+insertion to 2/50; reversing the four-frame order drops it to 8/50.
+Zeroing or shuffling the metric geometry costs 8 and 5 successes.
+Turning runtime ROI refinement off does not hurt (39/50 vs.\ 37/50; the
+$+2$ difference is within binomial noise). Thus the 74\% insertion uses
+dense last-decision evidence and temporal order; runtime ROI is not the
+binding mechanism.
+
+\begin{table}[t]
+\centering\small
+\caption{Paired causal diagnostics on the 15k winner (same seeds
+$35000$--$35049$). $\Delta$ is successes relative to the 37/50 baseline.}
+\label{tab:task35-causal}
+\begin{tabular}{lccc}
+\toprule
+condition & successes & rate & $\Delta$ \\
+\midrule
+none (acceptance) & 37/50 & 74\% & --- \\
+dense-zero & 2/50 & 4\% & $-35$ \\
+temporal-reverse & 8/50 & 16\% & $-29$ \\
+geometry-zero & 29/50 & 58\% & $-8$ \\
+geometry-shuffle & 32/50 & 64\% & $-5$ \\
+roi-off & 39/50 & 78\% & $+2$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
 \subsection{Comparison to literature baselines}
 \label{sec:baselines}
 Table~\ref{tab:baselines}: all baseline numbers cited from original papers
@@ -546,6 +623,12 @@ port) and is deferred. RoboTwin 2.0 is bimanual with 14-D actions, not
 directly supported by the single-arm architecture.
 \item \textbf{Real-robot validation} is planned (Sec.~\ref{sec:real}) and
 will be reported separately.
+\item \textbf{Precision insertion is single-task.}
+Sec.~\ref{sec:task35} uses one MetaWorld environment, one frozen language
+row, and elects only among $12\mathrm{k}/15\mathrm{k}/18\mathrm{k}/20\mathrm{k}$.
+We did not evaluate $3\mathrm{k}/6\mathrm{k}/9\mathrm{k}$ closed loop, did
+not train a Direct head, and did not enable WAM. The result does not
+transfer the MT50 macro claim.
 \end{itemize}
 
 \section{Conclusion}
@@ -558,8 +641,11 @@ end-to-end LoRA fine-tuning collapses the space (0.999) and removes
 selectivity (+1.5\%). Counterfactual evaluation on MetaWorld confirms
 language content beyond task identity is used (wrong-instruction +108.5\%).
 We remain scoped: visual shortcuts are a property of the data distribution
-that no architecture alone removes, and our closed-loop numbers are currently
-limited by training-data coverage, not architecture.
+that no architecture alone removes, and our MT50 closed-loop numbers are
+currently limited by training-data coverage, not architecture. On the
+scoped insertion task the same VA+FM decoder does succeed
+(Sec.~\ref{sec:task35}: 37/50 at 15k) when dense geometry and temporal
+order reach the policy.
 \todo{final numbers: multi-start, L\_m, VLA-RL, LIBERO-100}
 
 \bibliographystyle{abbrv}
