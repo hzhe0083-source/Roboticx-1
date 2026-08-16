@@ -36,6 +36,8 @@ class WMRMAux:
     belief: Tensor
     innovation: Tensor
     task_summary: Tensor
+    evidence: Tensor
+    proprio: Tensor
 
 
 class _CrossAttn(nn.Module):
@@ -208,6 +210,119 @@ class WAM4VA(nn.Module):
             logits = logits + self.mix_stage(task_summary)[:, None, :]
         return torch.softmax(logits, dim=-1)
 
+    def predict_world(
+        self,
+        action: Tensor,
+        proprio: Tensor,
+        belief: Tensor,
+        task_summary: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """ẑ from (A,s,B,L) only. Used for matched action-shuffle probes."""
+        state = proprio.to(dtype=action.dtype)
+        belief_pool = belief.mean(dim=1)
+        task_cond = self.world_from_task(task_summary)
+        span_latents = []
+        for segment, head in zip(self._segment_means(action), self.span_heads):
+            fused = torch.tanh(
+                self.world_from_action(segment)
+                + self.world_from_state(state)
+                + self.world_from_belief(belief_pool)
+                + task_cond
+            )
+            span_latents.append(head(fused))
+        z_spans = torch.stack(span_latents, dim=1)
+        z_hat = z_spans.mean(dim=1)
+        progress = self.progress_head(torch.cat((belief_pool, task_summary), dim=-1))
+        return z_hat, z_spans, progress
+
+    def mixed_residual(
+        self,
+        action: Tensor,
+        z_hat: Tensor,
+        task_summary: Tensor,
+        evidence: Tensor,
+        belief: Tensor,
+        proprio: Tensor,
+        progress: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Return (mixed, gate, pi) using only supervised z_hat in the geo source."""
+        horizon = action.shape[1]
+        hidden = action.shape[-1]
+        state = proprio.to(dtype=action.dtype)
+        geo_tokens = self.geo_to_token(z_hat)[:, None, :]
+        progress_tokens = self.progress_to_token(progress)[:, None, :]
+        source = torch.stack(
+            (
+                self.ca_belief(action, belief),
+                self.ca_geo(action, geo_tokens),
+                self.ca_progress(action, progress_tokens),
+            ),
+            dim=0,
+        )
+        gates = (1.0 + torch.tanh(self.source_gates)).view(3, 1, 1, 1)
+        sourced = (gates * source).sum(dim=0)
+        context = torch.cat(
+            (
+                action,
+                evidence.mean(dim=1, keepdim=True).expand(-1, horizon, -1),
+                state[:, None, :].expand(-1, horizon, -1),
+            ),
+            dim=-1,
+        )
+        bases = F.normalize(
+            self.basis(context).view(action.shape[0], horizon, self.rank, hidden),
+            dim=-1,
+        )
+        pi = self._pi(self._z_per_step(z_hat, horizon), action, task_summary)
+        mixed = (pi.unsqueeze(-1) * bases).sum(dim=2) + sourced
+        gate = torch.tanh(self.gate_proj(z_hat))
+        return mixed, gate, pi
+
+    def fm_condition_hinge(
+        self,
+        action: Tensor,
+        aux: WMRMAux,
+        action_norm: nn.Module,
+        *,
+        margin: float = 0.05,
+    ) -> Tensor:
+        """ReLU(m - ||LN(A+qM(z)) - LN(A+qM(z_shuf))||). Forces z into FM input."""
+        perm = torch.randperm(aux.z_hat.shape[0], device=aux.z_hat.device)
+        mixed, gate, _ = self.mixed_residual(
+            action,
+            aux.z_hat,
+            aux.task_summary,
+            aux.evidence,
+            aux.belief,
+            aux.proprio,
+            aux.progress,
+        )
+        mixed_alt, gate_alt, _ = self.mixed_residual(
+            action,
+            aux.z_hat[perm],
+            aux.task_summary,
+            aux.evidence,
+            aux.belief,
+            aux.proprio,
+            aux.progress,
+        )
+        cond = action_norm(action + gate.unsqueeze(-1) * mixed)
+        cond_alt = action_norm(action + gate_alt.unsqueeze(-1) * mixed_alt)
+        shift = (cond - cond_alt).flatten(1).norm(dim=-1).mean()
+        return torch.relu(cond.new_tensor(margin) - shift)
+
+    def action_dep_hinge(
+        self,
+        z_hat: Tensor,
+        z_hat_shuf: Tensor,
+        z_future: Tensor,
+        *,
+        margin: float = 0.05,
+    ) -> Tensor:
+        real = F.mse_loss(z_hat, z_future.detach())
+        shuf = F.mse_loss(z_hat_shuf, z_future.detach())
+        return torch.relu(z_hat.new_tensor(margin) - (shuf - real))
+
     def forward(
         self,
         action: Tensor,
@@ -271,51 +386,12 @@ class WAM4VA(nn.Module):
             )
             task_summary = task_tokens.mean(dim=1)
 
-        state = proprio.to(dtype=action.dtype)
-        belief_pool = belief.mean(dim=1)
-        task_cond = self.world_from_task(task_summary)
-        span_latents = []
-        for segment, head in zip(self._segment_means(action), self.span_heads):
-            fused = torch.tanh(
-                self.world_from_action(segment)
-                + self.world_from_state(state)
-                + self.world_from_belief(belief_pool)
-                + task_cond
-            )
-            span_latents.append(head(fused))
-        z_spans = torch.stack(span_latents, dim=1)
-        z_hat = z_spans.mean(dim=1)
-        progress = self.progress_head(torch.cat((belief_pool, task_summary), dim=-1))
-
-        geo_tokens = self.geo_to_token(z_spans)
-        progress_tokens = self.progress_to_token(progress)[:, None, :]
-        source = torch.stack(
-            (
-                self.ca_belief(action, belief),
-                self.ca_geo(action, geo_tokens),
-                self.ca_progress(action, progress_tokens),
-            ),
-            dim=0,
+        z_hat, z_spans, progress = self.predict_world(
+            action, proprio, belief, task_summary
         )
-        gates = (1.0 + torch.tanh(self.source_gates)).view(3, 1, 1, 1)
-        sourced = (gates * source).sum(dim=0)
-
-        context = torch.cat(
-            (
-                action,
-                evidence.mean(dim=1, keepdim=True).expand(-1, horizon, -1),
-                state[:, None, :].expand(-1, horizon, -1),
-            ),
-            dim=-1,
+        mixed, gate, pi = self.mixed_residual(
+            action, z_hat, task_summary, evidence, belief, proprio, progress
         )
-        bases = F.normalize(
-            self.basis(context).view(batch, horizon, self.rank, hidden),
-            dim=-1,
-        )
-        z_per_step = self._z_per_step(z_hat, horizon)
-        pi = self._pi(z_per_step, action, task_summary)
-        mixed = (pi.unsqueeze(-1) * bases).sum(dim=2) + sourced
-        gate = torch.tanh(self.gate_proj(z_hat))
         updated = action + gate.unsqueeze(-1) * mixed
         aux = WMRMAux(
             z_hat=z_hat,
@@ -326,6 +402,8 @@ class WAM4VA(nn.Module):
             belief=belief,
             innovation=innovation,
             task_summary=task_summary,
+            evidence=evidence,
+            proprio=proprio.to(dtype=action.dtype),
         )
         return updated, aux, belief, innovation
 

@@ -2495,6 +2495,8 @@ class VACompoundPolicy(nn.Module):
         self.last_wmrm_pi_kl = None
         self.last_wmrm_auxes: list = []
         self.last_wmrm_pi_kls: list = []
+        self.last_wmrm_pre_actions: list = []
+        self.last_wmrm_meds: list = []
         for index, (layer, layer_cache) in enumerate(
             zip(self.layers, language_cache.layers, strict=True)
         ):
@@ -2540,10 +2542,16 @@ class VACompoundPolicy(nn.Module):
                 )
                 self.last_wmrm = aux
                 self.last_wmrm_auxes.append(aux)
+                self.last_wmrm_pre_actions.append(pre_action)
                 if self.training:
                     inject_kl = self.wmrm.pi_kl_from_aux(pre_action, aux)
                     self.last_wmrm_pi_kls.append(inject_kl)
                     self.last_wmrm_pi_kl = inject_kl
+                    self.last_wmrm_meds.append(
+                        self.wmrm.fm_condition_hinge(
+                            pre_action, aux, self.action_norm
+                        )
+                    )
         action_condition = self.action_norm(action)
         if return_visual_memory:
             return action_condition, VisualMemory(layers=tuple(next_memory))
