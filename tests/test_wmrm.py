@@ -153,6 +153,20 @@ def test_cli_mutex() -> None:
         validate_args(args)
 
 
+def test_shared_eye_is_pre_va_projection() -> None:
+    torch.manual_seed(0)
+    model = VACompoundPolicy(_tiny_config(wmrm=True)).eval()
+    vision, proprio, previous, language, mask = _inputs(model.config)
+    with torch.no_grad():
+        projected = model.vision_projection(vision)
+        model.encode_condition(
+            vision, proprio, previous, language_hidden=language, language_mask=mask
+        )
+    assert model.last_wmrm is not None
+    # evidence is read from shared DINO/projection, not post-VA mixed vision
+    assert model.last_wmrm.evidence.shape[0] == 2
+
+
 def test_cli_mutex_direct_head() -> None:
     from train import parse_args, validate_args
 
