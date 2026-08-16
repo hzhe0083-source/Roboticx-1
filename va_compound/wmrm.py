@@ -38,6 +38,8 @@ class WMRMAux:
     task_summary: Tensor
     evidence: Tensor
     proprio: Tensor
+    z_tokens: Tensor | None = None
+    dino_tokens: Tensor | None = None
 
 
 class _CrossAttn(nn.Module):
@@ -84,6 +86,7 @@ class WAM4VA(nn.Module):
         n_task_queries: int = 4,
         cycle_steps: int = 6,
         condition_on_action: bool = True,
+        dino_dim: int | None = None,
     ) -> None:
         super().__init__()
         if hidden_dim < 1:
@@ -114,6 +117,7 @@ class WAM4VA(nn.Module):
         self.n_task_queries = n_task_queries
         self.cycle_steps = cycle_steps
         self.condition_on_action = condition_on_action
+        self.dino_dim = dino_dim
 
         self.belief_tokens = nn.Parameter(torch.zeros(n_belief, hidden_dim))
         self.evidence_queries = nn.Parameter(torch.empty(n_evidence, hidden_dim))
@@ -151,6 +155,23 @@ class WAM4VA(nn.Module):
         self.gate_proj = nn.Linear(world_dim, 1)
         nn.init.zeros_(self.gate_proj.weight)
         nn.init.zeros_(self.gate_proj.bias)
+        if dino_dim is not None:
+            if dino_dim < 1:
+                raise ValueError("dino_dim must be positive")
+            self.cond_to_dino = nn.Linear(hidden_dim, dino_dim)
+            self.dino_pred = nn.Linear(dino_dim, dino_dim)
+            nn.init.zeros_(self.dino_pred.weight)
+            nn.init.zeros_(self.dino_pred.bias)
+            self.token_readout = nn.Linear(dino_dim, world_dim)
+            self.z_query = nn.Parameter(torch.empty(1, world_dim))
+            nn.init.normal_(self.z_query, std=0.02)
+            self.z_read = _CrossAttn(world_dim, num_heads)
+        else:
+            self.cond_to_dino = None
+            self.dino_pred = None
+            self.token_readout = None
+            self.z_query = None
+            self.z_read = None
         self.innov_overlap = 0.5
 
     def has_action_shaped_head(self, action_dim: int) -> bool:
@@ -218,25 +239,22 @@ class WAM4VA(nn.Module):
             logits = logits + self.mix_stage(task_summary)[:, None, :]
         return torch.softmax(logits, dim=-1)
 
-    def predict_world(
+    def _world_condition(
         self,
         action: Tensor,
         proprio: Tensor,
         belief: Tensor,
         task_summary: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """ẑ from (A,s,B,L) only. Used for matched action-shuffle probes.
-
-        World heads see only the first ``min(cycle_steps, horizon)`` action
-        slots. Tail tokens after the executed cycle do not enter world heads.
-        When ``condition_on_action`` is False the action path is zeros so an
-        untrained VA cannot leak into the latent predictor.
-        """
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         state = proprio.to(dtype=action.dtype)
         belief_pool = belief.mean(dim=1)
         task_cond = self.world_from_task(task_summary)
         world_action = action if self.condition_on_action else torch.zeros_like(action)
         span_latents = []
+        fused_sum = torch.zeros(
+            action.shape[0], self.hidden_dim, device=action.device, dtype=action.dtype
+        )
+        n_spans = 0
         for segment, head in zip(self._segment_means(world_action), self.span_heads):
             fused = torch.tanh(
                 self.world_from_action(segment)
@@ -245,10 +263,45 @@ class WAM4VA(nn.Module):
                 + task_cond
             )
             span_latents.append(head(fused))
+            fused_sum = fused_sum + fused
+            n_spans += 1
         z_spans = torch.stack(span_latents, dim=1)
-        z_hat = z_spans.mean(dim=1)
         progress = self.progress_head(torch.cat((belief_pool, task_summary), dim=-1))
-        return z_hat, z_spans, progress
+        return fused_sum / max(n_spans, 1), z_spans, progress, belief_pool
+
+    def predict_world(
+        self,
+        action: Tensor,
+        proprio: Tensor,
+        belief: Tensor,
+        task_summary: Tensor,
+        dino_tokens: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
+        """Predict next DINO tokens when ``dino_tokens`` is given.
+
+        Mixer ẑ is a learned readout of those tokens, not the loss target.
+        Without DINO tokens this falls back to the compact span vector.
+        """
+        fused, z_spans, progress, _ = self._world_condition(
+            action, proprio, belief, task_summary
+        )
+        if dino_tokens is None or self.dino_pred is None:
+            return z_spans.mean(dim=1), z_spans, progress, None
+        if dino_tokens.ndim != 3 or dino_tokens.shape[0] != action.shape[0]:
+            raise ValueError(
+                f"dino_tokens must be [B, N, dino_dim], got {tuple(dino_tokens.shape)}"
+            )
+        if dino_tokens.shape[-1] != self.dino_dim:
+            raise ValueError(
+                f"dino_tokens last dim must be {self.dino_dim}, got {dino_tokens.shape[-1]}"
+            )
+        tokens = dino_tokens.to(dtype=action.dtype)
+        cond = self.cond_to_dino(fused)
+        z_tokens = tokens + self.dino_pred(torch.tanh(tokens + cond[:, None, :]))
+        kv = self.token_readout(z_tokens)
+        query = self.z_query[None].expand(action.shape[0], -1, -1)
+        z_hat = self.z_read(query, kv).squeeze(1)
+        return z_hat, z_spans, progress, z_tokens
 
     def mixed_residual(
         self,
@@ -361,6 +414,7 @@ class WAM4VA(nn.Module):
         prev_innovation: Tensor | None = None,
         language_keys: Tensor | None = None,
         world_goal: Tensor | None = None,
+        dino_tokens: Tensor | None = None,
     ) -> tuple[Tensor, WMRMAux, Tensor, Tensor]:
         if world_goal is not None:
             raise ValueError(
@@ -414,8 +468,8 @@ class WAM4VA(nn.Module):
             )
             task_summary = task_tokens.mean(dim=1)
 
-        z_hat, z_spans, progress = self.predict_world(
-            action, proprio, belief, task_summary
+        z_hat, z_spans, progress, z_tokens = self.predict_world(
+            action, proprio, belief, task_summary, dino_tokens=dino_tokens
         )
         mixed, gate, pi = self.mixed_residual(
             action, z_hat, task_summary, evidence, belief, proprio, progress
@@ -432,6 +486,8 @@ class WAM4VA(nn.Module):
             task_summary=task_summary,
             evidence=evidence,
             proprio=proprio.to(dtype=action.dtype),
+            z_tokens=z_tokens,
+            dino_tokens=None if dino_tokens is None else dino_tokens.to(dtype=action.dtype),
         )
         return updated, aux, belief, innovation
 

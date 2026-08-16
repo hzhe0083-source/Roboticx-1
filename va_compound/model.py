@@ -1918,6 +1918,7 @@ class VACompoundPolicy(nn.Module):
                     num_heads=config.num_heads,
                     cycle_steps=config.wmrm_cycle_steps,
                     condition_on_action=config.wmrm_handshake,
+                    dino_dim=config.vision_dim,
                 )
         else:
             self.wmrm = None
@@ -2564,6 +2565,7 @@ class VACompoundPolicy(nn.Module):
                     prev_innovation=prev_innovation,
                     language_keys=language_keys,
                     world_goal=world_goal,
+                    dino_tokens=vision_tokens.to(dtype=target_dtype),
                 )
                 if self.config.wmrm_handshake:
                     action = updated

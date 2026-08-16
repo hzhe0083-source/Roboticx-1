@@ -41,8 +41,8 @@ def wmrm_next_feature_target(
     vision_next = batch.get("vision_tokens")
     if vision_next is None or nxt >= vision_next.shape[1]:
         raise ValueError("wmrm_target=dino requires vision_tokens at t+1 (VA cycle)")
-    with torch.no_grad():
-        return model.project_shared_eye(vision_next[:, nxt]).mean(dim=1)
+    # Raw frozen DINO tokens for the next VA cycle. Do not project or pool.
+    return vision_next[:, nxt].detach()
 from va_compound.backbones import pool_flat_tokens, pool_mtvj_coarse_tokens
 from va_compound.metric_roi import (
     DINO_METRIC_ROI_CONTRACT,
@@ -3526,12 +3526,13 @@ def rollout_policy(
                 raise ValueError("WAM4VA produced no world predictions at a supervised step")
             pres = getattr(model, "last_wmrm_pre_actions", None) or []
             for inject_i, aux in enumerate(auxes):
-                if target.shape[-1] != aux.z_hat.shape[-1]:
+                pred = aux.z_tokens if aux.z_tokens is not None else aux.z_hat
+                if pred.shape != target.shape:
                     raise ValueError(
-                        "world target last dim must match z_hat: "
-                        f"{target.shape[-1]} vs {aux.z_hat.shape[-1]}"
+                        "world target shape must match prediction: "
+                        f"{tuple(target.shape)} vs {tuple(pred.shape)}"
                     )
-                wmrm_world_terms.append(wmrm_world_loss(aux.z_hat, target))
+                wmrm_world_terms.append(wmrm_world_loss(pred, target))
                 if inject_i < len(pres):
                     eye_mean = aux.evidence.mean(dim=1)
                     task_id = batch.get("task_id")
@@ -3547,15 +3548,20 @@ def rollout_policy(
                     cycle = min(model.wmrm.cycle_steps, donor.shape[1])
                     perm = matched_no_fixed_point_perm(task_id, eye_mean, aux.proprio)
                     donor[:, :cycle] = pres[inject_i][perm][:, :cycle]
-                    z_shuf, _, _ = model.wmrm.predict_world(
+                    z_alt, _, _, tok_shuf = model.wmrm.predict_world(
                         donor,
                         aux.proprio,
                         aux.belief,
                         aux.task_summary,
+                        dino_tokens=aux.dino_tokens,
                     )
+                    if tok_shuf is None:
+                        pred_real, z_shuf = aux.z_hat, z_alt
+                    else:
+                        pred_real, z_shuf = pred, tok_shuf
                     wmrm_adep_terms.append(
                         model.wmrm.action_dep_hinge(
-                            aux.z_hat,
+                            pred_real,
                             z_shuf,
                             target,
                             margin=wmrm_adep_margin,

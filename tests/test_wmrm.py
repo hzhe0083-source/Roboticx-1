@@ -342,17 +342,32 @@ def test_fm_condition_hinge_disables_dropout() -> None:
     torch.testing.assert_close(stacked, stacked[:1].expand_as(stacked), rtol=0.0, atol=0.0)
 
 
-def test_dino_target_uses_project_shared_eye() -> None:
+def test_dino_target_is_raw_tokens() -> None:
     from train import wmrm_next_feature_target
 
     model = VACompoundPolicy(_tiny_config(wmrm=True)).eval()
     batch = {
         "vision_tokens": torch.randn(2, 3, 11, model.config.vision_dim),
     }
-    with torch.no_grad():
-        got = wmrm_next_feature_target(model, batch, 0)
-        expected = model.project_shared_eye(batch["vision_tokens"][:, 1]).mean(1)
-    torch.testing.assert_close(got, expected)
+    got = wmrm_next_feature_target(model, batch, 0)
+    torch.testing.assert_close(got, batch["vision_tokens"][:, 1])
+    assert got.shape == (2, 11, model.config.vision_dim)
+
+
+def test_dino_residual_zero_init_copies_current() -> None:
+    block = WorldMediatedResidualModulation(
+        32, world_dim=8, rank=4, proprio_dim=9, dino_dim=16
+    )
+    action = torch.randn(2, 5, 32)
+    proprio = torch.randn(2, 9)
+    belief = torch.randn(2, 8, 32)
+    task = torch.randn(2, 32)
+    dino = torch.randn(2, 7, 16)
+    _, _, _, z_tokens = block.predict_world(
+        action, proprio, belief, task, dino_tokens=dino
+    )
+    assert z_tokens is not None
+    torch.testing.assert_close(z_tokens, dino, rtol=0.0, atol=0.0)
 
 
 def test_predict_world_ignores_action_tail() -> None:
@@ -366,13 +381,13 @@ def test_predict_world_ignores_action_tail() -> None:
     belief = torch.randn(2, 8, 32)
     task = torch.randn(2, 32)
     with torch.no_grad():
-        z1, _, _ = block.predict_world(action, proprio, belief, task)
+        z1, *_ = block.predict_world(action, proprio, belief, task)
         action2 = action.clone()
         action2[:, 6:] += 10
-        z2, _, _ = block.predict_world(action2, proprio, belief, task)
+        z2, *_ = block.predict_world(action2, proprio, belief, task)
         action3 = action.clone()
         action3[:, :6] += 1
-        z3, _, _ = block.predict_world(action3, proprio, belief, task)
+        z3, *_ = block.predict_world(action3, proprio, belief, task)
     torch.testing.assert_close(z1, z2)
     assert not torch.allclose(z1, z3)
 
@@ -388,12 +403,12 @@ def test_action_dep_hinge_zero_WA_has_grad() -> None:
     proprio = torch.randn(4, 9)
     belief = torch.randn(4, 8, 32)
     task = torch.randn(4, 32)
-    z_hat, _, _ = block.predict_world(action, proprio, belief, task)
+    z_hat, *_ = block.predict_world(action, proprio, belief, task)
     used = min(block.cycle_steps, action.shape[1])
     action_shuf = action.clone()
     perm = torch.randperm(action.shape[0])
     action_shuf[:, :used] = action[perm, :used]
-    z_shuf, _, _ = block.predict_world(action_shuf, proprio, belief, task)
+    z_shuf, *_ = block.predict_world(action_shuf, proprio, belief, task)
     target = torch.randn_like(z_hat)
     loss = block.action_dep_hinge(z_hat, z_shuf, target)
     loss.backward()
@@ -518,6 +533,6 @@ def test_handshake_off_ignores_va_action() -> None:
     other = action + 3.0
     belief = torch.randn(2, 8, 32)
     task = torch.randn(2, 32)
-    z1, _, _ = model.wmrm.predict_world(action, proprio, belief, task)
-    z2, _, _ = model.wmrm.predict_world(other, proprio, belief, task)
+    z1, *_ = model.wmrm.predict_world(action, proprio, belief, task)
+    z2, *_ = model.wmrm.predict_world(other, proprio, belief, task)
     torch.testing.assert_close(z1, z2)
