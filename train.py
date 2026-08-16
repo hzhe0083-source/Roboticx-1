@@ -6565,6 +6565,7 @@ def main() -> None:
             dataset = LongTrajFramesDataset(
                 args.data,
                 min_sequence_length=args.min_sequence_length,
+                decode_cache_tasks=2 if getattr(args, "dino_main_vision", False) else 1,
                 feature_cache=(
                     args.dino_feature_cache
                     if getattr(args, "dino_main_vision", False)
@@ -6578,7 +6579,8 @@ def main() -> None:
             print(
                 f"{'DINO-main' if args.dino_main_vision else 'MT-VJ'} data: "
                 f"LongTrajFramesDataset（{len(dataset)} 样本，"
-                f"帧从 longtraj JPEG 在线解码）",
+                f"帧从 longtraj JPEG 在线解码，"
+                f"decode_cache_tasks={dataset.decode_cache_tasks}）",
                 flush=True,
             )
         elif args.live_vjepa:
@@ -6910,9 +6912,10 @@ def main() -> None:
                         f"batch={args.mtvj_visual_aux_batch}）",
                         flush=True,
                     )
-                if args.dense_readout_mtvj:
-                    # MT-VJ（LongTrajFramesDataset）：任务局部性采样，缓存命中
-                    # ~100%（Codex P1-13，纯随机加权实测 50s/step 不可行）。
+                if args.dense_readout_mtvj or getattr(args, "dino_main_vision", False):
+                    # LongTraj JPEG frames: single-task batches + decode cache.
+                    # DINO-main must use this path; mixing tasks with cache=1
+                    # stalls the GPU on 3s full-task decodes.
                     from va_compound.longtraj_frames import mtvj_collate
                     sampler = TaskLocalityWeightedSampler(
                         dataset.payload["instruction_id"],

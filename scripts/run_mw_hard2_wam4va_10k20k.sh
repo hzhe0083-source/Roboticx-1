@@ -63,7 +63,7 @@ COMMON=(
   --metric-geometry-inject
   --wam4va --wmrm-inject last --wmrm-target dino
   --wmrm-cycle-steps 6 --wmrm-map-size 16 --wmrm-map-channels 32
-  --single-task --task-sampling weighted --task-locality-block-batches 16
+  --single-task --task-sampling weighted --task-locality-block-batches 32
   --sequence-length 4 --min-sequence-length 4 --num-workers 0
   --lr 0.0001 --seed 0 --device cuda
   --va-layers 8 --va-attention-backend auto
