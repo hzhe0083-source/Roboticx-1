@@ -86,6 +86,13 @@ class VACompoundConfig:
     future_predict: bool = False
     # E7 WAM v1：联合残差世界动作流（独立模块/权重，见 wam.py）
     wam_joint: bool = False
+    # WAM4VA：世界预测只调制 VA 动作流，禁止 Δv / 候选动作。CLI: --wam4va / --wmrm
+    wmrm: bool = False
+    wmrm_rank: int = 4
+    wmrm_world_dim: int = 8
+    # last = 单点末端调制（诚实默认）；all = 每层后握手；even = 奇数层。
+    wmrm_inject: str = "last"
+    wmrm_mixer_dropout: float = 0.3
     # 顺序式 A→V→A 耦合（2026-08-07 审阅落地④）：每 N 层使用
     # proposal→reorganize→correction 三遍注意力；0 = 全层同步联合（旧行为）。
     sequential_coupling: int = 0
@@ -291,6 +298,18 @@ class VACompoundConfig:
                     "dino_dense_metric requires dense_readout_mtvj "
                     "（逐层 dense K/V 机制复用）"
                 )
+        if self.wmrm and self.wam_joint:
+            raise ValueError("wmrm is mutually exclusive with wam_joint (no Δv path)")
+        if self.wmrm and self.memory_split:
+            raise ValueError("wmrm is mutually exclusive with memory_split (P2 last-layer hook)")
+        if self.wmrm_rank < 1:
+            raise ValueError("wmrm_rank must be positive")
+        if self.wmrm_world_dim < 1:
+            raise ValueError("wmrm_world_dim must be positive")
+        if self.wmrm_inject not in ("last", "all", "even"):
+            raise ValueError("wmrm_inject must be last|all|even")
+        if not 0.0 <= self.wmrm_mixer_dropout < 1.0:
+            raise ValueError("wmrm_mixer_dropout must be in [0, 1)")
 
 
 @dataclass(frozen=True)
@@ -1866,6 +1885,23 @@ class VACompoundPolicy(nn.Module):
             if self.geometry_projection is not None:
                 nn.init.zeros_(self.geometry_projection.weight)
                 nn.init.zeros_(self.geometry_projection.bias)
+            self.wmrm = None
+        if config.wmrm:
+            from va_compound.wmrm import WAM4VA
+
+            with torch.random.fork_rng(devices=[]):
+                self.wmrm = WAM4VA(
+                    config.hidden_dim,
+                    world_dim=config.wmrm_world_dim,
+                    rank=config.wmrm_rank,
+                    proprio_dim=config.proprio_dim,
+                    mixer_dropout=config.wmrm_mixer_dropout,
+                    num_heads=config.num_heads,
+                )
+        else:
+            self.wmrm = None
+        self.last_wmrm = None
+        self.last_wmrm_pi_kl = None
         self.action_queries = nn.Parameter(torch.empty(config.action_horizon, config.hidden_dim))
         nn.init.normal_(self.action_queries, std=0.02)
 
@@ -2178,6 +2214,15 @@ class VACompoundPolicy(nn.Module):
         relations = self.relation_tokens(slots, centers)
         return build_va_vision_input(coarse, slots, relations)  # [B, 25, D]
 
+    def _wmrm_inject_layers(self) -> set[int]:
+        n_layers = len(self.layers)
+        mode = self.config.wmrm_inject
+        if mode == "last":
+            return {n_layers - 1}
+        if mode == "all":
+            return set(range(n_layers))
+        return {index for index in range(n_layers) if index % 2 == 1 or index == n_layers - 1}
+
     def encode_condition(
         self,
         vision_tokens: Tensor,
@@ -2193,6 +2238,7 @@ class VACompoundPolicy(nn.Module):
         metric_tokens: Tensor | None = None,
         action_dense_evidence: dict[int, Tensor] | None = None,
         metric_g: Tensor | None = None,
+        world_goal: Tensor | None = None,
     ) -> Tensor | tuple[Tensor, VisualMemory]:
         if (language_hidden is None) == (language_cache is None):
             raise ValueError("provide exactly one of language_hidden or language_cache")
@@ -2441,6 +2487,10 @@ class VACompoundPolicy(nn.Module):
             return action_condition
 
         next_memory = []
+        belief = None
+        prev_innovation = None
+        self.last_wmrm = None
+        self.last_wmrm_pi_kl = None
         for index, (layer, layer_cache) in enumerate(
             zip(self.layers, language_cache.layers, strict=True)
         ):
@@ -2466,6 +2516,28 @@ class VACompoundPolicy(nn.Module):
                     action_dense_input=action_dense_input,
                 )
             next_memory.append(vision)
+            if self.wmrm is not None and index in self._wmrm_inject_layers():
+                pre_action = action
+                lang_key = layer_cache.key
+                language_keys = lang_key.transpose(1, 2).reshape(
+                    lang_key.shape[0], lang_key.shape[2], self.config.hidden_dim
+                )
+                mask = language_cache.attention_mask
+                if mask is not None:
+                    language_keys = language_keys * mask.to(dtype=language_keys.dtype)[:, :, None]
+                action, self.last_wmrm, belief, prev_innovation = self.wmrm(
+                    action,
+                    vision,
+                    proprio.to(dtype=action.dtype),
+                    belief=belief,
+                    prev_innovation=prev_innovation,
+                    language_keys=language_keys,
+                    world_goal=world_goal,
+                )
+                if self.training:
+                    self.last_wmrm_pi_kl = self.wmrm.pi_kl_from_aux(
+                        pre_action, self.last_wmrm
+                    )
         action_condition = self.action_norm(action)
         if return_visual_memory:
             return action_condition, VisualMemory(layers=tuple(next_memory))
@@ -2514,6 +2586,7 @@ class VACompoundPolicy(nn.Module):
         metric_tokens: Tensor | None = None,
         action_dense_evidence: dict[int, Tensor] | None = None,
         metric_g: Tensor | None = None,
+        world_goal: Tensor | None = None,
     ) -> Tensor | tuple[Tensor, VisualMemory]:
         encoded = self.encode_condition(
             vision_tokens,
@@ -2528,6 +2601,7 @@ class VACompoundPolicy(nn.Module):
             metric_tokens=metric_tokens,
             action_dense_evidence=action_dense_evidence,
             metric_g=metric_g,
+            world_goal=world_goal,
         )
         if return_visual_memory:
             action_condition, next_memory = encoded

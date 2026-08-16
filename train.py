@@ -16,6 +16,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, Sampler
 
 from va_compound import VACompoundConfig, VACompoundPolicy
+from va_compound.wmrm import wmrm_world_loss
 from va_compound.backbones import pool_flat_tokens, pool_mtvj_coarse_tokens
 from va_compound.metric_roi import (
     DINO_METRIC_ROI_CONTRACT,
@@ -1190,6 +1191,12 @@ def build_exact_run_contract(
     # here keeps the WAM-off model_config byte-compatible with pre-WAM configs.
     model_config = dict(getattr(config, "__dict__", {}))
     model_config.pop("wam_joint", None)
+    if not getattr(config, "wmrm", False):
+        model_config.pop("wmrm", None)
+        model_config.pop("wmrm_rank", None)
+        model_config.pop("wmrm_world_dim", None)
+        model_config.pop("wmrm_inject", None)
+        model_config.pop("wmrm_mixer_dropout", None)
     contract = {
         "contract_version": EXACT_RUN_CONTRACT_VERSION,
         "data_identity": getattr(sampler, "dataset_content_identity", None),
@@ -3410,6 +3417,8 @@ def rollout_policy(
     visual_memory = None
     predicted_velocities = []
     action_conditions = []
+    wmrm_world_terms: list[Tensor] = []
+    wmrm_pi_kl_terms: list[Tensor] = []
     memories: list[VisualMemory] | None = [] if model.config.future_predict else None
     direct_predictions = [] if model.config.direct_head else None
     c2_references = [] if model.config.c2_controller else None
@@ -3472,6 +3481,18 @@ def rollout_policy(
             return_visual_memory=True,
             **mtvj_kwargs,
         )
+        if (
+            model.wmrm is not None
+            and model.last_wmrm is not None
+            and metric_g is not None
+            and time_index + 1 < batch["actions"].shape[1]
+            and metric_g.shape[-1] == model.last_wmrm.z_hat.shape[-1]
+        ):
+            wmrm_world_terms.append(
+                wmrm_world_loss(model.last_wmrm.z_hat, metric_g[:, time_index + 1])
+            )
+        if getattr(model, "last_wmrm_pi_kl", None) is not None:
+            wmrm_pi_kl_terms.append(model.last_wmrm_pi_kl)
         if model.config.c2_controller:
             # C²-VA Stage B：c_current = P(当前决策视觉均值)；解码
             # a = clip(ū − K·(c_current − c̄))；reference 序列供 L_f 监督。
@@ -3584,6 +3605,14 @@ def rollout_policy(
             servo_stats[key] = torch.stack(servo_stats[key], dim=1)  # [B, T, ...]
     if c2_references is not None:
         return out + (torch.stack(c2_references, dim=1),)
+    if wmrm_world_terms:
+        model.last_wmrm_loss = torch.stack(wmrm_world_terms).mean()
+    else:
+        model.last_wmrm_loss = None
+    if wmrm_pi_kl_terms:
+        model.last_wmrm_pi_kl_loss = torch.stack(wmrm_pi_kl_terms).mean()
+    else:
+        model.last_wmrm_pi_kl_loss = None
     if memories is not None:
         return out + (memories,)
     return out
@@ -4037,6 +4066,47 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="E7 WAM v1：WAM 权重来源——独立训练器 checkpoint（含 wam_model 键）"
         "或裸 state_dict",
+    )
+    parser.add_argument(
+        "--wmrm",
+        action="store_true",
+        help="WAM4VA（原 --wmrm）：世界预测调制 VA 动作流（与 --wam-joint 互斥）",
+    )
+    parser.add_argument(
+        "--wam4va",
+        action="store_true",
+        dest="wmrm",
+        help="WAM4VA：同 --wmrm。WAM 向 VA 注入未来信息，动作仍由 VA 发出",
+    )
+    parser.add_argument(
+        "--wmrm-world-weight",
+        type=float,
+        default=1.0,
+        help="WMRM 世界预测 MSE 权重（仅 --wmrm；target 为下一决策 metric_g，stop-grad）",
+    )
+    parser.add_argument(
+        "--wmrm-inject",
+        choices=("last", "all", "even"),
+        default="last",
+        help="WMRM 握手位置：last 末端；all 每层后；even 奇数层+末层",
+    )
+    parser.add_argument(
+        "--wmrm-pi-kl-weight",
+        type=float,
+        default=0.1,
+        help="惩罚 π 对 z_hat 不敏感：λ * relu(margin - KL(π||π_shuffle z))",
+    )
+    parser.add_argument(
+        "--wmrm-pi-kl-margin",
+        type=float,
+        default=0.1,
+        help="π shuffle-KL 下限（nat）",
+    )
+    parser.add_argument(
+        "--wmrm-lang-align-weight",
+        type=float,
+        default=0.05,
+        help="belief 与 language task summary 的余弦对齐权重",
     )
     parser.add_argument(
         "--training-stage",
@@ -5003,6 +5073,12 @@ def validate_args(args: argparse.Namespace) -> None:
         # α=0 语义 = WAM 完全关闭：不构造、不恢复、不进契约，保证旧路径
         # 全局 bit-identical（含 RNG 消费）。必须赶在所有 wam 校验之前。
         args.wam_joint = False
+    if getattr(args, "wmrm", False) and getattr(args, "wam_joint", False):
+        raise ValueError("--wmrm is mutually exclusive with --wam-joint")
+    if getattr(args, "wmrm", False) and args.memory_split:
+        raise ValueError("--wmrm is mutually exclusive with --memory-split")
+    if getattr(args, "wmrm_world_weight", 1.0) < 0.0:
+        raise ValueError("--wmrm-world-weight must be non-negative")
     if getattr(args, "wam_joint", False) and (args.future_predict or args.evsm):
         raise ValueError("--wam-joint is mutually exclusive with --future-predict/--evsm")
     if getattr(args, "wam_joint", False) and args.memory_split:
@@ -6191,6 +6267,8 @@ def main() -> None:
             dual_attention=args.dual_attention,
             flow_semantic=args.flow_semantic,
             wam_joint=args.wam_joint,
+            wmrm=args.wmrm,
+            wmrm_inject=args.wmrm_inject,
             **_mtvj_config_kwargs(args),
         )
         if args.single_task:
@@ -6453,6 +6531,8 @@ def main() -> None:
             dual_attention=args.dual_attention,
             flow_semantic=args.flow_semantic,
             wam_joint=args.wam_joint,
+            wmrm=args.wmrm,
+            wmrm_inject=args.wmrm_inject,
             local_slots=(args.local_slots_data is not None) or args.live_vjepa,
             local_slots_direct288=args.local_slots_direct288,
             local_slots_fixed_query=args.local_slots_fixed_query,
@@ -6724,6 +6804,8 @@ def main() -> None:
             dual_attention=args.dual_attention,
             flow_semantic=args.flow_semantic,
             wam_joint=args.wam_joint,
+            wmrm=args.wmrm,
+            wmrm_inject=args.wmrm_inject,
             **_mtvj_config_kwargs(args),
         )
         smoke_batch = synthetic_sequence(
@@ -8004,10 +8086,30 @@ def main() -> None:
             )
             # P0-5：动作损失与语义损失分开返回——backward 时 LoRA 参数只缩放
             # 动作侧梯度（η_act），anchor/geometry 梯度完整。
+            wmrm_loss = getattr(model, "last_wmrm_loss", None)
+            if wmrm_loss is None:
+                wmrm_loss = flow_loss.new_zeros(())
+            pi_kl = getattr(model, "last_wmrm_pi_kl_loss", None)
+            if pi_kl is None:
+                pi_kl_hinge = flow_loss.new_zeros(())
+            else:
+                margin = float(getattr(args, "wmrm_pi_kl_margin", 0.1))
+                pi_kl_hinge = torch.relu(margin - pi_kl)
+            lang_align = flow_loss.new_zeros(())
+            last_aux = getattr(model, "last_wmrm", None)
+            if last_aux is not None and getattr(last_aux, "task_summary", None) is not None:
+                lang_align = 1.0 - F.cosine_similarity(
+                    last_aux.belief.mean(dim=1),
+                    last_aux.task_summary.detach(),
+                    dim=-1,
+                ).mean()
             action_total = (
                 flow_loss
                 + args.pair_loss_weight * pair_loss
                 + args.future_predict_weight * future_loss
+                + float(getattr(args, "wmrm_world_weight", 1.0)) * wmrm_loss
+                + float(getattr(args, "wmrm_pi_kl_weight", 0.1)) * pi_kl_hinge
+                + float(getattr(args, "wmrm_lang_align_weight", 0.05)) * lang_align
             )
             semantic_total = (
                 args.semantic_anchor_weight * semantic_anchor_loss
