@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
-# Standard MetaWorld DINO+VA+FM recipe, two hard tasks only + WAM4VA.
-# Tasks: 0 assembly-v3, 16 door-unlock-v3.
-# Eval later (normal MW 10 trials/task):
-#   eval_metaworld.py --task-ids 0,16 --trials-per-task 10 --execute-steps 6 --horizon 500
+# Standard MetaWorld DINO+VA+FM + WAM4VA on two hard tasks.
+#   0  assembly-v3
+#   16 door-unlock-v3
+#
+# Usage:
+#   bash scripts/run_mw_hard2_wam4va.sh           # 15k, batch 6
+#   bash scripts/run_mw_hard2_wam4va.sh 5000 6    # smoke
+# Eval:
+#   bash scripts/eval_mw_hard2_wam4va.sh
+#
+# Shared DINO eye; WAM predicts next VA-cycle DINO feature (not metric_g).
+# Handshake protocol unchanged: A += q * residual; VA Flow emits the action.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
