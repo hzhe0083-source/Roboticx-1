@@ -16,7 +16,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, Sampler
 
 from va_compound import VACompoundConfig, VACompoundPolicy
-from va_compound.wmrm import wmrm_world_loss
+from va_compound.wmrm import matched_no_fixed_point_perm, wmrm_world_loss
 
 
 def wmrm_next_feature_target(
@@ -41,9 +41,8 @@ def wmrm_next_feature_target(
     vision_next = batch.get("vision_tokens")
     if vision_next is None or nxt >= vision_next.shape[1]:
         raise ValueError("wmrm_target=dino requires vision_tokens at t+1 (VA cycle)")
-    tokens = vision_next[:, nxt].to(dtype=model.vision_projection.weight.dtype)
     with torch.no_grad():
-        return model.vision_projection(tokens).mean(dim=1)
+        return model.project_shared_eye(vision_next[:, nxt]).mean(dim=1)
 from va_compound.backbones import pool_flat_tokens, pool_mtvj_coarse_tokens
 from va_compound.metric_roi import (
     DINO_METRIC_ROI_CONTRACT,
@@ -3534,9 +3533,22 @@ def rollout_policy(
                     )
                 wmrm_world_terms.append(wmrm_world_loss(aux.z_hat, target))
                 if inject_i < len(pres):
-                    perm = torch.randperm(aux.z_hat.shape[0], device=aux.z_hat.device)
+                    eye_mean = aux.evidence.mean(dim=1)
+                    task_id = batch.get("task_id")
+                    if task_id is None:
+                        task_id = batch.get("task_ids")
+                    if task_id is None:
+                        task_id = batch.get("instruction_id")
+                    if task_id is not None:
+                        task_id = torch.as_tensor(task_id, device=aux.z_hat.device)
+                        if task_id.ndim > 1:
+                            task_id = task_id[:, time_index]
+                    donor = pres[inject_i].clone()
+                    cycle = min(model.wmrm.cycle_steps, donor.shape[1])
+                    perm = matched_no_fixed_point_perm(task_id, eye_mean, aux.proprio)
+                    donor[:, :cycle] = pres[inject_i][perm][:, :cycle]
                     z_shuf, _, _ = model.wmrm.predict_world(
-                        pres[inject_i][perm],
+                        donor,
                         aux.proprio,
                         aux.belief,
                         aux.task_summary,
@@ -4203,13 +4215,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--wmrm-med-weight",
         type=float,
         default=0.1,
-        help="ReLU(m - ||C_FM(z)-C_FM(z_shuf)||)：强迫 ẑ 改变 LN 后 FM 输入",
+        help="ReLU(m - signed(C_FM(z)-C_FM(z_shuf)))：强迫 ẑ 改变 LN 后 FM 输入"
+        "（signed shift，非 L2）",
     )
     parser.add_argument(
         "--wmrm-med-margin",
         type=float,
         default=0.05,
-        help="shuffle ẑ 后 FM condition 的最小 L2 变化",
+        help="shuffle ẑ 后 FM condition 的最小 signed shift",
+    )
+    parser.add_argument(
+        "--wmrm-cycle-steps",
+        type=int,
+        default=6,
+        dest="wmrm_cycle_steps",
+        help="WAM 执行前缀步数（须与闭环 --execute-steps 一致）",
     )
     parser.add_argument(
         "--training-stage",
@@ -5186,6 +5206,17 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--wmrm requires positive --wmrm-world-weight")
     if getattr(args, "wmrm_world_weight", 1.0) < 0.0:
         raise ValueError("--wmrm-world-weight must be non-negative")
+    if int(getattr(args, "wmrm_cycle_steps", 6)) < 1:
+        raise ValueError("--wmrm-cycle-steps must be >= 1")
+    if getattr(args, "wmrm", False) and getattr(args, "wmrm_target", "dino") == "vjepa":
+        dino_main = bool(getattr(args, "dino_main_vision", False))
+        backbone = getattr(args, "main_vision_backbone", "vjepa")
+        if dino_main or (backbone is not None and backbone != "vjepa"):
+            raise ValueError(
+                "wmrm_target=vjepa is incompatible with DINO main vision "
+                "(dino_main_vision / main_vision_backbone != vjepa); "
+                "do not infer V-JEPA from dense key 11"
+            )
     if getattr(args, "wam_joint", False) and (args.future_predict or args.evsm):
         raise ValueError("--wam-joint is mutually exclusive with --future-predict/--evsm")
     if getattr(args, "wam_joint", False) and args.memory_split:
@@ -6386,6 +6417,8 @@ def main() -> None:
                     else getattr(args, "hidden_dim", 512)
                 )
             ),
+            wmrm_cycle_steps=getattr(args, "wmrm_cycle_steps", 6),
+            wmrm_med_margin=getattr(args, "wmrm_med_margin", 0.05),
             **_mtvj_config_kwargs(args),
         )
         if args.single_task:
@@ -6660,6 +6693,8 @@ def main() -> None:
                     else getattr(args, "hidden_dim", 512)
                 )
             ),
+            wmrm_cycle_steps=getattr(args, "wmrm_cycle_steps", 6),
+            wmrm_med_margin=getattr(args, "wmrm_med_margin", 0.05),
             local_slots=(args.local_slots_data is not None) or args.live_vjepa,
             local_slots_direct288=args.local_slots_direct288,
             local_slots_fixed_query=args.local_slots_fixed_query,
@@ -6943,6 +6978,8 @@ def main() -> None:
                     else getattr(args, "hidden_dim", 512)
                 )
             ),
+            wmrm_cycle_steps=getattr(args, "wmrm_cycle_steps", 6),
+            wmrm_med_margin=getattr(args, "wmrm_med_margin", 0.05),
             **_mtvj_config_kwargs(args),
         )
         smoke_batch = synthetic_sequence(
