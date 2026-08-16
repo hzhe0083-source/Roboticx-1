@@ -97,6 +97,8 @@ class VACompoundConfig:
     wmrm_target: str = "dino"
     wmrm_cycle_steps: int = 6  # executed env steps per VA cycle; world heads read only this prefix
     wmrm_med_margin: float = 0.05
+    # False = JEPA-style world-only: predict next latent, do not write A' and do not read VA's A.
+    wmrm_handshake: bool = True
     # 顺序式 A→V→A 耦合（2026-08-07 审阅落地④）：每 N 层使用
     # proposal→reorganize→correction 三遍注意力；0 = 全层同步联合（旧行为）。
     sequential_coupling: int = 0
@@ -1915,6 +1917,7 @@ class VACompoundPolicy(nn.Module):
                     mixer_dropout=config.wmrm_mixer_dropout,
                     num_heads=config.num_heads,
                     cycle_steps=config.wmrm_cycle_steps,
+                    condition_on_action=config.wmrm_handshake,
                 )
         else:
             self.wmrm = None
@@ -2553,7 +2556,7 @@ class VACompoundPolicy(nn.Module):
                 mask = language_cache.attention_mask
                 if mask is not None:
                     language_keys = language_keys * mask.to(dtype=language_keys.dtype)[:, :, None]
-                action, aux, belief, prev_innovation = self.wmrm(
+                updated, aux, belief, prev_innovation = self.wmrm(
                     action,
                     shared_eye,
                     proprio.to(dtype=action.dtype),
@@ -2562,10 +2565,12 @@ class VACompoundPolicy(nn.Module):
                     language_keys=language_keys,
                     world_goal=world_goal,
                 )
+                if self.config.wmrm_handshake:
+                    action = updated
                 self.last_wmrm = aux
                 self.last_wmrm_auxes.append(aux)
                 self.last_wmrm_pre_actions.append(pre_action)
-                if self.training:
+                if self.training and self.config.wmrm_handshake:
                     inject_kl = self.wmrm.pi_kl_from_aux(pre_action, aux)
                     self.last_wmrm_pi_kls.append(inject_kl)
                     self.last_wmrm_pi_kl = inject_kl

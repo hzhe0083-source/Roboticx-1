@@ -83,6 +83,7 @@ class WAM4VA(nn.Module):
         n_progress: int = 4,
         n_task_queries: int = 4,
         cycle_steps: int = 6,
+        condition_on_action: bool = True,
     ) -> None:
         super().__init__()
         if hidden_dim < 1:
@@ -112,6 +113,7 @@ class WAM4VA(nn.Module):
         self.n_progress = n_progress
         self.n_task_queries = n_task_queries
         self.cycle_steps = cycle_steps
+        self.condition_on_action = condition_on_action
 
         self.belief_tokens = nn.Parameter(torch.zeros(n_belief, hidden_dim))
         self.evidence_queries = nn.Parameter(torch.empty(n_evidence, hidden_dim))
@@ -227,12 +229,15 @@ class WAM4VA(nn.Module):
 
         World heads see only the first ``min(cycle_steps, horizon)`` action
         slots. Tail tokens after the executed cycle do not enter world heads.
+        When ``condition_on_action`` is False the action path is zeros so an
+        untrained VA cannot leak into the latent predictor.
         """
         state = proprio.to(dtype=action.dtype)
         belief_pool = belief.mean(dim=1)
         task_cond = self.world_from_task(task_summary)
+        world_action = action if self.condition_on_action else torch.zeros_like(action)
         span_latents = []
-        for segment, head in zip(self._segment_means(action), self.span_heads):
+        for segment, head in zip(self._segment_means(world_action), self.span_heads):
             fused = torch.tanh(
                 self.world_from_action(segment)
                 + self.world_from_state(state)

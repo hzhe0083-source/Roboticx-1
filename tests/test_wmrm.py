@@ -480,6 +480,8 @@ def test_cli_wmrm_only_forces_med_off(tmp_path) -> None:
     )
     validate_args(args)
     assert args.wmrm_med_weight == 0.0
+    assert args.wmrm_adep_weight == 0.0
+    assert args.wmrm_handshake is False
     assert args.mtvj_train_metric_head is False
 
 
@@ -497,3 +499,25 @@ def test_wmrm_only_freezes_va_and_flow() -> None:
     assert not any(name.startswith("flow_head.") for name in trainable)
     assert not any(name.startswith("layers.") for name in trainable)
     assert groups[0]["lr"] == 1e-4
+
+
+def test_handshake_off_ignores_va_action() -> None:
+    torch.manual_seed(0)
+    model = VACompoundPolicy(_tiny_config(wmrm=True, wmrm_handshake=False)).eval()
+    vision, proprio, previous, language, mask = _inputs(model.config)
+    with torch.no_grad():
+        closed = model.encode_condition(
+            vision, proprio, previous, language_hidden=language, language_mask=mask
+        )
+        model.wmrm.gate_proj.bias.fill_(2.0)
+        still = model.encode_condition(
+            vision, proprio, previous, language_hidden=language, language_mask=mask
+        )
+    torch.testing.assert_close(closed, still, rtol=0.0, atol=0.0)
+    action = torch.randn(2, 5, 32)
+    other = action + 3.0
+    belief = torch.randn(2, 8, 32)
+    task = torch.randn(2, 32)
+    z1, _, _ = model.wmrm.predict_world(action, proprio, belief, task)
+    z2, _, _ = model.wmrm.predict_world(other, proprio, belief, task)
+    torch.testing.assert_close(z1, z2)

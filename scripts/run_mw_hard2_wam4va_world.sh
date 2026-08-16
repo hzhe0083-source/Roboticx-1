@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stage 1: JEPA world predictor only. Freeze VA/FM. q stays 0.
+# Stage 1: JEPA-style world only. Handshake off. Predictor does not read VA's A.
 #   bash scripts/run_mw_hard2_wam4va_world.sh          # 5k, batch 6
 #   bash scripts/run_mw_hard2_wam4va_world.sh 1000 6   # smoke
 # Then: bash scripts/run_mw_hard2_wam4va_joint.sh

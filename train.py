@@ -4234,8 +4234,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--wmrm-only",
         action="store_true",
-        help="第一阶段：冻 VA/FM，只训 WAM 的下一决策 latent predictor"
-        "（L_world；不开 L_med）。第二阶段去掉本开关 --resume 后联合。",
+        help="第一阶段 JEPA 式：断开握手、世界头不读 VA 的 A，只训下一 latent。"
+        "第二阶段去掉本开关 --resume 后再接上握手并训 VA+FM。",
     )
     parser.add_argument(
         "--training-stage",
@@ -5217,8 +5217,11 @@ def validate_args(args: argparse.Namespace) -> None:
     ):
         raise ValueError("--wmrm-only is mutually exclusive with --head-only/--servo-only/--action-vision-only")
     if getattr(args, "wmrm_only", False):
-        # Stage-1 JEPA: only the latent predictor. Do not open q into a frozen FM.
+        # Stage-1 JEPA-style: no handshake, no VA action leak, only L_world.
+        args.wmrm_handshake = False
         args.wmrm_med_weight = 0.0
+        args.wmrm_adep_weight = 0.0
+        args.wmrm_pi_kl_weight = 0.0
         args.mtvj_train_metric_head = False
         args.mtvj_train_relation = False
     if getattr(args, "wmrm", False) and float(getattr(args, "wmrm_world_weight", 1.0)) <= 0.0:
@@ -6457,6 +6460,7 @@ def main() -> None:
             ),
             wmrm_cycle_steps=getattr(args, "wmrm_cycle_steps", 6),
             wmrm_med_margin=getattr(args, "wmrm_med_margin", 0.05),
+            wmrm_handshake=getattr(args, "wmrm_handshake", True),
             **_mtvj_config_kwargs(args),
         )
         if args.single_task:
@@ -6733,6 +6737,7 @@ def main() -> None:
             ),
             wmrm_cycle_steps=getattr(args, "wmrm_cycle_steps", 6),
             wmrm_med_margin=getattr(args, "wmrm_med_margin", 0.05),
+            wmrm_handshake=getattr(args, "wmrm_handshake", True),
             local_slots=(args.local_slots_data is not None) or args.live_vjepa,
             local_slots_direct288=args.local_slots_direct288,
             local_slots_fixed_query=args.local_slots_fixed_query,
@@ -7018,6 +7023,7 @@ def main() -> None:
             ),
             wmrm_cycle_steps=getattr(args, "wmrm_cycle_steps", 6),
             wmrm_med_margin=getattr(args, "wmrm_med_margin", 0.05),
+            wmrm_handshake=getattr(args, "wmrm_handshake", True),
             **_mtvj_config_kwargs(args),
         )
         smoke_batch = synthetic_sequence(
