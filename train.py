@@ -4245,9 +4245,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--wmrm-map-size",
         type=int,
-        default=18,
+        default=16,
         dest="wmrm_map_size",
-        help="无参平均池化把 DINO patch 压成 map_size×map_size 再预测（默认 18）",
+        help="无参平均池化把 DINO patch 压成 map_size×map_size 再预测（默认 16，对齐 DINO 网格）",
     )
     parser.add_argument(
         "--wmrm-map-channels",
@@ -6486,7 +6486,7 @@ def main() -> None:
             wmrm_cycle_steps=getattr(args, "wmrm_cycle_steps", 6),
             wmrm_med_margin=getattr(args, "wmrm_med_margin", 0.05),
             wmrm_handshake=getattr(args, "wmrm_handshake", True),
-            wmrm_map_size=getattr(args, "wmrm_map_size", 18),
+            wmrm_map_size=getattr(args, "wmrm_map_size", 16),
             wmrm_map_channels=getattr(args, "wmrm_map_channels", 32),
             **_mtvj_config_kwargs(args),
         )
@@ -6765,7 +6765,7 @@ def main() -> None:
             wmrm_cycle_steps=getattr(args, "wmrm_cycle_steps", 6),
             wmrm_med_margin=getattr(args, "wmrm_med_margin", 0.05),
             wmrm_handshake=getattr(args, "wmrm_handshake", True),
-            wmrm_map_size=getattr(args, "wmrm_map_size", 18),
+            wmrm_map_size=getattr(args, "wmrm_map_size", 16),
             wmrm_map_channels=getattr(args, "wmrm_map_channels", 32),
             local_slots=(args.local_slots_data is not None) or args.live_vjepa,
             local_slots_direct288=args.local_slots_direct288,
@@ -7053,7 +7053,7 @@ def main() -> None:
             wmrm_cycle_steps=getattr(args, "wmrm_cycle_steps", 6),
             wmrm_med_margin=getattr(args, "wmrm_med_margin", 0.05),
             wmrm_handshake=getattr(args, "wmrm_handshake", True),
-            wmrm_map_size=getattr(args, "wmrm_map_size", 18),
+            wmrm_map_size=getattr(args, "wmrm_map_size", 16),
             wmrm_map_channels=getattr(args, "wmrm_map_channels", 32),
             **_mtvj_config_kwargs(args),
         )

@@ -99,7 +99,7 @@ class VACompoundConfig:
     wmrm_med_margin: float = 0.05
     # False = JEPA-style world-only: predict next latent, do not write A' and do not read VA's A.
     wmrm_handshake: bool = True
-    wmrm_map_size: int = 18
+    wmrm_map_size: int = 16
     wmrm_map_channels: int = 32
     # 顺序式 A→V→A 耦合（2026-08-07 审阅落地④）：每 N 层使用
     # proposal→reorganize→correction 三遍注意力；0 = 全层同步联合（旧行为）。

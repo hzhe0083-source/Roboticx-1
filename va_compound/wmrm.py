@@ -87,7 +87,7 @@ class WAM4VA(nn.Module):
         cycle_steps: int = 6,
         condition_on_action: bool = True,
         dino_dim: int | None = None,
-        map_size: int = 18,
+        map_size: int = 16,
         map_channels: int = 32,
         map_frames: int = 4,
         map_grid: int = 16,
@@ -174,7 +174,7 @@ class WAM4VA(nn.Module):
             nn.init.zeros_(self.dino_pred.bias)
             self.token_readout = nn.Linear(dino_dim, world_dim)
             # Spatial compressor is parameter-free avg-pool. Only the residual
-            # 1x1 on the 18x18 map is trained.
+            # 1x1 on the pooled DINO map is trained.
             self.map_pred = nn.Conv2d(map_channels, map_channels, kernel_size=1)
             nn.init.zeros_(self.map_pred.weight)
             nn.init.zeros_(self.map_pred.bias)
