@@ -87,6 +87,10 @@ class WAM4VA(nn.Module):
         cycle_steps: int = 6,
         condition_on_action: bool = True,
         dino_dim: int | None = None,
+        map_size: int = 18,
+        map_channels: int = 32,
+        map_frames: int = 4,
+        map_grid: int = 16,
     ) -> None:
         super().__init__()
         if hidden_dim < 1:
@@ -155,6 +159,12 @@ class WAM4VA(nn.Module):
         self.gate_proj = nn.Linear(world_dim, 1)
         nn.init.zeros_(self.gate_proj.weight)
         nn.init.zeros_(self.gate_proj.bias)
+        if map_size < 1 or map_channels < 1 or map_frames < 1 or map_grid < 1:
+            raise ValueError("map_size/channels/frames/grid must be positive")
+        self.map_size = map_size
+        self.map_channels = map_channels
+        self.map_frames = map_frames
+        self.map_grid = map_grid
         if dino_dim is not None:
             if dino_dim < 1:
                 raise ValueError("dino_dim must be positive")
@@ -163,6 +173,15 @@ class WAM4VA(nn.Module):
             nn.init.zeros_(self.dino_pred.weight)
             nn.init.zeros_(self.dino_pred.bias)
             self.token_readout = nn.Linear(dino_dim, world_dim)
+            self.map_reduce = nn.Conv2d(dino_dim, map_channels, kernel_size=1)
+            self.map_mix = nn.Conv2d(map_channels, map_channels, kernel_size=3, padding=1)
+            self.map_fuse = nn.Conv2d(map_frames * map_channels, map_channels, kernel_size=3, padding=1)
+            self.map_out = nn.Conv2d(map_channels, map_channels, kernel_size=1)
+            self.map_pred = nn.Conv2d(map_channels, map_channels, kernel_size=1)
+            nn.init.zeros_(self.map_pred.weight)
+            nn.init.zeros_(self.map_pred.bias)
+            self.cond_to_map = nn.Linear(hidden_dim, map_channels)
+            self.map_readout = nn.Linear(map_channels, world_dim)
             self.z_query = nn.Parameter(torch.empty(1, world_dim))
             nn.init.normal_(self.z_query, std=0.02)
             self.z_read = _CrossAttn(world_dim, num_heads)
@@ -170,6 +189,13 @@ class WAM4VA(nn.Module):
             self.cond_to_dino = None
             self.dino_pred = None
             self.token_readout = None
+            self.map_reduce = None
+            self.map_mix = None
+            self.map_fuse = None
+            self.map_out = None
+            self.map_pred = None
+            self.cond_to_map = None
+            self.map_readout = None
             self.z_query = None
             self.z_read = None
         self.innov_overlap = 0.5
@@ -269,6 +295,30 @@ class WAM4VA(nn.Module):
         progress = self.progress_head(torch.cat((belief_pool, task_summary), dim=-1))
         return fused_sum / max(n_spans, 1), z_spans, progress, belief_pool
 
+    def encode_dino_map(self, dino_tokens: Tensor) -> Tensor | None:
+        """CNN: frame-major DINO patches → [B, C, map_size, map_size]."""
+        if (
+            self.map_reduce is None
+            or dino_tokens.ndim != 3
+            or dino_tokens.shape[1] != self.map_frames * self.map_grid * self.map_grid
+            or dino_tokens.shape[-1] != self.dino_dim
+        ):
+            return None
+        batch = dino_tokens.shape[0]
+        frames, grid, dim = self.map_frames, self.map_grid, self.dino_dim
+        patches = dino_tokens.to(dtype=self.map_reduce.weight.dtype)
+        spatial = patches.view(batch, frames, grid, grid, dim).permute(0, 1, 4, 2, 3)
+        reduced = self.map_reduce(spatial.reshape(batch * frames, dim, grid, grid))
+        mixed = F.gelu(self.map_mix(reduced))
+        fused = self.map_fuse(mixed.view(batch, frames * self.map_channels, grid, grid))
+        sized = F.interpolate(
+            F.gelu(fused),
+            size=(self.map_size, self.map_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return self.map_out(sized)
+
     def predict_world(
         self,
         action: Tensor,
@@ -295,6 +345,15 @@ class WAM4VA(nn.Module):
             raise ValueError(
                 f"dino_tokens last dim must be {self.dino_dim}, got {dino_tokens.shape[-1]}"
             )
+        current_map = self.encode_dino_map(dino_tokens)
+        if current_map is not None and self.map_pred is not None:
+            cond = self.cond_to_map(fused)[:, :, None, None]
+            z_map = current_map + self.map_pred(torch.tanh(current_map + cond))
+            spatial = z_map.flatten(2).transpose(1, 2)
+            kv = self.map_readout(spatial)
+            query = self.z_query[None].expand(action.shape[0], -1, -1)
+            z_hat = self.z_read(query, kv).squeeze(1)
+            return z_hat, z_spans, progress, z_map
         tokens = dino_tokens.to(dtype=action.dtype)
         cond = self.cond_to_dino(fused)
         z_tokens = tokens + self.dino_pred(torch.tanh(tokens + cond[:, None, :]))

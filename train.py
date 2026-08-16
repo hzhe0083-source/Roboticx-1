@@ -41,8 +41,13 @@ def wmrm_next_feature_target(
     vision_next = batch.get("vision_tokens")
     if vision_next is None or nxt >= vision_next.shape[1]:
         raise ValueError("wmrm_target=dino requires vision_tokens at t+1 (VA cycle)")
-    # Raw frozen DINO tokens for the next VA cycle. Do not project or pool.
-    return vision_next[:, nxt].detach()
+    raw = vision_next[:, nxt]
+    wmrm = getattr(model, "wmrm", None)
+    if wmrm is not None and hasattr(wmrm, "encode_dino_map"):
+        mapped = wmrm.encode_dino_map(raw)
+        if mapped is not None:
+            return mapped.detach()
+    return raw.detach()
 from va_compound.backbones import pool_flat_tokens, pool_mtvj_coarse_tokens
 from va_compound.metric_roi import (
     DINO_METRIC_ROI_CONTRACT,
@@ -4238,6 +4243,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="WAM 执行前缀步数（须与闭环 --execute-steps 一致）",
     )
     parser.add_argument(
+        "--wmrm-map-size",
+        type=int,
+        default=18,
+        dest="wmrm_map_size",
+        help="CNN 把 DINO patch 卷成 map_size×map_size 再预测（默认 18）",
+    )
+    parser.add_argument(
+        "--wmrm-map-channels",
+        type=int,
+        default=32,
+        dest="wmrm_map_channels",
+        help="DINO 空间图通道数",
+    )
+    parser.add_argument(
         "--wmrm-only",
         action="store_true",
         help="第一阶段 JEPA 式：断开握手、世界头不读 VA 的 A，只训下一 latent。"
@@ -6467,6 +6486,8 @@ def main() -> None:
             wmrm_cycle_steps=getattr(args, "wmrm_cycle_steps", 6),
             wmrm_med_margin=getattr(args, "wmrm_med_margin", 0.05),
             wmrm_handshake=getattr(args, "wmrm_handshake", True),
+            wmrm_map_size=getattr(args, "wmrm_map_size", 18),
+            wmrm_map_channels=getattr(args, "wmrm_map_channels", 32),
             **_mtvj_config_kwargs(args),
         )
         if args.single_task:
@@ -6744,6 +6765,8 @@ def main() -> None:
             wmrm_cycle_steps=getattr(args, "wmrm_cycle_steps", 6),
             wmrm_med_margin=getattr(args, "wmrm_med_margin", 0.05),
             wmrm_handshake=getattr(args, "wmrm_handshake", True),
+            wmrm_map_size=getattr(args, "wmrm_map_size", 18),
+            wmrm_map_channels=getattr(args, "wmrm_map_channels", 32),
             local_slots=(args.local_slots_data is not None) or args.live_vjepa,
             local_slots_direct288=args.local_slots_direct288,
             local_slots_fixed_query=args.local_slots_fixed_query,
@@ -7030,6 +7053,8 @@ def main() -> None:
             wmrm_cycle_steps=getattr(args, "wmrm_cycle_steps", 6),
             wmrm_med_margin=getattr(args, "wmrm_med_margin", 0.05),
             wmrm_handshake=getattr(args, "wmrm_handshake", True),
+            wmrm_map_size=getattr(args, "wmrm_map_size", 18),
+            wmrm_map_channels=getattr(args, "wmrm_map_channels", 32),
             **_mtvj_config_kwargs(args),
         )
         smoke_batch = synthetic_sequence(

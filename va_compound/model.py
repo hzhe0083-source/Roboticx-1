@@ -99,6 +99,8 @@ class VACompoundConfig:
     wmrm_med_margin: float = 0.05
     # False = JEPA-style world-only: predict next latent, do not write A' and do not read VA's A.
     wmrm_handshake: bool = True
+    wmrm_map_size: int = 18
+    wmrm_map_channels: int = 32
     # 顺序式 A→V→A 耦合（2026-08-07 审阅落地④）：每 N 层使用
     # proposal→reorganize→correction 三遍注意力；0 = 全层同步联合（旧行为）。
     sequential_coupling: int = 0
@@ -329,6 +331,10 @@ class VACompoundConfig:
             )
         if self.wmrm_med_margin < 0:
             raise ValueError("wmrm_med_margin must be non-negative")
+        if self.wmrm_map_size < 1:
+            raise ValueError("wmrm_map_size must be positive")
+        if self.wmrm_map_channels < 1:
+            raise ValueError("wmrm_map_channels must be positive")
 
 
 @dataclass(frozen=True)
@@ -1919,6 +1925,10 @@ class VACompoundPolicy(nn.Module):
                     cycle_steps=config.wmrm_cycle_steps,
                     condition_on_action=config.wmrm_handshake,
                     dino_dim=config.vision_dim,
+                    map_size=config.wmrm_map_size,
+                    map_channels=config.wmrm_map_channels,
+                    map_frames=config.main_vision_frames,
+                    map_grid=config.main_vision_grid,
                 )
         else:
             self.wmrm = None
