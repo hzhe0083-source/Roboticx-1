@@ -1,0 +1,39 @@
+{
+  "contract": "task35_p0_failinit_data_v1",
+  "generated_at": "2026-08-16T16:45:00+08:00",
+  "baseline_A": {
+    "windows": "data/metaworld_longtraj_windows_h6_dino35_clean60_recovery30_v1.pt",
+    "n_windows": 1807,
+    "n_clean": 1119,
+    "n_recovery": 688,
+    "sha256": "a27e4617da1c98cb326fbaefbb30183adf8761a3777dd83ceba7aa7845cdd9ec",
+    "closed_loop": "37/50"
+  },
+  "p0_collection": {
+    "longtraj": "data/metaworld_longtraj_peg-insert-side-v3_recovery_failinit_v2_seed360.pt",
+    "n_episodes": 18,
+    "variants_per_seed": 2,
+    "seeds": [35002, 35004, 35007, 35009, 35014, 35021, 35028, 35033, 35039],
+    "skipped_unsolved": [35027],
+    "excluded_p1_only": [35036],
+    "perturbation_mode": "forced_single_pre_success",
+    "perturb_kinds": ["eef_lateral", "eef_height"],
+    "mean_len": 238
+  },
+  "p0_windows": {
+    "failinit_only": "data/metaworld_longtraj_windows_h6_dino35_recovery_failinit_v2_seed360.pt",
+    "failinit_only_n": 355,
+    "recovery_concat": "data/metaworld_longtraj_windows_h6_dino35_recovery_seed351_plus_failinit_v2.pt",
+    "recovery_concat_n": 1043,
+    "merged_C": "data/metaworld_longtraj_windows_h6_dino35_clean60_recovery30_failinit_v2.pt",
+    "merged_C_shape": [2162, 4, 6, 4],
+    "merged_C_sha256": "2d3dcde1b7aeac39bee88b0cbfcf054aa93cf5f61185d18fbbb0b68966f6591b",
+    "n_clean": 1119,
+    "n_recovery": 1043
+  },
+  "not_done": [
+    "build DINO cache for the 2162-window C payload",
+    "short finetune from 15k on C",
+    "eval50 C-A on seeds 35000-35049"
+  ]
+}

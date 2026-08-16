@@ -120,6 +120,11 @@ T0 门已过：**≥8/13 从未真正到位** → 完整 WAM 是错工具。
 门槛不变：同一 50 seed **≥42/50**，且 Wilson 下界 **>74%**，才算赢过 15k。
 
 1. **P0 数据，不是 WAM。** 针对慢性 7 seed + never-approach 6 seed，补接近/抓取 recovery 窗口（keep 15k 权重或只在新数据上短微调）。先测 `C−A`。
+   - 采集器已落地：`scripts/collect_task35_failinit_recovery.py`（pin eval init + `--force-perturb`）。
+   - 脚本专家探针：`artifacts/task35_p0_probe_2026-08-16.json`。**35027 在 MW 500 步内抓到但插不进**（`grasp_ok=1`, `min_d≈0.178`），不能进 recovery 文件。
+   - 已采 9 seed × 2 variant = **18** 条 forced recovery：`data/metaworld_longtraj_peg-insert-side-v3_recovery_failinit_v2_seed360.pt`。
+   - 已切 H6：**355** 个新 recovery 窗口。合并后的 C 载荷（**不要覆盖 1807 SHA**）：`data/metaworld_longtraj_windows_h6_dino35_clean60_recovery30_failinit_v2.pt`（1119 clean + 1043 recovery = 2162）。
+   - **还没做：** 给 2162 建新 DINO cache，再从 15k 短微调，再跑同一 50 seed 得 C。
 2. **P1 仅对 3 个 near-insert**（35021, 35036, 35039）：同一 15k 权重，`--execute-steps 2`。只有这 3 个翻了，才考虑很小的残差，不上 60M WAM。
 3. **P2 可选回放。** 这 13 个 seed 的 RGB 还没从 env 里 dump。若要写进论文失败分析，用 15k ckpt 只滚这些 seed（会占 GPU）。
 4. WAM 仍按 `artifacts/task35_wam_go_nogo_2026-08-16.md`：先过 `action[0:6] → Δ(pegHead−hole)` 探针，再改编 DINO-H6 契约。

@@ -1,0 +1,22 @@
+{
+  "contract": "task35_p0_scripted_probe_v1",
+  "generated_at": "2026-08-16T16:30:00+08:00",
+  "policy": "SawyerPegInsertionSideV3Policy",
+  "horizon": 500,
+  "note": "Same eval reset as eval50: np.random.seed(s); env.reset(seed=s). 35027 hits MetaWorld max_path_length=500 with grasp but no insert.",
+  "p0_union": [35002, 35004, 35007, 35009, 35014, 35021, 35027, 35028, 35033, 35039],
+  "scripted_ok": [35002, 35004, 35007, 35009, 35014, 35021, 35028, 35033, 35039],
+  "scripted_unsolved": [35027],
+  "rows": [
+    {"episode_seed": 35002, "scripted_success": true, "first_success": 93, "min_obj_to_target": 0.06526080319211737, "grasp_reward": 1.0},
+    {"episode_seed": 35004, "scripted_success": true, "first_success": 104, "min_obj_to_target": 0.06889706738515844, "grasp_reward": 1.0},
+    {"episode_seed": 35007, "scripted_success": true, "first_success": 174, "min_obj_to_target": 0.06526151862552942, "grasp_reward": 1.0},
+    {"episode_seed": 35009, "scripted_success": true, "first_success": 91, "min_obj_to_target": 0.06686906917684898, "grasp_reward": 1.0},
+    {"episode_seed": 35014, "scripted_success": true, "first_success": 79, "min_obj_to_target": 0.06300246556531977, "grasp_reward": 1.0},
+    {"episode_seed": 35021, "scripted_success": true, "first_success": 96, "min_obj_to_target": 0.06198632726361638, "grasp_reward": 1.0},
+    {"episode_seed": 35027, "scripted_success": false, "first_success": null, "min_obj_to_target": 0.178361964609593, "grasp_reward": 1.0, "near_object": 1.0, "grasp_success": 1.0, "in_place_reward": 0.5315601805145483, "truncated_at": 499},
+    {"episode_seed": 35028, "scripted_success": true, "first_success": 89, "min_obj_to_target": 0.06825211879690722, "grasp_reward": 1.0},
+    {"episode_seed": 35033, "scripted_success": true, "first_success": 185, "min_obj_to_target": 0.06607840895451245, "grasp_reward": 1.0},
+    {"episode_seed": 35039, "scripted_success": true, "first_success": 81, "min_obj_to_target": 0.06517702424474583, "grasp_reward": 1.0}
+  ]
+}
