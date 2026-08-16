@@ -354,22 +354,27 @@ def test_dino_target_is_raw_tokens() -> None:
     assert got.shape == (2, 11, model.config.vision_dim)
 
 
-def test_dino_map_avgpool_is_16x16_and_zero_init_copies() -> None:
+def test_dino_map_uses_last_frame_full_channels() -> None:
     block = WorldMediatedResidualModulation(
         32,
         world_dim=8,
         rank=4,
         proprio_dim=9,
         dino_dim=8,
-        map_size=16,
+        map_size=4,
         map_channels=4,
-        map_frames=1,
+        map_frames=2,
         map_grid=4,
     )
-    tokens = torch.randn(2, 16, 8)
+    first = torch.randn(2, 16, 8)
+    last = torch.randn(2, 16, 8)
+    tokens = torch.cat((first, last), dim=1)
     mapped = block.encode_dino_map(tokens)
     assert mapped is not None
-    assert mapped.shape == (2, 4, 16, 16)
+    assert mapped.shape == (2, 8, 4, 4)
+    expected = last.view(2, 4, 4, 8).permute(0, 3, 1, 2)
+    torch.testing.assert_close(mapped, expected)
+    assert not torch.allclose(mapped, first.view(2, 4, 4, 8).permute(0, 3, 1, 2))
     action = torch.randn(2, 5, 32)
     proprio = torch.randn(2, 9)
     belief = torch.randn(2, 8, 32)

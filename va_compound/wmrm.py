@@ -173,13 +173,12 @@ class WAM4VA(nn.Module):
             nn.init.zeros_(self.dino_pred.weight)
             nn.init.zeros_(self.dino_pred.bias)
             self.token_readout = nn.Linear(dino_dim, world_dim)
-            # Spatial compressor is parameter-free avg-pool. Only the residual
-            # 1x1 on the pooled DINO map is trained.
-            self.map_pred = nn.Conv2d(map_channels, map_channels, kernel_size=1)
+            # Last-frame DINO grid, full channel dim. No trained compressor.
+            self.map_pred = nn.Conv2d(dino_dim, dino_dim, kernel_size=1)
             nn.init.zeros_(self.map_pred.weight)
             nn.init.zeros_(self.map_pred.bias)
-            self.cond_to_map = nn.Linear(hidden_dim, map_channels)
-            self.map_readout = nn.Linear(map_channels, world_dim)
+            self.cond_to_map = nn.Linear(hidden_dim, dino_dim)
+            self.map_readout = nn.Linear(dino_dim, world_dim)
             self.z_query = nn.Parameter(torch.empty(1, world_dim))
             nn.init.normal_(self.z_query, std=0.02)
             self.z_read = _CrossAttn(world_dim, num_heads)
@@ -290,30 +289,24 @@ class WAM4VA(nn.Module):
         return fused_sum / max(n_spans, 1), z_spans, progress, belief_pool
 
     def encode_dino_map(self, dino_tokens: Tensor) -> Tensor | None:
-        """Untrained avg-pool: frame-major DINO patches → [B, C, map_size, map_size]."""
+        """Last-frame DINO grid [B, D, map_size, map_size]. No frame/channel mean."""
         if (
             self.dino_dim is None
             or dino_tokens.ndim != 3
-            or dino_tokens.shape[1] != self.map_frames * self.map_grid * self.map_grid
             or dino_tokens.shape[-1] != self.dino_dim
         ):
             return None
         batch = dino_tokens.shape[0]
-        frames, grid, dim = self.map_frames, self.map_grid, self.dino_dim
-        spatial = dino_tokens.view(batch, frames, grid, grid, dim).mean(dim=1)
-        pooled = F.adaptive_avg_pool2d(
-            spatial.permute(0, 3, 1, 2),
-            (self.map_size, self.map_size),
-        )
-        channels = self.map_channels
-        if dim == channels:
-            return pooled
-        if dim % channels == 0:
-            return pooled.view(batch, channels, dim // channels, self.map_size, self.map_size).mean(dim=2)
-        flat = pooled.flatten(2).transpose(1, 2)
-        return F.adaptive_avg_pool1d(flat, channels).transpose(1, 2).view(
-            batch, channels, self.map_size, self.map_size
-        )
+        grid, dim = self.map_grid, self.dino_dim
+        patches = grid * grid
+        expected = self.map_frames * patches
+        if dino_tokens.shape[1] != expected:
+            return None
+        last = dino_tokens[:, -patches:]
+        spatial = last.view(batch, grid, grid, dim).permute(0, 3, 1, 2)
+        if (grid, grid) == (self.map_size, self.map_size):
+            return spatial
+        return F.adaptive_avg_pool2d(spatial, (self.map_size, self.map_size))
 
     def predict_world(
         self,
