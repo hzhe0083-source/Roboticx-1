@@ -3376,6 +3376,7 @@ def rollout_policy(
     metric_tokens: Tensor | None = None,
     action_dense_evidence: dict[int, Tensor] | None = None,
     metric_g: Tensor | None = None,
+    wmrm_adep_margin: float = 0.05,
 ) -> tuple[Tensor, Tensor]:
     if model.config.plan_resampler:
         # Plan-Cache 方案 B：首决策场景摘要（vision 全局均值）→ plan tokens，
@@ -3419,6 +3420,8 @@ def rollout_policy(
     action_conditions = []
     wmrm_world_terms: list[Tensor] = []
     wmrm_pi_kl_terms: list[Tensor] = []
+    wmrm_adep_terms: list[Tensor] = []
+    wmrm_med_terms: list[Tensor] = []
     memories: list[VisualMemory] | None = [] if model.config.future_predict else None
     direct_predictions = [] if model.config.direct_head else None
     c2_references = [] if model.config.c2_controller else None
@@ -3489,15 +3492,34 @@ def rollout_policy(
             )
             if not auxes:
                 raise ValueError("WAM4VA produced no world predictions at a supervised step")
-            for aux in auxes:
+            pres = getattr(model, "last_wmrm_pre_actions", None) or []
+            for inject_i, aux in enumerate(auxes):
                 if metric_g.shape[-1] != aux.z_hat.shape[-1]:
                     raise ValueError(
                         "metric_g last dim must match z_hat: "
                         f"{metric_g.shape[-1]} vs {aux.z_hat.shape[-1]}"
                     )
-                wmrm_world_terms.append(
-                    wmrm_world_loss(aux.z_hat, metric_g[:, time_index + 1])
-                )
+                target = metric_g[:, time_index + 1]
+                wmrm_world_terms.append(wmrm_world_loss(aux.z_hat, target))
+                if inject_i < len(pres):
+                    perm = torch.randperm(aux.z_hat.shape[0], device=aux.z_hat.device)
+                    z_shuf, _, _ = model.wmrm.predict_world(
+                        pres[inject_i][perm],
+                        aux.proprio,
+                        aux.belief,
+                        aux.task_summary,
+                    )
+                    wmrm_adep_terms.append(
+                        model.wmrm.action_dep_hinge(
+                            aux.z_hat,
+                            z_shuf,
+                            target,
+                            margin=wmrm_adep_margin,
+                        )
+                    )
+        meds = getattr(model, "last_wmrm_meds", None)
+        if meds:
+            wmrm_med_terms.extend(meds)
         kls = getattr(model, "last_wmrm_pi_kls", None)
         if kls:
             wmrm_pi_kl_terms.extend(kls)
@@ -3623,6 +3645,14 @@ def rollout_policy(
         model.last_wmrm_pi_kl_loss = torch.stack(wmrm_pi_kl_terms).mean()
     else:
         model.last_wmrm_pi_kl_loss = None
+    if wmrm_adep_terms:
+        model.last_wmrm_adep_loss = torch.stack(wmrm_adep_terms).mean()
+    else:
+        model.last_wmrm_adep_loss = None
+    if wmrm_med_terms:
+        model.last_wmrm_med_loss = torch.stack(wmrm_med_terms).mean()
+    else:
+        model.last_wmrm_med_loss = None
     if memories is not None:
         return out + (memories,)
     return out
@@ -4117,6 +4147,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=0.05,
         help="belief 与 language task summary 的余弦对齐权重",
+    )
+    parser.add_argument(
+        "--wmrm-adep-weight",
+        type=float,
+        default=0.1,
+        help="ReLU(m - (L_W(A_shuf)-L_W(A)))：强迫 ẑ 依赖动作",
+    )
+    parser.add_argument(
+        "--wmrm-adep-margin",
+        type=float,
+        default=0.05,
+        help="动作打乱后 world MSE 至少应增加的幅度",
+    )
+    parser.add_argument(
+        "--wmrm-med-weight",
+        type=float,
+        default=0.1,
+        help="ReLU(m - ||C_FM(z)-C_FM(z_shuf)||)：强迫 ẑ 改变 LN 后 FM 输入",
+    )
+    parser.add_argument(
+        "--wmrm-med-margin",
+        type=float,
+        default=0.05,
+        help="shuffle ẑ 后 FM condition 的最小 L2 变化",
     )
     parser.add_argument(
         "--training-stage",
@@ -7874,6 +7928,7 @@ def main() -> None:
                     metric_tokens=mtvj_metric_tokens,
                     action_dense_evidence=action_dense_evidence,
                     metric_g=mtvj_metric_g,
+                    wmrm_adep_margin=float(getattr(args, "wmrm_adep_margin", 0.05)),
                 )
                 if model.config.future_predict:
                     predicted_velocity, action_conditions, memories = rollout
@@ -8117,6 +8172,12 @@ def main() -> None:
                     last_aux.task_summary.detach(),
                     dim=-1,
                 ).mean()
+            adep = getattr(model, "last_wmrm_adep_loss", None)
+            if adep is None:
+                adep = flow_loss.new_zeros(())
+            med = getattr(model, "last_wmrm_med_loss", None)
+            if med is None:
+                med = flow_loss.new_zeros(())
             action_total = (
                 flow_loss
                 + args.pair_loss_weight * pair_loss
@@ -8124,6 +8185,8 @@ def main() -> None:
                 + float(getattr(args, "wmrm_world_weight", 1.0)) * wmrm_loss
                 + float(getattr(args, "wmrm_pi_kl_weight", 0.1)) * pi_kl_hinge
                 + float(getattr(args, "wmrm_lang_align_weight", 0.05)) * lang_align
+                + float(getattr(args, "wmrm_adep_weight", 0.1)) * adep
+                + float(getattr(args, "wmrm_med_weight", 0.1)) * med
             )
             semantic_total = (
                 args.semantic_anchor_weight * semantic_anchor_loss

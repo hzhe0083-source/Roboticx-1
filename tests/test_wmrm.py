@@ -242,6 +242,29 @@ def test_span_ids_cover_horizon_when_not_divisible() -> None:
     torch.testing.assert_close(means[2], action[:, 6:].mean(dim=1))
 
 
+def test_action_dep_hinge_penalizes_action_independent_z() -> None:
+    block = WorldMediatedResidualModulation(32, world_dim=8, rank=4, proprio_dim=9)
+    z = torch.randn(4, 8)
+    z_shuf = z.clone()
+    future = z + 0.01
+    hinge = block.action_dep_hinge(z, z_shuf, future, margin=0.05)
+    assert float(hinge.item()) == pytest.approx(0.05)
+
+
+def test_fm_condition_hinge_zero_when_gate_closed() -> None:
+    block = WorldMediatedResidualModulation(32, world_dim=8, rank=4, proprio_dim=9)
+    block.eval()
+    action = torch.randn(3, 5, 32)
+    vision = torch.randn(3, 6, 32)
+    proprio = torch.randn(3, 9)
+    norm = torch.nn.LayerNorm(32)
+    with torch.no_grad():
+        _, aux, _, _ = block(action, vision, proprio)
+        hinge = block.fm_condition_hinge(action, aux, norm, margin=0.05)
+    assert float(aux.gate.abs().max()) == 0.0
+    assert float(hinge.item()) == pytest.approx(0.05)
+
+
 def test_source_gates_and_span_heads_exist() -> None:
     block = WorldMediatedResidualModulation(32, world_dim=8, rank=4, proprio_dim=9)
     assert block.source_gates.shape == (3,)
