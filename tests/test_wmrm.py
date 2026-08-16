@@ -452,3 +452,48 @@ def test_wmrm_target_vjepa_rejected_on_dino_config() -> None:
             main_vision_frames=4,
             main_vision_tokens=256,
         )
+
+
+def test_cli_wmrm_only_requires_wam4va() -> None:
+    from train import parse_args, validate_args
+
+    args = parse_args(["--wmrm-only"])
+    with pytest.raises(ValueError, match="wmrm-only"):
+        validate_args(args)
+
+
+def test_cli_wmrm_only_forces_med_off(tmp_path) -> None:
+    from train import parse_args, validate_args
+
+    data = tmp_path / "windows.pt"
+    data.write_bytes(b"x")
+    args = parse_args(
+        [
+            "--wam4va",
+            "--wmrm-only",
+            "--wmrm-med-weight",
+            "0.5",
+            "--mtvj-train-metric-head",
+            "--data",
+            str(data),
+        ]
+    )
+    validate_args(args)
+    assert args.wmrm_med_weight == 0.0
+    assert args.mtvj_train_metric_head is False
+
+
+def test_wmrm_only_freezes_va_and_flow() -> None:
+    from argparse import Namespace
+
+    from train import _feature_optimizer_groups
+
+    model = VACompoundPolicy(_tiny_config(wmrm=True))
+    args = Namespace(wmrm_only=True, lr=1e-4, action_vision_only=False, head_only=False)
+    groups = _feature_optimizer_groups(args, model, None)
+    trainable = {name for name, p in model.named_parameters() if p.requires_grad}
+    assert trainable
+    assert all(name.startswith("wmrm.") for name in trainable)
+    assert not any(name.startswith("flow_head.") for name in trainable)
+    assert not any(name.startswith("layers.") for name in trainable)
+    assert groups[0]["lr"] == 1e-4

@@ -4232,6 +4232,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="WAM 执行前缀步数（须与闭环 --execute-steps 一致）",
     )
     parser.add_argument(
+        "--wmrm-only",
+        action="store_true",
+        help="第一阶段：冻 VA/FM，只训 WAM 的下一决策 latent predictor"
+        "（L_world；不开 L_med）。第二阶段去掉本开关 --resume 后联合。",
+    )
+    parser.add_argument(
         "--training-stage",
         choices=("a", "b", "c"),
         default=None,
@@ -5202,6 +5208,19 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--wmrm is mutually exclusive with --memory-split")
     if getattr(args, "wmrm", False) and (args.direct_head or args.c2_controller):
         raise ValueError("--wmrm/--wam4va is mutually exclusive with --direct-head/--c2-controller")
+    if getattr(args, "wmrm_only", False) and not getattr(args, "wmrm", False):
+        raise ValueError("--wmrm-only requires --wmrm/--wam4va")
+    if getattr(args, "wmrm_only", False) and (
+        args.head_only
+        or args.servo_only
+        or getattr(args, "action_vision_only", False)
+    ):
+        raise ValueError("--wmrm-only is mutually exclusive with --head-only/--servo-only/--action-vision-only")
+    if getattr(args, "wmrm_only", False):
+        # Stage-1 JEPA: only the latent predictor. Do not open q into a frozen FM.
+        args.wmrm_med_weight = 0.0
+        args.mtvj_train_metric_head = False
+        args.mtvj_train_relation = False
     if getattr(args, "wmrm", False) and float(getattr(args, "wmrm_world_weight", 1.0)) <= 0.0:
         raise ValueError("--wmrm requires positive --wmrm-world-weight")
     if getattr(args, "wmrm_world_weight", 1.0) < 0.0:
@@ -5643,6 +5662,25 @@ def _feature_optimizer_groups(args, model, vision_backbone):
             flush=True,
         )
         return [{"params": action_params, "lr": args.lr_action_vision}]
+    if getattr(args, "wmrm_only", False):
+        if getattr(model, "wmrm", None) is None:
+            raise ValueError("--wmrm-only requires a constructed WAM4VA module")
+        wmrm_params, frozen_names = [], []
+        for name, param in model.named_parameters():
+            if name.startswith("wmrm."):
+                wmrm_params.append(param)
+            else:
+                frozen_names.append(name)
+                param.requires_grad_(False)
+        if not wmrm_params:
+            raise ValueError("--wmrm-only found no wmrm.* parameters")
+        print(
+            f"wmrm-only: freeze VA/FM ({len(frozen_names)} tensors); "
+            f"train latent predictor only "
+            f"({sum(p.numel() for p in wmrm_params):,} params)",
+            flush=True,
+        )
+        return [{"params": wmrm_params, "lr": args.lr}]
     if args.head_only:
         head_params, rest_names = [], []
         for name, param in model.named_parameters():
@@ -8284,16 +8322,24 @@ def main() -> None:
             med = getattr(model, "last_wmrm_med_loss", None)
             if med is None:
                 med = flow_loss.new_zeros(())
-            action_total = (
-                flow_loss
-                + args.pair_loss_weight * pair_loss
-                + args.future_predict_weight * future_loss
-                + float(getattr(args, "wmrm_world_weight", 1.0)) * wmrm_loss
-                + float(getattr(args, "wmrm_pi_kl_weight", 0.1)) * pi_kl_hinge
-                + float(getattr(args, "wmrm_lang_align_weight", 0.05)) * lang_align
-                + float(getattr(args, "wmrm_adep_weight", 0.1)) * adep
-                + float(getattr(args, "wmrm_med_weight", 0.1)) * med
-            )
+            if getattr(args, "wmrm_only", False):
+                action_total = (
+                    float(getattr(args, "wmrm_world_weight", 1.0)) * wmrm_loss
+                    + float(getattr(args, "wmrm_pi_kl_weight", 0.1)) * pi_kl_hinge
+                    + float(getattr(args, "wmrm_lang_align_weight", 0.05)) * lang_align
+                    + float(getattr(args, "wmrm_adep_weight", 0.1)) * adep
+                )
+            else:
+                action_total = (
+                    flow_loss
+                    + args.pair_loss_weight * pair_loss
+                    + args.future_predict_weight * future_loss
+                    + float(getattr(args, "wmrm_world_weight", 1.0)) * wmrm_loss
+                    + float(getattr(args, "wmrm_pi_kl_weight", 0.1)) * pi_kl_hinge
+                    + float(getattr(args, "wmrm_lang_align_weight", 0.05)) * lang_align
+                    + float(getattr(args, "wmrm_adep_weight", 0.1)) * adep
+                    + float(getattr(args, "wmrm_med_weight", 0.1)) * med
+                )
             semantic_total = (
                 args.semantic_anchor_weight * semantic_anchor_loss
                 + args.semantic_geometry_weight * semantic_geom_loss
@@ -8530,6 +8576,7 @@ def main() -> None:
             f"flow_tail{max(noisy_actions.shape[-2] - args.flow_prefix_steps, 0)}="
             f"{flow_tail_loss.item():.6f} "
             f"pair={pair_loss.item():.6f} future={future_loss.item():.6f} "
+            f"world={float((getattr(model, 'last_wmrm_loss', None) if model is not None else None) or 0.0):.6f} "
             f"goal_delta={predicted_delta.item():.6f}/"
             f"{target_delta.item():.6f} grad={float(gradient_norm):.6f}"
             f"{relation_log}{metric_head_log}{aux_log}{gate_log}{semantic_log}"
