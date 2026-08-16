@@ -50,8 +50,6 @@ class _CrossAttn(nn.Module):
         self.k = nn.Linear(dim, dim)
         self.v = nn.Linear(dim, dim)
         self.o = nn.Linear(dim, dim)
-        nn.init.zeros_(self.o.weight)
-        nn.init.zeros_(self.o.bias)
 
     def forward(self, query: Tensor, key_value: Tensor) -> Tensor:
         batch, n_q, dim = query.shape
@@ -162,45 +160,53 @@ class WAM4VA(nn.Module):
         ).sum(dim=-1, keepdim=True)
         denom = flat_prev.square().sum(dim=-1, keepdim=True).clamp_min(1e-8)
         coeff = (flat_cur * flat_prev).sum(dim=-1, keepdim=True) / denom
-        drop = (cosine.abs() > self.innov_overlap).to(dtype=current.dtype)
+        drop = (cosine > self.innov_overlap).to(dtype=current.dtype)
         while drop.ndim < current.ndim:
             drop = drop.unsqueeze(-1)
         return current - drop * (coeff * flat_prev).view_as(current)
 
-    def _z_per_step(self, z_spans: Tensor, horizon: int) -> Tensor:
-        n_spans = z_spans.shape[1]
-        step_ids = (
-            torch.arange(horizon, device=z_spans.device, dtype=torch.long) * n_spans
+    def _span_ids(self, horizon: int, device: torch.device) -> Tensor:
+        n_spans = self.n_spans
+        return (
+            torch.arange(horizon, device=device, dtype=torch.long) * n_spans
         ) // max(horizon, 1)
-        return z_spans[:, step_ids.clamp(max=n_spans - 1), :]
+
+    def _segment_means(self, action: Tensor) -> list[Tensor]:
+        horizon = action.shape[1]
+        ids = self._span_ids(horizon, action.device)
+        spans = []
+        for index in range(self.n_spans):
+            mask = ids == index
+            if not bool(mask.any()):
+                mask = ids == ids[-1]
+            spans.append(action[:, mask].mean(dim=1))
+        return spans
+
+    def _z_per_step(self, z_hat: Tensor, horizon: int) -> Tensor:
+        """Broadcast the supervised z_hat; do not feed unsupervised span residuals."""
+        if z_hat.ndim != 2:
+            raise ValueError(f"z_hat must be [B, G], got {tuple(z_hat.shape)}")
+        return z_hat[:, None, :].expand(-1, horizon, -1)
 
     def _pi(
         self,
         z_per_step: Tensor,
         action: Tensor,
         task_summary: Tensor | None = None,
+        *,
+        apply_dropout: bool | None = None,
     ) -> Tensor:
+        use_dropout = self.training if apply_dropout is None else apply_dropout
         world_logits = F.dropout(
-            self.mix_world(z_per_step), p=self.mixer_dropout, training=self.training
+            self.mix_world(z_per_step), p=self.mixer_dropout, training=use_dropout
         )
         action_logits = F.dropout(
-            self.mix_action(action), p=self.mixer_dropout, training=self.training
+            self.mix_action(action), p=self.mixer_dropout, training=use_dropout
         )
         logits = world_logits * action_logits
         if task_summary is not None:
             logits = logits + self.mix_stage(task_summary)[:, None, :]
         return torch.softmax(logits, dim=-1)
-
-    def _segment_means(self, action: Tensor) -> list[Tensor]:
-        horizon = action.shape[1]
-        spans = []
-        for index in range(self.n_spans):
-            start = index * horizon // self.n_spans
-            end = (index + 1) * horizon // self.n_spans
-            if end <= start:
-                end = start + 1
-            spans.append(action[:, start:end].mean(dim=1))
-        return spans
 
     def forward(
         self,
@@ -306,7 +312,7 @@ class WAM4VA(nn.Module):
             self.basis(context).view(batch, horizon, self.rank, hidden),
             dim=-1,
         )
-        z_per_step = self._z_per_step(z_spans, horizon)
+        z_per_step = self._z_per_step(z_hat, horizon)
         pi = self._pi(z_per_step, action, task_summary)
         mixed = (pi.unsqueeze(-1) * bases).sum(dim=2) + sourced
         gate = torch.tanh(self.gate_proj(z_hat))
@@ -334,11 +340,15 @@ class WAM4VA(nn.Module):
         return self.pi_kl_from_aux(action, aux)
 
     def pi_kl_from_aux(self, action: Tensor, aux: WMRMAux) -> Tensor:
-        perm = torch.randperm(aux.z_spans.shape[0], device=aux.z_spans.device)
-        z_real = self._z_per_step(aux.z_spans, action.shape[1])
-        z_shuf = self._z_per_step(aux.z_spans[perm], action.shape[1])
-        pi_real = self._pi(z_real, action, aux.task_summary).clamp_min(1e-8)
-        pi_shuf = self._pi(z_shuf, action, aux.task_summary).clamp_min(1e-8)
+        perm = torch.randperm(aux.z_hat.shape[0], device=aux.z_hat.device)
+        z_real = self._z_per_step(aux.z_hat, action.shape[1])
+        z_shuf = self._z_per_step(aux.z_hat[perm], action.shape[1])
+        pi_real = self._pi(
+            z_real, action, aux.task_summary, apply_dropout=False
+        ).clamp_min(1e-8)
+        pi_shuf = self._pi(
+            z_shuf, action, aux.task_summary, apply_dropout=False
+        ).clamp_min(1e-8)
         return (pi_real * (pi_real.log() - pi_shuf.log())).sum(dim=-1).mean()
 
 

@@ -153,6 +153,14 @@ def test_cli_mutex() -> None:
         validate_args(args)
 
 
+def test_cli_mutex_direct_head() -> None:
+    from train import parse_args, validate_args
+
+    args = parse_args(["--wam4va", "--direct-head"])
+    with pytest.raises(ValueError, match="direct-head"):
+        validate_args(args)
+
+
 def test_inject_all_zero_gate_still_identity() -> None:
     torch.manual_seed(3)
     off = VACompoundPolicy(_tiny_config(wmrm=False)).eval()
@@ -214,13 +222,24 @@ def test_language_keys_keep_zero_gate_identity() -> None:
     assert aux_b.task_summary.shape == (2, 32)
 
 
-def test_z_spans_align_to_horizon_steps() -> None:
+def test_supervised_z_hat_is_broadcast_to_horizon() -> None:
     block = WorldMediatedResidualModulation(32, world_dim=8, rank=4, proprio_dim=9, n_spans=3)
-    z_spans = torch.randn(2, 3, 8)
-    per_step = block._z_per_step(z_spans, 6)
-    assert per_step.shape == (2, 6, 8)
-    torch.testing.assert_close(per_step[:, 0], z_spans[:, 0])
-    torch.testing.assert_close(per_step[:, 5], z_spans[:, 2])
+    z_hat = torch.randn(2, 8)
+    per_step = block._z_per_step(z_hat, 8)
+    assert per_step.shape == (2, 8, 8)
+    torch.testing.assert_close(per_step[:, 0], z_hat)
+    torch.testing.assert_close(per_step[:, 7], z_hat)
+
+
+def test_span_ids_cover_horizon_when_not_divisible() -> None:
+    block = WorldMediatedResidualModulation(32, world_dim=8, rank=4, proprio_dim=9, n_spans=3)
+    ids = block._span_ids(8, torch.device("cpu"))
+    assert ids.tolist() == [0, 0, 0, 1, 1, 1, 2, 2]
+    action = torch.randn(1, 8, 32)
+    means = block._segment_means(action)
+    assert len(means) == 3
+    torch.testing.assert_close(means[0], action[:, :3].mean(dim=1))
+    torch.testing.assert_close(means[2], action[:, 6:].mean(dim=1))
 
 
 def test_source_gates_and_span_heads_exist() -> None:

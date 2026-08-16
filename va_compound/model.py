@@ -302,6 +302,8 @@ class VACompoundConfig:
             raise ValueError("wmrm is mutually exclusive with wam_joint (no Δv path)")
         if self.wmrm and self.memory_split:
             raise ValueError("wmrm is mutually exclusive with memory_split (P2 last-layer hook)")
+        if self.wmrm and (self.direct_head or self.c2_controller):
+            raise ValueError("wmrm is mutually exclusive with direct_head/c2_controller")
         if self.wmrm_rank < 1:
             raise ValueError("wmrm_rank must be positive")
         if self.wmrm_world_dim < 1:
@@ -2491,6 +2493,8 @@ class VACompoundPolicy(nn.Module):
         prev_innovation = None
         self.last_wmrm = None
         self.last_wmrm_pi_kl = None
+        self.last_wmrm_auxes: list = []
+        self.last_wmrm_pi_kls: list = []
         for index, (layer, layer_cache) in enumerate(
             zip(self.layers, language_cache.layers, strict=True)
         ):
@@ -2525,7 +2529,7 @@ class VACompoundPolicy(nn.Module):
                 mask = language_cache.attention_mask
                 if mask is not None:
                     language_keys = language_keys * mask.to(dtype=language_keys.dtype)[:, :, None]
-                action, self.last_wmrm, belief, prev_innovation = self.wmrm(
+                action, aux, belief, prev_innovation = self.wmrm(
                     action,
                     vision,
                     proprio.to(dtype=action.dtype),
@@ -2534,10 +2538,12 @@ class VACompoundPolicy(nn.Module):
                     language_keys=language_keys,
                     world_goal=world_goal,
                 )
+                self.last_wmrm = aux
+                self.last_wmrm_auxes.append(aux)
                 if self.training:
-                    self.last_wmrm_pi_kl = self.wmrm.pi_kl_from_aux(
-                        pre_action, self.last_wmrm
-                    )
+                    inject_kl = self.wmrm.pi_kl_from_aux(pre_action, aux)
+                    self.last_wmrm_pi_kls.append(inject_kl)
+                    self.last_wmrm_pi_kl = inject_kl
         action_condition = self.action_norm(action)
         if return_visual_memory:
             return action_condition, VisualMemory(layers=tuple(next_memory))
