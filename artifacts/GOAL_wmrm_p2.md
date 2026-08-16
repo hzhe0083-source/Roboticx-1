@@ -14,4 +14,5 @@
 8. `U = basis([A, evidence, proprio])`；mixer dropout 0.3；per-step π。
 9. `world_goal` 前向封死；`wmrm_world_loss(z_hat, next metric_g)` 进 `action_total`。
 10. `--wmrm` 与 `--wam-joint` 互斥。
-11. Language 暂保持现状：VA 每层读文本 K/V；WMRM 可问整句 summary。**不做 subgoal/阶段分类**（不训 phase*、不改 horizon 三等分语义）。下一步再做 LM×WAM 阶段词典。
+11. Language 暂保持现状：VA 每层读文本 K/V；WAM4VA 可问整句 summary。**不做 subgoal。** 三段时钟只用于内部 pooling，mixer 只用受监督的 `z_hat`（一步未来）。
+12. GPT Pro 审查后：π-KL 关 dropout；world loss 覆盖每个注入点；缺 `metric_g` fail-fast；与 direct/C² 互斥；innovation 只去正相关；CA 不再零输出初始化。

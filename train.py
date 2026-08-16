@@ -3481,17 +3481,27 @@ def rollout_policy(
             return_visual_memory=True,
             **mtvj_kwargs,
         )
-        if (
-            model.wmrm is not None
-            and model.last_wmrm is not None
-            and metric_g is not None
-            and time_index + 1 < batch["actions"].shape[1]
-            and metric_g.shape[-1] == model.last_wmrm.z_hat.shape[-1]
-        ):
-            wmrm_world_terms.append(
-                wmrm_world_loss(model.last_wmrm.z_hat, metric_g[:, time_index + 1])
+        if model.wmrm is not None and time_index + 1 < batch["actions"].shape[1]:
+            if metric_g is None:
+                raise ValueError("--wmrm/--wam4va requires metric_g for world supervision")
+            auxes = getattr(model, "last_wmrm_auxes", None) or (
+                [model.last_wmrm] if model.last_wmrm is not None else []
             )
-        if getattr(model, "last_wmrm_pi_kl", None) is not None:
+            if not auxes:
+                raise ValueError("WAM4VA produced no world predictions at a supervised step")
+            for aux in auxes:
+                if metric_g.shape[-1] != aux.z_hat.shape[-1]:
+                    raise ValueError(
+                        "metric_g last dim must match z_hat: "
+                        f"{metric_g.shape[-1]} vs {aux.z_hat.shape[-1]}"
+                    )
+                wmrm_world_terms.append(
+                    wmrm_world_loss(aux.z_hat, metric_g[:, time_index + 1])
+                )
+        kls = getattr(model, "last_wmrm_pi_kls", None)
+        if kls:
+            wmrm_pi_kl_terms.extend(kls)
+        elif getattr(model, "last_wmrm_pi_kl", None) is not None:
             wmrm_pi_kl_terms.append(model.last_wmrm_pi_kl)
         if model.config.c2_controller:
             # C²-VA Stage B：c_current = P(当前决策视觉均值)；解码
@@ -5077,6 +5087,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--wmrm is mutually exclusive with --wam-joint")
     if getattr(args, "wmrm", False) and args.memory_split:
         raise ValueError("--wmrm is mutually exclusive with --memory-split")
+    if getattr(args, "wmrm", False) and (args.direct_head or args.c2_controller):
+        raise ValueError("--wmrm/--wam4va is mutually exclusive with --direct-head/--c2-controller")
+    if getattr(args, "wmrm", False) and float(getattr(args, "wmrm_world_weight", 1.0)) <= 0.0:
+        raise ValueError("--wmrm requires positive --wmrm-world-weight")
     if getattr(args, "wmrm_world_weight", 1.0) < 0.0:
         raise ValueError("--wmrm-world-weight must be non-negative")
     if getattr(args, "wam_joint", False) and (args.future_predict or args.evsm):
