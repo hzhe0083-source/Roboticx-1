@@ -311,36 +311,41 @@ def evaluation_episode_seed(global_task_id: int, trial: int) -> int:
 TASK35_EVAL50_SEEDS = tuple(range(35000, 35050))
 
 
+def cached_task_language(
+    features: dict[str, Any],
+    device: torch.device,
+    *,
+    task_id: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Use the training-cache language tokens instead of loading Qwen on GPU."""
+    if "language_hidden" not in features or "language_mask" not in features:
+        raise ValueError("features missing cached language_hidden/language_mask")
+    if "instruction_id" not in features:
+        raise ValueError("features missing instruction_id")
+    instruction_id = torch.as_tensor(features["instruction_id"]).reshape(-1)
+    keep = instruction_id == int(task_id)
+    if not bool(keep.any()):
+        raise ValueError(f"features have no instruction_id={task_id} language cache")
+    hidden_rows = features["language_hidden"][keep]
+    mask_rows = features["language_mask"][keep]
+    if hidden_rows.ndim != 3 or mask_rows.shape[:2] != hidden_rows.shape[:2]:
+        raise ValueError(
+            f"cached language has unexpected shape {tuple(hidden_rows.shape)} / {tuple(mask_rows.shape)}"
+        )
+    if not torch.equal(hidden_rows, hidden_rows[:1].expand_as(hidden_rows)):
+        raise ValueError(f"cached language_hidden is not identical for task {task_id}")
+    if not torch.equal(mask_rows, mask_rows[:1].expand_as(mask_rows)):
+        raise ValueError(f"cached language_mask is not identical for task {task_id}")
+    return hidden_rows[:1].to(device=device), mask_rows[:1].to(device=device)
+
+
 def cached_task35_language(
     features: dict[str, Any],
     device: torch.device,
     *,
     task_id: int = 35,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Use the training-cache language tokens instead of loading Qwen on GPU.
-
-    All matching rows must be identical. Silently taking the first row would
-    hide a mixed-instruction payload.
-    """
-    if "language_hidden" not in features or "language_mask" not in features:
-        raise ValueError("task35 features missing cached language_hidden/language_mask")
-    if "instruction_id" not in features:
-        raise ValueError("task35 features missing instruction_id")
-    instruction_id = torch.as_tensor(features["instruction_id"]).reshape(-1)
-    keep = instruction_id == int(task_id)
-    if not bool(keep.any()):
-        raise ValueError(f"task35 features have no instruction_id={task_id} language cache")
-    hidden_rows = features["language_hidden"][keep]
-    mask_rows = features["language_mask"][keep]
-    if hidden_rows.ndim != 3 or mask_rows.shape[:2] != hidden_rows.shape[:2]:
-        raise ValueError(
-            f"cached task35 language has unexpected shape {tuple(hidden_rows.shape)} / {tuple(mask_rows.shape)}"
-        )
-    if not torch.equal(hidden_rows, hidden_rows[:1].expand_as(hidden_rows)):
-        raise ValueError("task35 cached language_hidden is not identical across windows")
-    if not torch.equal(mask_rows, mask_rows[:1].expand_as(mask_rows)):
-        raise ValueError("task35 cached language_mask is not identical across windows")
-    return hidden_rows[:1].to(device=device), mask_rows[:1].to(device=device)
+    return cached_task_language(features, device, task_id=task_id)
 
 
 def want_vjepa_dense_backbone(config: Any, args: Any) -> bool:
@@ -391,7 +396,7 @@ def validate_task35_eval50_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "success count matches": int(payload.get("successes") or 0)
         == sum(bool(row.get("success")) for row in trials),
         "language source recorded": payload.get("language_source")
-        in {"task35_features_cache", "qwen_text_backbone"},
+        in {"task35_features_cache", "feature_language_cache", "qwen_text_backbone"},
     }
     ablation = payload.get("task35_causal_ablation", "none")
     if payload.get("task35_precision_contract"):
@@ -2640,12 +2645,35 @@ def main() -> None:
         )
     model = VACompoundPolicy(config).eval().to(device)
     ckpt_direct_head = bool(ckpt["config"].get("direct_head", False))
+
+    def _mark_legacy_vision_gate(missing_keys) -> None:
+        gate_missing = [
+            key for key in missing_keys if key.startswith("wmrm.vision_gate_proj.")
+        ]
+        if gate_missing and getattr(model, "wmrm", None) is not None:
+            model.wmrm.legacy_ungated_vision = True
+            print(
+                "eval: checkpoint has no vision_gate; "
+                "use training-time ungated world→vision write",
+                flush=True,
+            )
+
     if ckpt_direct_head == config.direct_head and not dense_forced:
-        model.load_state_dict(ckpt["model"])
+        missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+        other_missing = [
+            key for key in missing if not key.startswith("wmrm.vision_gate_proj.")
+        ]
+        if unexpected or other_missing:
+            raise RuntimeError(
+                "checkpoint/model mismatch: "
+                f"missing={other_missing[:8]} unexpected={list(unexpected)[:8]}"
+            )
+        _mark_legacy_vision_gate(missing)
     elif dense_forced:
         # --dense-readout-mtvj 强制：ckpt 训练时未开 dense 层 → dense 权重缺失，
         # 非严格加载（W_o 零初始化 → 初始输出与无 dense 路径逐位一致）。
         missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+        _mark_legacy_vision_gate(missing)
         print(
             f"eval: --dense-readout-mtvj 强制 dense 层（ckpt config "
             f"dense_readout_mtvj={bool(ckpt['config'].get('dense_readout_mtvj', False))}）；"
@@ -2655,6 +2683,7 @@ def main() -> None:
         # --direct-head on/off 强制换解码器（消融）：另一头的 head 未训练，
         # 用非严格加载 + 显式警告。
         missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+        _mark_legacy_vision_gate(missing)
         print(
             f"eval: forced decoder override direct_head={config.direct_head} "
             f"(ckpt had {ckpt_direct_head}); missing={len(missing)} "
@@ -2926,19 +2955,27 @@ def main() -> None:
         raise ValueError("no tasks selected for evaluation")
     task_indices = [index for index, _ in selected_tasks]
     tasks = [text for _, text in selected_tasks]
-    use_cached_task35_language = (
-        (args.task35_precision_contract or args.task35_causal_ablation != "none")
-        and not has_plan
+    can_use_feature_language = (
+        not has_plan
         and not ckpt.get("qwen_state_dict")
         and not ckpt.get("lora")
         and not config.scene_teacher
-        and selected_tasks == [(35, "Insert a peg sideways")]
+        and "language_hidden" in features
+        and "language_mask" in features
+        and "instruction_id" in features
     )
     text_backbone = None
-    if use_cached_task35_language:
-        hidden, mask = cached_task35_language(features, device)
+    if can_use_feature_language:
+        hidden_rows = []
+        mask_rows = []
+        for task_id, _ in selected_tasks:
+            hid, msk = cached_task_language(features, device, task_id=int(task_id))
+            hidden_rows.append(hid)
+            mask_rows.append(msk)
+        hidden = torch.cat(hidden_rows, dim=0)
+        mask = torch.cat(mask_rows, dim=0)
         print(
-            "eval: using cached task35 language_hidden; Qwen not loaded",
+            f"eval: using cached language_hidden for task_ids={task_indices}; Qwen not loaded",
             flush=True,
         )
     else:
@@ -3691,6 +3728,56 @@ def main() -> None:
                                     frames, action_vision_backbone, device
                                 )
                             )
+                        world_action = None
+                        proposal_noise = None
+                        if getattr(model, "wmrm", None) is not None:
+                            if model.wmrm.cycle_steps != args.execute_steps:
+                                raise ValueError(
+                                    "WAM4VA cycle_steps must equal closed-loop execute_steps: "
+                                    f"{model.wmrm.cycle_steps} != {args.execute_steps}"
+                                )
+                            if args.flow_samples != 1:
+                                raise ValueError(
+                                    "WAM4VA closed loop requires --flow-samples 1 so the "
+                                    "world-conditioned proposal and executed decode share noise"
+                                )
+                            proposal_cond, _ = model.encode_condition(
+                                vision_in,
+                                proprio[0],
+                                previous[0],
+                                language_cache=task_caches[local_task_index],
+                                visual_memory=memory,
+                                return_visual_memory=True,
+                                skip_wmrm=True,
+                                **dense_kwargs,
+                            )
+                            proposal_noise = torch.randn(
+                                proposal_cond.shape[0],
+                                config.action_horizon,
+                                config.action_dim,
+                                device=proposal_cond.device,
+                                dtype=proposal_cond.dtype,
+                            )
+                            decoded_proposal = model.decode_actions(
+                                proposal_cond,
+                                steps=flow_steps,
+                                noise=proposal_noise,
+                                semantic_context=(
+                                    vision_in
+                                    if (
+                                        getattr(config, "flow_semantic", False)
+                                        and not config.direct_head
+                                    )
+                                    else None
+                                ),
+                            )
+                            cycle = model.wmrm.cycle_steps
+                            if decoded_proposal.shape[1] < cycle:
+                                raise ValueError(
+                                    f"decoded action horizon {decoded_proposal.shape[1]} "
+                                    f"is shorter than WAM4VA cycle {cycle}"
+                                )
+                            world_action = decoded_proposal[:, :cycle].clamp(-1.0, 1.0)
                         cond, memory = model.encode_condition(
                             vision_in,
                             proprio[0],
@@ -3698,6 +3785,7 @@ def main() -> None:
                             language_cache=task_caches[local_task_index],
                             visual_memory=memory,
                             return_visual_memory=True,
+                            env_action=world_action,
                             **dense_kwargs,
                         )
                         # 训练侧 flow_semantic 时槽输出（vision_in）作为 flow
@@ -3734,6 +3822,7 @@ def main() -> None:
                             decoded = model.decode_actions(
                                 cond,
                                 steps=flow_steps,
+                                noise=proposal_noise,
                                 semantic_context=semantic_ctx,
                                 **decode_kwargs,
                             )
@@ -3933,8 +4022,12 @@ def main() -> None:
             if len(selected_tasks) == 1
             else None,
             "language_source": (
-                "task35_features_cache"
-                if use_cached_task35_language
+                (
+                    "task35_features_cache"
+                    if task_indices == [35]
+                    else "feature_language_cache"
+                )
+                if can_use_feature_language
                 else "qwen_text_backbone"
             ),
             "trials": trial_records,

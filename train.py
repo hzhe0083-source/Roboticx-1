@@ -3414,6 +3414,7 @@ def rollout_policy(
     action_dense_evidence: dict[int, Tensor] | None = None,
     metric_g: Tensor | None = None,
     wmrm_adep_margin: float = 0.05,
+    flow_steps: int = 8,
 ) -> tuple[Tensor, Tensor]:
     if model.config.plan_resampler:
         # Plan-Cache 方案 B：首决策场景摘要（vision 全局均值）→ plan tokens，
@@ -3512,6 +3513,35 @@ def rollout_policy(
             vision_in = pool_mtvj_coarse_tokens(h11)  # [B, 16, 768]
         else:
             vision_in = batch["vision_tokens"][:, time_index]
+        world_action = None
+        if model.wmrm is not None:
+            cycle = model.wmrm.cycle_steps
+            if batch["actions"].shape[2] < cycle:
+                raise ValueError(
+                    f"WAM4VA needs {cycle} executable actions, "
+                    f"but the training chunk has {batch['actions'].shape[2]}"
+                )
+            if getattr(model.config, "wmrm_handshake", True):
+                proposal_cond, _ = model.encode_condition(
+                    vision_in,
+                    batch["proprio"][:, time_index],
+                    batch["previous_action"][:, time_index],
+                    language_cache=language_cache,
+                    visual_memory=visual_memory,
+                    return_visual_memory=True,
+                    skip_wmrm=True,
+                    **mtvj_kwargs,
+                )
+                with torch.no_grad():
+                    decoded = model.decode_actions(proposal_cond, steps=flow_steps)
+                if decoded.shape[1] < cycle:
+                    raise ValueError(
+                        f"decoded action horizon {decoded.shape[1]} "
+                        f"is shorter than WAM4VA cycle {cycle}"
+                    )
+                world_action = decoded[:, :cycle].clamp(-1.0, 1.0)
+            else:
+                world_action = batch["actions"][:, time_index, :cycle].clamp(-1.0, 1.0)
         condition, visual_memory = model.encode_condition(
             vision_in,
             batch["proprio"][:, time_index],
@@ -3519,6 +3549,7 @@ def rollout_policy(
             language_cache=language_cache,
             visual_memory=visual_memory,
             return_visual_memory=True,
+            env_action=world_action,
             **mtvj_kwargs,
         )
         if model.wmrm is not None and time_index + 1 < batch["actions"].shape[1]:
@@ -3535,12 +3566,9 @@ def rollout_policy(
             if not auxes:
                 raise ValueError("WAM4VA produced no world predictions at a supervised step")
             pres = getattr(model, "last_wmrm_pre_actions", None) or []
-            # Predict Ŷ after the last VA↔WM mix; supervise that last inject only.
-            world_idx = max(
-                (i for i, aux in enumerate(auxes) if aux.z_tokens is not None),
-                default=len(auxes) - 1,
-            )
-            for inject_i, aux in ((world_idx, auxes[world_idx]),):
+            # Every VA↔WM stage emits a full map. Average stage losses so all
+            # maps learn the same future without multiplying the world weight.
+            for inject_i, aux in enumerate(auxes):
                 pred = aux.z_tokens if aux.z_tokens is not None else aux.z_hat
                 if pred.shape != target.shape:
                     raise ValueError(
@@ -3566,6 +3594,9 @@ def rollout_policy(
                     env = aux.env_action
                     if env is not None:
                         env = env[perm]
+                    previous_map = (
+                        auxes[inject_i - 1].z_tokens if inject_i > 0 else None
+                    )
                     z_alt, _, _, tok_shuf = model.wmrm.predict_world(
                         donor,
                         aux.proprio,
@@ -3573,6 +3604,7 @@ def rollout_policy(
                         aux.task_summary,
                         dino_tokens=aux.dino_tokens,
                         env_action=env,
+                        previous_map=previous_map,
                     )
                     if tok_shuf is None:
                         pred_real, z_shuf = aux.z_hat, z_alt
@@ -8203,6 +8235,7 @@ def main() -> None:
                     action_dense_evidence=action_dense_evidence,
                     metric_g=mtvj_metric_g,
                     wmrm_adep_margin=float(getattr(args, "wmrm_adep_margin", 0.05)),
+                    flow_steps=int(args.flow_steps),
                 )
                 if model.config.future_predict:
                     predicted_velocity, action_conditions, memories = rollout

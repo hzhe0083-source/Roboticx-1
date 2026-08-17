@@ -37,6 +37,7 @@ class WMRMAux:
     dino_tokens: Tensor | None = None
     env_action: Tensor | None = None
     world_tokens: Tensor | None = None
+    vision_gate: Tensor | None = None
 
 
 class _CrossAttn(nn.Module):
@@ -160,7 +161,8 @@ class _DeepWorldPredictor(nn.Module):
         )
         return mask.masked_fill(~allowed, torch.finfo(dtype).min)
 
-    def forward(self, clip: Tensor, cond: Tensor) -> Tensor:
+    def forward(self, clip: Tensor, cond: Tensor, previous_map: Tensor | None = None) -> Tensor:
+        """Predict/refine endpoint map; ``previous_map`` is a differentiable stage state."""
         if clip.ndim != 5:
             raise ValueError(f"clip must be [B, T, D, H, W], got {tuple(clip.shape)}")
         batch, frames, dim, height, width = clip.shape
@@ -175,24 +177,27 @@ class _DeepWorldPredictor(nn.Module):
                 f"[B, {self.map_frames}, {self.dino_dim}, {self.map_size}, {self.map_size}], "
                 f"got {tuple(clip.shape)}"
             )
-        tokens = clip.permute(0, 1, 3, 4, 2).reshape(batch, frames * height * width, dim)
+        predictor_clip = clip
+        if previous_map is not None:
+            if previous_map.shape != (batch, dim, height, width):
+                raise ValueError(f"previous_map shape mismatch: {tuple(previous_map.shape)}")
+            predictor_clip = torch.cat((clip[:, :-1], previous_map[:, None]), dim=1)
+        tokens = predictor_clip.permute(0, 1, 3, 4, 2).reshape(
+            batch, frames * height * width, dim
+        )
         hidden = self.in_proj(tokens)
         time = torch.arange(frames, device=clip.device).repeat_interleave(height * width)
         rows = torch.arange(height, device=clip.device).repeat_interleave(width).repeat(frames)
         cols = torch.arange(width, device=clip.device).repeat(height * frames)
-        hidden = (
-            hidden
-            + self.time_embed(time)
-            + self.row_embed(rows)
-            + self.col_embed(cols)
-        )
+        hidden = hidden + self.time_embed(time) + self.row_embed(rows) + self.col_embed(cols)
         mask = self._causal_mask(clip.device, hidden.dtype)
         for block in self.blocks:
             hidden = block(hidden, cond, mask)
         last = hidden[:, -height * width :]
         residual = self.out_proj(self.out_norm(last))
         delta = residual.view(batch, height, width, dim).permute(0, 3, 1, 2)
-        return clip[:, -1] + delta
+        base = clip[:, -1] if previous_map is None else previous_map
+        return base + delta
 
 
 class WAM4VA(nn.Module):
@@ -288,7 +293,10 @@ class WAM4VA(nn.Module):
         self.belief_from_world = _CrossAttn(hidden_dim, num_heads)
         self.belief_from_world.zero_output()
         self.vision_from_world = _CrossAttn(hidden_dim, num_heads)
-        self.vision_from_world.zero_output()
+        self.legacy_ungated_vision = False
+        self.vision_gate_proj = nn.Linear(world_dim, 1)
+        nn.init.zeros_(self.vision_gate_proj.weight)
+        nn.init.zeros_(self.vision_gate_proj.bias)
 
         self.world_from_env = nn.Linear(hidden_dim, hidden_dim)
         self.world_from_state = nn.Linear(proprio_dim, hidden_dim)
@@ -492,24 +500,18 @@ class WAM4VA(nn.Module):
         """Return (step tokens [B, C, H], ordered flat cond [B, H])."""
         if env_action is None:
             return None, torch.zeros(batch, self.hidden_dim, device=device, dtype=dtype)
-        if env_action.ndim == 2:
-            env_action = env_action[:, None, :]
         if env_action.ndim != 3:
             raise ValueError(
-                f"env_action must be [B, A] or [B, H, A], got {tuple(env_action.shape)}"
+                f"env_action must be [B, C, A], got {tuple(env_action.shape)}"
             )
-        if env_action.shape[-1] != self.env_action_dim:
+        expected = (batch, self.cycle_steps, self.env_action_dim)
+        if tuple(env_action.shape) != expected:
             raise ValueError(
-                "env_action last dim must be "
-                f"{self.env_action_dim}, got {env_action.shape[-1]}"
+                f"env_action must have exact shape {expected}, got {tuple(env_action.shape)}"
             )
-        env_action = env_action.to(device=device, dtype=dtype)
-        cycle = min(self.cycle_steps, env_action.shape[1])
-        steps = env_action[:, :cycle]
-        tokens = self.env_step(steps) + self.env_time[:cycle].to(dtype=dtype)
-        padded = steps.new_zeros(steps.shape[0], self.cycle_steps, self.env_action_dim)
-        padded[:, :cycle] = steps
-        flat = self.env_seq(padded.flatten(1))
+        steps = env_action.to(device=device, dtype=dtype)
+        tokens = self.env_step(steps) + self.env_time.to(dtype=dtype)
+        flat = self.env_seq(steps.flatten(1))
         return tokens, flat
 
     def _world_condition(
@@ -603,12 +605,20 @@ class WAM4VA(nn.Module):
         task_summary: Tensor,
         dino_tokens: Tensor | None = None,
         env_action: Tensor | None = None,
+        previous_map: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
-        """Predict next last-frame DINO map from VA action proposal, not logged env action."""
-        del env_action
-        proposal = self._proposal_tokens(action)
+        """Predict the next DINO map from configured executable actions, not VA hidden A."""
+        if env_action is None:
+            env_tokens, env_flat = None, action.new_zeros(action.shape[0], self.hidden_dim)
+        else:
+            env_tokens, env_flat = self.encode_env_action(
+                env_action,
+                batch=action.shape[0],
+                dtype=action.dtype,
+                device=action.device,
+            )
         fused, z_spans, progress, _ = self._world_condition(
-            proprio, belief, task_summary, proposal, proposal.mean(dim=1)
+            proprio, belief.detach(), task_summary.detach(), env_tokens, env_flat
         )
         if dino_tokens is None or (
             self.st_predictor is None and self.map_dw1 is None and self.dino_pred is None
@@ -624,20 +634,23 @@ class WAM4VA(nn.Module):
             )
         clip = self.encode_dino_clip(dino_tokens)
         if clip is not None and self.st_predictor is not None:
-            cond = torch.cat(
-                (
-                    self.proposal_to_pred(proposal),
-                    self.belief_to_pred(belief),
-                    self.fused_to_pred(fused)[:, None, :],
-                ),
-                dim=1,
-            )
+            cond_parts = [
+                self.belief_to_pred(belief.detach()),
+                self.fused_to_pred(fused)[:, None, :],
+            ]
+            if env_tokens is not None:
+                cond_parts.insert(0, self.proposal_to_pred(env_tokens))
+            cond = torch.cat(cond_parts, dim=1)
             if self.training:
                 z_map = torch.utils.checkpoint.checkpoint(
-                    self.st_predictor, clip, cond, use_reentrant=False
+                    self.st_predictor,
+                    clip,
+                    cond,
+                    previous_map,
+                    use_reentrant=False,
                 )
             else:
-                z_map = self.st_predictor(clip, cond)
+                z_map = self.st_predictor(clip, cond, previous_map)
             world_tokens = self.encode_world_tokens(z_map)
             kv = self.map_readout(world_tokens)
             query = self.z_query[None].expand(action.shape[0], -1, -1)
@@ -654,10 +667,11 @@ class WAM4VA(nn.Module):
             stacked = torch.stack(per_frame, dim=1)
             mix = self.temporal_mix.to(dtype=stacked.dtype)
             context = torch.einsum("dt,btdhw->bdhw", mix, stacked)
-            last_frame = clip[:, -1]
+            last_frame = clip[:, -1] if previous_map is None else previous_map
             spatial = context.flatten(2).transpose(1, 2)
             hid = self.dino_to_hid(spatial)
-            hid = hid + self.action_read(hid, proposal)
+            if env_tokens is not None:
+                hid = hid + self.action_read(hid, env_tokens)
             context = context + self.hid_to_dino(hid).transpose(1, 2).view(
                 batch, dim, height, width
             )
@@ -804,6 +818,7 @@ class WAM4VA(nn.Module):
         env_action: Tensor | None = None,
         reuse_aux: WMRMAux | None = None,
         stage_index: int = 0,
+        previous_map: Tensor | None = None,
     ) -> tuple[Tensor, WMRMAux, Tensor, Tensor]:
         if world_goal is not None:
             raise ValueError(
@@ -875,6 +890,7 @@ class WAM4VA(nn.Module):
                 task_summary,
                 dino_tokens=dino_tokens,
                 env_action=env_action,
+                previous_map=previous_map,
             )
             world_tokens = None
             if (
@@ -901,6 +917,7 @@ class WAM4VA(nn.Module):
             world_tokens=world_tokens,
         )
         updated = action + gate.unsqueeze(-1) * mixed
+        vision_gate = torch.tanh(self.vision_gate_proj(z_hat))
         aux = WMRMAux(
             z_hat=z_hat,
             z_spans=z_spans,
@@ -914,16 +931,27 @@ class WAM4VA(nn.Module):
             proprio=proprio.to(dtype=action.dtype),
             z_tokens=z_tokens,
             dino_tokens=None if dino_tokens is None else dino_tokens.to(dtype=action.dtype),
-            env_action=None if env_action is None else env_action.to(dtype=action.dtype),
+            env_action=(
+                None
+                if env_action is None
+                else env_action.to(device=action.device, dtype=action.dtype)
+            ),
             world_tokens=world_tokens,
+            vision_gate=vision_gate,
         )
         return updated, aux, belief, innovation
 
-    def mix_world_into_vision(self, vision: Tensor, world_tokens: Tensor | None) -> Tensor:
-        """WM → next VA layer: write spatial world into the vision stream."""
-        if world_tokens is None:
+    def mix_world_into_vision(self, vision: Tensor, aux: WMRMAux) -> Tensor:
+        """WM → next VA: gated spatial world message, zero at initialization."""
+        if aux.world_tokens is None:
             return vision
-        return vision + self.vision_from_world(vision, world_tokens)
+        message = self.vision_from_world(vision, aux.world_tokens)
+        if self.legacy_ungated_vision:
+            return vision + message
+        gate = aux.vision_gate
+        if gate is None:
+            return vision
+        return vision + gate.unsqueeze(-1) * message
 
     def pi_shuffle_kl(
         self,

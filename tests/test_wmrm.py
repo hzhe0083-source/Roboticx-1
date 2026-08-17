@@ -188,6 +188,13 @@ def test_cli_mutex_direct_head() -> None:
         validate_args(args)
 
 
+def test_policy_wires_executable_action_dim() -> None:
+    model = VACompoundPolicy(_tiny_config(wmrm=True, action_dim=4, action_horizon=6))
+    assert model.wmrm is not None
+    assert model.wmrm.env_action_dim == 4
+    assert model.wmrm.cycle_steps == 6
+
+
 def test_default_inject_is_every_layer() -> None:
     model = VACompoundPolicy(_tiny_config(wmrm=True)).eval()
     assert model.config.wmrm_inject == "all"
@@ -402,7 +409,7 @@ def test_dino_map_uses_last_frame_full_channels() -> None:
     torch.testing.assert_close(clip[:, -1], mapped)
 
 
-def test_logged_env_action_is_ignored_by_world_pred() -> None:
+def test_world_pred_uses_executable_env_action() -> None:
     block = WorldMediatedResidualModulation(
         32,
         world_dim=8,
@@ -413,24 +420,27 @@ def test_logged_env_action_is_ignored_by_world_pred() -> None:
         map_channels=4,
         map_frames=2,
         map_grid=4,
-        env_action_dim=7,
+        env_action_dim=4,
     )
     action = torch.randn(2, 6, 32)
     proprio = torch.randn(2, 9)
     belief = torch.randn(2, 8, 32)
     task = torch.randn(2, 32)
     tokens = torch.randn(2, 32, 8)
+    env = torch.randn(2, 6, 4)
     _, _, _, z0 = block.predict_world(
-        action, proprio, belief, task, dino_tokens=tokens, env_action=torch.randn(2, 6, 7)
+        action, proprio, belief, task, dino_tokens=tokens, env_action=env
     )
     _, _, _, z1 = block.predict_world(
-        action, proprio, belief, task, dino_tokens=tokens, env_action=torch.randn(2, 6, 7)
+        action + 1.5, proprio, belief, task, dino_tokens=tokens, env_action=env
     )
     torch.testing.assert_close(z0, z1, rtol=0.0, atol=0.0)
     block.film_shift.weight.data.normal_(0, 0.2)
-    _, _, _, z2 = block.predict_world(action, proprio, belief, task, dino_tokens=tokens)
+    _, _, _, z2 = block.predict_world(
+        action, proprio, belief, task, dino_tokens=tokens, env_action=env
+    )
     _, _, _, z3 = block.predict_world(
-        action + 1.5, proprio, belief, task, dino_tokens=tokens
+        action, proprio, belief, task, dino_tokens=tokens, env_action=env + 1.5
     )
     assert not torch.allclose(z2, z3)
 
@@ -451,46 +461,47 @@ def test_dino_residual_zero_init_copies_current() -> None:
     torch.testing.assert_close(z_tokens, dino, rtol=0.0, atol=0.0)
 
 
-def test_predict_world_uses_va_proposal_not_logged_env() -> None:
+def test_predict_world_uses_logged_env_not_va_hidden() -> None:
     torch.manual_seed(4)
     block = WorldMediatedResidualModulation(
-        32, world_dim=8, rank=4, proprio_dim=9, cycle_steps=6, env_action_dim=7
+        32, world_dim=8, rank=4, proprio_dim=9, cycle_steps=6, env_action_dim=4
     )
     block.eval()
     action = torch.randn(2, 12, 32)
     proprio = torch.randn(2, 9)
     belief = torch.randn(2, 8, 32)
     task = torch.randn(2, 32)
-    env = torch.randn(2, 6, 7)
+    env = torch.randn(2, 6, 4)
     with torch.no_grad():
         z1, *_ = block.predict_world(action, proprio, belief, task, env_action=env)
-        z2, *_ = block.predict_world(action, proprio, belief, task, env_action=env + 10)
-        z3, *_ = block.predict_world(action + 1, proprio, belief, task, env_action=env)
-        action_tail = action.clone()
-        action_tail[:, 6:] += 3
-        z4, *_ = block.predict_world(action_tail, proprio, belief, task, env_action=env)
+        z2, *_ = block.predict_world(action + 10, proprio, belief, task, env_action=env)
+        z3, *_ = block.predict_world(action, proprio, belief, task, env_action=env.flip(1))
+        env_tail = env.clone()
+        env_tail[:, 3:] += 2
+        z4, *_ = block.predict_world(action, proprio, belief, task, env_action=env_tail)
     torch.testing.assert_close(z1, z2)
     assert not torch.allclose(z1, z3)
-    torch.testing.assert_close(z1, z4)
+    assert not torch.allclose(z1, z4)
 
 
-def test_action_dep_hinge_proposal_has_grad() -> None:
+def test_action_dep_hinge_env_action_has_grad() -> None:
     torch.manual_seed(2)
     block = WorldMediatedResidualModulation(
-        32, world_dim=8, rank=4, proprio_dim=9, cycle_steps=6, env_action_dim=7
+        32, world_dim=8, rank=4, proprio_dim=9, cycle_steps=6, env_action_dim=4
     )
     action = torch.randn(4, 8, 32)
     proprio = torch.randn(4, 9)
     belief = torch.randn(4, 8, 32)
     task = torch.randn(4, 32)
-    z_hat, *_ = block.predict_world(action, proprio, belief, task)
-    perm = torch.randperm(action.shape[0])
-    z_shuf, *_ = block.predict_world(action[perm], proprio, belief, task)
+    env = torch.randn(4, 6, 4)
+    z_hat, *_ = block.predict_world(action, proprio, belief, task, env_action=env)
+    perm = torch.randperm(env.shape[0])
+    z_shuf, *_ = block.predict_world(action, proprio, belief, task, env_action=env[perm])
     target = torch.randn_like(z_hat)
     loss = block.action_dep_hinge(z_hat, z_shuf, target)
     loss.backward()
-    assert block.world_from_env.weight.grad is not None
-    assert float(block.world_from_env.weight.grad.norm()) > 0
+    assert block.env_step.weight.grad is not None
+    assert float(block.env_step.weight.grad.norm()) > 0
 
 
 def test_handshake_gets_spatial_world_tokens() -> None:
@@ -504,13 +515,13 @@ def test_handshake_gets_spatial_world_tokens() -> None:
         map_frames=2,
         map_grid=4,
         world_grid=4,
-        env_action_dim=7,
+        env_action_dim=4,
     )
     action = torch.randn(2, 5, 32)
     vision = torch.randn(2, 6, 32)
     proprio = torch.randn(2, 9)
     tokens = torch.randn(2, 32, 8)
-    env = torch.randn(2, 6, 7)
+    env = torch.randn(2, 6, 4)
     _, aux, _, _ = block(
         action, vision, proprio, dino_tokens=tokens, env_action=env
     )
@@ -518,6 +529,37 @@ def test_handshake_gets_spatial_world_tokens() -> None:
     assert aux.world_tokens.shape == (2, 16, 32)
     assert aux.z_tokens is not None
     assert aux.z_tokens.shape == (2, 8, 4, 4)
+
+
+def test_zero_vision_gate_can_learn_from_nonzero_world_message() -> None:
+    block = WorldMediatedResidualModulation(
+        32,
+        world_dim=8,
+        rank=4,
+        proprio_dim=9,
+        dino_dim=8,
+        map_size=4,
+        map_frames=2,
+        map_grid=4,
+        world_grid=4,
+        env_action_dim=4,
+    )
+    action = torch.randn(2, 5, 32)
+    vision = torch.randn(2, 6, 32)
+    proprio = torch.randn(2, 9)
+    env = torch.randn(2, 6, 4)
+    _, aux, _, _ = block(
+        action,
+        vision,
+        proprio,
+        dino_tokens=torch.randn(2, 32, 8),
+        env_action=env,
+    )
+    mixed = block.mix_world_into_vision(vision, aux)
+    torch.testing.assert_close(mixed, vision, rtol=0.0, atol=0.0)
+    mixed.square().mean().backward()
+    assert block.vision_gate_proj.weight.grad is not None
+    assert float(block.vision_gate_proj.weight.grad.norm()) > 0
 
 
 def test_each_forward_emits_full_spatial_map() -> None:
@@ -531,7 +573,7 @@ def test_each_forward_emits_full_spatial_map() -> None:
         map_frames=2,
         map_grid=4,
         world_grid=4,
-        env_action_dim=7,
+        env_action_dim=4,
         predictor="st_blocks",
         predictor_depth=2,
         predictor_width=32,
@@ -543,7 +585,11 @@ def test_each_forward_emits_full_spatial_map() -> None:
     tokens = torch.randn(2, 32, 8)
     belief = None
     innov = None
+    previous_map = None
+    env = torch.randn(2, 6, 4)
     maps = []
+    with torch.no_grad():
+        block.st_predictor.out_proj.weight.normal_(0, 0.05)
     for stage in range(3):
         _, aux, belief, innov = block(
             action,
@@ -552,14 +598,48 @@ def test_each_forward_emits_full_spatial_map() -> None:
             belief=belief,
             prev_innovation=innov,
             dino_tokens=tokens,
+            env_action=env,
             stage_index=stage,
+            previous_map=previous_map,
         )
         assert aux.z_tokens is not None
         assert aux.z_tokens.shape == (2, 8, 4, 4)
         assert aux.world_tokens is not None
         assert aux.world_tokens.shape == (2, 16, 32)
         maps.append(aux.z_tokens)
-    assert maps[0].shape == maps[-1].shape
+        previous_map = aux.z_tokens
+    assert not torch.allclose(maps[0], maps[-1])
+    maps[-1].square().mean().backward()
+    assert block.st_predictor.in_proj.weight.grad is not None
+    assert float(block.st_predictor.in_proj.weight.grad.norm()) > 0
+
+
+def test_env_action_requires_exact_cycle_and_dimension() -> None:
+    block = WorldMediatedResidualModulation(
+        32, world_dim=8, rank=4, proprio_dim=9, cycle_steps=6, env_action_dim=4
+    )
+    tokens, flat = block.encode_env_action(
+        torch.randn(2, 6, 4),
+        batch=2,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    assert tokens.shape == (2, 6, 32)
+    assert flat.shape == (2, 32)
+    with pytest.raises(ValueError, match="exact shape"):
+        block.encode_env_action(
+            torch.randn(2, 5, 4),
+            batch=2,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+    with pytest.raises(ValueError, match="exact shape"):
+        block.encode_env_action(
+            torch.randn(2, 6, 7),
+            batch=2,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
 
 
 def test_handshake_keeps_native_16x16() -> None:
@@ -573,7 +653,7 @@ def test_handshake_keeps_native_16x16() -> None:
         map_frames=1,
         map_grid=16,
         world_grid=16,
-        env_action_dim=7,
+        env_action_dim=4,
     )
     mapped = block.encode_dino_map(torch.randn(1, 256, 8))
     tokens = block.encode_world_tokens(mapped)
@@ -699,7 +779,7 @@ def test_handshake_off_ignores_va_action() -> None:
     task = torch.randn(2, 32)
     z1, *_ = model.wmrm.predict_world(action, proprio, belief, task)
     z2, *_ = model.wmrm.predict_world(other, proprio, belief, task)
-    assert not torch.allclose(z1, z2)
+    torch.testing.assert_close(z1, z2)
 
 
 def test_st_predictor_copies_last_frame_and_uses_proposal() -> None:
@@ -713,7 +793,7 @@ def test_st_predictor_copies_last_frame_and_uses_proposal() -> None:
         map_frames=2,
         map_grid=4,
         world_grid=4,
-        env_action_dim=7,
+        env_action_dim=4,
         predictor="st_blocks",
         predictor_depth=2,
         predictor_width=32,
@@ -729,13 +809,57 @@ def test_st_predictor_copies_last_frame_and_uses_proposal() -> None:
     torch.testing.assert_close(z_map, current, rtol=0.0, atol=0.0)
     assert z_map.shape == (2, 8, 4, 4)
     block.st_predictor.out_proj.weight.data.normal_(0, 0.05)
-    _, _, _, z0 = block.predict_world(action, proprio, belief, task, dino_tokens=tokens)
-    _, _, _, z1 = block.predict_world(
-        action, proprio, belief, task, dino_tokens=tokens, env_action=torch.randn(2, 6, 7)
+    env = torch.randn(2, 6, 4)
+    _, _, _, z0 = block.predict_world(
+        action, proprio, belief, task, dino_tokens=tokens, env_action=env
     )
-    _, _, _, z2 = block.predict_world(action + 1, proprio, belief, task, dino_tokens=tokens)
+    _, _, _, z1 = block.predict_world(
+        action + 1, proprio, belief, task, dino_tokens=tokens, env_action=env
+    )
+    _, _, _, z2 = block.predict_world(
+        action, proprio, belief, task, dino_tokens=tokens, env_action=env + 1
+    )
     torch.testing.assert_close(z0, z1)
     assert not torch.allclose(z0, z2)
     loss = z0.square().mean()
     loss.backward()
     assert any(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in block.st_predictor.parameters())
+    assert block.env_step.weight.grad is not None
+    assert float(block.env_step.weight.grad.norm()) > 0
+
+
+def test_previous_map_is_read_not_only_added() -> None:
+    block = WorldMediatedResidualModulation(
+        32,
+        world_dim=8,
+        rank=4,
+        proprio_dim=9,
+        dino_dim=8,
+        map_size=4,
+        map_frames=2,
+        map_grid=4,
+        world_grid=4,
+        env_action_dim=4,
+        predictor="st_blocks",
+        predictor_depth=2,
+        predictor_width=32,
+        predictor_heads=4,
+    )
+    action = torch.randn(2, 6, 32)
+    proprio = torch.randn(2, 9)
+    belief = torch.randn(2, 8, 32)
+    task = torch.randn(2, 32)
+    tokens = torch.randn(2, 32, 8)
+    env = torch.randn(2, 6, 4)
+    with torch.no_grad():
+        block.st_predictor.out_proj.weight.normal_(0, 0.08)
+    prev_a = torch.randn(2, 8, 4, 4)
+    prev_b = prev_a + 1.5
+    _, _, _, za = block.predict_world(
+        action, proprio, belief, task, dino_tokens=tokens, env_action=env, previous_map=prev_a
+    )
+    _, _, _, zb = block.predict_world(
+        action, proprio, belief, task, dino_tokens=tokens, env_action=env, previous_map=prev_b
+    )
+    assert not torch.allclose(za, zb)
+    assert not torch.allclose(za - prev_a, zb - prev_b)

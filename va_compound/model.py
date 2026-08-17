@@ -2324,6 +2324,7 @@ class VACompoundPolicy(nn.Module):
         metric_g: Tensor | None = None,
         world_goal: Tensor | None = None,
         env_action: Tensor | None = None,
+        skip_wmrm: bool = False,
     ) -> Tensor | tuple[Tensor, VisualMemory]:
         if (language_hidden is None) == (language_cache is None):
             raise ValueError("provide exactly one of language_hidden or language_cache")
@@ -2562,6 +2563,7 @@ class VACompoundPolicy(nn.Module):
             self._wmrm_inject_layers() if self.wmrm is not None else set()
         )
         last_inject = max(inject_layers) if inject_layers else -1
+        previous_map = None
         for index, (layer, layer_cache) in enumerate(
             zip(self.layers, language_cache.layers, strict=True)
         ):
@@ -2587,7 +2589,11 @@ class VACompoundPolicy(nn.Module):
                     action_dense_input=action_dense_input,
                 )
             next_memory.append(vision)
-            if self.wmrm is not None and index in inject_layers:
+            if (
+                self.wmrm is not None
+                and not skip_wmrm
+                and index in inject_layers
+            ):
                 pre_action = action
                 lang_key = layer_cache.key
                 language_keys = lang_key.transpose(1, 2).reshape(
@@ -2605,12 +2611,16 @@ class VACompoundPolicy(nn.Module):
                     language_keys=language_keys,
                     world_goal=world_goal,
                     dino_tokens=vision_tokens.to(dtype=target_dtype),
+                    env_action=env_action,
                     stage_index=index,
+                    previous_map=previous_map,
                 )
+                if aux.z_tokens is not None and aux.z_tokens.ndim == 4:
+                    previous_map = aux.z_tokens
                 if self.config.wmrm_handshake:
                     action = updated
                     vision = self.wmrm.mix_world_into_vision(
-                        vision, aux.world_tokens
+                        vision, aux
                     )
                     next_memory[-1] = vision
                 self.last_wmrm = aux
