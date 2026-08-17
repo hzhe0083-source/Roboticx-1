@@ -1,0 +1,77 @@
+<mxfile host="app.diagrams.net" agent="ZCode" version="26.0.9" pages="1">
+  <diagram id="wam4va-now" name="as coded">
+    <mxGraphModel dx="1600" dy="900" grid="1" gridSize="10" page="1" pageWidth="1500" pageHeight="820" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="t" value="As coded: propose (VA) → exchange every layer → predict Ŷ only at last WM → refine A' → FM" style="text;html=1;strokeColor=none;fillColor=none;align=left;fontFamily=Helvetica;fontSize=15;fontStyle=1;fontColor=#111827;" vertex="1" parent="1">
+          <mxGeometry x="28" y="12" width="1400" height="24" as="geometry" />
+        </mxCell>
+
+        <mxCell id="g06" value="" style="rounded=1;dashed=1;dashPattern=8 6;fillColor=#faf5ff;strokeColor=#6d28d9;strokeWidth=1.2;" vertex="1" parent="1">
+          <mxGeometry x="24" y="48" width="1452" height="220" as="geometry" />
+        </mxCell>
+        <mxCell id="l06" value="layers 0–6  (same WAM module, stage embedding i)" style="text;html=1;fontFamily=Helvetica;fontSize=12;fontStyle=1;fontColor=#5b21b6;" vertex="1" parent="1">
+          <mxGeometry x="36" y="52" width="420" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="va" value="VA_i&#xa;vision_i , A_i" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ede9fe;strokeColor=#6d28d9;strokeWidth=1.5;fontFamily=Helvetica;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="48" y="92" width="150" height="64" as="geometry" />
+        </mxCell>
+        <mxCell id="wm" value="WM_i&#xa;read vision_i and A_i&#xa;belief_i = belief_{i-1} + innov + stage_i&#xa;NO Ŷ yet&#xa;world_tokens = belief_i" style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=8;fillColor=#ffffff;strokeColor=#6d28d9;strokeWidth=1.5;fontFamily=Helvetica;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="230" y="80" width="360" height="112" as="geometry" />
+        </mxCell>
+        <mxCell id="wr" value="write back&#xa;A' = A + q·mixed(A, belief)&#xa;vision' = vision + CA(vision, belief)&#xa;next VA uses both" style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=8;fillColor=#fce7f3;strokeColor=#be185d;strokeWidth=1.5;fontFamily=Helvetica;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="620" y="80" width="360" height="112" as="geometry" />
+        </mxCell>
+        <mxCell id="nx" value="VA_{i+1}" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ede9fe;strokeColor=#6d28d9;strokeWidth=1.5;fontFamily=Helvetica;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="1010" y="108" width="120" height="56" as="geometry" />
+        </mxCell>
+        <mxCell id="e1" style="endArrow=block;html=1;strokeColor=#6d28d9;strokeWidth=1.5;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="va" target="wm"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e2" style="endArrow=block;html=1;strokeColor=#be185d;strokeWidth=1.5;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="wm" target="wr"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e3" style="endArrow=block;html=1;strokeColor=#6d28d9;strokeWidth=1.5;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="wr" target="nx"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <mxCell id="g7" value="" style="rounded=1;dashed=1;dashPattern=8 6;fillColor=#f0fdf4;strokeColor=#15803d;strokeWidth=1.2;" vertex="1" parent="1">
+          <mxGeometry x="24" y="288" width="1452" height="380" as="geometry" />
+        </mxCell>
+        <mxCell id="l7" value="layer 7 only: deep world predictor" style="text;html=1;fontFamily=Helvetica;fontSize=12;fontStyle=1;fontColor=#166534;" vertex="1" parent="1">
+          <mxGeometry x="36" y="292" width="360" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="va7" value="VA_7&#xa;vision_7 , A_7" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ede9fe;strokeColor=#6d28d9;strokeWidth=1.5;fontFamily=Helvetica;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="48" y="332" width="150" height="56" as="geometry" />
+        </mxCell>
+        <mxCell id="prop" value="proposal = A_7[:, :6]&#xa;VA latent, not logged env a" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffedd5;strokeColor=#c2410c;strokeWidth=1.5;fontFamily=Helvetica;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="48" y="408" width="150" height="64" as="geometry" />
+        </mxCell>
+        <mxCell id="clip" value="raw DINO clip&#xa;4 × 16×16×1024&#xa;not VA-mixed vision" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dbeafe;strokeColor=#1d4ed8;strokeWidth=1.5;fontFamily=Helvetica;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="48" y="488" width="150" height="72" as="geometry" />
+        </mxCell>
+        <mxCell id="st" value="ST predictor  (6 × 384 × 12 heads, SDPA)&#xa;tokens = 4×256, time+row+col pos&#xa;block-causal SA + CA(proposal, belief, fused)&#xa;Ŷ = Y_d + zero-init residual&#xa;shape [B,1024,16,16]" style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=8;fillColor=#86efac;strokeColor=#15803d;strokeWidth=2;fontFamily=Helvetica;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="230" y="332" width="430" height="140" as="geometry" />
+        </mxCell>
+        <mxCell id="tok" value="256 cells&#xa;1024→512 only" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#15803d;strokeWidth=1.5;fontFamily=Helvetica;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="690" y="360" width="140" height="64" as="geometry" />
+        </mxCell>
+        <mxCell id="lw" value="L_world&#xa;MSE(Ŷ, Y_{d+6})&#xa;stop-grad DINO" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fef08a;strokeColor=#a16207;strokeWidth=2;fontFamily=Helvetica;fontSize=12;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="230" y="492" width="200" height="72" as="geometry" />
+        </mxCell>
+        <mxCell id="a7" value="A' = A + q·mixed(A, 256 Ŷ cells)&#xa;vision' = vision + CA(vision, 256)&#xa;no VA_8 — vision' is memory only" style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=8;fillColor=#fce7f3;strokeColor=#be185d;strokeWidth=1.5;fontFamily=Helvetica;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="860" y="332" width="380" height="88" as="geometry" />
+        </mxCell>
+        <mxCell id="fm" value="LN(A') → Flow Matching → 7-D&#xa;L_flow   only action head" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#93c5fd;strokeColor=#1d4ed8;strokeWidth=2;fontFamily=Helvetica;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="860" y="444" width="380" height="64" as="geometry" />
+        </mxCell>
+        <mxCell id="e4" style="endArrow=block;html=1;strokeColor=#6d28d9;strokeWidth=1.5;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="va7" target="st"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e5" style="endArrow=block;html=1;strokeColor=#c2410c;strokeWidth=1.5;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="prop" target="st"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e6" style="endArrow=block;html=1;strokeColor=#1d4ed8;strokeWidth=1.5;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="clip" target="st"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e7" style="endArrow=block;html=1;strokeColor=#15803d;strokeWidth=1.5;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="st" target="tok"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e8" style="endArrow=block;html=1;strokeColor=#a16207;strokeWidth=1.5;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="st" target="lw"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e9" style="endArrow=block;html=1;strokeColor=#be185d;strokeWidth=1.5;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="tok" target="a7"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e10" style="endArrow=block;html=1;strokeColor=#1d4ed8;strokeWidth=2;edgeStyle=orthogonalEdgeStyle;" edge="1" parent="1" source="a7" target="fm"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <mxCell id="note" value="q=0 ⇒ A'≡A and vision'≡vision. Logged env actions are not a predictor input. Two losses: L_flow + L_world." style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=10;fillColor=#ffffff;strokeColor=#334155;strokeWidth=1.5;fontFamily=Helvetica;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="24" y="688" width="1452" height="40" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

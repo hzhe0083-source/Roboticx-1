@@ -1230,6 +1230,10 @@ def build_exact_run_contract(
         model_config.pop("wmrm_inject", None)
         model_config.pop("wmrm_mixer_dropout", None)
         model_config.pop("wmrm_target", None)
+        model_config.pop("wmrm_predictor", None)
+        model_config.pop("wmrm_predictor_depth", None)
+        model_config.pop("wmrm_predictor_width", None)
+        model_config.pop("wmrm_predictor_heads", None)
     contract = {
         "contract_version": EXACT_RUN_CONTRACT_VERSION,
         "data_identity": getattr(sampler, "dataset_content_identity", None),
@@ -3531,7 +3535,12 @@ def rollout_policy(
             if not auxes:
                 raise ValueError("WAM4VA produced no world predictions at a supervised step")
             pres = getattr(model, "last_wmrm_pre_actions", None) or []
-            for inject_i, aux in enumerate(auxes):
+            # Predict Ŷ after the last VA↔WM mix; supervise that last inject only.
+            world_idx = max(
+                (i for i, aux in enumerate(auxes) if aux.z_tokens is not None),
+                default=len(auxes) - 1,
+            )
+            for inject_i, aux in ((world_idx, auxes[world_idx]),):
                 pred = aux.z_tokens if aux.z_tokens is not None else aux.z_hat
                 if pred.shape != target.shape:
                     raise ValueError(
@@ -3554,12 +3563,16 @@ def rollout_policy(
                     cycle = min(model.wmrm.cycle_steps, donor.shape[1])
                     perm = matched_no_fixed_point_perm(task_id, eye_mean, aux.proprio)
                     donor[:, :cycle] = pres[inject_i][perm][:, :cycle]
+                    env = aux.env_action
+                    if env is not None:
+                        env = env[perm]
                     z_alt, _, _, tok_shuf = model.wmrm.predict_world(
                         donor,
                         aux.proprio,
                         aux.belief,
                         aux.task_summary,
                         dino_tokens=aux.dino_tokens,
+                        env_action=env,
                     )
                     if tok_shuf is None:
                         pred_real, z_shuf = aux.z_hat, z_alt
@@ -4190,14 +4203,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--wmrm-inject",
         choices=("last", "all", "even"),
-        default="last",
-        help="WMRM 握手位置：last 末端；all 每层后；even 奇数层+末层",
+        default="all",
+        help="WAM↔VA 握手：all 每层对传；last 只末端；even 奇数层+末层",
     )
     parser.add_argument(
         "--wmrm-pi-kl-weight",
         type=float,
-        default=0.1,
-        help="惩罚 π 对 z_hat 不敏感：λ * relu(margin - KL(π||π_shuffle z))",
+        default=0.0,
+        help="可选：π 对 z_hat 不敏感惩罚（默认 0，联合训练只用 world+flow）",
     )
     parser.add_argument(
         "--wmrm-pi-kl-margin",
@@ -4208,14 +4221,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--wmrm-lang-align-weight",
         type=float,
-        default=0.05,
-        help="belief 与 language task summary 的余弦对齐权重",
+        default=0.0,
+        help="可选：belief 与语言摘要对齐（默认 0）",
     )
     parser.add_argument(
         "--wmrm-adep-weight",
         type=float,
-        default=0.1,
-        help="ReLU(m - (L_W(A_shuf)-L_W(A)))：强迫 ẑ 依赖动作",
+        default=0.0,
+        help="可选：动作打乱 hinge（默认 0；JEPA 世界已吃日志动作）",
     )
     parser.add_argument(
         "--wmrm-adep-margin",
@@ -4226,9 +4239,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--wmrm-med-weight",
         type=float,
-        default=0.1,
-        help="ReLU(m - signed(C_FM(z)-C_FM(z_shuf)))：强迫 ẑ 改变 LN 后 FM 输入"
-        "（signed shift，非 L2）",
+        default=0.0,
+        help="可选：强迫 ẑ 进入 FM 条件的 hinge（默认 0；握手已写 A'）",
     )
     parser.add_argument(
         "--wmrm-med-margin",
@@ -4256,6 +4268,38 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=32,
         dest="wmrm_map_channels",
         help="DINO 空间图通道数",
+    )
+    parser.add_argument(
+        "--wmrm-world-grid",
+        type=int,
+        default=16,
+        dest="wmrm_world_grid",
+        help="握手空间格子，默认 16=满 DINO 网格，不再 16→4 池化",
+    )
+    parser.add_argument(
+        "--wmrm-predictor",
+        choices=("legacy", "st_blocks"),
+        default="legacy",
+        dest="wmrm_predictor",
+        help="世界图预测器：legacy=浅卷积；st_blocks=V-JEPA2 风格时空 Transformer",
+    )
+    parser.add_argument(
+        "--wmrm-predictor-depth",
+        type=int,
+        default=6,
+        dest="wmrm_predictor_depth",
+    )
+    parser.add_argument(
+        "--wmrm-predictor-width",
+        type=int,
+        default=384,
+        dest="wmrm_predictor_width",
+    )
+    parser.add_argument(
+        "--wmrm-predictor-heads",
+        type=int,
+        default=12,
+        dest="wmrm_predictor_heads",
     )
     parser.add_argument(
         "--wmrm-only",
@@ -6499,6 +6543,11 @@ def main() -> None:
             wmrm_handshake=getattr(args, "wmrm_handshake", True),
             wmrm_map_size=getattr(args, "wmrm_map_size", 16),
             wmrm_map_channels=getattr(args, "wmrm_map_channels", 32),
+            wmrm_world_grid=getattr(args, "wmrm_world_grid", 16),
+            wmrm_predictor=getattr(args, "wmrm_predictor", "legacy"),
+            wmrm_predictor_depth=getattr(args, "wmrm_predictor_depth", 6),
+            wmrm_predictor_width=getattr(args, "wmrm_predictor_width", 384),
+            wmrm_predictor_heads=getattr(args, "wmrm_predictor_heads", 12),
             **_mtvj_config_kwargs(args),
         )
         if args.single_task:
@@ -6780,6 +6829,11 @@ def main() -> None:
             wmrm_handshake=getattr(args, "wmrm_handshake", True),
             wmrm_map_size=getattr(args, "wmrm_map_size", 16),
             wmrm_map_channels=getattr(args, "wmrm_map_channels", 32),
+            wmrm_world_grid=getattr(args, "wmrm_world_grid", 16),
+            wmrm_predictor=getattr(args, "wmrm_predictor", "legacy"),
+            wmrm_predictor_depth=getattr(args, "wmrm_predictor_depth", 6),
+            wmrm_predictor_width=getattr(args, "wmrm_predictor_width", 384),
+            wmrm_predictor_heads=getattr(args, "wmrm_predictor_heads", 12),
             local_slots=(args.local_slots_data is not None) or args.live_vjepa,
             local_slots_direct288=args.local_slots_direct288,
             local_slots_fixed_query=args.local_slots_fixed_query,
@@ -7069,6 +7123,11 @@ def main() -> None:
             wmrm_handshake=getattr(args, "wmrm_handshake", True),
             wmrm_map_size=getattr(args, "wmrm_map_size", 16),
             wmrm_map_channels=getattr(args, "wmrm_map_channels", 32),
+            wmrm_world_grid=getattr(args, "wmrm_world_grid", 16),
+            wmrm_predictor=getattr(args, "wmrm_predictor", "legacy"),
+            wmrm_predictor_depth=getattr(args, "wmrm_predictor_depth", 6),
+            wmrm_predictor_width=getattr(args, "wmrm_predictor_width", 384),
+            wmrm_predictor_heads=getattr(args, "wmrm_predictor_heads", 12),
             **_mtvj_config_kwargs(args),
         )
         smoke_batch = synthetic_sequence(
@@ -7518,11 +7577,31 @@ def main() -> None:
                 resume_ckpt.get("exact_run_contract"), runtime_exact_run_contract
             )
         resume_config = resume_ckpt["config"]
-        for key in ("num_layers", "hidden_dim", "action_dim", "proprio_dim", "mode"):
-            if resume_config.get(key) != getattr(config, key):
+        for key in (
+            "num_layers",
+            "hidden_dim",
+            "action_dim",
+            "proprio_dim",
+            "mode",
+            "wmrm_predictor",
+            "wmrm_predictor_depth",
+            "wmrm_predictor_width",
+            "wmrm_predictor_heads",
+        ):
+            if key.startswith("wmrm_") and not getattr(config, "wmrm", False):
+                continue
+            left = resume_config.get(key)
+            right = getattr(config, key, None)
+            if key.startswith("wmrm_") and left is None:
+                left = {
+                    "wmrm_predictor": "legacy",
+                    "wmrm_predictor_depth": 6,
+                    "wmrm_predictor_width": 384,
+                    "wmrm_predictor_heads": 12,
+                }[key]
+            if left != right:
                 raise ValueError(
-                    f"resume config mismatch on {key}: "
-                    f"{resume_config.get(key)} vs {getattr(config, key)}"
+                    f"resume config mismatch on {key}: {left} vs {right}"
                 )
         if e2e_model is not None:
             e2e_model.policy.load_state_dict(resume_ckpt["model"])
@@ -8376,9 +8455,9 @@ def main() -> None:
             if getattr(args, "wmrm_only", False):
                 action_total = (
                     float(getattr(args, "wmrm_world_weight", 1.0)) * wmrm_loss
-                    + float(getattr(args, "wmrm_pi_kl_weight", 0.1)) * pi_kl_hinge
-                    + float(getattr(args, "wmrm_lang_align_weight", 0.05)) * lang_align
-                    + float(getattr(args, "wmrm_adep_weight", 0.1)) * adep
+                    + float(getattr(args, "wmrm_pi_kl_weight", 0.0)) * pi_kl_hinge
+                    + float(getattr(args, "wmrm_lang_align_weight", 0.0)) * lang_align
+                    + float(getattr(args, "wmrm_adep_weight", 0.0)) * adep
                 )
             else:
                 action_total = (
@@ -8386,10 +8465,10 @@ def main() -> None:
                     + args.pair_loss_weight * pair_loss
                     + args.future_predict_weight * future_loss
                     + float(getattr(args, "wmrm_world_weight", 1.0)) * wmrm_loss
-                    + float(getattr(args, "wmrm_pi_kl_weight", 0.1)) * pi_kl_hinge
-                    + float(getattr(args, "wmrm_lang_align_weight", 0.05)) * lang_align
-                    + float(getattr(args, "wmrm_adep_weight", 0.1)) * adep
-                    + float(getattr(args, "wmrm_med_weight", 0.1)) * med
+                    + float(getattr(args, "wmrm_pi_kl_weight", 0.0)) * pi_kl_hinge
+                    + float(getattr(args, "wmrm_lang_align_weight", 0.0)) * lang_align
+                    + float(getattr(args, "wmrm_adep_weight", 0.0)) * adep
+                    + float(getattr(args, "wmrm_med_weight", 0.0)) * med
                 )
             semantic_total = (
                 args.semantic_anchor_weight * semantic_anchor_loss

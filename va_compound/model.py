@@ -90,8 +90,8 @@ class VACompoundConfig:
     wmrm: bool = False
     wmrm_rank: int = 4
     wmrm_world_dim: int = 8
-    # last = 单点末端调制（诚实默认）；all = 每层后握手；even = 奇数层。
-    wmrm_inject: str = "last"
+    # all = 每层 VA 后与 WAM 对传（默认）；last = 只在末端写一次；even = 奇数层+末层。
+    wmrm_inject: str = "all"
     wmrm_mixer_dropout: float = 0.3
     # dino: 预测下一决策 DINO/投影 feature；vjepa: 下一决策 H11 池化；metric: 旧几何。
     wmrm_target: str = "dino"
@@ -101,6 +101,11 @@ class VACompoundConfig:
     wmrm_handshake: bool = True
     wmrm_map_size: int = 16
     wmrm_map_channels: int = 32
+    wmrm_world_grid: int = 16  # handshake keeps native DINO grid; do not pool 16→4
+    wmrm_predictor: str = "legacy"
+    wmrm_predictor_depth: int = 6
+    wmrm_predictor_width: int = 384
+    wmrm_predictor_heads: int = 12
     # 顺序式 A→V→A 耦合（2026-08-07 审阅落地④）：每 N 层使用
     # proposal→reorganize→correction 三遍注意力；0 = 全层同步联合（旧行为）。
     sequential_coupling: int = 0
@@ -335,6 +340,18 @@ class VACompoundConfig:
             raise ValueError("wmrm_map_size must be positive")
         if self.wmrm_map_channels < 1:
             raise ValueError("wmrm_map_channels must be positive")
+        if self.wmrm_world_grid < 1:
+            raise ValueError("wmrm_world_grid must be positive")
+        if self.wmrm_predictor not in {"legacy", "st_blocks"}:
+            raise ValueError("wmrm_predictor must be legacy|st_blocks")
+        if self.wmrm_predictor_depth < 1:
+            raise ValueError("wmrm_predictor_depth must be positive")
+        if self.wmrm_predictor_width < 1:
+            raise ValueError("wmrm_predictor_width must be positive")
+        if self.wmrm_predictor_heads < 1:
+            raise ValueError("wmrm_predictor_heads must be positive")
+        if self.wmrm_predictor_width % self.wmrm_predictor_heads != 0:
+            raise ValueError("wmrm_predictor_width must be divisible by wmrm_predictor_heads")
 
 
 @dataclass(frozen=True)
@@ -1929,6 +1946,13 @@ class VACompoundPolicy(nn.Module):
                     map_channels=config.wmrm_map_channels,
                     map_frames=config.main_vision_frames,
                     map_grid=config.main_vision_grid,
+                    env_action_dim=config.action_dim,
+                    world_grid=config.wmrm_world_grid,
+                    predictor=config.wmrm_predictor,
+                    predictor_depth=config.wmrm_predictor_depth,
+                    predictor_width=config.wmrm_predictor_width,
+                    predictor_heads=config.wmrm_predictor_heads,
+                    max_stages=config.num_layers,
                 )
         else:
             self.wmrm = None
@@ -2299,6 +2323,7 @@ class VACompoundPolicy(nn.Module):
         action_dense_evidence: dict[int, Tensor] | None = None,
         metric_g: Tensor | None = None,
         world_goal: Tensor | None = None,
+        env_action: Tensor | None = None,
     ) -> Tensor | tuple[Tensor, VisualMemory]:
         if (language_hidden is None) == (language_cache is None):
             raise ValueError("provide exactly one of language_hidden or language_cache")
@@ -2533,6 +2558,10 @@ class VACompoundPolicy(nn.Module):
         self.last_wmrm_pi_kls: list = []
         self.last_wmrm_pre_actions: list = []
         self.last_wmrm_meds: list = []
+        inject_layers = (
+            self._wmrm_inject_layers() if self.wmrm is not None else set()
+        )
+        last_inject = max(inject_layers) if inject_layers else -1
         for index, (layer, layer_cache) in enumerate(
             zip(self.layers, language_cache.layers, strict=True)
         ):
@@ -2558,7 +2587,7 @@ class VACompoundPolicy(nn.Module):
                     action_dense_input=action_dense_input,
                 )
             next_memory.append(vision)
-            if self.wmrm is not None and index in self._wmrm_inject_layers():
+            if self.wmrm is not None and index in inject_layers:
                 pre_action = action
                 lang_key = layer_cache.key
                 language_keys = lang_key.transpose(1, 2).reshape(
@@ -2569,20 +2598,29 @@ class VACompoundPolicy(nn.Module):
                     language_keys = language_keys * mask.to(dtype=language_keys.dtype)[:, :, None]
                 updated, aux, belief, prev_innovation = self.wmrm(
                     action,
-                    shared_eye,
+                    vision,
                     proprio.to(dtype=action.dtype),
                     belief=belief,
                     prev_innovation=prev_innovation,
                     language_keys=language_keys,
                     world_goal=world_goal,
                     dino_tokens=vision_tokens.to(dtype=target_dtype),
+                    stage_index=index,
                 )
                 if self.config.wmrm_handshake:
                     action = updated
+                    vision = self.wmrm.mix_world_into_vision(
+                        vision, aux.world_tokens
+                    )
+                    next_memory[-1] = vision
                 self.last_wmrm = aux
                 self.last_wmrm_auxes.append(aux)
                 self.last_wmrm_pre_actions.append(pre_action)
-                if self.training and self.config.wmrm_handshake:
+                if (
+                    self.training
+                    and self.config.wmrm_handshake
+                    and index == last_inject
+                ):
                     inject_kl = self.wmrm.pi_kl_from_aux(pre_action, aux)
                     self.last_wmrm_pi_kls.append(inject_kl)
                     self.last_wmrm_pi_kl = inject_kl
@@ -2641,6 +2679,7 @@ class VACompoundPolicy(nn.Module):
         action_dense_evidence: dict[int, Tensor] | None = None,
         metric_g: Tensor | None = None,
         world_goal: Tensor | None = None,
+        env_action: Tensor | None = None,
     ) -> Tensor | tuple[Tensor, VisualMemory]:
         encoded = self.encode_condition(
             vision_tokens,
@@ -2656,6 +2695,7 @@ class VACompoundPolicy(nn.Module):
             action_dense_evidence=action_dense_evidence,
             metric_g=metric_g,
             world_goal=world_goal,
+            env_action=env_action,
         )
         if return_visual_memory:
             action_condition, next_memory = encoded
