@@ -464,7 +464,7 @@ def test_formal_stable_detach_runner_syntax_and_pinned_lineage() -> None:
     assert "ADDITIONAL_STEPS=7990" in text
     assert "EXPECTED_SOURCE_SHA256=f580caa4c1588b2a9807f9b0ab746ac54259eaaa482cea16ce5001c30a382f11" in text
     assert "EXPECTED_SOURCE_REALPATH=/home/ryan/Documents/robot/ORA0/checkpoints/" in text
-    assert "formal_12010_to_20000" in text
+    assert "stable_detach_static2_v1.formal_12010_to_20000" in text
 
 
 def test_formal_stable_detach_runner_is_exact_immutable_and_fail_closed() -> None:
@@ -484,10 +484,18 @@ def test_formal_stable_detach_runner_is_exact_immutable_and_fail_closed() -> Non
     assert 'max_gradient_norm") is not None' in text
 
 
-def test_formal_stable_detach_runner_uses_diagnostic_contract_without_migration() -> None:
+def test_formal_stable_detach_runner_uses_controlled_static2_contract() -> None:
     text = _formal_stable_detach_text()
     assert "--wmrm-detach-proposal-stage-state" in text
-    assert "--resume-exact-contract-migration" not in text
+    assert "MIGRATION_ID=wmrm_static_constraint_weight_4_to_2_v1" in text
+    assert '--resume-exact-contract-migration "$MIGRATION_ID"' in text
+    assert 'STATIC_CONSTRAINT_WEIGHT=2.0' in text
+    assert 'WORLD_WEIGHT=1.0' in text
+    assert '--wmrm-static-constraint-weight "$STATIC_CONSTRAINT_WEIGHT"' in text
+    assert '--wmrm-world-weight "$WORLD_WEIGHT"' in text
+    assert 'args.get("wmrm_static_constraint_weight", 4.0) != 4.0' in text
+    assert "a.get('wmrm_static_constraint_weight') != 2.0" in text
+    assert "a.get('wmrm_world_weight') != 1.0" in text
     assert '--steps "$ADDITIONAL_STEPS" --save-every 1000' in text
     assert '--save "$SAVE" --resume-exact "$SOURCE"' in text
     assert "--save-step-copies" not in text

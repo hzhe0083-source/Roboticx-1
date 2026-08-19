@@ -185,6 +185,10 @@ ORACLE_STGAP_WORLD_STATIC_COPY_CONSTRAINT = {
     "reduction": "stage_aux_weighted_masked_mean",
     "boundary": "1.00_detached_copy_each_stage",
 }
+ORACLE_STGAP_WORLD_STATIC_COPY_CONSTRAINTS = (
+    ORACLE_STGAP_WORLD_STATIC_COPY_CONSTRAINT,
+    {**ORACLE_STGAP_WORLD_STATIC_COPY_CONSTRAINT, "weight": 2.0},
+)
 _ORACLE_STGAP_WORLD_ACTION_RANKING_COMMON = {
     "top10_min_relative_margin": 0.12,
     "weight": 1.0,
@@ -764,7 +768,7 @@ def _checkpoint_world_contract(
                 and contract.get("world_no_regression")
                 == CONSTRAINED_WORLD_NO_REGRESSION
                 and contract.get("world_static_copy_constraint")
-                == ORACLE_STGAP_WORLD_STATIC_COPY_CONSTRAINT
+                in ORACLE_STGAP_WORLD_STATIC_COPY_CONSTRAINTS
                 and contract.get("world_action_ranking")
                 in ORACLE_STGAP_WORLD_ACTION_RANKINGS
             )

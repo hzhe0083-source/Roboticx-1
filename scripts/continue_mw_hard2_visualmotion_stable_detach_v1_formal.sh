@@ -11,7 +11,10 @@ EXPECTED_SOURCE_SHA256=f580caa4c1588b2a9807f9b0ab746ac54259eaaa482cea16ce5001c30
 EXPECTED_SOURCE_STEP=12010
 TARGET_STEP=20000
 ADDITIONAL_STEPS=7990
-RUN_ID=mw_hard2_wam4va_visualmotion_stable_detach_v1.formal_12010_to_20000
+MIGRATION_ID=wmrm_static_constraint_weight_4_to_2_v1
+STATIC_CONSTRAINT_WEIGHT=2.0
+WORLD_WEIGHT=1.0
+RUN_ID=mw_hard2_wam4va_visualmotion_stable_detach_static2_v1.formal_12010_to_20000
 SAVE=checkpoints/${RUN_ID}.pt
 LOG=logs/${RUN_ID}.train.log
 LOCK=/tmp/ora0_wam4va_visualmotion_train.lock
@@ -79,6 +82,13 @@ args = contract.get("arguments") or {}
 model = contract.get("model_config") or {}
 if args.get("wmrm_detach_proposal_stage_state") is not True or model.get("wmrm_detach_proposal_stage_state") is not True:
     raise SystemExit("source detach contract is not exactly true")
+if args.get("wmrm_world_weight") != 1.0:
+    raise SystemExit("source World weight is not exactly 1.0")
+if args.get("wmrm_static_constraint_weight", 4.0) != 4.0:
+    raise SystemExit("source static constraint weight is not exactly 4.0")
+static = (payload.get("training_contract") or {}).get("world_static_copy_constraint") or {}
+if static.get("weight") != 4.0:
+    raise SystemExit("source training contract static constraint weight is not exactly 4.0")
 if args.get("max_gradient_norm") is not None:
     raise SystemExit("source max_gradient_norm is not exactly None")
 for key, expected in {
@@ -161,6 +171,10 @@ for key in ('epoch','batch_cursor','dataset_fingerprint','task_weights'):
     if key not in s: raise SystemExit(f'final sampler lacks {key}')
 a = (p['exact_run_contract'].get('arguments') or {}); m = (p['exact_run_contract'].get('model_config') or {})
 if a.get('wmrm_detach_proposal_stage_state') is not True or m.get('wmrm_detach_proposal_stage_state') is not True: raise SystemExit('final detach contract is not true')
+if a.get('wmrm_world_weight') != 1.0: raise SystemExit('final World weight is not 1.0')
+if a.get('wmrm_static_constraint_weight') != 2.0: raise SystemExit('final static constraint weight is not 2.0')
+static = (p.get('training_contract') or {}).get('world_static_copy_constraint') or {}
+if static.get('weight') != 2.0: raise SystemExit('final training contract static constraint weight is not 2.0')
 if a.get('max_gradient_norm') is not None: raise SystemExit('final max_gradient_norm is not None')
 for key, expected_value in {'main_vision_backbone':'dinov2_vitl14_reg4','main_vision_dim':1024,'main_vision_frames':4,'main_vision_grid':16,'wmrm':True,'wmrm_inject':'all','wmrm_target':'dino','wmrm_predictor':'st_blocks','wmrm_predictor_depth':6,'wmrm_predictor_width':384,'wmrm_predictor_heads':12}.items():
     if m.get(key) != expected_value: raise SystemExit(f'final model {key} mismatch')
@@ -178,14 +192,14 @@ available_kib=$(df --output=avail -k checkpoints | tail -n 1 | tr -d '[:space:]'
 ((available_kib >= 14 * 1024 * 1024)) || fail "at least 14 GiB free is required"
 mkdir -p checkpoints logs
 [[ "$SAVE" != "$SOURCE" ]] || fail 'source and destination must differ'
-printf 'formal continuation: global_step %s -> %s (%s updates); rolling save every 1000 global updates; no evaluator\n' "$EXPECTED_SOURCE_STEP" "$TARGET_STEP" "$ADDITIONAL_STEPS"
+printf 'formal controlled migration: global_step %s -> %s (%s updates); static constraint 4.0 -> %s; World weight fixed at %s; rolling save every 1000 global updates; no evaluator\n' "$EXPECTED_SOURCE_STEP" "$TARGET_STEP" "$ADDITIONAL_STEPS" "$STATIC_CONSTRAINT_WEIGHT" "$WORLD_WEIGHT"
 set +e
 PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   "$PY" -u -B train.py \
   --data "$DATA" --world-split-manifest "$SPLIT" --visual-world-supervision --world-action-rank-stage cycle \
   --dino-main-vision --dino-dense-metric --main-vision-checkpoint "$DINO" --main-vision-grid 16 --main-vision-frames 4 \
   --main-vision-temporal --main-vision-temporal-scale 1.0 --main-vision-encode-batch 8 --metric-geometry-inject \
-  --wam4va --wmrm-inject all --wmrm-target dino --wmrm-world-weight 1.0 --wmrm-cycle-steps 6 \
+  --wam4va --wmrm-inject all --wmrm-target dino --wmrm-world-weight "$WORLD_WEIGHT" --wmrm-static-constraint-weight "$STATIC_CONSTRAINT_WEIGHT" --wmrm-cycle-steps 6 \
   --wmrm-map-size 16 --wmrm-map-channels 1024 --wmrm-world-grid 16 --wmrm-predictor st_blocks --wmrm-predictor-depth 6 \
   --wmrm-predictor-width 384 --wmrm-predictor-heads 12 --wmrm-detach-proposal-stage-state \
   --single-task --task-sampling balanced --task-locality-block-batches 4 --batch-size 3 --sequence-length 4 --min-sequence-length 4 \
@@ -193,7 +207,7 @@ PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 PYTORCH_CUDA_ALLOC
   --flow-cond adaln --flow-layers 6 --flow-steps 8 --flow-prefix-steps 6 --flow-prefix-weight 1.0 --flow-tail-weight 0.036 \
   --mtvj-train-metric-head --lr-mtvj-metric-head 0.0003 --mtvj-train-relation --lr-mtvj-relation 0.00002 \
   --mtvj-visual-aux-every 10 --mtvj-visual-aux-batch 8 --steps "$ADDITIONAL_STEPS" --save-every 1000 \
-  --save "$SAVE" --resume-exact "$SOURCE" 2>&1 | tee "$LOG"
+  --save "$SAVE" --resume-exact "$SOURCE" --resume-exact-contract-migration "$MIGRATION_ID" 2>&1 | tee "$LOG"
 status=("${PIPESTATUS[@]}")
 set -e
 [[ "${status[0]}" -eq 0 ]] || exit "${status[0]}"

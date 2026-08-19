@@ -1048,6 +1048,9 @@ WMRM_DETACH_PROPOSAL_STAGE_STATE_MIGRATION = (
     "wmrm_detach_proposal_stage_state_v1"
 )
 WMRM_WORLD_WEIGHT_1_TO_0_5_MIGRATION = "wmrm_world_weight_1_to_0_5_v1"
+WMRM_STATIC_CONSTRAINT_WEIGHT_4_TO_2_MIGRATION = (
+    "wmrm_static_constraint_weight_4_to_2_v1"
+)
 
 # These only control how long/where the already-defined run is executed. They
 # cannot change the next stochastic optimizer update and therefore are allowed
@@ -1617,6 +1620,7 @@ def _normalize_legacy_exact_run_contract(contract: dict) -> dict:
     arguments = normalized.get("arguments")
     if isinstance(arguments, dict):
         arguments.setdefault("wmrm_detach_proposal_stage_state", False)
+        arguments.setdefault("wmrm_static_constraint_weight", 4.0)
         arguments.setdefault("max_gradient_norm", None)
     model_config = normalized.get("model_config")
     if isinstance(model_config, dict):
@@ -1639,6 +1643,7 @@ def validate_exact_run_contract(
     normalized_current = _normalize_legacy_exact_run_contract(current)
     mismatches = exact_run_contract_mismatches(normalized_saved, normalized_current)
     if migration_id == WMRM_WORLD_WEIGHT_1_TO_0_5_MIGRATION:
+        saved_target, current_target = 1.0, 0.5
         allowed_paths = {"arguments.wmrm_world_weight"}
         saved_arguments = normalized_saved.get("arguments")
         current_arguments = normalized_current.get("arguments")
@@ -1657,14 +1662,14 @@ def validate_exact_run_contract(
             and isinstance(current_arguments, dict)
             and type(saved_weight) is float
             and type(current_weight) is float
-            and saved_weight == 1.0
-            and current_weight == 0.5
+            and saved_weight == saved_target
+            and current_weight == current_target
             and {path for path, _, _ in mismatches} == allowed_paths
             and all(
                 type(left) is float
                 and type(right) is float
-                and left == 1.0
-                and right == 0.5
+                and left == saved_target
+                and right == current_target
                 for path, left, right in mismatches
             )
         )
@@ -1673,7 +1678,50 @@ def validate_exact_run_contract(
         details = "; ".join(
             f"{path}: checkpoint={left!r}, runtime={right!r}"
             for path, left, right in mismatches[:12]
-        ) or "no coherent old-1.0 to new-0.5 transition"
+        ) or f"no coherent old-{saved_target} to new-{current_target} transition"
+        raise ValueError(
+            f"controlled exact-resume migration {migration_id!r} refused: {details}"
+        )
+    if migration_id == WMRM_STATIC_CONSTRAINT_WEIGHT_4_TO_2_MIGRATION:
+        allowed_paths = {"arguments.wmrm_static_constraint_weight"}
+        saved_arguments = normalized_saved.get("arguments")
+        current_arguments = normalized_current.get("arguments")
+        saved_weight = (
+            saved_arguments.get("wmrm_static_constraint_weight")
+            if isinstance(saved_arguments, dict)
+            else None
+        )
+        current_weight = (
+            current_arguments.get("wmrm_static_constraint_weight")
+            if isinstance(current_arguments, dict)
+            else None
+        )
+        coherent = (
+            isinstance(saved_arguments, dict)
+            and isinstance(current_arguments, dict)
+            and type(saved_weight) is float
+            and type(current_weight) is float
+            and saved_weight == 4.0
+            and current_weight == 2.0
+            and saved_arguments.get("wmrm_world_weight") == 1.0
+            and current_arguments.get("wmrm_world_weight") == 1.0
+            and saved_arguments.get("wmrm_detach_proposal_stage_state") is True
+            and current_arguments.get("wmrm_detach_proposal_stage_state") is True
+            and {path for path, _, _ in mismatches} == allowed_paths
+            and all(
+                type(left) is float
+                and type(right) is float
+                and left == 4.0
+                and right == 2.0
+                for path, left, right in mismatches
+            )
+        )
+        if coherent:
+            return
+        details = "; ".join(
+            f"{path}: checkpoint={left!r}, runtime={right!r}"
+            for path, left, right in mismatches[:12]
+        ) or "no coherent static-constraint 4.0 to 2.0 transition"
         raise ValueError(
             f"controlled exact-resume migration {migration_id!r} refused: {details}"
         )
@@ -4066,6 +4114,7 @@ def rollout_policy(
     flow_steps: int = 8,
     world_action_rank_step: int = 0,
     world_action_rank_stage: str = "cycle",
+    wmrm_static_constraint_weight: float = 4.0,
     feature_autocast_bf16: bool = False,
 ) -> tuple[Tensor, Tensor]:
     if world_action_rank_step < 0:
@@ -4711,7 +4760,7 @@ def rollout_policy(
         model.last_world_action_strong_loss = action_strong_loss
         model.last_wmrm_loss = (
             objective_world_loss
-            + float(WORLD_STATIC_COPY_CONSTRAINT["weight"])
+            + float(wmrm_static_constraint_weight)
             * static_constraint_loss
             + float(WORLD_ACTION_RANKING["weight"]) * action_rank_loss
         )
@@ -5228,6 +5277,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=1.0,
         help="WMRM 世界预测 MSE 权重（仅 --wmrm；target 为下一决策 metric_g，stop-grad）",
+    )
+    parser.add_argument(
+        "--wmrm-static-constraint-weight",
+        type=float,
+        default=4.0,
+        help="visual World static-copy constraint loss weight (default: 4.0)",
     )
     parser.add_argument(
         "--visual-world-supervision",
@@ -6053,6 +6108,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=[
             WMRM_DETACH_PROPOSAL_STAGE_STATE_MIGRATION,
             WMRM_WORLD_WEIGHT_1_TO_0_5_MIGRATION,
+            WMRM_STATIC_CONSTRAINT_WEIGHT_4_TO_2_MIGRATION,
         ],
         help=(
             "allow one named, controlled exact-contract compatibility transition; "
@@ -6458,6 +6514,17 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--wmrm requires positive --wmrm-world-weight")
     if getattr(args, "wmrm_world_weight", 1.0) < 0.0:
         raise ValueError("--wmrm-world-weight must be non-negative")
+    static_constraint_weight = float(
+        getattr(args, "wmrm_static_constraint_weight", 4.0)
+    )
+    if not math.isfinite(static_constraint_weight) or static_constraint_weight < 0.0:
+        raise ValueError("--wmrm-static-constraint-weight must be finite and non-negative")
+    if static_constraint_weight != 4.0 and not getattr(
+        args, "visual_world_supervision", False
+    ):
+        raise ValueError(
+            "--wmrm-static-constraint-weight only applies with --visual-world-supervision"
+        )
     if int(getattr(args, "wmrm_cycle_steps", 6)) < 1:
         raise ValueError("--wmrm-cycle-steps must be >= 1")
     if getattr(args, "wmrm", False) and getattr(args, "wmrm_target", "dino") == "vjepa":
@@ -7647,9 +7714,12 @@ def save_checkpoint(
                 "world_loss_weights": dict(WORLD_LOSS_COMPONENT_WEIGHTS),
                 "world_stage_auxiliary_decay": WORLD_STAGE_AUXILIARY_DECAY,
                 "world_no_regression": dict(WORLD_NO_REGRESSION),
-                "world_static_copy_constraint": dict(
-                    WORLD_STATIC_COPY_CONSTRAINT
-                ),
+                "world_static_copy_constraint": {
+                    **WORLD_STATIC_COPY_CONSTRAINT,
+                    "weight": float(
+                        getattr(args, "wmrm_static_constraint_weight", 4.0)
+                    ),
+                },
                 "world_action_ranking": world_action_ranking_contract(
                     getattr(args, "world_action_rank_stage", "cycle")
                 ),
@@ -9712,6 +9782,9 @@ def main() -> None:
                     world_action_rank_step=next_global_step,
                     world_action_rank_stage=getattr(
                         args, "world_action_rank_stage", "cycle"
+                    ),
+                    wmrm_static_constraint_weight=float(
+                        getattr(args, "wmrm_static_constraint_weight", 4.0)
                     ),
                     feature_autocast_bf16=bool(args.feature_autocast_bf16),
                 )

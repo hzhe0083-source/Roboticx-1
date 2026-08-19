@@ -688,6 +688,56 @@ def test_controlled_world_weight_migration_rejects_reverse_unnecessary_and_addit
         )
 
 
+def test_static_constraint_weight_migration_is_strict_and_isolated() -> None:
+    saved = _contract()
+    saved["arguments"].update(
+        wmrm_static_constraint_weight=4.0,
+        wmrm_world_weight=1.0,
+        wmrm_detach_proposal_stage_state=True,
+    )
+    current = copy.deepcopy(saved)
+    current["arguments"]["wmrm_static_constraint_weight"] = 2.0
+
+    validate_exact_run_contract(
+        saved, current, migration_id="wmrm_static_constraint_weight_4_to_2_v1"
+    )
+
+    for key, value in (
+        ("wmrm_world_weight", 0.5),
+        ("wmrm_detach_proposal_stage_state", False),
+        ("flow_tail_weight", 0.2),
+    ):
+        bad = copy.deepcopy(current)
+        bad["arguments"][key] = value
+        with pytest.raises(ValueError, match="controlled exact-resume migration"):
+            validate_exact_run_contract(
+                saved, bad, migration_id="wmrm_static_constraint_weight_4_to_2_v1"
+            )
+
+
+def test_static_constraint_weight_cli_is_semantic_and_migration_id_operational() -> None:
+    _, optimizer = _model_and_optimizer()
+    args = parse_args(
+        [
+            "--wam4va", "--visual-world-supervision",
+            "--wmrm-world-weight", "1.0",
+            "--wmrm-static-constraint-weight", "2.0",
+            "--wmrm-detach-proposal-stage-state",
+            "--resume-exact", "checkpoint.pt",
+            "--resume-exact-contract-migration",
+            "wmrm_static_constraint_weight_4_to_2_v1",
+        ]
+    )
+    config = SimpleNamespace(
+        num_layers=8, action_horizon=48, wmrm=True,
+        wmrm_detach_proposal_stage_state=True,
+    )
+    contract = build_exact_run_contract(args, config, optimizer, _sampler())
+    assert contract["arguments"]["wmrm_static_constraint_weight"] == 2.0
+    assert contract["arguments"]["wmrm_world_weight"] == 1.0
+    assert "resume_exact_contract_migration" not in contract["arguments"]
+
+
 def test_controlled_world_weight_migration_id_is_operational_not_semantic() -> None:
     _, optimizer = _model_and_optimizer()
     args = parse_args(

@@ -469,6 +469,34 @@ def test_checkpoint_world_contract_requires_matched_context_logged_branch() -> N
         True,
     )
 
+    oracle_static2 = {
+        "training_contract": {
+            **oracle_stgap_v7["training_contract"],
+            "world_static_copy_constraint": {
+                **oracle_stgap_v7["training_contract"]["world_static_copy_constraint"],
+                "weight": 2.0,
+            },
+        }
+    }
+    assert _checkpoint_world_contract(
+        oracle_static2, allow_unmarked=False
+    ) == (
+        "visual_motion_oracle_stgap_v7",
+        "matched_context_full_forward_v1",
+        True,
+    )
+    oracle_static3 = {
+        "training_contract": {
+            **oracle_static2["training_contract"],
+            "world_static_copy_constraint": {
+                **oracle_static2["training_contract"]["world_static_copy_constraint"],
+                "weight": 3.0,
+            },
+        }
+    }
+    with pytest.raises(ValueError, match="world_static_copy_constraint"):
+        _checkpoint_world_contract(oracle_static3, allow_unmarked=False)
+
     missing_constraints = {
         "training_contract": {
             "world_supervision": "visual_motion_constrained_v2",
