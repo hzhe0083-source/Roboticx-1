@@ -440,3 +440,63 @@ def test_stable_detach_runner_holds_global_lock_and_requires_idle_machine() -> N
     launch = text.index('"$PY" -u -B train.py')
     assert text.index("require_no_trainer", text.index("source_sha_before=")) < launch
     assert text.index("require_idle_gpu", text.index("source_sha_before=")) < launch
+
+
+FORMAL_STABLE_DETACH_RUNNER = (
+    ROOT / "scripts" / "continue_mw_hard2_visualmotion_stable_detach_v1_formal.sh"
+)
+
+
+def _formal_stable_detach_text() -> str:
+    return FORMAL_STABLE_DETACH_RUNNER.read_text(encoding="utf-8")
+
+
+def test_formal_stable_detach_runner_syntax_and_pinned_lineage() -> None:
+    syntax = subprocess.run(
+        ["bash", "-n", str(FORMAL_STABLE_DETACH_RUNNER)], cwd=ROOT,
+        capture_output=True, text=True, check=False,
+    )
+    assert syntax.returncode == 0, syntax.stderr
+    text = _formal_stable_detach_text()
+    assert "stable_detach_v1.candidate_diag.pt" in text
+    assert "EXPECTED_SOURCE_STEP=12010" in text
+    assert "TARGET_STEP=20000" in text
+    assert "ADDITIONAL_STEPS=7990" in text
+    assert "EXPECTED_SOURCE_SHA256=f580caa4c1588b2a9807f9b0ab746ac54259eaaa482cea16ce5001c30a382f11" in text
+    assert "EXPECTED_SOURCE_REALPATH=/home/ryan/Documents/robot/ORA0/checkpoints/" in text
+    assert "formal_12010_to_20000" in text
+
+
+def test_formal_stable_detach_runner_is_exact_immutable_and_fail_closed() -> None:
+    text = _formal_stable_detach_text()
+    assert 'exec 9>"$LOCK"' in text and "flock -n 9" in text
+    assert "require_no_trainer" in text
+    assert "--query-compute-apps=pid,process_name,used_memory" in text
+    assert "display use is allowed" in text
+    assert "available_kib >= 14 * 1024 * 1024" in text
+    assert 'refuse_existing_outputs' in text
+    assert '[[ "$SAVE" != "$SOURCE" ]]' in text
+    assert 'source checkpoint was modified' in text
+    assert '"model", "optimizer_state", "sampler_state", "rng_state"' in text
+    assert 'optimizer.get("kind") != "adamw"' in text
+    assert 'set(rng) != {"python", "numpy", "torch_cpu", "torch_cuda"}' in text
+    assert 'wmrm_detach_proposal_stage_state") is not True' in text
+    assert 'max_gradient_norm") is not None' in text
+
+
+def test_formal_stable_detach_runner_uses_diagnostic_contract_without_migration() -> None:
+    text = _formal_stable_detach_text()
+    assert "--wmrm-detach-proposal-stage-state" in text
+    assert "--resume-exact-contract-migration" not in text
+    assert '--steps "$ADDITIONAL_STEPS" --save-every 1000' in text
+    assert '--save "$SAVE" --resume-exact "$SOURCE"' in text
+    assert "--save-step-copies" not in text
+    assert "evaluator not run" in text
+    assert 'verify_final' in text
+    launch = text[text.index('"$PY" -u -B train.py'):]
+    for required in (
+        "--world-action-rank-stage cycle", "--main-vision-encode-batch 8",
+        "--wmrm-predictor-depth 6", "--batch-size 3", "--flow-tail-weight 0.036",
+        "--mtvj-visual-aux-every 10",
+    ):
+        assert required in launch
