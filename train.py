@@ -1044,6 +1044,9 @@ class TaskLocalityWeightedSampler(Sampler[list[int]]):
 
 EXACT_RESUME_VERSION = 2
 EXACT_RUN_CONTRACT_VERSION = 1
+WMRM_DETACH_PROPOSAL_STAGE_STATE_MIGRATION = (
+    "wmrm_detach_proposal_stage_state_v1"
+)
 
 # These only control how long/where the already-defined run is executed. They
 # cannot change the next stochastic optimizer update and therefore are allowed
@@ -1056,6 +1059,9 @@ _EXACT_RUN_OPERATIONAL_ARGS = {
     "resume",
     "resume_exact",
     "resume_weights",
+    # This selects a narrowly controlled compatibility policy for validation; it
+    # does not become part of the semantic run contract saved after migration.
+    "resume_exact_contract_migration",
     # Content/config identity is recorded separately, so an identical external
     # metric checkpoint copied to another filename is still the same input.
     "metric_visual_checkpoint",
@@ -1524,6 +1530,7 @@ def build_exact_run_contract(
         model_config.pop("wmrm_inject", None)
         model_config.pop("wmrm_mixer_dropout", None)
         model_config.pop("wmrm_target", None)
+        model_config.pop("wmrm_detach_proposal_stage_state", None)
         model_config.pop("wmrm_predictor", None)
         model_config.pop("wmrm_predictor_depth", None)
         model_config.pop("wmrm_predictor_width", None)
@@ -1603,13 +1610,85 @@ def exact_run_contract_mismatches(saved: dict, current: dict) -> list[tuple[str,
     return mismatches
 
 
-def validate_exact_run_contract(saved: dict | None, current: dict) -> None:
+def _normalize_legacy_exact_run_contract(contract: dict) -> dict:
+    """Fill only defaults that are known for contracts predating these fields."""
+    normalized = _normalize_contract_value(contract)
+    arguments = normalized.get("arguments")
+    if isinstance(arguments, dict):
+        arguments.setdefault("wmrm_detach_proposal_stage_state", False)
+        arguments.setdefault("max_gradient_norm", None)
+    model_config = normalized.get("model_config")
+    if isinstance(model_config, dict):
+        model_config.setdefault("wmrm_detach_proposal_stage_state", False)
+    return normalized
+
+
+def validate_exact_run_contract(
+    saved: dict | None,
+    current: dict,
+    *,
+    migration_id: str | None = None,
+) -> None:
     if saved is None:
         raise ValueError(
             "--resume-exact checkpoint is missing exact_run_contract; "
             "use --resume for legacy weights-only loading"
         )
-    mismatches = exact_run_contract_mismatches(saved, current)
+    normalized_saved = _normalize_legacy_exact_run_contract(saved)
+    normalized_current = _normalize_legacy_exact_run_contract(current)
+    mismatches = exact_run_contract_mismatches(normalized_saved, normalized_current)
+    if migration_id is not None:
+        if migration_id != WMRM_DETACH_PROPOSAL_STAGE_STATE_MIGRATION:
+            raise ValueError(
+                "unsupported --resume-exact-contract-migration: "
+                f"{migration_id!r}"
+            )
+        allowed_paths = {
+            "arguments.wmrm_detach_proposal_stage_state",
+            "model_config.wmrm_detach_proposal_stage_state",
+        }
+        # The migration changes one semantic flag, but the exact contract stores
+        # it in two representations.  Normalize legacy omissions to False, then
+        # require both sides to be coherent before allowing the transition.  In
+        # particular, never accept a partial/contradictory transition where only
+        # one representation changes (or where either contract is internally
+        # inconsistent).
+        saved_arguments = normalized_saved.get("arguments")
+        saved_model_config = normalized_saved.get("model_config")
+        current_arguments = normalized_current.get("arguments")
+        current_model_config = normalized_current.get("model_config")
+        detach_paths = (
+            (saved_arguments, "arguments"),
+            (saved_model_config, "model_config"),
+            (current_arguments, "arguments"),
+            (current_model_config, "model_config"),
+        )
+        if not all(isinstance(value, dict) for value, _ in detach_paths):
+            details = "arguments and model_config must both be mappings"
+        else:
+            saved_values = (
+                saved_arguments["wmrm_detach_proposal_stage_state"],
+                saved_model_config["wmrm_detach_proposal_stage_state"],
+            )
+            current_values = (
+                current_arguments["wmrm_detach_proposal_stage_state"],
+                current_model_config["wmrm_detach_proposal_stage_state"],
+            )
+            coherent = (
+                saved_values == (False, False)
+                and current_values == (True, True)
+                and {path for path, _, _ in mismatches} == allowed_paths
+                and all(left is False and right is True for path, left, right in mismatches)
+            )
+            if coherent:
+                return
+            details = "; ".join(
+                f"{path}: checkpoint={left!r}, runtime={right!r}"
+                for path, left, right in mismatches[:12]
+            ) or "no coherent old-false-both to new-true-both transition"
+        raise ValueError(
+            f"controlled exact-resume migration {migration_id!r} refused: {details}"
+        )
     if mismatches:
         details = "; ".join(
             f"{path}: checkpoint={left!r}, runtime={right!r}"
@@ -1678,7 +1757,7 @@ def exact_optimizer_state_dict(optimizer: torch.optim.Optimizer) -> dict:
     if isinstance(optimizer, SAM):
         if not isinstance(optimizer.base_optimizer, torch.optim.AdamW):
             raise TypeError("--resume-exact only supports SAM with an AdamW base optimizer")
-        if any("e_w" in value for value in optimizer.state.values()):
+        if any("pre_perturbation" in value for value in optimizer.state.values()):
             raise RuntimeError("cannot checkpoint exact state between SAM first_step/second_step")
         return {
             "kind": "sam_adamw",
@@ -1714,6 +1793,7 @@ def restore_exact_optimizer_state(
         if not isinstance(optimizer, torch.optim.AdamW):
             raise TypeError("--resume-exact currently supports AdamW only")
         optimizer.load_state_dict(saved["state_dict"])
+    validate_optimizer_update_state(optimizer)
 
 
 def build_exact_resume_state(
@@ -1746,6 +1826,7 @@ def restore_exact_resume_state(
     sampler: TaskLocalityWeightedSampler | TaskWeightedSampler | None,
     *,
     runtime_exact_run_contract: dict | None = None,
+    migration_id: str | None = None,
     restore_rng: bool = True,
 ) -> int:
     """Restore optimizer/sampler and optionally RNG; return completed updates."""
@@ -1771,7 +1852,9 @@ def restore_exact_resume_state(
     if runtime_exact_run_contract is not None:
         # Contract comparison intentionally precedes every mutable restore below.
         validate_exact_run_contract(
-            checkpoint["exact_run_contract"], runtime_exact_run_contract
+            checkpoint["exact_run_contract"],
+            runtime_exact_run_contract,
+            migration_id=migration_id,
         )
     saved_sampler = checkpoint["sampler_state"]
     if saved_sampler is None:
@@ -4140,6 +4223,9 @@ def rollout_policy(
             visual_memory=pre_step_visual_memory,
             return_visual_memory=True,
             env_action=world_action,
+            detach_wmrm_stage_state=bool(
+                getattr(model.config, "wmrm_detach_proposal_stage_state", False)
+            ),
             **mtvj_kwargs,
         )
         proposal_auxes = list(getattr(model, "last_wmrm_auxes", None) or ())
@@ -5175,6 +5261,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="WAM 执行前缀步数（须与闭环 --execute-steps 一致）",
     )
     parser.add_argument(
+        "--wmrm-detach-proposal-stage-state",
+        action="store_true",
+        help=(
+            "训练 proposal 分支在相邻 WMRM stage map 间 stop-grad；"
+            "前向值不变，默认关闭以保留旧反向语义"
+        ),
+    )
+    parser.add_argument(
         "--wmrm-map-size",
         type=int,
         default=16,
@@ -5886,6 +5980,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "finetuning keeps instruction following (arXiv:2606.23641): perturb weights by "
         "rho*grad/||grad|| then take the real step; costs one extra forward/backward.",
     )
+    parser.add_argument(
+        "--max-gradient-norm",
+        type=float,
+        default=None,
+        help="abort an update when the aggregate gradient norm exceeds this threshold "
+        "(default: disabled). Individual finite gradient elements may exceed it. "
+        "This argument is bound into the exact-resume contract.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     resume_group = parser.add_mutually_exclusive_group()
     resume_group.add_argument(
@@ -5904,6 +6006,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "load model/MT-VJ weights only; optimizer, sampler, RNG and step restart. "
             "Allowed with --task35-precision-contract so a new data/cache SHA can be stamped"
+        ),
+    )
+    parser.add_argument(
+        "--resume-exact-contract-migration",
+        choices=[WMRM_DETACH_PROPOSAL_STAGE_STATE_MIGRATION],
+        help=(
+            "allow one named, controlled exact-contract compatibility transition; "
+            "the selector is operational and is not saved as a run semantic"
         ),
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -5925,10 +6035,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def validate_args(args: argparse.Namespace) -> None:
     """Arg 级契约校验（main 入口调用；纯参数检查，不加载数据/模型）。"""
-    if args.steps <= 0 or args.flow_steps <= 0 or args.lr <= 0.0:
-        raise ValueError("training steps, flow steps, and learning rate must be positive")
-    if args.pair_loss_weight < 0.0:
-        raise ValueError("pair loss weight must be non-negative")
+    finite_positive = {
+        "--lr": args.lr,
+    }
+    for flag, value in finite_positive.items():
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"{flag} must be a positive finite value")
+    for name, value in vars(args).items():
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError(f"--{name.replace('_', '-')} must be finite")
+    if args.steps <= 0 or args.flow_steps <= 0:
+        raise ValueError("training steps and flow steps must be positive")
+    if not math.isfinite(args.pair_loss_weight) or args.pair_loss_weight < 0.0:
+        raise ValueError("pair loss weight must be a non-negative finite value")
+    if args.max_gradient_norm is not None and (
+        not math.isfinite(args.max_gradient_norm) or args.max_gradient_norm <= 0.0
+    ):
+        raise ValueError("--max-gradient-norm must be a positive finite value")
+    if args.resume_exact_contract_migration is not None and args.resume_exact is None:
+        raise ValueError(
+            "--resume-exact-contract-migration requires --resume-exact"
+        )
     visual_world = bool(getattr(args, "visual_world_supervision", False))
     split_manifest = getattr(args, "world_split_manifest", None)
     if visual_world:
@@ -6652,6 +6779,210 @@ def validate_args(args: argparse.Namespace) -> None:
             "warning: --dual-attention only splits the non-sequential VA layers; "
             "sequential layers keep the legacy shared path"
         )
+
+
+def validate_finite_update_scalars(
+    named_losses: list[tuple[str, object]],
+) -> None:
+    """Reject non-finite scalar losses before autograd can touch parameters."""
+    for name, value in named_losses:
+        if value is None:
+            continue
+        if not isinstance(value, torch.Tensor):
+            value = torch.as_tensor(value)
+        if value.numel() != 1:
+            raise RuntimeError(
+                f"non-scalar update loss {name}: shape={tuple(value.shape)}"
+            )
+        if not bool(torch.isfinite(value.detach()).item()):
+            raise FloatingPointError(
+                f"non-finite update loss {name}: value={value.detach().item()!r}"
+            )
+
+
+def validate_update_gradients(
+    named_parameters,
+    *,
+    max_norm: float | None = None,
+) -> float:
+    """Validate current parameters/gradients and return their aggregate grad norm.
+
+    The parameter check shares the already-required gradient traversal, so every
+    update is guarded without copying parameters or optimizer state. ``None``
+    gradients are allowed because conditional branches can leave modules unused.
+    ``max_norm`` applies only to the aggregate norm, never to individual elements.
+    """
+    norm_terms: list[float] = []
+    seen: set[int] = set()
+    for name, parameter in named_parameters:
+        if not parameter.requires_grad or id(parameter) in seen:
+            continue
+        seen.add(id(parameter))
+        parameter_value = parameter.detach()
+        if not bool(torch.isfinite(parameter_value).all().item()):
+            bad = (~torch.isfinite(parameter_value)).flatten().nonzero(as_tuple=False)[0].item()
+            value = parameter_value.flatten()[bad].item()
+            raise FloatingPointError(f"non-finite parameter {name}: value={value!r}")
+        gradient = parameter.grad
+        if gradient is None:
+            continue
+        finite = torch.isfinite(gradient.detach())
+        if not bool(finite.all().item()):
+            bad = (~finite).flatten().nonzero(as_tuple=False)[0].item()
+            value = gradient.detach().flatten()[bad].item()
+            raise FloatingPointError(
+                f"non-finite gradient {name}: value={value!r}"
+            )
+        norm_terms.append(float(gradient.detach().double().norm().item()))
+    norm = math.sqrt(math.fsum(term * term for term in norm_terms))
+    if not math.isfinite(norm):
+        raise FloatingPointError(f"non-finite aggregate gradient norm: value={norm!r}")
+    if max_norm is not None and norm > max_norm:
+        raise FloatingPointError(
+            f"gradient threshold exceeded aggregate_norm: value={norm!r} "
+            f"> threshold={max_norm!r}"
+        )
+    return norm
+
+
+def validate_optimizer_update_state(
+    optimizer: torch.optim.Optimizer,
+    *,
+    validate_values: bool = True,
+) -> None:
+    """Validate optimizer hyperparameters, parameters, and existing tensor state.
+
+    This full state scan runs once after startup/resume. Per update, callers repeat
+    the cheap param-group validation and use :func:`validate_update_gradients` to
+    scan live parameters; AdamW state is not transactionally copied or rescanned
+    because finite source state plus guarded parameters, gradients, and arithmetic
+    inputs make the next ordinary update finite.
+    """
+    base = optimizer.base_optimizer if isinstance(optimizer, SAM) else optimizer
+    for group_index, group in enumerate(base.param_groups):
+        def finite_number(key: str, *, minimum: float, strict: bool = False) -> float:
+            try:
+                value = float(group[key])
+            except (KeyError, TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    f"invalid optimizer group[{group_index}] {key}: {group.get(key)!r}"
+                ) from exc
+            valid = math.isfinite(value) and (value > minimum if strict else value >= minimum)
+            if not valid:
+                comparator = ">" if strict else ">="
+                raise ValueError(
+                    f"invalid optimizer group[{group_index}] {key}: {value!r}; "
+                    f"must be finite and {comparator} {minimum}"
+                )
+            return value
+
+        finite_number("lr", minimum=0.0)
+        if "initial_lr" in group:
+            finite_number("initial_lr", minimum=0.0)
+        finite_number("weight_decay", minimum=0.0)
+        finite_number("eps", minimum=0.0, strict=True)
+        betas = group.get("betas")
+        if not isinstance(betas, (tuple, list)) or len(betas) != 2:
+            raise ValueError(f"invalid optimizer group[{group_index}] betas: {betas!r}")
+        for beta_index, beta in enumerate(betas):
+            try:
+                beta_value = float(beta)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    f"invalid optimizer group[{group_index}] beta[{beta_index}]: {beta!r}"
+                ) from exc
+            if not math.isfinite(beta_value) or not 0.0 <= beta_value < 1.0:
+                raise ValueError(
+                    f"invalid optimizer group[{group_index}] beta[{beta_index}]: "
+                    f"{beta_value!r}; must be finite and in [0, 1)"
+                )
+        if isinstance(optimizer, SAM):
+            sam_group = optimizer.param_groups[group_index]
+            try:
+                rho = float(sam_group["rho"])
+            except (KeyError, TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    f"invalid optimizer group[{group_index}] rho: {sam_group.get('rho')!r}"
+                ) from exc
+            if not math.isfinite(rho) or rho < 0.0:
+                raise ValueError(
+                    f"invalid optimizer group[{group_index}] rho: {rho!r}; "
+                    "must be finite and >= 0"
+                )
+        if validate_values:
+            for parameter_index, parameter in enumerate(group["params"]):
+                if not bool(torch.isfinite(parameter.detach()).all().item()):
+                    raise FloatingPointError(
+                        f"non-finite optimizer parameter group[{group_index}]"
+                        f"[{parameter_index}]"
+                    )
+
+    def validate_state_value(path: str, value: object) -> None:
+        if isinstance(value, torch.Tensor):
+            if not bool(torch.isfinite(value.detach()).all().item()):
+                raise FloatingPointError(f"non-finite optimizer state {path}")
+        elif isinstance(value, dict):
+            for key, child in value.items():
+                validate_state_value(f"{path}.{key}", child)
+        elif isinstance(value, (list, tuple)):
+            for index, child in enumerate(value):
+                validate_state_value(f"{path}[{index}]", child)
+        elif isinstance(value, (float, np.floating)) and not math.isfinite(float(value)):
+            raise FloatingPointError(f"non-finite optimizer state {path}: {value!r}")
+
+    for state_index, state in enumerate(base.state.values()):
+        if validate_values:
+            validate_state_value(f"state[{state_index}]", state)
+
+
+def named_trainable_parameters(*modules):
+    """Yield unique, stably named trainable parameters from update modules."""
+    seen: set[int] = set()
+    for prefix, module in modules:
+        if module is None:
+            continue
+        for name, parameter in module.named_parameters():
+            if parameter.requires_grad and id(parameter) not in seen:
+                seen.add(id(parameter))
+                yield f"{prefix}.{name}", parameter
+
+
+def named_optimizer_parameters(optimizer, *modules):
+    """Name every unique trainable optimizer parameter, including external heads."""
+    known = {
+        id(parameter): name
+        for name, parameter in named_trainable_parameters(*modules)
+    }
+    seen: set[int] = set()
+    for group_index, group in enumerate(optimizer.param_groups):
+        for parameter_index, parameter in enumerate(group["params"]):
+            if not parameter.requires_grad or id(parameter) in seen:
+                continue
+            seen.add(id(parameter))
+            yield (
+                known.get(
+                    id(parameter),
+                    f"optimizer.group[{group_index}].parameter[{parameter_index}]",
+                ),
+                parameter,
+            )
+
+
+def clip_update_gradients(named_parameters, *, max_norm: float) -> float:
+    """Clip already-validated gradients, with PyTorch's finite-error guard."""
+    unique_parameters = []
+    seen: set[int] = set()
+    for _, parameter in named_parameters:
+        if parameter.requires_grad and id(parameter) not in seen:
+            seen.add(id(parameter))
+            unique_parameters.append(parameter)
+    return float(
+        torch.nn.utils.clip_grad_norm_(
+            unique_parameters,
+            max_norm,
+            error_if_nonfinite=True,
+        ).item()
+    )
 
 
 def scale_semantic_lora_grads(text_backbone: nn.Module, scale: float) -> None:
@@ -7417,7 +7748,8 @@ class SAM(torch.optim.Optimizer):
     """
 
     def __init__(self, params, base_optimizer, rho: float, **kwargs) -> None:
-        assert rho >= 0.0, "SAM rho must be non-negative"
+        if not math.isfinite(float(rho)) or rho < 0.0:
+            raise ValueError("SAM rho must be finite and non-negative")
         defaults = dict(rho=rho, **kwargs)
         super().__init__(params, defaults)
         self.base_optimizer = base_optimizer(self.param_groups, **kwargs)
@@ -7431,20 +7763,27 @@ class SAM(torch.optim.Optimizer):
             for p in group["params"]:
                 if p.grad is None:
                     continue
+                original = p.detach().clone(memory_format=torch.preserve_format)
                 e_w = p.grad * scale.to(p.device)
                 p.add_(e_w)
-                self.state[p]["e_w"] = e_w
+                self.state[p]["pre_perturbation"] = original
+        if zero_grad:
+            self.zero_grad()
+
+    @torch.no_grad()
+    def restore_step(self, zero_grad: bool = False) -> None:
+        """Undo a first-step perturbation without applying the base optimizer."""
+        for group in self.param_groups:
+            for p in group["params"]:
+                original = self.state[p].pop("pre_perturbation", None)
+                if original is not None:
+                    p.copy_(original)
         if zero_grad:
             self.zero_grad()
 
     @torch.no_grad()
     def second_step(self, zero_grad: bool = False) -> None:
-        for group in self.param_groups:
-            for p in group["params"]:
-                if p.grad is None or "e_w" not in self.state[p]:
-                    continue
-                p.sub_(self.state[p]["e_w"])
-                self.state[p].pop("e_w", None)
+        self.restore_step(zero_grad=False)
         self.base_optimizer.step()
         if zero_grad:
             self.zero_grad()
@@ -7588,6 +7927,9 @@ def main() -> None:
             wmrm_cycle_steps=getattr(args, "wmrm_cycle_steps", 6),
             wmrm_med_margin=getattr(args, "wmrm_med_margin", 0.05),
             wmrm_handshake=getattr(args, "wmrm_handshake", True),
+            wmrm_detach_proposal_stage_state=getattr(
+                args, "wmrm_detach_proposal_stage_state", False
+            ),
             wmrm_map_size=getattr(args, "wmrm_map_size", 16),
             wmrm_map_channels=getattr(args, "wmrm_map_channels", 32),
             wmrm_world_grid=getattr(args, "wmrm_world_grid", 16),
@@ -7891,6 +8233,9 @@ def main() -> None:
             wmrm_cycle_steps=getattr(args, "wmrm_cycle_steps", 6),
             wmrm_med_margin=getattr(args, "wmrm_med_margin", 0.05),
             wmrm_handshake=getattr(args, "wmrm_handshake", True),
+            wmrm_detach_proposal_stage_state=getattr(
+                args, "wmrm_detach_proposal_stage_state", False
+            ),
             wmrm_map_size=getattr(args, "wmrm_map_size", 16),
             wmrm_map_channels=getattr(args, "wmrm_map_channels", 32),
             wmrm_world_grid=getattr(args, "wmrm_world_grid", 16),
@@ -8185,6 +8530,9 @@ def main() -> None:
             wmrm_cycle_steps=getattr(args, "wmrm_cycle_steps", 6),
             wmrm_med_margin=getattr(args, "wmrm_med_margin", 0.05),
             wmrm_handshake=getattr(args, "wmrm_handshake", True),
+            wmrm_detach_proposal_stage_state=getattr(
+                args, "wmrm_detach_proposal_stage_state", False
+            ),
             wmrm_map_size=getattr(args, "wmrm_map_size", 16),
             wmrm_map_channels=getattr(args, "wmrm_map_channels", 32),
             wmrm_world_grid=getattr(args, "wmrm_world_grid", 16),
@@ -8588,6 +8936,7 @@ def main() -> None:
             weight_decay=1e-4,
         )
         print(f"SAM enabled: rho={args.sam_rho} (2x forward per step)")
+    validate_optimizer_update_state(optimizer)
 
     # E7 WAM v1（M0）：--wam-joint 时 attach 独立 WAM 模块（只读残差通路，
     # 由 scripts/train_wam_e7.py 独立训练）。object.__setattr__ 绕过
@@ -8646,7 +8995,9 @@ def main() -> None:
             # Fail before restoring model/optimizer/sampler/RNG if any data,
             # objective, sampler, architecture or optimizer semantic changed.
             validate_exact_run_contract(
-                resume_ckpt.get("exact_run_contract"), runtime_exact_run_contract
+                resume_ckpt.get("exact_run_contract"),
+                runtime_exact_run_contract,
+                migration_id=args.resume_exact_contract_migration,
             )
         resume_config = resume_ckpt["config"]
         for key in (
@@ -8862,6 +9213,7 @@ def main() -> None:
                 optimizer,
                 sampler,
                 runtime_exact_run_contract=runtime_exact_run_contract,
+                migration_id=args.resume_exact_contract_migration,
                 restore_rng=False,
             )
             resume_rng_state = resume_ckpt["rng_state"]
@@ -9176,9 +9528,21 @@ def main() -> None:
                     f"(ρ1={metrics['rho1']:.4f}/ρ6={metrics['rho6']:.2f})]"
                 )
             optimizer.zero_grad(set_to_none=True)
+            validate_finite_update_scalars([("c2.total", loss)])
             loss.backward()
-            gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            c2_named_parameters = list(
+                named_trainable_parameters(("model", model))
+            )
+            validate_optimizer_update_state(optimizer, validate_values=False)
+            validate_update_gradients(
+                c2_named_parameters,
+                max_norm=args.max_gradient_norm,
+            )
+            gradient_norm = clip_update_gradients(
+                c2_named_parameters, max_norm=1.0
+            )
             optimizer.step()
+            validate_optimizer_update_state(optimizer)
             commit_successful_update(step, consumed_locality_batch)
             print(
                 f"step={step} mode={args.mode} contract=single_c2 "
@@ -9615,6 +9979,19 @@ def main() -> None:
                 semantic_geom_loss,
             ) = compute_loss(batch, noisy_actions, flow_time)
 
+        validate_finite_update_scalars(
+            [
+                ("total", total_loss),
+                ("action", action_total),
+                ("flow", flow_loss),
+                ("flow_prefix", flow_prefix_loss),
+                ("flow_tail", flow_tail_loss),
+                ("pair", pair_loss),
+                ("future", future_loss),
+                ("semantic_anchor", semantic_anchor_loss),
+                ("semantic_geometry", semantic_geom_loss),
+            ]
+        )
         # P0-5：动作损失与语义损失分开 backward——LoRA 参数只缩放动作侧梯度
         # （η_act），anchor/geometry 梯度完整（旧实现统一缩放两者）。
         action_total.backward()
@@ -9652,6 +10029,7 @@ def main() -> None:
                     vis_lambda=args.mtvj_visual_aux_vis_lambda,
                     sim_batch=aux_sim_batch,
                 )
+            validate_finite_update_scalars([("visual_aux", aux_loss)])
             aux_loss.backward()
         if e2e_model is not None and args.semantic_adapter:
             scale_semantic_lora_grads(
@@ -9697,10 +10075,37 @@ def main() -> None:
             metric_clip_params = [
                 p for p in metric_head.parameters() if p.requires_grad
             ]
-        gradient_norm = torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
+        update_named_parameters = list(
+            named_optimizer_parameters(
+                optimizer,
+                ("e2e_model", e2e_model),
+                ("model", model),
+                ("scene_teacher", scene_teacher),
+                ("vision_backbone", vision_backbone),
+                ("servo", servo),
+                ("relation_encoder", relation_encoder),
+                ("metric_head", metric_head),
+            )
+        )
+        validate_optimizer_update_state(optimizer, validate_values=False)
+        validate_update_gradients(
+            update_named_parameters, max_norm=args.max_gradient_norm
+        )
+        main_parameter_ids = {id(parameter) for parameter in clip_params}
+        main_named_parameters = [
+            (name, parameter)
+            for name, parameter in update_named_parameters
+            if id(parameter) in main_parameter_ids
+        ]
+        gradient_norm = clip_update_gradients(main_named_parameters, max_norm=1.0)
+        metric_named_parameters = [
+            (name, parameter)
+            for name, parameter in update_named_parameters
+            if id(parameter) in {id(p) for p in metric_clip_params}
+        ]
         metric_clip_norm = (
-            torch.nn.utils.clip_grad_norm_(metric_clip_params, 1.0)
-            if metric_clip_params
+            clip_update_gradients(metric_named_parameters, max_norm=1.0)
+            if metric_named_parameters
             else None
         )
         if args.sam_rho > 0:
@@ -9709,25 +10114,40 @@ def main() -> None:
             # 文档：first_step 的扰动方向与缩放无关——ρ·g/‖g‖ 与缩放无关；实际步长
             # 由第二次缩放后的梯度决定，因此两次缩放才使 η_act 对 SAM 生效）。
             optimizer.first_step(zero_grad=True)
-            with feature_policy_autocast(
-                device, bool(args.feature_autocast_bf16)
-            ):
-                second_losses = compute_loss(batch, noisy_actions, flow_time)
-            action_total2, semantic_total2 = second_losses[:2]
-            action_total2.backward()
-            if e2e_model is not None and args.semantic_adapter:
-                scale_semantic_lora_grads(
-                    e2e_model.text_backbone, args.semantic_act_grad_scale
+            try:
+                with feature_policy_autocast(
+                    device, bool(args.feature_autocast_bf16)
+                ):
+                    second_losses = compute_loss(batch, noisy_actions, flow_time)
+                action_total2, semantic_total2 = second_losses[:2]
+                validate_finite_update_scalars(
+                    [("sam.total", second_losses[1]), ("sam.action", action_total2)]
                 )
-            if args.semantic_adapter and (
-                args.semantic_anchor_weight > 0.0
-                or args.semantic_geometry_weight > 0.0
-            ):
-                semantic_total2.backward()
-            torch.nn.utils.clip_grad_norm_(clip_params, 1.0)
+                action_total2.backward()
+                if e2e_model is not None and args.semantic_adapter:
+                    scale_semantic_lora_grads(
+                        e2e_model.text_backbone, args.semantic_act_grad_scale
+                    )
+                if args.semantic_adapter and (
+                    args.semantic_anchor_weight > 0.0
+                    or args.semantic_geometry_weight > 0.0
+                ):
+                    semantic_total2.backward()
+                validate_optimizer_update_state(optimizer, validate_values=False)
+                validate_update_gradients(
+                    update_named_parameters,
+                    max_norm=args.max_gradient_norm,
+                )
+                clip_update_gradients(main_named_parameters, max_norm=1.0)
+                if metric_named_parameters:
+                    clip_update_gradients(metric_named_parameters, max_norm=1.0)
+            except Exception:
+                optimizer.restore_step(zero_grad=True)
+                raise
             optimizer.second_step(zero_grad=True)
         else:
             optimizer.step()
+        validate_optimizer_update_state(optimizer)
         commit_successful_update(step, consumed_locality_batch)
         gate_log = (
             f" evsm_gate={evsm_gate_mean:.3f}" if evsm_gate_mean is not None else ""

@@ -99,6 +99,9 @@ class VACompoundConfig:
     wmrm_med_margin: float = 0.05
     # False = JEPA-style world-only: predict next latent, do not write A' and do not read VA's A.
     wmrm_handshake: bool = True
+    # Training proposal only: stop gradients between successive WMRM stage maps while
+    # preserving their forward values. Logged/evaluator forwards choose explicitly.
+    wmrm_detach_proposal_stage_state: bool = False
     wmrm_map_size: int = 16
     wmrm_map_channels: int = 32
     wmrm_world_grid: int = 16  # handshake keeps native DINO grid; do not pool 16→4

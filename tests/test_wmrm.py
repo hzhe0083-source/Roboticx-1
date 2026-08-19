@@ -124,6 +124,91 @@ def test_encode_condition_stage_map_detach_gradient_contract() -> None:
     assert detached_grad is None or int(torch.count_nonzero(detached_grad)) == 0
 
 
+def test_rollout_proposal_stage_detach_is_explicit_and_forward_identical() -> None:
+    from train import rollout_policy
+
+    base_config = _tiny_spatial_config()
+    detached_config = _tiny_config(
+        vision_dim=8,
+        main_vision_dim=8,
+        num_layers=2,
+        action_horizon=6,
+        action_dim=4,
+        wmrm=True,
+        wmrm_cycle_steps=6,
+        wmrm_inject="all",
+        wmrm_handshake=True,
+        wmrm_detach_proposal_stage_state=True,
+        wmrm_predictor="st_blocks",
+        wmrm_predictor_depth=1,
+        wmrm_predictor_width=16,
+        wmrm_predictor_heads=4,
+        wmrm_map_size=4,
+        wmrm_map_channels=8,
+        wmrm_world_grid=4,
+        main_vision_grid=4,
+        main_vision_frames=2,
+        main_vision_tokens=32,
+    )
+    legacy = VACompoundPolicy(base_config).eval()
+    detached = VACompoundPolicy(detached_config).eval()
+    detached.load_state_dict(legacy.state_dict(), strict=True)
+
+    vision, proprio, previous, language, mask, actions = _spatial_inputs(base_config)
+    sequence = 2
+    batch = {
+        "vision_tokens": vision[:, None].expand(-1, sequence, -1, -1).clone(),
+        "proprio": proprio[:, None].expand(-1, sequence, -1).clone(),
+        "previous_action": previous[:, None].expand(-1, sequence, -1).clone(),
+        "actions": actions[:, None].expand(-1, sequence, -1, -1).clone(),
+        "language_hidden": language,
+        "language_mask": mask,
+    }
+    noisy = torch.randn(
+        vision.shape[0], sequence, base_config.action_horizon, base_config.action_dim
+    )
+    flow_time = torch.rand(vision.shape[0], sequence)
+
+    calls: dict[str, list[bool]] = {"legacy": [], "detached": []}
+    for name, model in (("legacy", legacy), ("detached", detached)):
+        original = model.encode_condition
+
+        def record(*args, _name=name, _original=original, **kwargs):
+            if not kwargs.get("skip_wmrm", False):
+                calls[_name].append(bool(kwargs.get("detach_wmrm_stage_state", False)))
+            return _original(*args, **kwargs)
+
+        model.encode_condition = record
+
+    legacy_outputs = rollout_policy(legacy, batch, noisy, flow_time, flow_steps=2)
+    detached_outputs = rollout_policy(detached, batch, noisy, flow_time, flow_steps=2)
+
+    assert calls == {"legacy": [False, False], "detached": [True, True]}
+    for legacy_output, detached_output in zip(
+        legacy_outputs, detached_outputs, strict=True
+    ):
+        torch.testing.assert_close(
+            legacy_output, detached_output, rtol=0.0, atol=0.0
+        )
+    torch.testing.assert_close(
+        torch.stack([aux.z_tokens for aux in legacy.last_wmrm_auxes]),
+        torch.stack([aux.z_tokens for aux in detached.last_wmrm_auxes]),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
+def test_cli_proposal_stage_detach_defaults_off_and_is_configurable() -> None:
+    from train import parse_args
+
+    assert parse_args([]).wmrm_detach_proposal_stage_state is False
+    assert (
+        parse_args(["--wmrm-detach-proposal-stage-state"])
+        .wmrm_detach_proposal_stage_state
+        is True
+    )
+
+
 def test_evaluator_world_forward_matches_full_logged_forward_stage_maps() -> None:
     from scripts.eval_wam4va_world_action import _world_forward
 

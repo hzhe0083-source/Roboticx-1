@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import random
 from types import SimpleNamespace
 
@@ -24,6 +25,12 @@ from train import (
     build_dataset_content_identity,
     build_exact_resume_state,
     build_exact_run_contract,
+    clip_update_gradients,
+    named_optimizer_parameters,
+    validate_args,
+    validate_finite_update_scalars,
+    validate_optimizer_update_state,
+    validate_update_gradients,
     final_checkpoint_save_due,
     parse_args,
     restore_exact_resume_state,
@@ -257,6 +264,93 @@ def test_step_copy_collision_does_not_overwrite_archive(tmp_path) -> None:
     assert not (tmp_path / "policy_s7.pt.tmp").exists()
 
 
+def test_update_guards_reject_nonfinite_without_optimizer_mutation() -> None:
+    model = nn.Linear(1, 1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
+    parameter_snapshot = {
+        name: value.detach().clone() for name, value in model.named_parameters()
+    }
+    optimizer_snapshot = optimizer.state_dict()
+    loss = torch.tensor(float("nan"), requires_grad=True)
+    with pytest.raises(FloatingPointError, match="non-finite update loss total"):
+        validate_finite_update_scalars([("total", loss)])
+    assert optimizer.state_dict() == optimizer_snapshot
+    for name, value in model.named_parameters():
+        torch.testing.assert_close(value, parameter_snapshot[name])
+
+
+def test_gradient_guard_names_first_bad_value_and_clip_is_finite() -> None:
+    model = nn.Linear(2, 1)
+    named = list(
+        named_optimizer_parameters(
+            torch.optim.AdamW(model.parameters()), ("model", model)
+        )
+    )
+    model.weight.grad = torch.tensor([[1.0, float("inf")]])
+    model.bias.grad = torch.tensor([1.0])
+    with pytest.raises(FloatingPointError, match="non-finite gradient model.weight"):
+        validate_update_gradients(named)
+    model.weight.grad = torch.tensor([[3.0, 4.0]])
+    norm = validate_update_gradients(named, max_norm=10.0)
+    assert norm == pytest.approx(5.0990195)
+    assert clip_update_gradients(named, max_norm=1.0) == pytest.approx(norm)
+    assert torch.isfinite(model.weight.grad).all()
+
+
+def test_gradient_threshold_applies_only_to_aggregate_norm() -> None:
+    parameter = nn.Parameter(torch.tensor([0.0]))
+    parameter.grad = torch.tensor([2.0])
+    assert validate_update_gradients([("parameter", parameter)], max_norm=3.0) == 2.0
+    with pytest.raises(FloatingPointError, match="aggregate_norm"):
+        validate_update_gradients([("parameter", parameter)], max_norm=1.0)
+
+
+def test_optimizer_guard_rejects_nan_lr_and_nonfinite_state() -> None:
+    model = nn.Linear(1, 1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
+    optimizer.param_groups[0]["lr"] = float("nan")
+    with pytest.raises(ValueError, match=r"group\[0\] lr"):
+        validate_optimizer_update_state(optimizer)
+
+    optimizer.param_groups[0]["lr"] = 1e-2
+    parameter = next(model.parameters())
+    optimizer.state[parameter]["exp_avg"] = torch.tensor([float("inf")])
+    with pytest.raises(FloatingPointError, match="optimizer state"):
+        validate_optimizer_update_state(optimizer)
+
+
+def test_validate_args_rejects_nan_learning_rate() -> None:
+    args = parse_args(["--single-task", "--lr", "nan"])
+    with pytest.raises(ValueError, match="--lr must be a positive finite value"):
+        validate_args(args)
+
+
+def test_parameter_guard_rejects_nonfinite_value_before_update() -> None:
+    model = nn.Linear(1, 1)
+    with torch.no_grad():
+        model.weight.fill_(float("nan"))
+    model.weight.grad = torch.ones_like(model.weight)
+    with pytest.raises(FloatingPointError, match="non-finite parameter model.weight"):
+        validate_update_gradients([("model.weight", model.weight)])
+
+
+def test_sam_guard_can_restore_perturbation_without_base_step() -> None:
+    model = nn.Linear(1, 1)
+    optimizer = SAM(model.parameters(), torch.optim.AdamW, rho=0.1, lr=1e-2)
+    original = {
+        name: value.detach().clone() for name, value in model.named_parameters()
+    }
+    model(torch.ones(1, 1)).backward()
+    optimizer.first_step(zero_grad=True)
+    model.weight.grad = torch.tensor([[float("nan")]])
+    with pytest.raises(FloatingPointError, match="model.weight"):
+        validate_update_gradients([("model.weight", model.weight)])
+    optimizer.restore_step(zero_grad=True)
+    for name, value in model.named_parameters():
+        assert torch.equal(value, original[name]), f"SAM restore changed bits for {name}"
+    assert optimizer.base_optimizer.state_dict()["state"] == {}
+
+
 def test_sam_roundtrip_uses_base_adamw_state() -> None:
     torch.manual_seed(7)
     model = nn.Linear(2, 1)
@@ -381,6 +475,164 @@ def test_exact_contract_rejects_changed_objective_args(
     )
     with pytest.raises(ValueError, match=field):
         validate_exact_run_contract(baseline, current)
+
+
+def test_exact_contract_binds_wmrm_proposal_stage_detach() -> None:
+    _, optimizer = _model_and_optimizer()
+    baseline_args = parse_args(["--wam4va"])
+    changed_args = parse_args(["--wam4va", "--wmrm-detach-proposal-stage-state"])
+    config = SimpleNamespace(
+        num_layers=8,
+        action_horizon=48,
+        wmrm=True,
+        wmrm_detach_proposal_stage_state=False,
+    )
+    baseline = build_exact_run_contract(baseline_args, config, optimizer, _sampler())
+    current = build_exact_run_contract(changed_args, config, optimizer, _sampler())
+    with pytest.raises(ValueError, match="wmrm_detach_proposal_stage_state"):
+        validate_exact_run_contract(baseline, current)
+
+
+def test_controlled_detach_migration_allows_only_false_or_absent_to_true() -> None:
+    _, optimizer = _model_and_optimizer()
+    legacy_args = parse_args(["--wam4va"])
+    candidate_args = parse_args(
+        ["--wam4va", "--wmrm-detach-proposal-stage-state"]
+    )
+    legacy_config = SimpleNamespace(
+        num_layers=8,
+        action_horizon=48,
+        wmrm=True,
+        wmrm_detach_proposal_stage_state=False,
+    )
+    candidate_config = SimpleNamespace(
+        num_layers=8,
+        action_horizon=48,
+        wmrm=True,
+        wmrm_detach_proposal_stage_state=True,
+    )
+    saved = build_exact_run_contract(
+        legacy_args, legacy_config, optimizer, _sampler()
+    )
+    current = build_exact_run_contract(
+        candidate_args, candidate_config, optimizer, _sampler()
+    )
+    saved["arguments"].pop("wmrm_detach_proposal_stage_state")
+    saved["arguments"].pop("max_gradient_norm")
+    saved["model_config"].pop("wmrm_detach_proposal_stage_state")
+    snapshot = copy.deepcopy(saved)
+
+    validate_exact_run_contract(
+        saved,
+        current,
+        migration_id="wmrm_detach_proposal_stage_state_v1",
+    )
+    assert saved == snapshot
+
+    changed = copy.deepcopy(current)
+    changed["arguments"]["flow_tail_weight"] = 0.2
+    with pytest.raises(ValueError, match="controlled exact-resume migration.*flow_tail_weight"):
+        validate_exact_run_contract(
+            saved,
+            changed,
+            migration_id="wmrm_detach_proposal_stage_state_v1",
+        )
+
+
+def test_controlled_detach_migration_id_is_operational_and_not_a_bypass() -> None:
+    _, optimizer = _model_and_optimizer()
+    args = parse_args(
+        [
+            "--wam4va",
+            "--wmrm-detach-proposal-stage-state",
+            "--resume-exact-contract-migration",
+            "wmrm_detach_proposal_stage_state_v1",
+        ]
+    )
+    config = SimpleNamespace(
+        num_layers=8,
+        action_horizon=48,
+        wmrm=True,
+        wmrm_detach_proposal_stage_state=True,
+    )
+    contract = build_exact_run_contract(args, config, optimizer, _sampler())
+    assert "resume_exact_contract_migration" not in contract["arguments"]
+    with pytest.raises(ValueError, match="no coherent old-false-both"):
+        validate_exact_run_contract(
+            contract,
+            contract,
+            migration_id="wmrm_detach_proposal_stage_state_v1",
+        )
+    with pytest.raises(ValueError, match="unsupported"):
+        validate_exact_run_contract(contract, contract, migration_id="wrong_v1")
+
+
+def test_controlled_detach_migration_rejects_partial_representation_transition() -> None:
+    _, optimizer = _model_and_optimizer()
+    saved = _contract()
+    current = copy.deepcopy(saved)
+    saved["arguments"]["wmrm_detach_proposal_stage_state"] = False
+    saved["model_config"]["wmrm_detach_proposal_stage_state"] = False
+    current["arguments"]["wmrm_detach_proposal_stage_state"] = True
+    current["model_config"]["wmrm_detach_proposal_stage_state"] = False
+    with pytest.raises(ValueError, match="controlled exact-resume migration"):
+        validate_exact_run_contract(
+            saved,
+            current,
+            migration_id="wmrm_detach_proposal_stage_state_v1",
+        )
+
+
+def test_controlled_detach_migration_rejects_contradictory_saved_contract() -> None:
+    saved = _contract()
+    current = copy.deepcopy(saved)
+    saved["arguments"]["wmrm_detach_proposal_stage_state"] = False
+    saved["model_config"]["wmrm_detach_proposal_stage_state"] = True
+    current["arguments"]["wmrm_detach_proposal_stage_state"] = True
+    current["model_config"]["wmrm_detach_proposal_stage_state"] = True
+    with pytest.raises(ValueError, match="controlled exact-resume migration"):
+        validate_exact_run_contract(
+            saved,
+            current,
+            migration_id="wmrm_detach_proposal_stage_state_v1",
+        )
+
+
+def test_migrated_restore_preserves_checkpoint_and_exact_training_state() -> None:
+    model, optimizer = _model_and_optimizer()
+    sampler = _sampler()
+    _seed_training_rngs()
+    _update(model, optimizer, sampler)
+    saved_contract = _contract()
+    saved_contract["arguments"].update(
+        {"wmrm_detach_proposal_stage_state": False, "max_gradient_norm": None}
+    )
+    saved_contract["model_config"]["wmrm_detach_proposal_stage_state"] = False
+    checkpoint = {"model": copy.deepcopy(model.state_dict())}
+    checkpoint.update(build_exact_resume_state(optimizer, 1, sampler, saved_contract))
+    checkpoint_snapshot = copy.deepcopy(checkpoint)
+
+    restored_model, restored_optimizer = _model_and_optimizer()
+    restored_sampler = _sampler()
+    restored_model.load_state_dict(checkpoint["model"])
+    current_contract = copy.deepcopy(saved_contract)
+    current_contract["arguments"]["wmrm_detach_proposal_stage_state"] = True
+    current_contract["model_config"]["wmrm_detach_proposal_stage_state"] = True
+    step = restore_exact_resume_state(
+        checkpoint,
+        restored_optimizer,
+        restored_sampler,
+        runtime_exact_run_contract=current_contract,
+        migration_id="wmrm_detach_proposal_stage_state_v1",
+    )
+
+    assert step == 1
+    assert restored_optimizer.state_dict() == optimizer.state_dict()
+    assert restored_sampler.state_dict() == sampler.state_dict()
+    assert checkpoint.keys() == checkpoint_snapshot.keys()
+    assert checkpoint["exact_run_contract"] == checkpoint_snapshot["exact_run_contract"]
+    for name, value in checkpoint["model"].items():
+        torch.testing.assert_close(value, checkpoint_snapshot["model"][name], rtol=0, atol=0)
 
 
 def test_exact_contract_allows_checkpoint_archive_policy_changes() -> None:

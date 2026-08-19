@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import subprocess
 
 
@@ -315,3 +316,126 @@ def test_research_ab_20k_is_ordered_exact_resume_with_rolling_save() -> None:
         '"$rolling" "$final_report" "$final_gate_log" 20000 "$stage_mode"'
         in formal
     )
+
+
+STABLE_DETACH_RUNNER = (
+    ROOT / "scripts" / "continue_mw_hard2_visualmotion_stable_detach_v1.sh"
+)
+
+
+def _stable_detach_text() -> str:
+    return STABLE_DETACH_RUNNER.read_text(encoding="utf-8")
+
+
+def test_stable_detach_runner_syntax_and_nonlaunching_usage() -> None:
+    syntax = subprocess.run(
+        ["bash", "-n", str(STABLE_DETACH_RUNNER)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert syntax.returncode == 0, syntax.stderr
+
+    invalid = subprocess.run(
+        ["bash", str(STABLE_DETACH_RUNNER), "invalid-mode"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert invalid.returncode == 2
+    assert "{baseline-replay|stabilized-candidate}" in invalid.stderr
+
+    candidate = subprocess.run(
+        ["bash", str(STABLE_DETACH_RUNNER), "stabilized-candidate"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "PY": "/definitely/missing/python"},
+    )
+    assert candidate.returncode != 0
+    assert "missing required file: /definitely/missing/python" in candidate.stderr
+    assert "diagnostic only:" not in candidate.stdout
+
+
+def test_stable_detach_runner_has_new_immutable_lineage_and_short_stop() -> None:
+    text = _stable_detach_text()
+    assert "PY=${PY:-/home/ryan/.venvs/openvla/bin/python}" in text
+    assert "FAMILY=mw_hard2_wam4va_visualmotion_stable_detach_v1" in text
+    assert "EXPECTED_SOURCE_STEP=12000" in text
+    assert "DIAGNOSTIC_TARGET_STEP=12010" in text
+    assert "--steps 10 --save-every 1 --save-step-copies" in text
+    assert "STOP before formal continuation" in text
+    assert "20000" not in text
+    assert 'refuse_output_family "$run_id"' in text
+    assert '[[ "$save" != "$SOURCE" ]]' in text
+    assert "refusing to overwrite immutable diagnostic family" in text
+    assert "checkpoints/${run_id}_s${step}.pt" in text
+
+
+def test_stable_detach_runner_binds_and_rechecks_source_checkpoint() -> None:
+    text = _stable_detach_text()
+    assert "SOURCE=checkpoints/mw_hard2_wam4va_visualmotion_joint_v1.pt" in text
+    assert (
+        "EXPECTED_SOURCE_REALPATH=/home/ryan/Documents/robot/ORA0/checkpoints/"
+        "mw_hard2_wam4va_visualmotion_joint_v1.pt" in text
+    )
+    assert (
+        "EXPECTED_SOURCE_SHA256="
+        "0b7438c0d4f681787043a1703fc754ba977b11891419a633cc018dfae6458113"
+        in text
+    )
+    verify = _block(text, "verify_source_checkpoint() {", "refuse_output_family() {")
+    for field in (
+        '"model", "optimizer_state", "sampler_state", "rng_state"',
+        '"exact_run_contract", "exact_resume_version", "global_step"',
+        'payload["global_step"] != expected_step',
+        'payload["exact_resume_version"] != 2',
+        'optimizer.get("kind") != "adamw"',
+        '"sampler_contract_version": 3',
+        '"batch_size": 3',
+        '"block_batches": 4',
+        '"sampling_mode": "balanced"',
+        '"active_tasks": [0, 16]',
+        'set(rng) != {"python", "numpy", "torch_cpu", "torch_cuda"}',
+    ):
+        assert field in verify
+    assert 'source_sha_before=$(checkpoint_sha256 "$SOURCE")' in text
+    assert '"$(checkpoint_sha256 "$SOURCE")" == "$source_sha_before"' in text
+    assert '--save "$save" --resume-exact "$SOURCE"' in text
+    assert "--resume-weights" not in text
+
+
+def test_stable_detach_modes_separate_exact_replay_from_controlled_migration() -> None:
+    text = _stable_detach_text()
+    migration = _block(text, "candidate_migration_args() {", "verify_diagnostic_checkpoint() {")
+    assert "MIGRATION_FLAG=--resume-exact-contract-migration" in text
+    assert "MIGRATION_ID=wmrm_detach_proposal_stage_state_v1" in text
+    assert 'grep -Fq -- \'"--wmrm-detach-proposal-stage-state"\' train.py' in migration
+    assert 'grep -Fq -- "\\\"$MIGRATION_FLAG\\\"" train.py' in migration
+    assert "candidate refused" in migration
+    modes = _block(text, 'case "$MODE" in\n  baseline-replay)', "refuse_output_family")
+    baseline = modes.split("stabilized-candidate)", 1)[0]
+    candidate = modes.split("stabilized-candidate)", 1)[1]
+    assert "extra_args" not in baseline
+    assert "candidate_migration_args" in candidate
+    assert '"${extra_args[@]}"' in text
+    assert "--wmrm-detach-proposal-stage-state" not in _block(
+        text, "COMMON=(", "verify_source_checkpoint"
+    )
+
+
+def test_stable_detach_runner_holds_global_lock_and_requires_idle_machine() -> None:
+    text = _stable_detach_text()
+    assert "LOCK=/tmp/ora0_wam4va_visualmotion_train.lock" in text
+    assert 'exec 9>"$LOCK"' in text
+    assert "flock -n 9" in text
+    assert text.index("flock -n 9") < text.index("verify_source_checkpoint")
+    assert 'any(Path(arg).name == "train.py"' in text
+    assert "--query-compute-apps=pid,process_name,used_memory" in text
+    assert "free_bytes < int(total_bytes * 0.95)" in text
+    launch = text.index('"$PY" -u -B train.py')
+    assert text.index("require_no_trainer", text.index("source_sha_before=")) < launch
+    assert text.index("require_idle_gpu", text.index("source_sha_before=")) < launch
