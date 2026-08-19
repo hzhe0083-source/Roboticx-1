@@ -43,6 +43,128 @@ def _inputs(config: VACompoundConfig):
     )
 
 
+def _tiny_spatial_config() -> VACompoundConfig:
+    return _tiny_config(
+        vision_dim=8,
+        main_vision_dim=8,
+        num_layers=2,
+        action_horizon=6,
+        action_dim=4,
+        wmrm=True,
+        wmrm_cycle_steps=6,
+        wmrm_inject="all",
+        wmrm_handshake=True,
+        wmrm_predictor="st_blocks",
+        wmrm_predictor_depth=1,
+        wmrm_predictor_width=16,
+        wmrm_predictor_heads=4,
+        wmrm_map_size=4,
+        wmrm_map_channels=8,
+        wmrm_world_grid=4,
+        main_vision_grid=4,
+        main_vision_frames=2,
+        main_vision_tokens=32,
+    )
+
+
+def _spatial_inputs(config: VACompoundConfig):
+    torch.manual_seed(12)
+    batch = 2
+    tokens = config.main_vision_frames * config.main_vision_grid**2
+    return (
+        torch.randn(batch, tokens, config.vision_dim),
+        torch.randn(batch, config.proprio_dim),
+        torch.randn(batch, config.action_dim),
+        torch.randn(batch, 5, config.language_dim),
+        torch.ones(batch, 5, dtype=torch.bool),
+        torch.rand(batch, config.wmrm_cycle_steps, config.action_dim) * 2.0 - 1.0,
+    )
+
+
+def test_encode_condition_stage_map_detach_gradient_contract() -> None:
+    config = _tiny_spatial_config()
+    model = VACompoundPolicy(config).eval()
+    vision, proprio, previous, language, mask, logged_action = _spatial_inputs(config)
+    language_cache = model.build_language_cache(language, mask)
+
+    def run(detach: bool | None):
+        model.zero_grad(set_to_none=True)
+        kwargs = {} if detach is None else {"detach_wmrm_stage_state": detach}
+        condition = model.encode_condition(
+            vision,
+            proprio,
+            previous,
+            language_cache=language_cache,
+            env_action=logged_action,
+            **kwargs,
+        )
+        maps = [aux.z_tokens for aux in model.last_wmrm_auxes]
+        assert len(maps) == config.num_layers
+        assert all(stage_map is not None for stage_map in maps)
+        first_map, final_map = maps[0], maps[-1]
+        first_map.retain_grad()
+        final_map.square().mean().backward()
+        first_grad = None if first_map.grad is None else first_map.grad.detach().clone()
+        return (
+            condition.detach().clone(),
+            torch.stack([stage_map.detach().clone() for stage_map in maps]),
+            first_grad,
+        )
+
+    default_condition, default_maps, default_grad = run(None)
+    explicit_condition, explicit_maps, explicit_grad = run(False)
+    detached_condition, detached_maps, detached_grad = run(True)
+
+    torch.testing.assert_close(default_condition, explicit_condition, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(default_maps, explicit_maps, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(default_condition, detached_condition, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(default_maps, detached_maps, rtol=0.0, atol=0.0)
+    assert default_grad is not None and float(default_grad.abs().sum()) > 0.0
+    torch.testing.assert_close(default_grad, explicit_grad, rtol=0.0, atol=0.0)
+    assert detached_grad is None or int(torch.count_nonzero(detached_grad)) == 0
+
+
+def test_evaluator_world_forward_matches_full_logged_forward_stage_maps() -> None:
+    from scripts.eval_wam4va_world_action import _world_forward
+
+    config = _tiny_spatial_config()
+    model = VACompoundPolicy(config).eval()
+    vision, proprio, previous, language, mask, logged_action = _spatial_inputs(config)
+    language_cache = model.build_language_cache(language, mask)
+    noisy_actions = torch.randn(vision.shape[0], config.action_horizon, config.action_dim)
+    flow_time = torch.rand(vision.shape[0])
+
+    with torch.inference_mode():
+        model(
+            vision,
+            proprio,
+            previous,
+            noisy_actions,
+            flow_time,
+            language_cache=language_cache,
+            env_action=logged_action,
+        )
+        full_forward_maps = torch.stack(
+            [aux.z_tokens for aux in model.last_wmrm_auxes]
+        ).clone()
+        evaluator_maps = _world_forward(
+            model,
+            vision,
+            proprio,
+            previous,
+            language_cache,
+            None,
+            None,
+            None,
+            logged_action,
+        )
+
+    assert full_forward_maps.shape == evaluator_maps.shape
+    torch.testing.assert_close(
+        full_forward_maps, evaluator_maps, rtol=0.0, atol=0.0
+    )
+
+
 def test_off_path_matches_legacy_encode() -> None:
     config = _tiny_config(wmrm=False)
     model = VACompoundPolicy(config).eval()
@@ -719,6 +841,14 @@ def test_cli_wmrm_only_requires_wam4va() -> None:
     args = parse_args(["--wmrm-only"])
     with pytest.raises(ValueError, match="wmrm-only"):
         validate_args(args)
+
+
+def test_cli_wam4va_defaults_to_handshake() -> None:
+    from train import parse_args, validate_args
+
+    args = parse_args(["--wam4va"])
+    validate_args(args)
+    assert getattr(args, "wmrm_handshake", True) is True
 
 
 def test_cli_wmrm_only_forces_med_off(tmp_path) -> None:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -29,6 +31,14 @@ class _FakeEnv:
         pass
 
 
+class _FakeRenderer:
+    def __init__(self, env: _FakeEnv) -> None:
+        self.env = env
+
+    def close(self) -> None:
+        pass
+
+
 def _fake_make_env(task: str, seed: int) -> _FakeEnv:
     env = _FakeEnv(task)
     env.reset(seed=seed)
@@ -42,6 +52,7 @@ def _fake_sample(
     w: int,
     *,
     include_raw_frames: bool = False,
+    renderer=None,
 ) -> dict:
     # Exercise all three state sources used by the real generator: env reset,
     # isolated Generator draws and legacy global np.random draws.  Mutating
@@ -86,6 +97,7 @@ def _concatenate(chunks: list[dict], key: str):
 @pytest.mark.parametrize("task", [metric_data.SUPPORTED_TASKS[0], "any"])
 def test_once_eight_matches_two_calls_of_four(monkeypatch, task: str) -> None:
     monkeypatch.setattr(metric_data, "make_env", _fake_make_env)
+    monkeypatch.setattr(metric_data, "_Renderer", _FakeRenderer)
     monkeypatch.setattr(metric_data, "_sample_one", _fake_sample)
 
     once_rng = np.random.default_rng(20260812)
@@ -130,3 +142,156 @@ def test_metric_batch_rejects_empty_sample_request() -> None:
         metric_data.make_metric_batch(
             metric_data.SUPPORTED_TASKS[0], np.random.default_rng(0), 0
         )
+
+
+def test_fixed_task_reuses_one_renderer_and_closes_at_batch_boundary(monkeypatch) -> None:
+    events: list[tuple[str, object]] = []
+
+    class FakeRenderer:
+        def __init__(self, env) -> None:
+            self.env = env
+            events.append(("construct", env))
+
+        def close(self) -> None:
+            events.append(("close", self.env))
+
+    seen_renderers = []
+
+    def fake_sample(env, task, rng, w, *, include_raw_frames=False, renderer=None):
+        assert renderer is not None
+        seen_renderers.append(renderer)
+        events.append(("sample", renderer))
+        return _fake_sample(
+            env,
+            task,
+            rng,
+            w,
+            include_raw_frames=include_raw_frames,
+            renderer=renderer,
+        )
+
+    monkeypatch.setattr(metric_data, "make_env", _fake_make_env)
+    monkeypatch.setattr(metric_data, "_Renderer", FakeRenderer)
+    monkeypatch.setattr(metric_data, "_sample_one", fake_sample)
+
+    metric_data.make_metric_batch(
+        metric_data.SUPPORTED_TASKS[0], np.random.default_rng(17), 5
+    )
+
+    assert len(seen_renderers) == 5
+    assert len({id(renderer) for renderer in seen_renderers}) == 1
+    assert [kind for kind, _ in events] == [
+        "construct",
+        "sample",
+        "sample",
+        "sample",
+        "sample",
+        "sample",
+        "close",
+    ]
+
+
+def test_sample_one_does_not_close_injected_renderer(monkeypatch) -> None:
+    class FakeEnv:
+        def __init__(self) -> None:
+            self.data = SimpleNamespace(
+                mocap_pos=np.zeros((1, 3), dtype=np.float64),
+                mocap_quat=np.zeros((1, 4), dtype=np.float64),
+            )
+            self.actions = []
+
+        def step(self, action) -> None:
+            self.actions.append(action.copy())
+
+    class InjectedRenderer:
+        def __init__(self) -> None:
+            self.rgb_calls = 0
+            self.depth_calls = 0
+            self.close_calls = 0
+
+        def render_rgb(self):
+            self.rgb_calls += 1
+            return np.zeros((8, 8, 3), dtype=np.uint8)
+
+        def render_depth(self):
+            self.depth_calls += 1
+            return np.ones((8, 8), dtype=np.float32)
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    for name in (
+        "_randomize_colors",
+        "_jitter_camera",
+        "_move_object_random",
+        "_randomize_nonrobot_articulation",
+    ):
+        monkeypatch.setattr(metric_data, name, lambda env, rng: None)
+    monkeypatch.setattr(metric_data, "_import_mujoco_metaworld", lambda: (object(), object()))
+    monkeypatch.setattr(
+        metric_data,
+        "keypoint_world_positions",
+        lambda env, task: np.zeros((4, 3), dtype=np.float64),
+    )
+    monkeypatch.setattr(
+        metric_data,
+        "project_points",
+        lambda env, world: (
+            np.full((4, 2), 4.0, dtype=np.float64),
+            np.ones(4, dtype=np.float64),
+        ),
+    )
+    monkeypatch.setattr(
+        metric_data,
+        "_role_visibility",
+        lambda pixels, depths, depth: tuple(
+            np.ones(4, dtype=np.float32) for _ in range(3)
+        ),
+    )
+    monkeypatch.setattr(
+        metric_data,
+        "_entity_aware_visibility",
+        lambda env, world, surface_visible, in_frame: surface_visible.copy(),
+    )
+
+    renderer = InjectedRenderer()
+    record = metric_data._sample_one(
+        FakeEnv(),
+        metric_data.SUPPORTED_TASKS[0],
+        np.random.default_rng(41),
+        2,
+        renderer=renderer,
+    )
+
+    assert record["frames"].shape == (2, 384, 384, 3)
+    assert renderer.rgb_calls == 2
+    assert renderer.depth_calls == 1
+    assert renderer.close_calls == 0
+
+
+def test_mixed_task_keeps_sample_owned_renderer_behavior(monkeypatch) -> None:
+    specs = [
+        (metric_data.SUPPORTED_TASKS[0], 11),
+        (metric_data.SUPPORTED_TASKS[1], 22),
+        (metric_data.SUPPORTED_TASKS[0], 33),
+    ]
+    seen_renderers = []
+
+    def fake_sample(env, task, rng, w, *, include_raw_frames=False, renderer=None):
+        seen_renderers.append(renderer)
+        return _fake_sample(
+            env,
+            task,
+            rng,
+            w,
+            include_raw_frames=include_raw_frames,
+            renderer=renderer,
+        )
+
+    monkeypatch.setattr(metric_data, "_derive_sample_specs", lambda task, rng, n: specs)
+    monkeypatch.setattr(metric_data, "make_env", _fake_make_env)
+    monkeypatch.setattr(metric_data, "_sample_one", fake_sample)
+
+    metric_data.make_metric_batch("any", np.random.default_rng(23), len(specs))
+
+    assert seen_renderers == [None, None, None]

@@ -2325,6 +2325,7 @@ class VACompoundPolicy(nn.Module):
         world_goal: Tensor | None = None,
         env_action: Tensor | None = None,
         skip_wmrm: bool = False,
+        detach_wmrm_stage_state: bool = False,
     ) -> Tensor | tuple[Tensor, VisualMemory]:
         if (language_hidden is None) == (language_cache is None):
             raise ValueError("provide exactly one of language_hidden or language_cache")
@@ -2616,7 +2617,11 @@ class VACompoundPolicy(nn.Module):
                     previous_map=previous_map,
                 )
                 if aux.z_tokens is not None and aux.z_tokens.ndim == 4:
-                    previous_map = aux.z_tokens
+                    previous_map = (
+                        aux.z_tokens.detach()
+                        if detach_wmrm_stage_state
+                        else aux.z_tokens
+                    )
                 if self.config.wmrm_handshake:
                     action = updated
                     vision = self.wmrm.mix_world_into_vision(

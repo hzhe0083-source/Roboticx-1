@@ -20,7 +20,6 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-
 @dataclass(frozen=True)
 class WMRMAux:
     z_hat: Tensor
@@ -38,6 +37,10 @@ class WMRMAux:
     env_action: Tensor | None = None
     world_tokens: Tensor | None = None
     vision_gate: Tensor | None = None
+    # Belief state exactly at the predictor input. ``belief`` above is the
+    # post-prediction/handshake state and is therefore not valid for an
+    # action-counterfactual re-evaluation of the final World stage.
+    predict_belief: Tensor | None = None
 
 
 class _CrossAttn(nn.Module):
@@ -841,6 +844,15 @@ class WAM4VA(nn.Module):
             raise ValueError("action, vision, and proprio batch sizes must match")
 
         batch, horizon, hidden = action.shape
+        # === DIAGNOSTIC: gradient norm prints ===
+        if self.training:
+            for name, param in self.named_parameters():
+                if param.requires_grad and param.grad is not None:
+                    norm = param.grad.norm().item()
+                    if norm > 1e4:
+                        print(f"DIAG: {name} grad norm BEFORE mixed_residual: {norm:.2e}", flush=True)
+        # === END DIAG ===
+
         queries = self.evidence_queries[None].expand(batch, -1, -1)
         evidence = self.evidence_read(queries, vision)
         if belief is None:
@@ -882,7 +894,13 @@ class WAM4VA(nn.Module):
             progress = reuse_aux.progress
             z_tokens = reuse_aux.z_tokens
             world_tokens = reuse_aux.world_tokens
+            predict_belief = (
+                reuse_aux.predict_belief
+                if reuse_aux.predict_belief is not None
+                else reuse_aux.belief
+            )
         else:
+            predict_belief = belief.detach()
             z_hat, z_spans, progress, z_tokens = self.predict_world(
                 action,
                 proprio,
@@ -906,6 +924,15 @@ class WAM4VA(nn.Module):
             # spatially addressable memory; the final layer replaces it with
             # the predicted DINO map tokens.
             world_tokens = belief
+        # === DIAGNOSTIC: after predict_world ===
+        if self.training:
+            for name, param in self.named_parameters():
+                if param.requires_grad and param.grad is not None:
+                    norm = param.grad.norm().item()
+                    if norm > 1e4:
+                        print(f"DIAG: {name} grad norm AFTER predict_world: {norm:.2e}", flush=True)
+        # === END DIAG ===
+
         mixed, gate, pi = self.mixed_residual(
             action,
             z_hat,
@@ -938,6 +965,7 @@ class WAM4VA(nn.Module):
             ),
             world_tokens=world_tokens,
             vision_gate=vision_gate,
+            predict_belief=predict_belief,
         )
         return updated, aux, belief, innovation
 

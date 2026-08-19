@@ -12,13 +12,25 @@ from train import (
     SAM,
     TaskLocalityWeightedSampler,
     TaskWeightedSampler,
+    WORLD_ACTION_DONOR_CONTRACT,
+    WORLD_ACTION_RANKING,
+    WORLD_LOGGED_BRANCH_CONTRACT,
+    WORLD_LOSS_COMPONENT_WEIGHTS,
+    WORLD_NO_REGRESSION,
+    WORLD_STAGE_AUXILIARY_DECAY,
+    WORLD_STATIC_COPY_CONSTRAINT,
+    WORLD_SUPERVISION_CONTRACT,
+    WORLD_TRANSITION_CONTRACT,
     build_dataset_content_identity,
     build_exact_resume_state,
     build_exact_run_contract,
+    final_checkpoint_save_due,
     parse_args,
     restore_exact_resume_state,
     save_checkpoint,
     validate_exact_run_contract,
+    validate_visual_world_resume_contract,
+    world_action_ranking_contract,
 )
 
 
@@ -196,7 +208,53 @@ def test_main_checkpoint_contains_exact_training_state(tmp_path) -> None:
     assert loaded["optimizer_state"]["kind"] == "adamw"
     assert loaded["sampler_state"] == sampler.state_dict()
     assert set(loaded["rng_state"]) == {"python", "numpy", "torch_cpu", "torch_cuda"}
+    assert loaded["rng_state"]["numpy"]["state"].dtype == torch.int64
     assert loaded["exact_run_contract"]["contract_version"] == 1
+
+
+def test_final_checkpoint_skips_same_step_periodic_save(tmp_path) -> None:
+    path = tmp_path / "policy.pt"
+    assert not final_checkpoint_save_due(path, 1000, 1000)
+
+
+def test_final_checkpoint_kept_for_nonperiodic_final_step(tmp_path) -> None:
+    path = tmp_path / "policy.pt"
+    assert final_checkpoint_save_due(path, 1001, 1000)
+
+
+def test_step_copy_collision_does_not_overwrite_archive(tmp_path) -> None:
+    path = tmp_path / "policy.pt"
+    args = parse_args(
+        ["--single-task", "--save", str(path), "--save-step-copies"]
+    )
+    model, optimizer = _model_and_optimizer()
+    save_checkpoint(
+        args,
+        SimpleNamespace(),
+        model,
+        None,
+        optimizer=optimizer,
+        global_step=7,
+        sampler=_sampler(),
+    )
+    step_path = tmp_path / "policy_s7.pt"
+    archived = step_path.read_bytes()
+
+    with torch.no_grad():
+        next(model.parameters()).add_(1.0)
+    with pytest.raises(FileExistsError, match="refusing to overwrite"):
+        save_checkpoint(
+            args,
+            SimpleNamespace(),
+            model,
+            None,
+            optimizer=optimizer,
+            global_step=7,
+            sampler=_sampler(),
+        )
+
+    assert step_path.read_bytes() == archived
+    assert not (tmp_path / "policy_s7.pt.tmp").exists()
 
 
 def test_sam_roundtrip_uses_base_adamw_state() -> None:
@@ -323,3 +381,69 @@ def test_exact_contract_rejects_changed_objective_args(
     )
     with pytest.raises(ValueError, match=field):
         validate_exact_run_contract(baseline, current)
+
+
+def test_exact_contract_allows_checkpoint_archive_policy_changes() -> None:
+    _, optimizer = _model_and_optimizer()
+    baseline_args = parse_args(["--single-task"])
+    changed_args = parse_args(["--single-task", "--save-step-copies"])
+    config = SimpleNamespace(num_layers=8, action_horizon=48)
+
+    baseline = build_exact_run_contract(
+        baseline_args, config, optimizer, _sampler()
+    )
+    current = build_exact_run_contract(
+        changed_args, config, optimizer, _sampler()
+    )
+
+    assert baseline == current
+
+
+def test_visual_world_exact_resume_binds_fixed_action_donors() -> None:
+    identity = {
+        "manifest_sha256": "m" * 64,
+        "source_sha256": "s" * 64,
+        "world_action_donor_sha256": "d" * 64,
+        "world_action_donor_transitions": 3297,
+        "world_action_rank_transitions": 2931,
+    }
+    contract = {
+        "world_supervision": WORLD_SUPERVISION_CONTRACT,
+        "world_transition": WORLD_TRANSITION_CONTRACT,
+        "world_loss_weights": WORLD_LOSS_COMPONENT_WEIGHTS,
+        "world_stage_auxiliary_decay": WORLD_STAGE_AUXILIARY_DECAY,
+        "world_no_regression": WORLD_NO_REGRESSION,
+        "world_static_copy_constraint": WORLD_STATIC_COPY_CONSTRAINT,
+        "world_action_ranking": WORLD_ACTION_RANKING,
+        "world_action_donor_contract": WORLD_ACTION_DONOR_CONTRACT,
+        "world_action_donor_sha256": identity["world_action_donor_sha256"],
+        "world_action_donor_transitions": identity[
+            "world_action_donor_transitions"
+        ],
+        "world_action_rank_transitions": identity[
+            "world_action_rank_transitions"
+        ],
+        "world_logged_branch": WORLD_LOGGED_BRANCH_CONTRACT,
+        "split_manifest_sha256": identity["manifest_sha256"],
+        "split_source_sha256": identity["source_sha256"],
+    }
+    checkpoint = {"training_contract": contract}
+    validate_visual_world_resume_contract(checkpoint, identity)
+
+    final_ranking = world_action_ranking_contract("final")
+    final_checkpoint = {
+        "training_contract": {
+            **contract,
+            "world_action_ranking": final_ranking,
+        }
+    }
+    validate_visual_world_resume_contract(
+        final_checkpoint, identity, final_ranking
+    )
+    with pytest.raises(ValueError, match="world_action_ranking"):
+        validate_visual_world_resume_contract(final_checkpoint, identity)
+
+    changed = {**checkpoint, "training_contract": {**contract}}
+    changed["training_contract"]["world_action_donor_sha256"] = "x" * 64
+    with pytest.raises(ValueError, match="world_action_donor_sha256"):
+        validate_visual_world_resume_contract(changed, identity)

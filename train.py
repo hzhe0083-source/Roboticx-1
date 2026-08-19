@@ -6,6 +6,7 @@ from collections.abc import Iterator
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import random
 import shutil
@@ -18,6 +19,70 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 
 from va_compound import VACompoundConfig, VACompoundPolicy
 from va_compound.wmrm import matched_no_fixed_point_perm, wmrm_world_loss
+from va_compound.world_supervision import (
+    action_top10_oracle_straight_through_gap_loss,
+    masked_reduction as masked_world_reduction,
+    stage_supervision_weights,
+    static_copy_anchor_loss,
+    transition_mask as world_transition_mask,
+    visual_no_regression_loss,
+    visual_world_loss,
+)
+
+
+WORLD_SUPERVISION_CONTRACT = "visual_motion_oracle_stgap_v7"
+WORLD_TRANSITION_CONTRACT = "current_first6_and_next_first_v1"
+WORLD_LOSS_COMPONENT_WEIGHTS = {
+    "all": 0.25,
+    "motion": 0.25,
+    "top20": 0.50,
+}
+WORLD_STAGE_AUXILIARY_DECAY = 0.25
+WORLD_LOGGED_BRANCH_CONTRACT = "matched_context_full_forward_v1"
+WORLD_ACTION_DONOR_CONTRACT = "train_split_task_cross_episode_proprio_nearest_v1"
+FEATURE_AUTOCAST_CONTRACT = "bf16_nograd_decode_cache_isolated_v1"
+WORLD_NO_REGRESSION = {
+    "all_ratio": 1.0,
+    "weight": 1.0,
+    "components": ["all"],
+}
+WORLD_STATIC_COPY_CONSTRAINT = {
+    "static_ratio": 1.0,
+    "weight": 4.0,
+    "region": "outside_top20",
+    "penalty": "copy_budget_hinge_plus_always_copy_anchor_v1",
+    "reduction": "stage_aux_weighted_masked_mean",
+    "boundary": "1.00_detached_copy_each_stage",
+}
+_WORLD_ACTION_RANKING_COMMON = {
+    "top10_min_relative_margin": 0.12,
+    "weight": 1.0,
+    "negatives": ["shuffle"],
+    "diagnostic_negatives": ["zero"],
+    "context": "logged_stage_detached_pair",
+    "gradient": "oracle_motion_straight_through_exact_gap_v1",
+}
+
+
+def world_action_ranking_contract(stage_mode: str) -> dict[str, object]:
+    if stage_mode == "final":
+        stage = "final_direct_matched_context"
+        schedule = "final_each_valid_transition"
+    elif stage_mode == "cycle":
+        stage = "rotating_8stage_direct_matched_context"
+        schedule = "(global_step+time_index)%num_stages"
+    else:
+        raise ValueError(f"unsupported World action-ranking stage mode: {stage_mode}")
+    return {
+        "stage": stage,
+        **_WORLD_ACTION_RANKING_COMMON,
+        "schedule": schedule,
+    }
+
+
+# Programmatic callers retain a deterministic default; experiment runners pass
+# the final/cycle choice explicitly and persist the resolved dictionary.
+WORLD_ACTION_RANKING = world_action_ranking_contract("cycle")
 
 
 def wmrm_next_feature_target(
@@ -463,6 +528,13 @@ class FeatureDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, Tensor]:
         item = {key: self.payload[key][index] for key in self.REQUIRED if key in self.payload}
+        for key in (
+            "episode_id",
+            "world_rank_shuffle_action",
+            "world_rank_shuffle_mask",
+        ):
+            if key in self.payload:
+                item[key] = self.payload[key][index]
         for key in ACTION_MASK_KEYS:
             if key in self.payload:
                 item[key] = self.payload[key][index]
@@ -980,6 +1052,7 @@ _EXACT_RUN_OPERATIONAL_ARGS = {
     "steps",
     "save",
     "save_every",
+    "save_step_copies",
     "resume",
     "resume_exact",
     "resume_weights",
@@ -1029,6 +1102,227 @@ def _sha256_file(path: Path) -> str:
         for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def validate_visual_world_training_split(
+    payload: dict,
+    data_path: Path,
+    manifest_path: Path,
+) -> dict[str, str]:
+    """Validate the immutable episode-level train split before model startup."""
+
+    from scripts.split_wam4va_episode_holdout import (
+        MANIFEST_CONTRACT,
+        canonical_manifest_sha256,
+        transition_mask as split_transition_mask,
+    )
+
+    resolved_data = data_path.expanduser().resolve(strict=True)
+    resolved_manifest = manifest_path.expanduser().resolve(strict=True)
+    manifest = json.loads(resolved_manifest.read_text(encoding="utf-8"))
+    if manifest.get("contract") != MANIFEST_CONTRACT:
+        raise ValueError(
+            f"unexpected World split contract: {manifest.get('contract')!r}"
+        )
+    manifest_sha = canonical_manifest_sha256(manifest)
+    if manifest.get("manifest_sha256") != manifest_sha:
+        raise ValueError("World split manifest canonical SHA mismatch")
+    if Path(str(manifest.get("manifest_path", ""))).expanduser().resolve() != resolved_manifest:
+        raise ValueError("World split manifest_path does not match the supplied file")
+
+    metadata = payload.get("metadata") or {}
+    if metadata.get("split_name") != "train":
+        raise ValueError("visual World training requires metadata.split_name='train'")
+    if metadata.get("split_contract") != manifest:
+        raise ValueError("embedded split_contract differs from the external manifest")
+    if metadata.get("split_manifest_sha256") != manifest_sha:
+        raise ValueError("training payload split_manifest_sha256 mismatch")
+    if Path(str(metadata.get("split_manifest_path", ""))).expanduser().resolve() != resolved_manifest:
+        raise ValueError("training payload split_manifest_path mismatch")
+
+    actions = payload.get("actions")
+    action_valid = payload.get("action_valid_mask")
+    recovery = payload.get("recovery_mask")
+    task_ids = payload.get("instruction_id")
+    episode_ids = payload.get("episode_id")
+    if not isinstance(actions, Tensor) or actions.ndim != 4:
+        raise ValueError("visual World actions must be [N,T,H,A]")
+    if not actions.is_floating_point() or not bool(torch.isfinite(actions).all()):
+        raise ValueError("visual World actions must be finite floating-point values")
+    if tuple(actions.shape[1:]) != (4, 48, 4):
+        raise ValueError(
+            "visual World training requires T=4/H=48/A=4, got "
+            f"{tuple(actions.shape[1:])}"
+        )
+    expected_mask_shape = actions.shape[:-1]
+    for name, value in (
+        ("action_valid_mask", action_valid),
+        ("recovery_mask", recovery),
+    ):
+        if (
+            not isinstance(value, Tensor)
+            or value.dtype != torch.bool
+            or value.shape != expected_mask_shape
+        ):
+            raise ValueError(
+                f"{name} must be bool {tuple(expected_mask_shape)} for visual World"
+            )
+    for name, value in (("instruction_id", task_ids), ("episode_id", episode_ids)):
+        if (
+            not isinstance(value, Tensor)
+            or value.ndim != 1
+            or value.shape[0] != actions.shape[0]
+            or value.dtype == torch.bool
+            or value.is_floating_point()
+        ):
+            raise ValueError(f"{name} must be an integer [N] tensor")
+    actual_tasks = sorted(int(value) for value in torch.unique(task_ids).tolist())
+    if actual_tasks != [0, 16]:
+        raise ValueError(
+            "visual World joint training requires task ids [0,16], got "
+            f"{actual_tasks}"
+        )
+
+    splits = manifest.get("splits") or {}
+    train_contract = splits.get("train") or {}
+    eval_contract = splits.get("eval") or {}
+    if Path(str(train_contract.get("output_path", ""))).expanduser().resolve() != resolved_data:
+        raise ValueError("World split train output_path does not match --data")
+    if int(train_contract.get("windows", -1)) != int(actions.shape[0]):
+        raise ValueError("World split train window count mismatch")
+    actual_episodes = sorted(int(value) for value in torch.unique(episode_ids).tolist())
+    declared_episodes = sorted(int(value) for value in train_contract.get("episode_ids", []))
+    if actual_episodes != declared_episodes:
+        raise ValueError("World split train episode list mismatch")
+    eval_episodes = {int(value) for value in eval_contract.get("episode_ids", [])}
+    if set(actual_episodes) & eval_episodes:
+        raise ValueError("World split train/eval episode leakage detected")
+
+    expected_names = {0: "assembly-v3", 16: "door-unlock-v3"}
+    manifest_tasks = {
+        int(item["task_id"]): str(item.get("task_name"))
+        for item in manifest.get("tasks", [])
+    }
+    if manifest_tasks != expected_names:
+        raise ValueError(
+            "World split task contract must be assembly-v3 + door-unlock-v3, got "
+            f"{manifest_tasks}"
+        )
+
+    transition = split_transition_mask(action_valid)
+    transition_stats = (train_contract.get("mask_stats") or {}).get("transition") or {}
+    if (
+        int(transition.sum()) != int(transition_stats.get("true", -1))
+        or transition.numel() != int(transition_stats.get("total", -1))
+        or not bool(transition.any())
+    ):
+        raise ValueError("World split transition-mask statistics mismatch")
+    task_contracts = {
+        int(item["task_id"]): item for item in train_contract.get("tasks", [])
+    }
+    if sorted(task_contracts) != [0, 16]:
+        raise ValueError("World split train task list mismatch")
+    for task_id, item in task_contracts.items():
+        selected = task_ids == task_id
+        task_episodes = sorted(
+            int(value) for value in torch.unique(episode_ids[selected]).tolist()
+        )
+        if int(selected.sum()) != int(item.get("windows", -1)):
+            raise ValueError(f"World split task {task_id} window count mismatch")
+        if task_episodes != sorted(int(value) for value in item.get("episode_ids", [])):
+            raise ValueError(f"World split task {task_id} episode list mismatch")
+        task_transition = transition[selected]
+        task_stats = (item.get("mask_stats") or {}).get("transition") or {}
+        if (
+            int(task_transition.sum()) != int(task_stats.get("true", -1))
+            or task_transition.numel() != int(task_stats.get("total", -1))
+        ):
+            raise ValueError(f"World split task {task_id} transition stats mismatch")
+
+    source = manifest.get("source") or {}
+    source_path = Path(str(source.get("path", ""))).expanduser().resolve(strict=True)
+    source_sha = str(source.get("sha256", ""))
+    if not source_sha or _sha256_file(source_path) != source_sha:
+        raise ValueError("World split source SHA mismatch")
+    if int(metadata.get("source_n_windows", -1)) != int(source.get("n_windows", -2)):
+        raise ValueError("World split source window count mismatch")
+
+    return {
+        "manifest_id": str(manifest.get("manifest_id")),
+        "manifest_path": str(resolved_manifest),
+        "manifest_sha256": manifest_sha,
+        "source_path": str(source_path),
+        "source_sha256": source_sha,
+    }
+
+
+def validate_visual_world_resume_contract(
+    checkpoint: dict,
+    split_identity: dict[str, object],
+    action_ranking: dict[str, object] | None = None,
+) -> None:
+    """Reject exact continuation from an old or differently split loss graph."""
+
+    contract = checkpoint.get("training_contract") or {}
+    expected = {
+        "world_supervision": WORLD_SUPERVISION_CONTRACT,
+        "world_transition": WORLD_TRANSITION_CONTRACT,
+        "world_loss_weights": WORLD_LOSS_COMPONENT_WEIGHTS,
+        "world_stage_auxiliary_decay": WORLD_STAGE_AUXILIARY_DECAY,
+        "world_no_regression": WORLD_NO_REGRESSION,
+        "world_static_copy_constraint": WORLD_STATIC_COPY_CONSTRAINT,
+        "world_action_ranking": (
+            WORLD_ACTION_RANKING if action_ranking is None else action_ranking
+        ),
+        "world_action_donor_contract": WORLD_ACTION_DONOR_CONTRACT,
+        "world_action_donor_sha256": split_identity[
+            "world_action_donor_sha256"
+        ],
+        "world_action_donor_transitions": split_identity[
+            "world_action_donor_transitions"
+        ],
+        "world_action_rank_transitions": split_identity[
+            "world_action_rank_transitions"
+        ],
+        "world_logged_branch": WORLD_LOGGED_BRANCH_CONTRACT,
+        "split_manifest_sha256": split_identity["manifest_sha256"],
+        "split_source_sha256": split_identity["source_sha256"],
+    }
+    mismatches = {
+        key: (contract.get(key), value)
+        for key, value in expected.items()
+        if contract.get(key) != value
+    }
+    if mismatches:
+        raise ValueError(
+            "--resume-exact requires the same visual-motion World contract: "
+            f"{mismatches}"
+        )
+
+
+def runtime_resource_stats(device: torch.device) -> dict[str, float | int]:
+    """Cheap Linux process/GPU counters for long-run stability logs."""
+
+    rss_mib = 0.0
+    try:
+        resident_pages = int(Path("/proc/self/statm").read_text().split()[1])
+        rss_mib = resident_pages * os.sysconf("SC_PAGE_SIZE") / float(1 << 20)
+    except (OSError, IndexError, ValueError):
+        pass
+    try:
+        fd_count = sum(1 for _ in Path("/proc/self/fd").iterdir())
+    except OSError:
+        fd_count = -1
+    allocated = reserved = 0.0
+    if device.type == "cuda" and torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated(device) / float(1 << 20)
+        reserved = torch.cuda.memory_reserved(device) / float(1 << 20)
+    return {
+        "rss_mib": rss_mib,
+        "fd_count": fd_count,
+        "cuda_allocated_mib": allocated,
+        "cuda_reserved_mib": reserved,
+    }
 
 
 def _sampled_file_identity(path: Path) -> dict:
@@ -1259,6 +1553,13 @@ def build_exact_run_contract(
             "roi_checkpoint_identity": roi_identity,
         },
     }
+    if getattr(args, "feature_autocast_bf16", False):
+        contract["feature_autocast"] = {
+            "contract": FEATURE_AUTOCAST_CONTRACT,
+            "dtype": "bfloat16",
+            "training_cache_enabled": True,
+            "no_grad_decode_cache_enabled": False,
+        }
     if getattr(args, "wam_joint", False):
         # WAM-on contract: freeze alpha and the content identity of the base
         # WAM checkpoint (path spelling is not a model semantic).
@@ -1326,7 +1627,9 @@ def capture_rng_state(*, include_cuda: bool = True) -> dict:
         "python": random.getstate(),
         "numpy": {
             "bit_generator": numpy_state[0],
-            "state": torch.from_numpy(numpy_state[1].copy()),
+            # torch 2.2 cannot construct tensors from NumPy uint32 arrays.
+            # MT19937 words fit losslessly in int64 and are cast back on restore.
+            "state": torch.from_numpy(numpy_state[1].astype(np.int64, copy=True)),
             "position": int(numpy_state[2]),
             "has_gauss": int(numpy_state[3]),
             "cached_gaussian": float(numpy_state[4]),
@@ -1351,7 +1654,7 @@ def restore_rng_state(state: dict) -> None:
     np.random.set_state(
         (
             numpy_state["bit_generator"],
-            numpy_state["state"].cpu().numpy().copy(),
+            numpy_state["state"].cpu().numpy().astype(np.uint32, copy=True),
             int(numpy_state["position"]),
             int(numpy_state["has_gauss"]),
             float(numpy_state["cached_gaussian"]),
@@ -1572,6 +1875,26 @@ def move_batch(batch: dict[str, Tensor], device: torch.device) -> dict[str, Tens
         key: value.to(device) if isinstance(value, Tensor) else value
         for key, value in batch.items()
     }
+
+
+def feature_policy_autocast(device: torch.device, enabled: bool):
+    """BF16 feature forward with the normal training weight cache."""
+    return torch.autocast(
+        device_type=device.type,
+        dtype=torch.bfloat16,
+        enabled=enabled,
+        cache_enabled=True,
+    )
+
+
+def feature_no_grad_decode_autocast(device: torch.device, enabled: bool):
+    """Keep no-grad proposal casts out of the enclosing training cache."""
+    return torch.autocast(
+        device_type=device.type,
+        dtype=torch.bfloat16,
+        enabled=enabled,
+        cache_enabled=False,
+    )
 
 
 def _enable_optional_action_masks(dataset: Dataset) -> None:
@@ -3113,6 +3436,7 @@ def _mtvj_visual_aux_loss(
     vis_lambda: float,
     sigma_px: float = 4.0,
     hinge_margin: float = 0.1,
+    sim_batch: dict | None = None,
 ) -> tuple[Tensor, dict]:
     """双数据流视觉辅助批次（阶段 C，2026-08-12）：在线仿真真值（
     make_metric_batch）→ 冻结 V-JEPA dense 编码 → metric head 前向 →
@@ -3129,7 +3453,11 @@ def _mtvj_visual_aux_loss(
     from train_metric_visual import compute_losses
     from va_compound.live_vjepa import _dense_coords
 
-    sim = make_metric_batch(task, rng, aux_batch)
+    sim = (
+        make_metric_batch(task, rng, aux_batch)
+        if sim_batch is None
+        else sim_batch
+    )
     text = ENV_TO_TASK.get(task, task)
     if text not in lang_aux_cache:
         raise KeyError(
@@ -3194,6 +3522,7 @@ def _dino_visual_aux_loss(
     vis_lambda: float,
     sigma_px: float = 4.0,
     hinge_margin: float = 0.1,
+    sim_batch: dict | None = None,
 ) -> tuple[Tensor, dict]:
     """DINO 版视觉辅助批次（2026-08-16）：MT-VJ 高清头的真正训练信号。
 
@@ -3208,8 +3537,10 @@ def _dino_visual_aux_loss(
     from train_metric_visual import compute_losses
     from va_compound.model import dense_coords
 
-    sim = make_metric_batch(
-        task, rng, aux_batch, include_raw_frames=True
+    sim = (
+        make_metric_batch(task, rng, aux_batch, include_raw_frames=True)
+        if sim_batch is None
+        else sim_batch
     )
     text = ENV_TO_TASK.get(task, task)
     if text not in lang_aux_cache:
@@ -3322,6 +3653,35 @@ def _mtvj_visual_aux_sample(
     return env_name, rng
 
 
+def _prepare_mtvj_visual_aux_step(
+    task_descriptions: list[str],
+    task_weights: Tensor,
+    env_by_description: dict[str, str],
+    *,
+    seed: int,
+    global_step: int,
+    every: int,
+    aux_batch: int,
+    include_raw_frames: bool,
+) -> tuple[str, np.random.Generator, dict] | None:
+    """Generate the CPU simulator batch before the training graph is built."""
+
+    if every <= 0 or global_step % every != 0:
+        return None
+    task, rng = _mtvj_visual_aux_sample(
+        task_descriptions,
+        task_weights,
+        env_by_description,
+        seed=seed,
+        global_step=global_step,
+    )
+    from prepare_metaworld_metric import make_metric_batch
+
+    kwargs = {"include_raw_frames": True} if include_raw_frames else {}
+    sim_batch = make_metric_batch(task, rng, aux_batch, **kwargs)
+    return task, rng, sim_batch
+
+
 def servo_correction_t0(
     model: VACompoundPolicy,
     servo: InteractionServo,
@@ -3398,6 +3758,170 @@ def sample_pair_intervention(
     return probe, shared_tau, target_velocity
 
 
+def _world_task_ids(
+    batch: dict[str, Tensor], time_index: int, device: torch.device
+) -> Tensor:
+    task_id = batch.get("task_id")
+    if task_id is None:
+        task_id = batch.get("task_ids")
+    if task_id is None:
+        task_id = batch.get("instruction_id")
+    if task_id is None:
+        raise ValueError("visual World supervision requires per-sample task ids")
+    task_id = torch.as_tensor(task_id, device=device)
+    if task_id.ndim > 1:
+        task_id = task_id[:, time_index]
+    if task_id.ndim != 1 or task_id.shape[0] != batch["actions"].shape[0]:
+        raise ValueError("World task ids must have shape [B] or [B,T]")
+    return task_id.to(dtype=torch.long)
+
+
+def _nearest_cross_episode_donors(
+    proprio: Tensor,
+    task_ids: Tensor,
+    episode_ids: Tensor,
+    eligible: Tensor,
+) -> Tensor:
+    """Return deterministic proprio-nearest cross-episode donor indices."""
+
+    batch = proprio.shape[0]
+    if proprio.ndim != 2:
+        raise ValueError("proprio must be [B,P]")
+    if task_ids.ndim != 1 or task_ids.shape[0] != batch:
+        raise ValueError("task_ids must be [B]")
+    if episode_ids.ndim != 1 or episode_ids.shape[0] != batch:
+        raise ValueError("episode_ids must be [B]")
+    if eligible.ndim != 1 or eligible.shape[0] != batch or eligible.dtype != torch.bool:
+        raise ValueError("eligible must be bool [B]")
+
+    state = proprio.detach().to(device="cpu", dtype=torch.float64)
+    task = task_ids.detach().to(device="cpu", dtype=torch.int64)
+    episode = episode_ids.detach().to(device="cpu", dtype=torch.int64)
+    eligible = eligible.detach().to(device="cpu", dtype=torch.bool)
+    donors = torch.full((batch,), -1, dtype=torch.int64)
+    for row in range(batch):
+        if not bool(eligible[row]):
+            continue
+        candidate = eligible & task.eq(task[row]) & ~episode.eq(episode[row])
+        if not bool(candidate.any()):
+            continue
+        distance = (state - state[row]).square().sum(dim=-1)
+        distance.masked_fill_(~candidate, float("inf"))
+        donors[row] = int(distance.argmin())
+    return donors
+
+
+def prepare_visual_world_action_ranking(payload: dict) -> dict[str, object]:
+    """Attach the fixed train-split shuffled-action table to a dataset payload."""
+
+    actions = torch.as_tensor(payload["actions"])
+    proprio = torch.as_tensor(payload["proprio"])
+    task_ids = torch.as_tensor(payload["instruction_id"], dtype=torch.int64)
+    episode_ids = torch.as_tensor(payload["episode_id"], dtype=torch.int64)
+    valid = world_transition_mask(
+        torch.as_tensor(payload["action_valid_mask"]), cycle_steps=6
+    )
+    rows, times = torch.nonzero(valid, as_tuple=True)
+    flat_actions = actions[rows, times, :6]
+    flat_proprio = proprio[rows, times]
+    flat_tasks = task_ids[rows]
+    flat_episodes = episode_ids[rows]
+    donors = _nearest_cross_episode_donors(
+        flat_proprio,
+        flat_tasks,
+        flat_episodes,
+        torch.ones(rows.numel(), dtype=torch.bool),
+    )
+    if bool((donors < 0).any()):
+        raise ValueError("visual World action ranking found a transition without a donor")
+    shuffled = flat_actions.index_select(0, donors)
+    distinct = shuffled.ne(flat_actions).any(dim=(1, 2))
+    table = actions.new_zeros((actions.shape[0], actions.shape[1] - 1, 6, 4))
+    table[rows, times] = shuffled
+    rank_mask = torch.zeros_like(valid)
+    rank_mask[rows, times] = distinct
+    payload["world_rank_shuffle_action"] = table
+    payload["world_rank_shuffle_mask"] = rank_mask
+
+    identity = torch.stack((rows, times, donors, distinct.to(torch.int64)), dim=1)
+    digest = hashlib.sha256(identity.contiguous().numpy().tobytes()).hexdigest()
+    return {
+        "world_action_donor_contract": WORLD_ACTION_DONOR_CONTRACT,
+        "world_action_donor_sha256": digest,
+        "world_action_donor_transitions": int(rows.numel()),
+        "world_action_rank_transitions": int(distinct.sum()),
+    }
+
+
+def _summarize_visual_world_metrics(
+    final_records: list[dict[str, Tensor]],
+    stage_records: list[list[tuple[Tensor, Tensor, Tensor]]],
+) -> dict[int, dict[str, object]]:
+    """Reduce final-stage World/copy metrics independently for each task."""
+
+    if not final_records:
+        return {}
+    task_values = sorted(
+        {
+            int(value)
+            for record in final_records
+            for value in torch.unique(record["task_ids"]).detach().cpu()
+        }
+    )
+    output: dict[int, dict[str, object]] = {}
+    metric_names = (
+        "world_all",
+        "copy_all",
+        "world_motion",
+        "copy_motion",
+        "world_top10",
+        "copy_top10",
+        "world_static",
+        "copy_static",
+        "motion_energy",
+    )
+    for task_id in task_values:
+        masks = [
+            record["valid"] & record["task_ids"].eq(task_id)
+            for record in final_records
+        ]
+        reduced = {
+            name: float(
+                masked_world_reduction(
+                    [record[name] for record in final_records], masks
+                ).detach()
+            )
+            for name in metric_names
+        }
+        reduced["gain_all"] = reduced["copy_all"] - reduced["world_all"]
+        reduced["gain_motion"] = (
+            reduced["copy_motion"] - reduced["world_motion"]
+        )
+        copy_top10 = float(reduced["copy_top10"])
+        reduced["relative_gain_top10"] = (
+            (copy_top10 - float(reduced["world_top10"])) / copy_top10
+            if copy_top10 > 0.0
+            else 0.0
+        )
+        reduced["transitions"] = sum(int(mask.sum().item()) for mask in masks)
+        per_stage = []
+        for records in stage_records:
+            stage_masks = [
+                valid & task_ids.eq(task_id)
+                for task_ids, valid, _ in records
+            ]
+            per_stage.append(
+                float(
+                    masked_world_reduction(
+                        [value for _, _, value in records], stage_masks
+                    ).detach()
+                )
+            )
+        reduced["stage_losses"] = per_stage
+        output[task_id] = reduced
+    return output
+
+
 def rollout_policy(
     model: VACompoundPolicy,
     batch: dict[str, Tensor],
@@ -3414,8 +3938,17 @@ def rollout_policy(
     action_dense_evidence: dict[int, Tensor] | None = None,
     metric_g: Tensor | None = None,
     wmrm_adep_margin: float = 0.05,
+    visual_world_supervision: bool = False,
+    wmrm_adep_enabled: bool = False,
     flow_steps: int = 8,
+    world_action_rank_step: int = 0,
+    world_action_rank_stage: str = "cycle",
+    feature_autocast_bf16: bool = False,
 ) -> tuple[Tensor, Tensor]:
+    if world_action_rank_step < 0:
+        raise ValueError("world_action_rank_step must be non-negative")
+    if world_action_rank_stage not in {"final", "cycle"}:
+        raise ValueError("world_action_rank_stage must be 'final' or 'cycle'")
     if model.config.plan_resampler:
         # Plan-Cache 方案 B：首决策场景摘要（vision 全局均值）→ plan tokens，
         # cat 进语言序列后统一 build 缓存（与闭环"episode 首帧建缓存"语义一致）。
@@ -3457,6 +3990,16 @@ def rollout_policy(
     predicted_velocities = []
     action_conditions = []
     wmrm_world_terms: list[Tensor] = []
+    visual_world_stage_records: list[list[tuple[Tensor, Tensor, Tensor]]] = []
+    visual_world_objective_stage_records: list[
+        list[tuple[Tensor, Tensor, Tensor]]
+    ] = []
+    visual_world_guard_stage_records: list[list[tuple[Tensor, Tensor, Tensor]]] = []
+    visual_world_static_constraint_stage_records: list[
+        list[tuple[Tensor, Tensor, Tensor]]
+    ] = []
+    visual_world_action_shuffle_records: list[tuple[Tensor, Tensor, Tensor]] = []
+    visual_world_final_records: list[dict[str, Tensor]] = []
     wmrm_pi_kl_terms: list[Tensor] = []
     wmrm_adep_terms: list[Tensor] = []
     wmrm_med_terms: list[Tensor] = []
@@ -3467,6 +4010,47 @@ def rollout_policy(
     target_dtype = model.vision_projection.weight.dtype
     lang_cond = None
     g_prev = None
+    transition_validity = None
+    rank_shuffle_actions = None
+    rank_shuffle_validity = None
+    if visual_world_supervision:
+        if model.wmrm is None or getattr(model.config, "wmrm_target", None) != "dino":
+            raise ValueError("visual World supervision requires WAM4VA with DINO targets")
+        action_valid_mask = batch.get("action_valid_mask")
+        if action_valid_mask is None:
+            raise ValueError(
+                "visual World supervision requires the recorded action_valid_mask"
+            )
+        transition_validity = world_transition_mask(
+            action_valid_mask,
+            cycle_steps=model.wmrm.cycle_steps,
+        )
+        rank_shuffle_actions = batch.get("world_rank_shuffle_action")
+        rank_shuffle_validity = batch.get("world_rank_shuffle_mask")
+        expected_actions = (
+            batch["actions"].shape[0],
+            batch["actions"].shape[1] - 1,
+            model.wmrm.cycle_steps,
+            batch["actions"].shape[-1],
+        )
+        expected_mask = expected_actions[:2]
+        if (
+            rank_shuffle_actions is None
+            or tuple(rank_shuffle_actions.shape) != expected_actions
+        ):
+            raise ValueError(
+                "visual World action ranking requires fixed train-split shuffled "
+                f"actions with shape {expected_actions}"
+            )
+        if (
+            rank_shuffle_validity is None
+            or rank_shuffle_validity.dtype != torch.bool
+            or tuple(rank_shuffle_validity.shape) != expected_mask
+        ):
+            raise ValueError(
+                "visual World action ranking requires bool donor mask with shape "
+                f"{expected_mask}"
+            )
     if servo is not None:
         if model.slot_reader is None or language_cache.role_queries is None:
             raise ValueError(
@@ -3477,6 +4061,7 @@ def rollout_policy(
             for key in ("stage", "innovation_flag", "beta", "hyp_entropy", "correction"):
                 servo_stats[key] = []
     for time_index in range(batch["actions"].shape[1]):
+        pre_step_visual_memory = visual_memory
         semantic_context = None
         mtvj_kwargs = {}
         if dense_evidence is not None:
@@ -3527,13 +4112,18 @@ def rollout_policy(
                     batch["proprio"][:, time_index],
                     batch["previous_action"][:, time_index],
                     language_cache=language_cache,
-                    visual_memory=visual_memory,
+                    visual_memory=pre_step_visual_memory,
                     return_visual_memory=True,
                     skip_wmrm=True,
                     **mtvj_kwargs,
                 )
-                with torch.no_grad():
-                    decoded = model.decode_actions(proposal_cond, steps=flow_steps)
+                with feature_no_grad_decode_autocast(
+                    proposal_cond.device, feature_autocast_bf16
+                ):
+                    with torch.no_grad():
+                        decoded = model.decode_actions(
+                            proposal_cond, steps=flow_steps
+                        )
                 if decoded.shape[1] < cycle:
                     raise ValueError(
                         f"decoded action horizon {decoded.shape[1]} "
@@ -3547,11 +4137,19 @@ def rollout_policy(
             batch["proprio"][:, time_index],
             batch["previous_action"][:, time_index],
             language_cache=language_cache,
-            visual_memory=visual_memory,
+            visual_memory=pre_step_visual_memory,
             return_visual_memory=True,
             env_action=world_action,
             **mtvj_kwargs,
         )
+        proposal_auxes = list(getattr(model, "last_wmrm_auxes", None) or ())
+        if not proposal_auxes and getattr(model, "last_wmrm", None) is not None:
+            proposal_auxes = [model.last_wmrm]
+        proposal_pres = list(getattr(model, "last_wmrm_pre_actions", None) or ())
+        proposal_meds = list(getattr(model, "last_wmrm_meds", None) or ())
+        proposal_kls = list(getattr(model, "last_wmrm_pi_kls", None) or ())
+        proposal_last = getattr(model, "last_wmrm", None)
+        proposal_last_kl = getattr(model, "last_wmrm_pi_kl", None)
         if model.wmrm is not None and time_index + 1 < batch["actions"].shape[1]:
             target = wmrm_next_feature_target(
                 model,
@@ -3560,43 +4158,233 @@ def rollout_policy(
                 dense_evidence=dense_evidence,
                 metric_g=metric_g,
             )
-            auxes = getattr(model, "last_wmrm_auxes", None) or (
-                [model.last_wmrm] if model.last_wmrm is not None else []
-            )
-            if not auxes:
+            if not proposal_auxes:
                 raise ValueError("WAM4VA produced no world predictions at a supervised step")
-            pres = getattr(model, "last_wmrm_pre_actions", None) or []
-            # Every VA↔WM stage emits a full map. Average stage losses so all
-            # maps learn the same future without multiplying the world weight.
-            for inject_i, aux in enumerate(auxes):
-                pred = aux.z_tokens if aux.z_tokens is not None else aux.z_hat
-                if pred.shape != target.shape:
+            if visual_world_supervision:
+                if transition_validity is None:
+                    raise RuntimeError("visual World stage context is incomplete")
+                valid = transition_validity[:, time_index]
+                task_ids = _world_task_ids(batch, time_index, target.device)
+                current = model.wmrm.encode_dino_map(
+                    batch["vision_tokens"][:, time_index]
+                )
+                if current is None or current.shape != target.shape:
                     raise ValueError(
-                        "world target shape must match prediction: "
-                        f"{tuple(target.shape)} vs {tuple(pred.shape)}"
+                        "visual World current/target maps must match, got "
+                        f"{None if current is None else tuple(current.shape)} and "
+                        f"{tuple(target.shape)}"
                     )
-                wmrm_world_terms.append(wmrm_world_loss(pred, target))
-                if inject_i < len(pres):
+                logged_action = batch["actions"][
+                    :, time_index, : model.wmrm.cycle_steps
+                ]
+                logged_visual_memory = (
+                    None
+                    if pre_step_visual_memory is None
+                    else pre_step_visual_memory.detach()
+                )
+                try:
+                    logged_condition = model.encode_condition(
+                        vision_in,
+                        batch["proprio"][:, time_index],
+                        batch["previous_action"][:, time_index],
+                        language_cache=language_cache,
+                        visual_memory=logged_visual_memory,
+                        env_action=logged_action,
+                        detach_wmrm_stage_state=True,
+                        **mtvj_kwargs,
+                    )
+                    logged_auxes = list(
+                        getattr(model, "last_wmrm_auxes", None) or ()
+                    )
+                    logged_pres = list(
+                        getattr(model, "last_wmrm_pre_actions", None) or ()
+                    )
+                    del logged_condition
+                finally:
+                    # The independent logged-action branch must not replace the
+                    # proposal branch consumed by Flow/handshake regularizers.
+                    model.last_wmrm = proposal_last
+                    model.last_wmrm_auxes = proposal_auxes
+                    model.last_wmrm_pre_actions = proposal_pres
+                    model.last_wmrm_meds = proposal_meds
+                    model.last_wmrm_pi_kls = proposal_kls
+                    model.last_wmrm_pi_kl = proposal_last_kl
+                if len(logged_auxes) != len(proposal_auxes):
+                    raise RuntimeError(
+                        "logged/proposal World stage counts differ: "
+                        f"{len(logged_auxes)} vs {len(proposal_auxes)}"
+                    )
+                if len(logged_pres) != len(logged_auxes):
+                    raise RuntimeError(
+                        "logged World pre-action/stage counts differ: "
+                        f"{len(logged_pres)} vs {len(logged_auxes)}"
+                    )
+                final_visual = None
+                logged_visuals = []
+                for inject_i, aux in enumerate(logged_auxes):
+                    logged_map = aux.z_tokens
+                    if logged_map is None or logged_map.shape != target.shape:
+                        raise ValueError(
+                            "logged-action World prediction must be the full DINO map: "
+                            f"{None if logged_map is None else tuple(logged_map.shape)} "
+                            f"vs {tuple(target.shape)}"
+                        )
+                    visual = visual_world_loss(logged_map, target, current)
+                    logged_visuals.append(visual)
+                    guard = visual_no_regression_loss(
+                        visual,
+                        all_copy_ratio=float(WORLD_NO_REGRESSION["all_ratio"]),
+                        static_copy_ratio=float(
+                            WORLD_STATIC_COPY_CONSTRAINT["static_ratio"]
+                        ),
+                    )
+                    while len(visual_world_stage_records) <= inject_i:
+                        visual_world_stage_records.append([])
+                        visual_world_objective_stage_records.append([])
+                        visual_world_guard_stage_records.append([])
+                        visual_world_static_constraint_stage_records.append([])
+                    visual_world_stage_records[inject_i].append(
+                        (task_ids, valid, visual.loss_per_sample)
+                    )
+                    visual_world_objective_stage_records[inject_i].append(
+                        (
+                            task_ids,
+                            valid,
+                            visual.loss_per_sample
+                            + float(WORLD_NO_REGRESSION["weight"])
+                            * guard.all_hinge_per_sample,
+                        )
+                    )
+                    visual_world_guard_stage_records[inject_i].append(
+                        (task_ids, valid, guard.all_hinge_per_sample)
+                    )
+                    visual_world_static_constraint_stage_records[inject_i].append(
+                        (
+                            task_ids,
+                            valid,
+                            guard.static_hinge_per_sample
+                            + static_copy_anchor_loss(
+                                logged_map,
+                                current,
+                                visual.static_mask,
+                            ),
+                        )
+                    )
+                    if inject_i == len(logged_auxes) - 1:
+                        final_visual = visual
+                        visual_world_final_records.append(
+                            {
+                                "task_ids": task_ids.detach(),
+                                "valid": valid.detach(),
+                                "world_all": visual.all_per_sample.detach(),
+                                "copy_all": visual.copy_all_per_sample.detach(),
+                                "world_motion": visual.motion_per_sample.detach(),
+                                "copy_motion": visual.copy_motion_per_sample.detach(),
+                                "world_top10": visual.top10_per_sample.detach(),
+                                "copy_top10": visual.copy_top10_per_sample.detach(),
+                                "world_static": visual.static_per_sample.detach(),
+                                "copy_static": visual.copy_static_per_sample.detach(),
+                                "motion_energy": visual.motion_energy_per_sample.detach(),
+                            }
+                        )
+                if final_visual is None:
+                    raise RuntimeError("logged World branch produced no final visual loss")
+                if rank_shuffle_actions is None or rank_shuffle_validity is None:
+                    raise RuntimeError("visual World action-ranking batch is incomplete")
+                shuffle_valid = valid & rank_shuffle_validity[:, time_index]
+                if bool(valid.any()):
+                    rank_stage = (
+                        len(logged_auxes) - 1
+                        if world_action_rank_stage == "final"
+                        else (world_action_rank_step + time_index)
+                        % len(logged_auxes)
+                    )
+                    rank_aux = logged_auxes[rank_stage]
+                    if rank_aux.predict_belief is None:
+                        raise RuntimeError(
+                            "ranked logged World stage lacks predictor belief"
+                        )
+                    previous_map = (
+                        logged_auxes[rank_stage - 1].z_tokens.detach()
+                        if rank_stage > 0
+                        and logged_auxes[rank_stage - 1].z_tokens is not None
+                        else None
+                    )
+                    _, _, _, shuffled_map = model.wmrm.predict_world(
+                        logged_pres[rank_stage],
+                        rank_aux.proprio,
+                        rank_aux.predict_belief,
+                        rank_aux.task_summary,
+                        dino_tokens=rank_aux.dino_tokens,
+                        env_action=rank_shuffle_actions[:, time_index],
+                        previous_map=previous_map,
+                    )
+                    if shuffled_map is None or shuffled_map.shape != target.shape:
+                        raise ValueError(
+                            "action-gap World prediction must be the full DINO map"
+                        )
+                    real_visual = logged_visuals[rank_stage]
+                    shuffled_visual = visual_world_loss(
+                        shuffled_map, target, current
+                    )
+                    for name in (
+                        "motion_weights",
+                        "topk_mask",
+                        "top10_mask",
+                        "static_mask",
+                    ):
+                        if not torch.equal(
+                            getattr(shuffled_visual, name), getattr(real_visual, name)
+                        ):
+                            raise RuntimeError(
+                                "action-gap oracle reduction changed under shuffled "
+                                f"action: {name}"
+                            )
+                    ranking = action_top10_oracle_straight_through_gap_loss(
+                        real_visual,
+                        shuffled_visual,
+                        logged_auxes[rank_stage].z_tokens,
+                        shuffled_map,
+                        target,
+                        current,
+                        minimum_relative_degradation=float(
+                            WORLD_ACTION_RANKING["top10_min_relative_margin"]
+                        ),
+                    )
+                    visual_world_action_shuffle_records.append(
+                        (task_ids, shuffle_valid, ranking.loss_per_sample)
+                    )
+            else:
+                # Legacy World supervision remains available for old experiments;
+                # visual-motion runs use the separate logged-action branch above.
+                for aux in proposal_auxes:
+                    pred = aux.z_tokens if aux.z_tokens is not None else aux.z_hat
+                    if pred.shape != target.shape:
+                        raise ValueError(
+                            "world target shape must match prediction: "
+                            f"{tuple(target.shape)} vs {tuple(pred.shape)}"
+                        )
+                    wmrm_world_terms.append(wmrm_world_loss(pred, target))
+            if wmrm_adep_enabled:
+                for inject_i, aux in enumerate(proposal_auxes):
+                    if inject_i >= len(proposal_pres):
+                        continue
                     eye_mean = aux.evidence.mean(dim=1)
-                    task_id = batch.get("task_id")
-                    if task_id is None:
-                        task_id = batch.get("task_ids")
-                    if task_id is None:
-                        task_id = batch.get("instruction_id")
-                    if task_id is not None:
-                        task_id = torch.as_tensor(task_id, device=aux.z_hat.device)
-                        if task_id.ndim > 1:
-                            task_id = task_id[:, time_index]
-                    donor = pres[inject_i].clone()
+                    task_id = _world_task_ids(batch, time_index, aux.z_hat.device)
+                    donor = proposal_pres[inject_i].clone()
                     cycle = min(model.wmrm.cycle_steps, donor.shape[1])
                     perm = matched_no_fixed_point_perm(task_id, eye_mean, aux.proprio)
-                    donor[:, :cycle] = pres[inject_i][perm][:, :cycle]
+                    donor[:, :cycle] = proposal_pres[inject_i][perm][:, :cycle]
                     env = aux.env_action
                     if env is not None:
                         env = env[perm]
                     previous_map = (
-                        auxes[inject_i - 1].z_tokens if inject_i > 0 else None
+                        proposal_auxes[inject_i - 1].z_tokens
+                        if inject_i > 0
+                        else None
                     )
+                    if previous_map is not None:
+                        previous_map = previous_map.detach()
                     z_alt, _, _, tok_shuf = model.wmrm.predict_world(
                         donor,
                         aux.proprio,
@@ -3609,7 +4397,10 @@ def rollout_policy(
                     if tok_shuf is None:
                         pred_real, z_shuf = aux.z_hat, z_alt
                     else:
-                        pred_real, z_shuf = pred, tok_shuf
+                        pred_real = (
+                            aux.z_tokens if aux.z_tokens is not None else aux.z_hat
+                        )
+                        z_shuf = tok_shuf
                     wmrm_adep_terms.append(
                         model.wmrm.action_dep_hinge(
                             pred_real,
@@ -3618,14 +4409,12 @@ def rollout_policy(
                             margin=wmrm_adep_margin,
                         )
                     )
-        meds = getattr(model, "last_wmrm_meds", None)
-        if meds:
-            wmrm_med_terms.extend(meds)
-        kls = getattr(model, "last_wmrm_pi_kls", None)
-        if kls:
-            wmrm_pi_kl_terms.extend(kls)
-        elif getattr(model, "last_wmrm_pi_kl", None) is not None:
-            wmrm_pi_kl_terms.append(model.last_wmrm_pi_kl)
+        if proposal_meds:
+            wmrm_med_terms.extend(proposal_meds)
+        if proposal_kls:
+            wmrm_pi_kl_terms.extend(proposal_kls)
+        elif proposal_last_kl is not None:
+            wmrm_pi_kl_terms.append(proposal_last_kl)
         if model.config.c2_controller:
             # C²-VA Stage B：c_current = P(当前决策视觉均值)；解码
             # a = clip(ū − K·(c_current − c̄))；reference 序列供 L_f 监督。
@@ -3738,10 +4527,92 @@ def rollout_policy(
             servo_stats[key] = torch.stack(servo_stats[key], dim=1)  # [B, T, ...]
     if c2_references is not None:
         return out + (torch.stack(c2_references, dim=1),)
-    if wmrm_world_terms:
+    if visual_world_stage_records:
+        stage_weights = stage_supervision_weights(
+            len(visual_world_stage_records),
+            auxiliary_decay=WORLD_STAGE_AUXILIARY_DECAY,
+        )
+
+        def reduce_stage_records(
+            records_by_stage: list[list[tuple[Tensor, Tensor, Tensor]]],
+        ) -> Tensor:
+            values: list[Tensor] = []
+            masks: list[Tensor] = []
+            weights: list[float] = []
+            for stage_weight, records in zip(
+                stage_weights, records_by_stage, strict=True
+            ):
+                for _, valid, value in records:
+                    values.append(value)
+                    masks.append(valid)
+                    weights.append(stage_weight)
+            return masked_world_reduction(values, masks, weights)
+
+        base_world_loss = reduce_stage_records(visual_world_stage_records)
+        no_regression_loss = reduce_stage_records(
+            visual_world_guard_stage_records
+        )
+        objective_world_loss = reduce_stage_records(
+            visual_world_objective_stage_records
+        )
+
+        static_constraint_loss = reduce_stage_records(
+            visual_world_static_constraint_stage_records
+        )
+
+        def reduce_action_records(
+            records: list[tuple[Tensor, Tensor, Tensor]],
+        ) -> Tensor:
+            if not records:
+                return objective_world_loss * 0.0
+            return masked_world_reduction(
+                [value for _, _, value in records],
+                [valid for _, valid, _ in records],
+            )
+
+        action_shuffle_loss = reduce_action_records(
+            visual_world_action_shuffle_records
+        )
+        action_zero_loss = objective_world_loss * 0.0
+        action_strong_loss = objective_world_loss * 0.0
+        action_rank_loss = action_shuffle_loss
+        model.last_wmrm_base_loss = base_world_loss
+        model.last_world_no_regression_loss = no_regression_loss
+        model.last_world_static_constraint_loss = static_constraint_loss
+        model.last_world_action_rank_loss = action_rank_loss
+        model.last_world_action_shuffle_loss = action_shuffle_loss
+        model.last_world_action_zero_loss = action_zero_loss
+        model.last_world_action_strong_loss = action_strong_loss
+        model.last_wmrm_loss = (
+            objective_world_loss
+            + float(WORLD_STATIC_COPY_CONSTRAINT["weight"])
+            * static_constraint_loss
+            + float(WORLD_ACTION_RANKING["weight"]) * action_rank_loss
+        )
+        model.last_visual_world_metrics = _summarize_visual_world_metrics(
+            visual_world_final_records,
+            visual_world_stage_records,
+        )
+    elif wmrm_world_terms:
         model.last_wmrm_loss = torch.stack(wmrm_world_terms).mean()
+        model.last_wmrm_base_loss = model.last_wmrm_loss
+        model.last_world_no_regression_loss = model.last_wmrm_loss * 0.0
+        model.last_world_static_constraint_loss = model.last_wmrm_loss * 0.0
+        model.last_world_action_rank_loss = model.last_wmrm_loss * 0.0
+        model.last_world_action_shuffle_loss = model.last_wmrm_loss * 0.0
+        model.last_world_action_zero_loss = model.last_wmrm_loss * 0.0
+        model.last_world_action_strong_loss = model.last_wmrm_loss * 0.0
+        model.last_visual_world_metrics = {}
     else:
         model.last_wmrm_loss = None
+        model.last_wmrm_base_loss = None
+        model.last_world_no_regression_loss = None
+        model.last_world_static_constraint_loss = None
+        model.last_world_action_rank_loss = None
+        model.last_world_action_shuffle_loss = None
+        model.last_world_action_zero_loss = None
+        model.last_world_action_strong_loss = None
+        model.last_visual_world_metrics = {}
     if wmrm_pi_kl_terms:
         model.last_wmrm_pi_kl_loss = torch.stack(wmrm_pi_kl_terms).mean()
     else:
@@ -4233,6 +5104,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="WMRM 世界预测 MSE 权重（仅 --wmrm；target 为下一决策 metric_g，stop-grad）",
     )
     parser.add_argument(
+        "--visual-world-supervision",
+        action="store_true",
+        help="use visual-motion-aware full-map World supervision on logged actions",
+    )
+    parser.add_argument(
+        "--world-split-manifest",
+        type=Path,
+        help="immutable episode-level train/eval split manifest for visual World runs",
+    )
+    parser.add_argument(
+        "--world-action-rank-stage",
+        choices=("final", "cycle"),
+        default="cycle",
+        help="v6 shuffled-action gap supervision at the final or rotating WAM stage",
+    )
+    parser.add_argument(
         "--wmrm-inject",
         choices=("last", "all", "even"),
         default="all",
@@ -4355,6 +5242,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--vision-dtype", choices=("float32", "float16", "bfloat16"), default="bfloat16"
+    )
+    parser.add_argument(
+        "--feature-autocast-bf16",
+        action="store_true",
+        help="Run the feature-policy forward in CUDA BF16 autocast while keeping "
+        "model/optimizer parameters and loss reductions in FP32.",
     )
     parser.add_argument("--e2e-pooling", choices=("flat", "spatial"), default="flat")
     parser.add_argument(
@@ -5036,6 +5929,66 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("training steps, flow steps, and learning rate must be positive")
     if args.pair_loss_weight < 0.0:
         raise ValueError("pair loss weight must be non-negative")
+    visual_world = bool(getattr(args, "visual_world_supervision", False))
+    split_manifest = getattr(args, "world_split_manifest", None)
+    if visual_world:
+        required = {
+            "--data": args.data is not None,
+            "--world-split-manifest": split_manifest is not None,
+            "--wam4va": bool(getattr(args, "wmrm", False)),
+            "--wmrm-target dino": getattr(args, "wmrm_target", None) == "dino",
+            "--wmrm-cycle-steps 6": int(getattr(args, "wmrm_cycle_steps", 0)) == 6,
+            "--wmrm-inject all": getattr(args, "wmrm_inject", None) == "all",
+            "WAM4VA handshake enabled": bool(
+                getattr(args, "wmrm_handshake", True)
+            ),
+            "--va-layers 8": int(getattr(args, "va_layers", 0)) == 8,
+            "--wmrm-predictor st_blocks": getattr(args, "wmrm_predictor", None)
+            == "st_blocks",
+            "--wmrm-predictor-depth 6": int(
+                getattr(args, "wmrm_predictor_depth", 0)
+            )
+            == 6,
+            "--wmrm-predictor-width 384": int(
+                getattr(args, "wmrm_predictor_width", 0)
+            )
+            == 384,
+            "--wmrm-predictor-heads 12": int(
+                getattr(args, "wmrm_predictor_heads", 0)
+            )
+            == 12,
+            "--wmrm-map-size 16": int(getattr(args, "wmrm_map_size", 0)) == 16,
+            "--wmrm-map-channels 1024": int(
+                getattr(args, "wmrm_map_channels", 0)
+            )
+            == 1024,
+            "--wmrm-world-grid 16": int(getattr(args, "wmrm_world_grid", 0))
+            == 16,
+            "--dino-main-vision": bool(getattr(args, "dino_main_vision", False)),
+            "--main-vision-grid 16": int(getattr(args, "main_vision_grid", 0)) == 16,
+            "--main-vision-frames 4": int(getattr(args, "main_vision_frames", 0))
+            == 4,
+            "--sequence-length 4": int(getattr(args, "sequence_length", 0)) == 4,
+            "--min-sequence-length 4": int(
+                getattr(args, "min_sequence_length", 0)
+            )
+            == 4,
+            "--single-task joint sampler": bool(args.single_task),
+        }
+        missing = [name for name, enabled in required.items() if not enabled]
+        if missing:
+            raise ValueError(
+                "--visual-world-supervision missing required settings: "
+                + ", ".join(missing)
+            )
+        if args.resume is not None or getattr(args, "resume_weights", None) is not None:
+            raise ValueError(
+                "visual World training may only start scratch or use --resume-exact"
+            )
+    elif split_manifest is not None:
+        raise ValueError(
+            "--world-split-manifest requires --visual-world-supervision"
+        )
     flow_prefix_steps = getattr(args, "flow_prefix_steps", 6)
     flow_prefix_weight = getattr(args, "flow_prefix_weight", 1.0)
     flow_tail_weight = getattr(args, "flow_tail_weight", 1.0)
@@ -5564,10 +6517,10 @@ def validate_args(args: argparse.Namespace) -> None:
                     "--mtvj-visual-aux-every requires --mtvj-train-relation："
                     "视觉坐标漂移时 relation bridge 必须同步适配"
                 )
-            if args.task_sampling != "weighted":
+            if args.task_sampling not in {"weighted", "balanced"}:
                 raise ValueError(
-                    "--mtvj-visual-aux-every requires --task-sampling weighted"
-                    "（辅助任务按难度权重采样）"
+                    "--mtvj-visual-aux-every requires --task-sampling "
+                    "weighted|balanced（辅助任务需要显式任务权重）"
                 )
             if args.sam_rho > 0.0:
                 raise ValueError(
@@ -6007,6 +6960,15 @@ def _restore_mtvj_policy_modules(
             )
 
 
+def final_checkpoint_save_due(
+    save_path: Path | None,
+    global_step: int,
+    last_saved_global_step: int | None,
+) -> bool:
+    """Return whether the completed run still needs its final checkpoint save."""
+    return save_path is not None and last_saved_global_step != global_step
+
+
 def save_checkpoint(
     args,
     config,
@@ -6298,6 +7260,44 @@ def save_checkpoint(
             )
             payload["training_contract"]["wam_joint"] = True
             payload["training_contract"]["wam_contract_version"] = 1
+    if getattr(args, "visual_world_supervision", False):
+        split_identity = getattr(args, "visual_world_split_identity", None)
+        if not isinstance(split_identity, dict):
+            raise ValueError(
+                "visual World checkpoint requires a validated split identity"
+            )
+        payload["training_contract"].update(
+            {
+                "world_supervision": WORLD_SUPERVISION_CONTRACT,
+                "world_transition": WORLD_TRANSITION_CONTRACT,
+                "world_loss_weights": dict(WORLD_LOSS_COMPONENT_WEIGHTS),
+                "world_stage_auxiliary_decay": WORLD_STAGE_AUXILIARY_DECAY,
+                "world_no_regression": dict(WORLD_NO_REGRESSION),
+                "world_static_copy_constraint": dict(
+                    WORLD_STATIC_COPY_CONSTRAINT
+                ),
+                "world_action_ranking": world_action_ranking_contract(
+                    getattr(args, "world_action_rank_stage", "cycle")
+                ),
+                "world_action_donor_contract": WORLD_ACTION_DONOR_CONTRACT,
+                "world_action_donor_sha256": split_identity[
+                    "world_action_donor_sha256"
+                ],
+                "world_action_donor_transitions": split_identity[
+                    "world_action_donor_transitions"
+                ],
+                "world_action_rank_transitions": split_identity[
+                    "world_action_rank_transitions"
+                ],
+                "world_action_source": "logged_cycle6",
+                "world_target_stop_gradient": True,
+                "world_logged_branch": WORLD_LOGGED_BRANCH_CONTRACT,
+                "split_manifest_id": split_identity["manifest_id"],
+                "split_manifest_path": split_identity["manifest_path"],
+                "split_manifest_sha256": split_identity["manifest_sha256"],
+                "split_source_sha256": split_identity["source_sha256"],
+            }
+        )
     if (
         roi_head is not None
         and getattr(args, "dino_roi_checkpoint", None) is not None
@@ -6392,7 +7392,19 @@ def save_checkpoint(
         step_path = args.save.with_name(
             f"{args.save.stem}_s{int(global_step)}{args.save.suffix}"
         )
-        shutil.copy2(args.save, step_path)
+        step_tmp = step_path.with_suffix(step_path.suffix + ".tmp")
+        if step_path.exists():
+            if _sha256_file(step_path) != _sha256_file(args.save):
+                raise FileExistsError(
+                    f"refusing to overwrite checkpoint step copy: {step_path}"
+                )
+        else:
+            if step_tmp.exists():
+                raise FileExistsError(
+                    f"stale checkpoint step-copy temporary exists: {step_tmp}"
+                )
+            shutil.copy2(args.save, step_tmp)
+            step_tmp.replace(step_path)
 
 
 class SAM(torch.optim.Optimizer):
@@ -6523,6 +7535,9 @@ def main() -> None:
     m = 0
     task_log_names: dict[int, str] = {}
     env_by_description: dict[str, str] = {}
+    lang_aux_cache: dict[str, tuple[Tensor, Tensor]] = {}
+    aux_tasks: list[str] = []
+    aux_task_w = torch.empty(0, dtype=torch.float64)
     fork_iter = None  # 修复 HEAD 隐患：无 --data 的合成冒烟路径此前 UnboundLocalError
     if args.e2e_data:
         dataset = E2EDataset(args.e2e_data, min_sequence_length=args.min_sequence_length)
@@ -6698,6 +7713,23 @@ def main() -> None:
                 coords=(local_payload["coords"] if local_payload is not None else None),
             )
         _enable_optional_action_masks(dataset)
+        if getattr(args, "visual_world_supervision", False):
+            args.visual_world_split_identity = validate_visual_world_training_split(
+                dataset.payload,
+                args.data,
+                args.world_split_manifest,
+            )
+            donor_identity = prepare_visual_world_action_ranking(dataset.payload)
+            args.visual_world_split_identity.update(donor_identity)
+            print(
+                "visual World split: PASS "
+                f"manifest={args.visual_world_split_identity['manifest_id']} "
+                f"sha256={args.visual_world_split_identity['manifest_sha256']} "
+                "action_donors="
+                f"{donor_identity['world_action_rank_transitions']}/"
+                f"{donor_identity['world_action_donor_transitions']}",
+                flush=True,
+            )
         descriptions = list(
             dataset.payload.get("metadata", {}).get("tasks", [])
         )
@@ -6968,8 +8000,8 @@ def main() -> None:
                 # 与 build_longtraj_features.task_language_t 同源）；辅助任务按
                 # 难度权重 raw_task_w 多项式采样。单任务子集（2026-08-16）只缓存
                 # 数据里实际出现的任务。
-                lang_aux_cache: dict[str, tuple[Tensor, Tensor]] = {}
-                aux_tasks: list[str] = []
+                lang_aux_cache = {}
+                aux_tasks = []
                 aux_weights: list[float] = []
                 if args.mtvj_visual_aux_every > 0:
                     hid_all = dataset.payload["language_hidden"]
@@ -7603,6 +8635,14 @@ def main() -> None:
             else torch.load(resume_path, map_location="cpu", weights_only=True)
         )
         if exact_resume:
+            if getattr(args, "visual_world_supervision", False):
+                validate_visual_world_resume_contract(
+                    resume_ckpt,
+                    args.visual_world_split_identity,
+                    world_action_ranking_contract(
+                        getattr(args, "world_action_rank_stage", "cycle")
+                    ),
+                )
             # Fail before restoring model/optimizer/sampler/RNG if any data,
             # objective, sampler, architecture or optimizer semantic changed.
             validate_exact_run_contract(
@@ -7873,13 +8913,19 @@ def main() -> None:
         iterator = iter(loader)
         restore_rng_state(resume_rng_state)
 
+    last_saved_global_step: int | None = None
+
     def commit_successful_update(local_step: int, consumed_locality_batch: bool) -> None:
         """Advance all resumable state only after the optimizer update succeeds."""
-        nonlocal global_step
+        nonlocal global_step, last_saved_global_step
         if consumed_locality_batch:
             sampler.advance()
         global_step += 1
-        if args.save_every > 0 and global_step % args.save_every == 0:
+        if (
+            args.save is not None
+            and args.save_every > 0
+            and global_step % args.save_every == 0
+        ):
             save_checkpoint(
                 args,
                 config,
@@ -7896,6 +8942,7 @@ def main() -> None:
                 sampler=sampler,
                 exact_run_contract=runtime_exact_run_contract,
             )
+            last_saved_global_step = global_step
             print(
                 f"step={local_step} global_step={global_step} "
                 f"periodic checkpoint saved to {args.save}",
@@ -8159,6 +9206,18 @@ def main() -> None:
             else sample_flow_matching_inputs(batch["actions"])
         )
 
+        next_global_step = global_step + 1
+        prepared_visual_aux = _prepare_mtvj_visual_aux_step(
+            aux_tasks,
+            aux_task_w,
+            env_by_description,
+            seed=args.seed,
+            global_step=next_global_step,
+            every=args.mtvj_visual_aux_every,
+            aux_batch=args.mtvj_visual_aux_batch,
+            include_raw_frames=bool(getattr(args, "dino_main_vision", False)),
+        )
+
         def compute_loss(batch, noisy_actions, flow_time):
             """Forward + flow/pair loss（SAM 二次前向复用同一噪声/配对）。"""
             evsm_gates = []
@@ -8235,7 +9294,19 @@ def main() -> None:
                     action_dense_evidence=action_dense_evidence,
                     metric_g=mtvj_metric_g,
                     wmrm_adep_margin=float(getattr(args, "wmrm_adep_margin", 0.05)),
+                    visual_world_supervision=bool(
+                        getattr(args, "visual_world_supervision", False)
+                    ),
+                    wmrm_adep_enabled=float(
+                        getattr(args, "wmrm_adep_weight", 0.0)
+                    )
+                    > 0.0,
                     flow_steps=int(args.flow_steps),
+                    world_action_rank_step=next_global_step,
+                    world_action_rank_stage=getattr(
+                        args, "world_action_rank_stage", "cycle"
+                    ),
+                    feature_autocast_bf16=bool(args.feature_autocast_bf16),
                 )
                 if model.config.future_predict:
                     predicted_velocity, action_conditions, memories = rollout
@@ -8522,22 +9593,28 @@ def main() -> None:
                 semantic_geom_loss,
             )
 
-        (
-            action_total,
-            total_loss,
-            flow_loss,
-            flow_prefix_loss,
-            flow_tail_loss,
-            pair_loss,
-            predicted_delta,
-            target_delta,
-            future_loss,
-            evsm_gate_mean,
-            semantic_anchor_loss,
-            semantic_geom_loss,
-        ) = compute_loss(batch, noisy_actions, flow_time)
-
+        # No accumulation is used on this path.  Release the previous update's
+        # gradients before constructing the next 8-stage World graph; keeping
+        # them through the forward needlessly raises the transient CUDA peak.
         optimizer.zero_grad(set_to_none=True)
+        with feature_policy_autocast(
+            device, bool(args.feature_autocast_bf16)
+        ):
+            (
+                action_total,
+                total_loss,
+                flow_loss,
+                flow_prefix_loss,
+                flow_tail_loss,
+                pair_loss,
+                predicted_delta,
+                target_delta,
+                future_loss,
+                evsm_gate_mean,
+                semantic_anchor_loss,
+                semantic_geom_loss,
+            ) = compute_loss(batch, noisy_actions, flow_time)
+
         # P0-5：动作损失与语义损失分开 backward——LoRA 参数只缩放动作侧梯度
         # （η_act），anchor/geometry 梯度完整（旧实现统一缩放两者）。
         action_total.backward()
@@ -8545,22 +9622,8 @@ def main() -> None:
         # 累积到同一优化器 step；辅助分支只反传 metric head，且视觉头与
         # VA/relation 分别 clip，避免大辅助梯度压小动作学习信号。
         aux_parts: dict[str, float] = {}
-        # Derive the auxiliary schedule and simulator RNG only from the next
-        # committed global update.  This keeps auxiliary data bit-reproducible
-        # across --resume-exact without serializing a second NumPy Generator,
-        # and avoids resetting the cadence when the local loop restarts at 1.
-        next_global_step = global_step + 1
-        if (
-            args.mtvj_visual_aux_every > 0
-            and next_global_step % args.mtvj_visual_aux_every == 0
-        ):
-            aux_task, aux_rng = _mtvj_visual_aux_sample(
-                aux_tasks,
-                aux_task_w,
-                env_by_description,
-                seed=args.seed,
-                global_step=next_global_step,
-            )
+        if prepared_visual_aux is not None:
+            aux_task, aux_rng, aux_sim_batch = prepared_visual_aux
             if getattr(args, "dino_main_vision", False):
                 # DINO 版视觉辅助（2026-08-16 移植）：仿真真值 → DINO dense
                 # evidence → metric head（grid=16）。V-JEPA 路径保持原样。
@@ -8574,6 +9637,7 @@ def main() -> None:
                     device,
                     loc_lambda=args.mtvj_visual_aux_loc_lambda,
                     vis_lambda=args.mtvj_visual_aux_vis_lambda,
+                    sim_batch=aux_sim_batch,
                 )
             else:
                 aux_loss, aux_parts = _mtvj_visual_aux_loss(
@@ -8586,6 +9650,7 @@ def main() -> None:
                     device,
                     loc_lambda=args.mtvj_visual_aux_loc_lambda,
                     vis_lambda=args.mtvj_visual_aux_vis_lambda,
+                    sim_batch=aux_sim_batch,
                 )
             aux_loss.backward()
         if e2e_model is not None and args.semantic_adapter:
@@ -8644,7 +9709,10 @@ def main() -> None:
             # 文档：first_step 的扰动方向与缩放无关——ρ·g/‖g‖ 与缩放无关；实际步长
             # 由第二次缩放后的梯度决定，因此两次缩放才使 η_act 对 SAM 生效）。
             optimizer.first_step(zero_grad=True)
-            second_losses = compute_loss(batch, noisy_actions, flow_time)
+            with feature_policy_autocast(
+                device, bool(args.feature_autocast_bf16)
+            ):
+                second_losses = compute_loss(batch, noisy_actions, flow_time)
             action_total2, semantic_total2 = second_losses[:2]
             action_total2.backward()
             if e2e_model is not None and args.semantic_adapter:
@@ -8728,6 +9796,43 @@ def main() -> None:
         valid_fraction = effective_action_valid_fraction(
             batch, batch["actions"]
         ).detach()
+        world_task_log = ""
+        visual_metrics = getattr(model, "last_visual_world_metrics", {}) or {}
+        if visual_metrics:
+            task_parts = []
+            for task_id, metrics in sorted(visual_metrics.items()):
+                stage_text = ",".join(
+                    f"{float(value):.5f}" for value in metrics["stage_losses"]
+                )
+                task_parts.append(
+                    f"{task_log_names.get(task_id, str(task_id))}:"
+                    f"all={metrics['world_all']:.5f}/{metrics['copy_all']:.5f} "
+                    f"gain={metrics['gain_all']:.5f} "
+                    f"motion={metrics['world_motion']:.5f}/{metrics['copy_motion']:.5f} "
+                    f"mgain={metrics['gain_motion']:.5f} "
+                    f"top10={metrics['world_top10']:.5f}/{metrics['copy_top10']:.5f} "
+                    f"rel={metrics['relative_gain_top10']:.3f} "
+                    f"static={metrics['world_static']:.5f}/{metrics['copy_static']:.5f} "
+                    f"n={metrics['transitions']} energy={metrics['motion_energy']:.5f} "
+                    f"stages={stage_text}"
+                )
+            world_task_log = " world_task[" + " | ".join(task_parts) + "]"
+        world_constraint_log = ""
+        if getattr(model, "last_world_no_regression_loss", None) is not None:
+            world_constraint_log = (
+                f" world_base={float(model.last_wmrm_base_loss):.6f}"
+                f" world_guard={float(model.last_world_no_regression_loss):.6f}"
+                " world_static_constraint="
+                f"{float(model.last_world_static_constraint_loss):.6f}"
+                f" world_action_rank={float(model.last_world_action_rank_loss):.6f}"
+            )
+        resources = runtime_resource_stats(device)
+        resource_log = (
+            f" resources[rss={resources['rss_mib']:.1f}MiB "
+            f"fd={resources['fd_count']} "
+            f"cuda={resources['cuda_allocated_mib']:.1f}/"
+            f"{resources['cuda_reserved_mib']:.1f}MiB]"
+        )
         print(
             f"step={global_step} mode={args.mode} contract="
             f"{'e2e_single' if e2e_model is not None else ('single' if args.single_task else 'paired')} "
@@ -8743,10 +9848,13 @@ def main() -> None:
             f"goal_delta={predicted_delta.item():.6f}/"
             f"{target_delta.item():.6f} grad={float(gradient_norm):.6f}"
             f"{relation_log}{metric_head_log}{aux_log}{gate_log}{semantic_log}"
-            f"{compile_step_log}{servo_log}"
+            f"{compile_step_log}{servo_log}{world_task_log}{resource_log}"
+            f"{world_constraint_log}"
         )
 
-    if args.save:
+    if final_checkpoint_save_due(
+        args.save, global_step, last_saved_global_step
+    ):
         save_checkpoint(
             args,
             config,

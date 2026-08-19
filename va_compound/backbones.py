@@ -1198,15 +1198,15 @@ class TimmActionVisionBackbone(nn.Module):
             )
         parameter = next(self.model.parameters())
         images = images.to(device=parameter.device, dtype=parameter.dtype)
-        outputs = self.model.forward_intermediates(
+        outputs = self.model.get_intermediate_layers(
             images,
-            indices=list(self.output_layers),
+            n=list(self.output_layers),
+            reshape=False,
             return_prefix_tokens=True,
             norm=True,
-            output_fmt="NLC",
-            intermediates_only=True,
         )
-        if not isinstance(outputs, list) or len(outputs) != 2:
+        outputs = list(outputs)
+        if len(outputs) != 2:
             raise RuntimeError("action-vision tower must return two intermediate levels")
         patches: list[Tensor] = []
         for output in outputs:

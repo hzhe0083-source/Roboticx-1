@@ -195,6 +195,13 @@ class LongTrajFramesDataset:
 
     def __getitem__(self, index: int) -> dict:
         item = {key: self.payload[key][index] for key in self.REQUIRED}
+        for key in (
+            "episode_id",
+            "world_rank_shuffle_action",
+            "world_rank_shuffle_mask",
+        ):
+            if key in self.payload:
+                item[key] = self.payload[key][index]
         for key in ACTION_MASK_KEYS:
             if key in self.payload:
                 item[key] = self.payload[key][index]

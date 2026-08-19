@@ -604,6 +604,7 @@ def _sample_one(
     w: int,
     *,
     include_raw_frames: bool = False,
+    renderer: _Renderer | None = None,
 ) -> dict:
     mujoco = _import_mujoco_metaworld()[0]
     # 随机化（颜色/相机/物体位置；reset 随机化已在 make_metric_batch 里做）
@@ -635,16 +636,21 @@ def _sample_one(
         a[3] = 1.0  # 夹爪张开
         return a
 
-    renderer = _Renderer(env)  # 与 env.render() 同相机同画面（MAE≈0）
-    frames: list[np.ndarray] = []
-    for i in range(total):
-        if i >= SETTLE_STEPS and (i - SETTLE_STEPS) in offsets:
-            frames.append(renderer.render_rgb())
-        if i < total - 1:  # 最新帧渲染后不 step（P0-2：标签与最新帧同状态）
-            env.step(_rand_action())
-    # 深度（遮挡判据）+ 关键点（渲染后 data 新鲜）
-    depth = renderer.render_depth()
-    renderer.close()
+    owns_renderer = renderer is None
+    if renderer is None:
+        renderer = _Renderer(env)  # 与 env.render() 同相机同画面（MAE≈0）
+    try:
+        frames: list[np.ndarray] = []
+        for i in range(total):
+            if i >= SETTLE_STEPS and (i - SETTLE_STEPS) in offsets:
+                frames.append(renderer.render_rgb())
+            if i < total - 1:  # 最新帧渲染后不 step（P0-2：标签与最新帧同状态）
+                env.step(_rand_action())
+        # 深度（遮挡判据）+ 关键点（渲染后 data 新鲜）
+        depth = renderer.render_depth()
+    finally:
+        if owns_renderer:
+            renderer.close()
 
     world = keypoint_world_positions(env, task)
     supported = world is not None
@@ -833,7 +839,9 @@ def make_metric_batch(
         model = getattr(env, "model", None)
         geom_rgba = getattr(model, "geom_rgba", None)
         base_geom_rgba = None if geom_rgba is None else geom_rgba.copy()
+        renderer = None
         try:
+            renderer = _Renderer(env)
             for i, (t, sample_seed) in enumerate(sample_specs):
                 if i > 0:
                     _reset_env_for_sample(env, sample_seed, base_geom_rgba)
@@ -844,10 +852,15 @@ def make_metric_batch(
                     sample_rng,
                     frames_per_sample,
                     include_raw_frames=include_raw_frames,
+                    renderer=renderer,
                 )
                 batch.append(rec)
         finally:
-            env.close()
+            try:
+                if renderer is not None:
+                    renderer.close()
+            finally:
+                env.close()
     result = {
         "frames": np.stack([b["frames"] for b in batch]),
         "language_text": [ENV_TO_TASK.get(t, t) for t in tasks],
