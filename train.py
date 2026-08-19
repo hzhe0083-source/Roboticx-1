@@ -64,7 +64,10 @@ _WORLD_ACTION_RANKING_COMMON = {
 }
 
 
-def world_action_ranking_contract(stage_mode: str) -> dict[str, object]:
+def world_action_ranking_contract(
+    stage_mode: str,
+    per_sample_cap: float | None = None,
+) -> dict[str, object]:
     if stage_mode == "final":
         stage = "final_direct_matched_context"
         schedule = "final_each_valid_transition"
@@ -73,11 +76,14 @@ def world_action_ranking_contract(stage_mode: str) -> dict[str, object]:
         schedule = "(global_step+time_index)%num_stages"
     else:
         raise ValueError(f"unsupported World action-ranking stage mode: {stage_mode}")
-    return {
+    contract = {
         "stage": stage,
         **_WORLD_ACTION_RANKING_COMMON,
         "schedule": schedule,
     }
+    if per_sample_cap is not None:
+        contract["per_sample_cap"] = per_sample_cap
+    return contract
 
 
 # Programmatic callers retain a deterministic default; experiment runners pass
@@ -1051,6 +1057,7 @@ WMRM_WORLD_WEIGHT_1_TO_0_5_MIGRATION = "wmrm_world_weight_1_to_0_5_v1"
 WMRM_STATIC_CONSTRAINT_WEIGHT_4_TO_2_MIGRATION = (
     "wmrm_static_constraint_weight_4_to_2_v1"
 )
+WMRM_ACTION_RANK_CAP_NONE_TO_0_2_MIGRATION = "wmrm_action_rank_cap_none_to_0_2_v1"
 
 # These only control how long/where the already-defined run is executed. They
 # cannot change the next stochastic optimizer update and therefore are allowed
@@ -1270,6 +1277,8 @@ def validate_visual_world_resume_contract(
     checkpoint: dict,
     split_identity: dict[str, object],
     action_ranking: dict[str, object] | None = None,
+    static_constraint_weight: float = 4.0,
+    migration_id: str | None = None,
 ) -> None:
     """Reject exact continuation from an old or differently split loss graph."""
 
@@ -1280,7 +1289,10 @@ def validate_visual_world_resume_contract(
         "world_loss_weights": WORLD_LOSS_COMPONENT_WEIGHTS,
         "world_stage_auxiliary_decay": WORLD_STAGE_AUXILIARY_DECAY,
         "world_no_regression": WORLD_NO_REGRESSION,
-        "world_static_copy_constraint": WORLD_STATIC_COPY_CONSTRAINT,
+        "world_static_copy_constraint": {
+            **WORLD_STATIC_COPY_CONSTRAINT,
+            "weight": float(static_constraint_weight),
+        },
         "world_action_ranking": (
             WORLD_ACTION_RANKING if action_ranking is None else action_ranking
         ),
@@ -1303,6 +1315,19 @@ def validate_visual_world_resume_contract(
         for key, value in expected.items()
         if contract.get(key) != value
     }
+    if migration_id == WMRM_ACTION_RANK_CAP_NONE_TO_0_2_MIGRATION:
+        source_ranking = world_action_ranking_contract(
+            "final" if action_ranking and action_ranking.get("stage") == "final_direct_matched_context" else "cycle"
+        )
+        mismatches = {
+            key: values
+            for key, values in mismatches.items()
+            if not (
+                key == "world_action_ranking"
+                and values[0] == source_ranking
+                and values[1] == action_ranking
+            )
+        }
     if mismatches:
         raise ValueError(
             "--resume-exact requires the same visual-motion World contract: "
@@ -1621,6 +1646,7 @@ def _normalize_legacy_exact_run_contract(contract: dict) -> dict:
     if isinstance(arguments, dict):
         arguments.setdefault("wmrm_detach_proposal_stage_state", False)
         arguments.setdefault("wmrm_static_constraint_weight", 4.0)
+        arguments.setdefault("wmrm_action_rank_per_sample_cap", None)
         arguments.setdefault("max_gradient_norm", None)
     model_config = normalized.get("model_config")
     if isinstance(model_config, dict):
@@ -1679,6 +1705,49 @@ def validate_exact_run_contract(
             f"{path}: checkpoint={left!r}, runtime={right!r}"
             for path, left, right in mismatches[:12]
         ) or f"no coherent old-{saved_target} to new-{current_target} transition"
+        raise ValueError(
+            f"controlled exact-resume migration {migration_id!r} refused: {details}"
+        )
+    if migration_id == WMRM_ACTION_RANK_CAP_NONE_TO_0_2_MIGRATION:
+        allowed_paths = {"arguments.wmrm_action_rank_per_sample_cap"}
+        saved_arguments = normalized_saved.get("arguments")
+        current_arguments = normalized_current.get("arguments")
+        saved_cap = (
+            saved_arguments.get("wmrm_action_rank_per_sample_cap")
+            if isinstance(saved_arguments, dict)
+            else "<missing>"
+        )
+        current_cap = (
+            current_arguments.get("wmrm_action_rank_per_sample_cap")
+            if isinstance(current_arguments, dict)
+            else "<missing>"
+        )
+        coherent = (
+            isinstance(saved_arguments, dict)
+            and isinstance(current_arguments, dict)
+            and saved_cap is None
+            and type(current_cap) is float
+            and current_cap == 0.2
+            and type(saved_arguments.get("wmrm_static_constraint_weight")) is float
+            and saved_arguments.get("wmrm_static_constraint_weight") == 2.0
+            and current_arguments.get("wmrm_static_constraint_weight") == 2.0
+            and type(saved_arguments.get("wmrm_world_weight")) is float
+            and saved_arguments.get("wmrm_world_weight") == 1.0
+            and current_arguments.get("wmrm_world_weight") == 1.0
+            and saved_arguments.get("wmrm_detach_proposal_stage_state") is True
+            and current_arguments.get("wmrm_detach_proposal_stage_state") is True
+            and {path for path, _, _ in mismatches} == allowed_paths
+            and all(
+                left is None and type(right) is float and right == 0.2
+                for path, left, right in mismatches
+            )
+        )
+        if coherent:
+            return
+        details = "; ".join(
+            f"{path}: checkpoint={left!r}, runtime={right!r}"
+            for path, left, right in mismatches[:12]
+        ) or "no coherent static2/world1/detached action-rank cap None to 0.2 transition"
         raise ValueError(
             f"controlled exact-resume migration {migration_id!r} refused: {details}"
         )
@@ -4114,6 +4183,7 @@ def rollout_policy(
     flow_steps: int = 8,
     world_action_rank_step: int = 0,
     world_action_rank_stage: str = "cycle",
+    wmrm_action_rank_per_sample_cap: float | None = None,
     wmrm_static_constraint_weight: float = 4.0,
     feature_autocast_bf16: bool = False,
 ) -> tuple[Tensor, Tensor]:
@@ -4526,8 +4596,27 @@ def rollout_policy(
                             WORLD_ACTION_RANKING["top10_min_relative_margin"]
                         ),
                     )
+                    ranking_loss_per_sample = ranking.loss_per_sample
+                    if wmrm_action_rank_per_sample_cap is not None:
+                        cap = ranking_loss_per_sample.new_tensor(
+                            float(wmrm_action_rank_per_sample_cap)
+                        )
+                        forward = ranking_loss_per_sample.clamp_max(cap)
+                        scale = torch.where(
+                            ranking_loss_per_sample.detach() <= cap,
+                            torch.ones_like(ranking_loss_per_sample),
+                            torch.maximum(
+                                ranking_loss_per_sample.new_tensor(0.1),
+                                cap
+                                / ranking_loss_per_sample.detach().clamp_min(
+                                    torch.finfo(ranking_loss_per_sample.dtype).eps
+                                ),
+                            ),
+                        )
+                        scaled = ranking_loss_per_sample * scale
+                        ranking_loss_per_sample = scaled + (forward - scaled).detach()
                     visual_world_action_shuffle_records.append(
-                        (task_ids, shuffle_valid, ranking.loss_per_sample)
+                        (task_ids, shuffle_valid, ranking_loss_per_sample)
                     )
             else:
                 # Legacy World supervision remains available for old experiments;
@@ -5283,6 +5372,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=4.0,
         help="visual World static-copy constraint loss weight (default: 4.0)",
+    )
+    parser.add_argument(
+        "--wmrm-action-rank-per-sample-cap",
+        type=float,
+        default=None,
+        help=(
+            "cap each action-ranking sample before masked transition reduction "
+            "(default: uncapped)"
+        ),
     )
     parser.add_argument(
         "--visual-world-supervision",
@@ -6109,6 +6207,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             WMRM_DETACH_PROPOSAL_STAGE_STATE_MIGRATION,
             WMRM_WORLD_WEIGHT_1_TO_0_5_MIGRATION,
             WMRM_STATIC_CONSTRAINT_WEIGHT_4_TO_2_MIGRATION,
+            WMRM_ACTION_RANK_CAP_NONE_TO_0_2_MIGRATION,
         ],
         help=(
             "allow one named, controlled exact-contract compatibility transition; "
@@ -6151,6 +6250,18 @@ def validate_args(args: argparse.Namespace) -> None:
         not math.isfinite(args.max_gradient_norm) or args.max_gradient_norm <= 0.0
     ):
         raise ValueError("--max-gradient-norm must be a positive finite value")
+    cap = args.wmrm_action_rank_per_sample_cap
+    if cap is not None and (
+        not math.isfinite(cap) or cap <= 0.0
+    ):
+        raise ValueError(
+            "--wmrm-action-rank-per-sample-cap must be a positive finite value"
+        )
+    if cap is not None and not getattr(args, "visual_world_supervision", False):
+        raise ValueError(
+            "--wmrm-action-rank-per-sample-cap only applies with "
+            "--visual-world-supervision"
+        )
     if args.resume_exact_contract_migration is not None and args.resume_exact is None:
         raise ValueError(
             "--resume-exact-contract-migration requires --resume-exact"
@@ -7721,7 +7832,8 @@ def save_checkpoint(
                     ),
                 },
                 "world_action_ranking": world_action_ranking_contract(
-                    getattr(args, "world_action_rank_stage", "cycle")
+                    getattr(args, "world_action_rank_stage", "cycle"),
+                    getattr(args, "wmrm_action_rank_per_sample_cap", None),
                 ),
                 "world_action_donor_contract": WORLD_ACTION_DONOR_CONTRACT,
                 "world_action_donor_sha256": split_identity[
@@ -9102,8 +9214,11 @@ def main() -> None:
                     resume_ckpt,
                     args.visual_world_split_identity,
                     world_action_ranking_contract(
-                        getattr(args, "world_action_rank_stage", "cycle")
+                        getattr(args, "world_action_rank_stage", "cycle"),
+                        getattr(args, "wmrm_action_rank_per_sample_cap", None),
                     ),
+                    float(getattr(args, "wmrm_static_constraint_weight", 4.0)),
+                    args.resume_exact_contract_migration,
                 )
             # Fail before restoring model/optimizer/sampler/RNG if any data,
             # objective, sampler, architecture or optimizer semantic changed.
@@ -9782,6 +9897,9 @@ def main() -> None:
                     world_action_rank_step=next_global_step,
                     world_action_rank_stage=getattr(
                         args, "world_action_rank_stage", "cycle"
+                    ),
+                    wmrm_action_rank_per_sample_cap=getattr(
+                        args, "wmrm_action_rank_per_sample_cap", None
                     ),
                     wmrm_static_constraint_weight=float(
                         getattr(args, "wmrm_static_constraint_weight", 4.0)

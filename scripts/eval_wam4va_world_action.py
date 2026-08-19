@@ -197,17 +197,21 @@ _ORACLE_STGAP_WORLD_ACTION_RANKING_COMMON = {
     "context": "logged_stage_detached_pair",
     "gradient": "oracle_motion_straight_through_exact_gap_v1",
 }
-ORACLE_STGAP_WORLD_ACTION_RANKINGS = (
-    {
-        "stage": "final_direct_matched_context",
-        **_ORACLE_STGAP_WORLD_ACTION_RANKING_COMMON,
-        "schedule": "final_each_valid_transition",
-    },
-    {
-        "stage": "rotating_8stage_direct_matched_context",
-        **_ORACLE_STGAP_WORLD_ACTION_RANKING_COMMON,
-        "schedule": "(global_step+time_index)%num_stages",
-    },
+ORACLE_STGAP_WORLD_ACTION_RANKINGS = tuple(
+    ranking
+    for base_ranking in (
+        {
+            "stage": "final_direct_matched_context",
+            **_ORACLE_STGAP_WORLD_ACTION_RANKING_COMMON,
+            "schedule": "final_each_valid_transition",
+        },
+        {
+            "stage": "rotating_8stage_direct_matched_context",
+            **_ORACLE_STGAP_WORLD_ACTION_RANKING_COMMON,
+            "schedule": "(global_step+time_index)%num_stages",
+        },
+    )
+    for ranking in (base_ranking, {**base_ranking, "per_sample_cap": 0.2})
 )
 DEFAULT_CYCLE_STEPS = 6
 PROPOSAL_FLOW_STEPS = 8

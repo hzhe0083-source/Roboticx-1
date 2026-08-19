@@ -485,6 +485,34 @@ def test_checkpoint_world_contract_requires_matched_context_logged_branch() -> N
         "matched_context_full_forward_v1",
         True,
     )
+    oracle_static2_cap02 = {
+        "training_contract": {
+            **oracle_static2["training_contract"],
+            "world_action_ranking": {
+                **oracle_static2["training_contract"]["world_action_ranking"],
+                "per_sample_cap": 0.2,
+            },
+        }
+    }
+    assert _checkpoint_world_contract(
+        oracle_static2_cap02, allow_unmarked=False
+    ) == (
+        "visual_motion_oracle_stgap_v7",
+        "matched_context_full_forward_v1",
+        True,
+    )
+    oracle_static2_cap01 = {
+        "training_contract": {
+            **oracle_static2_cap02["training_contract"],
+            "world_action_ranking": {
+                **oracle_static2_cap02["training_contract"]["world_action_ranking"],
+                "per_sample_cap": 0.1,
+            },
+        }
+    }
+    with pytest.raises(ValueError, match="world_action_ranking"):
+        _checkpoint_world_contract(oracle_static2_cap01, allow_unmarked=False)
+
     oracle_static3 = {
         "training_contract": {
             **oracle_static2["training_contract"],

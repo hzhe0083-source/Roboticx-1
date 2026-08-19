@@ -302,6 +302,41 @@ def test_action_gap_reduces_only_distinct_shuffle_mask(
     assert model.last_world_action_rank_loss.item() == pytest.approx(1.0)
 
 
+def test_action_gap_caps_each_sample_before_masked_reduction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _tiny_world_model()
+    batch, noisy_actions, flow_time = _rollout_batch(transitions_valid=True)
+    batch["world_rank_shuffle_mask"].fill_(True)
+
+    def fixed_ranking(real, shuffled, *args, **kwargs):
+        connected_zero = real.top10_per_sample * 0.0
+        per_sample = connected_zero + torch.tensor(
+            [0.1, 1.0], device=connected_zero.device, dtype=connected_zero.dtype
+        )
+        return ActionTop10GapLoss(
+            loss_per_sample=per_sample,
+            error_gap_per_sample=connected_zero,
+        )
+
+    monkeypatch.setattr(
+        train_module,
+        "action_top10_oracle_straight_through_gap_loss",
+        fixed_ranking,
+    )
+    rollout_policy(
+        model,
+        batch,
+        noisy_actions,
+        flow_time,
+        visual_world_supervision=True,
+        flow_steps=2,
+        wmrm_action_rank_per_sample_cap=0.2,
+    )
+
+    assert model.last_world_action_rank_loss.item() == pytest.approx(0.15)
+
+
 @pytest.mark.parametrize(
     ("stage_mode", "expected_previous_map_is_none"),
     [("final", [False, False]), ("cycle", [True, False])],
