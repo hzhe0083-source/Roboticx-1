@@ -177,12 +177,12 @@ import torch
 if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
     raise SystemExit("exactly one idle CUDA device is required")
 free_bytes, total_bytes = torch.cuda.mem_get_info()
-if free_bytes < int(total_bytes * 0.95):
+if free_bytes < int(total_bytes * 0.85):
     raise SystemExit(
-        f"GPU is not idle enough: free={free_bytes / 2**30:.2f}GiB "
+        f"GPU lacks the required diagnostic headroom: free={free_bytes / 2**30:.2f}GiB "
         f"total={total_bytes / 2**30:.2f}GiB"
     )
-print("GPU check: idle", flush=True)
+print("GPU check: no compute processes and at least 85% memory free", flush=True)
 PY
 }
 

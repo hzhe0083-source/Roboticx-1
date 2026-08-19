@@ -435,7 +435,7 @@ def test_stable_detach_runner_holds_global_lock_and_requires_idle_machine() -> N
     assert text.index("flock -n 9") < text.index("verify_source_checkpoint")
     assert 'any(Path(arg).name == "train.py"' in text
     assert "--query-compute-apps=pid,process_name,used_memory" in text
-    assert "free_bytes < int(total_bytes * 0.95)" in text
+    assert "free_bytes < int(total_bytes * 0.85)" in text
     launch = text.index('"$PY" -u -B train.py')
     assert text.index("require_no_trainer", text.index("source_sha_before=")) < launch
     assert text.index("require_idle_gpu", text.index("source_sha_before=")) < launch
