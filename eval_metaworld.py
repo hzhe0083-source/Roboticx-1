@@ -987,6 +987,29 @@ def _wam_geo8_from_metric(metric_g: torch.Tensor | None, device) -> torch.Tensor
     return metric_g
 
 
+def wmrm_ablation_writes(mode: str) -> tuple[bool, bool]:
+    """Return (action_write, vision_write) for a closed-loop WMRM mode."""
+    if mode == "normal":
+        return True, True
+    if mode == "action-write-off":
+        return False, True
+    if mode == "vision-write-off":
+        return True, False
+    if mode in ("both-write-off", "proposal-only"):
+        return False, False
+    raise ValueError(f"unknown WMRM ablation mode: {mode!r}")
+
+
+def wmrm_ablation_provenance(mode: str) -> dict[str, Any]:
+    action_write, vision_write = wmrm_ablation_writes(mode)
+    return {
+        "wmrm_ablation_mode": mode,
+        "wmrm_action_write_enabled": action_write,
+        "wmrm_vision_write_enabled": vision_write,
+        "wmrm_proposal_only": mode == "proposal-only",
+    }
+
+
 VISION_WINDOW = 4
 DECISION_STRIDE = 6  # 80 FPS, decide every 6 frames (13.3 Hz), matches training
 ACTION_HORIZON = 8
@@ -1093,7 +1116,23 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="WAM 残差速度缩放系数（默认 1.0；0 = 名义动作，消融对照）。",
     )
+    parser.add_argument(
+        "--wmrm-ablation-mode",
+        choices=("normal", "action-write-off", "vision-write-off", "both-write-off", "proposal-only"),
+        default="normal",
+        help="Controlled closed-loop WMRM ablation; normal preserves default behavior.",
+    )
+    parser.add_argument(
+        "--record-action-chunks",
+        action="store_true",
+        help="Include decoded normalized chunks in per-trial JSON for paired divergence analysis.",
+    )
     parser.add_argument("--trials-per-task", type=int, default=10)
+    parser.add_argument(
+        "--show-window",
+        action="store_true",
+        help="实时显示闭环 corner2 RGB 画面；按 q 可提前关闭显示窗口",
+    )
     parser.add_argument(
         "--output-json",
         type=Path,
@@ -2278,8 +2317,11 @@ def build_plan_language_cache(
 
 def main() -> None:
     args = parse_args()
+    wmrm_action_write, wmrm_vision_write = wmrm_ablation_writes(args.wmrm_ablation_mode)
     if args.flow_samples < 1:
         raise ValueError("--flow-samples must be >= 1")
+    if args.wmrm_ablation_mode != "normal" and args.flow_samples != 1:
+        raise ValueError("WMRM ablation modes require --flow-samples 1")
     torch.manual_seed(0)  # 固定 flow 采样噪声（口径要求：重跑可复现，2026-08-05 审查补充）
     device = torch.device(args.device)
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
@@ -3102,6 +3144,7 @@ def main() -> None:
                 "best_obj_step": -1,
             }
             decision_count = 0  # 2026-08-06：--memory-reset-every 的决策计数器
+            recorded_chunks: list[list[list[float]]] = []
             plan_step = None  # C²/伺服：上次规划的原始步
             c2_token = 0  # C²/伺服：自规划以来消费的 token 索引
             c2_params = None  # C²：缓存的 {ū, c̄, K}
@@ -3112,6 +3155,14 @@ def main() -> None:
             servo_first = True  # 首决策 a_prev=None（ν≡0，servo.py 契约）
             for step in range(args.horizon):
                 img = env.render()  # 数据图像与本地渲染一致（实测 MAE 0.48 vs flip 55，勿加 flip）
+                if args.show_window:
+                    import cv2
+
+                    title = "MetaWorld closed-loop (q to stop)"
+                    cv2.imshow(title, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        cv2.destroyAllWindows()
+                        args.show_window = False
                 frame_buffer.append(img)
                 if step == 0:
                     # 2026-08-06 评估缺陷修复：原实现首决策前执行 chunk 的初始零值
@@ -3786,6 +3837,8 @@ def main() -> None:
                             visual_memory=memory,
                             return_visual_memory=True,
                             env_action=world_action,
+                            wmrm_action_write=wmrm_action_write,
+                            wmrm_vision_write=wmrm_vision_write,
                             **dense_kwargs,
                         )
                         # 训练侧 flow_semantic 时槽输出（vision_in）作为 flow
@@ -3818,7 +3871,11 @@ def main() -> None:
                                 _wam_geo8_from_metric(metric_g, device),
                                 args.wam_alpha,
                             )
-                        if args.flow_samples == 1:
+                        if args.wmrm_ablation_mode == "proposal-only":
+                            if getattr(model, "wmrm", None) is None or proposal_noise is None:
+                                raise ValueError("proposal-only requires a WMRM checkpoint")
+                            decoded = decoded_proposal
+                        elif args.flow_samples == 1:
                             decoded = model.decode_actions(
                                 cond,
                                 steps=flow_steps,
@@ -3839,6 +3896,8 @@ def main() -> None:
                                 ]
                             ).mean(dim=0)
                         chunk = decoded[0].cpu().numpy()
+                        if args.record_action_chunks:
+                            recorded_chunks.append(chunk.astype(float).tolist())
                         chunk_start_step = step
                         if args.debug_first_action and not _DEBUG_FA_DONE.get("x"):
                             _DEBUG_FA_DONE["x"] = True
@@ -3905,6 +3964,8 @@ def main() -> None:
                     "min_obj_to_target": float(stage_metrics["obj_to_target"]),
                     "best_obj_step": int(stage_metrics["best_obj_step"]),
                 }
+            if args.record_action_chunks:
+                record["action_chunks"] = recorded_chunks
             trial_records.append(record)
             print(
                 f"trial task={global_task_index} trial={trial} seed={episode_seed} "
@@ -4011,6 +4072,10 @@ def main() -> None:
                     else "conditional_flow_matching"
                 )
             ),
+            "wmrm_ablation_mode": args.wmrm_ablation_mode,
+            "wmrm_action_write_enabled": bool(wmrm_action_write),
+            "wmrm_vision_write_enabled": bool(wmrm_vision_write),
+            "wmrm_proposal_only": args.wmrm_ablation_mode == "proposal-only",
             "task35_precision_contract": bool(args.task35_precision_contract),
             "task35_causal_ablation": args.task35_causal_ablation,
             "dino_feature_cache": (
