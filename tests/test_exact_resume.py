@@ -635,6 +635,161 @@ def test_migrated_restore_preserves_checkpoint_and_exact_training_state() -> Non
         torch.testing.assert_close(value, checkpoint_snapshot["model"][name], rtol=0, atol=0)
 
 
+def test_controlled_world_weight_migration_allows_only_1_to_0_5_without_mutation() -> None:
+    saved = _contract()
+    saved["arguments"]["wmrm_world_weight"] = 1.0
+    current = copy.deepcopy(saved)
+    current["arguments"]["wmrm_world_weight"] = 0.5
+    saved_snapshot = copy.deepcopy(saved)
+    current_snapshot = copy.deepcopy(current)
+
+    validate_exact_run_contract(
+        saved,
+        current,
+        migration_id="wmrm_world_weight_1_to_0_5_v1",
+    )
+
+    assert saved == saved_snapshot
+    assert current == current_snapshot
+
+
+@pytest.mark.parametrize(
+    ("saved_weight", "current_weight", "extra_mismatch"),
+    [
+        (0.5, 1.0, False),
+        (1.0, 1.0, False),
+        (0.5, 0.5, False),
+        (0.75, 0.5, False),
+        (1.0, 0.25, False),
+        (1, 0.5, False),
+        (None, 0.5, False),
+        (1.0, None, False),
+        (1.0, 0.5, True),
+    ],
+)
+def test_controlled_world_weight_migration_rejects_reverse_unnecessary_and_additional_mismatch(
+    saved_weight, current_weight, extra_mismatch: bool
+) -> None:
+    saved = _contract()
+    current = copy.deepcopy(saved)
+    saved["arguments"]["wmrm_world_weight"] = saved_weight
+    current["arguments"]["wmrm_world_weight"] = current_weight
+    if extra_mismatch:
+        current["arguments"]["flow_tail_weight"] = 0.2
+
+    with pytest.raises(
+        ValueError,
+        match="controlled exact-resume migration.*wmrm_world_weight_1_to_0_5_v1.*refused",
+    ):
+        validate_exact_run_contract(
+            saved,
+            current,
+            migration_id="wmrm_world_weight_1_to_0_5_v1",
+        )
+
+
+def test_controlled_world_weight_migration_id_is_operational_not_semantic() -> None:
+    _, optimizer = _model_and_optimizer()
+    args = parse_args(
+        [
+            "--wam4va",
+            "--wmrm-world-weight",
+            "0.5",
+            "--resume-exact",
+            "checkpoint.pt",
+            "--resume-exact-contract-migration",
+            "wmrm_world_weight_1_to_0_5_v1",
+        ]
+    )
+    config = SimpleNamespace(num_layers=8, action_horizon=48, wmrm=True)
+    contract = build_exact_run_contract(args, config, optimizer, _sampler())
+
+    assert args.resume_exact_contract_migration == "wmrm_world_weight_1_to_0_5_v1"
+    assert contract["arguments"]["wmrm_world_weight"] == 0.5
+    assert "resume_exact_contract_migration" not in contract["arguments"]
+
+
+def test_world_weight_migrated_restore_preserves_model_adamw_sampler_and_rng() -> None:
+    model, optimizer = _model_and_optimizer()
+    sampler = _sampler()
+    _seed_training_rngs()
+    _update(model, optimizer, sampler)
+    saved_contract = _contract()
+    saved_contract["arguments"]["wmrm_world_weight"] = 1.0
+    checkpoint = {"model": copy.deepcopy(model.state_dict())}
+    checkpoint.update(build_exact_resume_state(optimizer, 1, sampler, saved_contract))
+    checkpoint_snapshot = copy.deepcopy(checkpoint)
+
+    expected_python = random.random()
+    expected_numpy = float(np.random.random())
+    expected_torch = torch.rand(())
+
+    restored_model, restored_optimizer = _model_and_optimizer()
+    restored_sampler = _sampler()
+    restored_model.load_state_dict(checkpoint["model"], strict=True)
+    current_contract = copy.deepcopy(saved_contract)
+    current_contract["arguments"]["wmrm_world_weight"] = 0.5
+    step = restore_exact_resume_state(
+        checkpoint,
+        restored_optimizer,
+        restored_sampler,
+        runtime_exact_run_contract=current_contract,
+        migration_id="wmrm_world_weight_1_to_0_5_v1",
+    )
+
+    assert step == 1
+    assert restored_optimizer.state_dict() == optimizer.state_dict()
+    assert restored_sampler.state_dict() == sampler.state_dict()
+    assert random.random() == expected_python
+    assert float(np.random.random()) == expected_numpy
+    torch.testing.assert_close(torch.rand(()), expected_torch, rtol=0.0, atol=0.0)
+    assert checkpoint.keys() == checkpoint_snapshot.keys()
+    assert checkpoint["exact_run_contract"] == checkpoint_snapshot["exact_run_contract"]
+    for name, value in checkpoint_snapshot["model"].items():
+        torch.testing.assert_close(checkpoint["model"][name], value, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(restored_model.state_dict()[name], value, rtol=0.0, atol=0.0)
+
+
+def test_world_weight_migration_restore_refuses_before_mutating_training_state() -> None:
+    model, optimizer = _model_and_optimizer()
+    sampler = _sampler()
+    _seed_training_rngs()
+    _update(model, optimizer, sampler)
+    saved_contract = _contract()
+    saved_contract["arguments"]["wmrm_world_weight"] = 1.0
+    checkpoint = build_exact_resume_state(optimizer, 1, sampler, saved_contract)
+
+    fresh_model, fresh_optimizer = _model_and_optimizer()
+    del fresh_model
+    fresh_sampler = _sampler()
+    optimizer_snapshot = copy.deepcopy(fresh_optimizer.state_dict())
+    sampler_snapshot = copy.deepcopy(fresh_sampler.state_dict())
+    python_rng_snapshot = random.getstate()
+    numpy_rng_snapshot = np.random.get_state()
+    torch_rng_snapshot = torch.get_rng_state().clone()
+    current_contract = copy.deepcopy(saved_contract)
+    current_contract["arguments"]["wmrm_world_weight"] = 0.5
+    current_contract["arguments"]["flow_tail_weight"] = 0.2
+
+    with pytest.raises(ValueError, match="flow_tail_weight"):
+        restore_exact_resume_state(
+            checkpoint,
+            fresh_optimizer,
+            fresh_sampler,
+            runtime_exact_run_contract=current_contract,
+            migration_id="wmrm_world_weight_1_to_0_5_v1",
+        )
+
+    assert fresh_optimizer.state_dict() == optimizer_snapshot
+    assert fresh_sampler.state_dict() == sampler_snapshot
+    assert random.getstate() == python_rng_snapshot
+    current_numpy_rng = np.random.get_state()
+    assert current_numpy_rng[0] == numpy_rng_snapshot[0]
+    np.testing.assert_array_equal(current_numpy_rng[1], numpy_rng_snapshot[1])
+    assert current_numpy_rng[2:] == numpy_rng_snapshot[2:]
+    assert torch.equal(torch.get_rng_state(), torch_rng_snapshot)
+
+
 def test_exact_contract_allows_checkpoint_archive_policy_changes() -> None:
     _, optimizer = _model_and_optimizer()
     baseline_args = parse_args(["--single-task"])

@@ -1047,6 +1047,7 @@ EXACT_RUN_CONTRACT_VERSION = 1
 WMRM_DETACH_PROPOSAL_STAGE_STATE_MIGRATION = (
     "wmrm_detach_proposal_stage_state_v1"
 )
+WMRM_WORLD_WEIGHT_1_TO_0_5_MIGRATION = "wmrm_world_weight_1_to_0_5_v1"
 
 # These only control how long/where the already-defined run is executed. They
 # cannot change the next stochastic optimizer update and therefore are allowed
@@ -1637,6 +1638,45 @@ def validate_exact_run_contract(
     normalized_saved = _normalize_legacy_exact_run_contract(saved)
     normalized_current = _normalize_legacy_exact_run_contract(current)
     mismatches = exact_run_contract_mismatches(normalized_saved, normalized_current)
+    if migration_id == WMRM_WORLD_WEIGHT_1_TO_0_5_MIGRATION:
+        allowed_paths = {"arguments.wmrm_world_weight"}
+        saved_arguments = normalized_saved.get("arguments")
+        current_arguments = normalized_current.get("arguments")
+        saved_weight = (
+            saved_arguments.get("wmrm_world_weight")
+            if isinstance(saved_arguments, dict)
+            else None
+        )
+        current_weight = (
+            current_arguments.get("wmrm_world_weight")
+            if isinstance(current_arguments, dict)
+            else None
+        )
+        coherent = (
+            isinstance(saved_arguments, dict)
+            and isinstance(current_arguments, dict)
+            and type(saved_weight) is float
+            and type(current_weight) is float
+            and saved_weight == 1.0
+            and current_weight == 0.5
+            and {path for path, _, _ in mismatches} == allowed_paths
+            and all(
+                type(left) is float
+                and type(right) is float
+                and left == 1.0
+                and right == 0.5
+                for path, left, right in mismatches
+            )
+        )
+        if coherent:
+            return
+        details = "; ".join(
+            f"{path}: checkpoint={left!r}, runtime={right!r}"
+            for path, left, right in mismatches[:12]
+        ) or "no coherent old-1.0 to new-0.5 transition"
+        raise ValueError(
+            f"controlled exact-resume migration {migration_id!r} refused: {details}"
+        )
     if migration_id is not None:
         if migration_id != WMRM_DETACH_PROPOSAL_STAGE_STATE_MIGRATION:
             raise ValueError(
@@ -6010,7 +6050,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--resume-exact-contract-migration",
-        choices=[WMRM_DETACH_PROPOSAL_STAGE_STATE_MIGRATION],
+        choices=[
+            WMRM_DETACH_PROPOSAL_STAGE_STATE_MIGRATION,
+            WMRM_WORLD_WEIGHT_1_TO_0_5_MIGRATION,
+        ],
         help=(
             "allow one named, controlled exact-contract compatibility transition; "
             "the selector is operational and is not saved as a run semantic"
