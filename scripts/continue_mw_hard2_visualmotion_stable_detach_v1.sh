@@ -299,13 +299,19 @@ save=checkpoints/${run_id}.pt
 log=logs/${run_id}.train_step12000_to_step12010.log
 [[ "$save" != "$SOURCE" ]] || die "source and destination checkpoint must differ"
 
-# Ten one-step immutable copies (_s12001.._s12010) give dense initial evidence.
+available_kib=$(df --output=avail -k checkpoints | tail -n 1 | tr -d '[:space:]')
+[[ "$available_kib" =~ ^[0-9]+$ ]] || die "cannot determine checkpoint filesystem free space"
+((available_kib >= 8 * 1024 * 1024)) || \
+  die "at least 8 GiB free is required for atomic diagnostic checkpoint saving"
+
+# The per-step log is the dense diagnostic record. Save only the final checkpoint:
+# ten 2 GiB immutable copies can exhaust the filesystem before step 12010.
 echo "diagnostic only: mode=$MODE step12000 -> step12010; formal continuation is intentionally out of scope"
 set +e
 PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 \
   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   "$PY" -u -B train.py "${COMMON[@]}" "${extra_args[@]}" \
-  --steps 10 --save-every 1 --save-step-copies \
+  --steps 10 --save-every 10 \
   --save "$save" --resume-exact "$SOURCE" 2>&1 | tee "$log"
 pipeline_status=("${PIPESTATUS[@]}")
 set -e
@@ -314,10 +320,5 @@ set -e
 [[ "$(checkpoint_sha256 "$SOURCE")" == "$source_sha_before" ]] || \
   die "source checkpoint was modified"
 
-for ((step = EXPECTED_SOURCE_STEP + 1; step <= DIAGNOSTIC_TARGET_STEP; step++)); do
-  archive=checkpoints/${run_id}_s${step}.pt
-  [[ -s "$archive" ]] || die "missing immutable diagnostic archive: $archive"
-  verify_diagnostic_checkpoint "$archive" "$step" "$expected_detach"
-done
 verify_diagnostic_checkpoint "$save" "$DIAGNOSTIC_TARGET_STEP" "$expected_detach"
 echo "diagnostic milestone reached at step ${DIAGNOSTIC_TARGET_STEP}; STOP before formal continuation"

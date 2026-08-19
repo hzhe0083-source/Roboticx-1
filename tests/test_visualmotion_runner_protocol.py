@@ -366,13 +366,14 @@ def test_stable_detach_runner_has_new_immutable_lineage_and_short_stop() -> None
     assert "FAMILY=mw_hard2_wam4va_visualmotion_stable_detach_v1" in text
     assert "EXPECTED_SOURCE_STEP=12000" in text
     assert "DIAGNOSTIC_TARGET_STEP=12010" in text
-    assert "--steps 10 --save-every 1 --save-step-copies" in text
+    assert "--steps 10 --save-every 10" in text
     assert "STOP before formal continuation" in text
     assert "20000" not in text
     assert 'refuse_output_family "$run_id"' in text
     assert '[[ "$save" != "$SOURCE" ]]' in text
     assert "refusing to overwrite immutable diagnostic family" in text
-    assert "checkpoints/${run_id}_s${step}.pt" in text
+    assert "at least 8 GiB free is required" in text
+    assert "--save-step-copies" not in text
 
 
 def test_stable_detach_runner_binds_and_rechecks_source_checkpoint() -> None:
