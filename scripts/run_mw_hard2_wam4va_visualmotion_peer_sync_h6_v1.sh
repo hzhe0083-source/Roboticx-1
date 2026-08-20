@@ -6,6 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PY=${PY:-/home/ryan/.venvs/openvla/bin/python}
+VERIFY_PY=${VERIFY_PY:-/home/ryan/.venvs/pytorch-gpu/bin/python}
 DINO=/home/ryan/.cache/huggingface/hub/models--timm--vit_large_patch14_reg4_dinov2.lvd142m/snapshots/f3c408e77602bb412aa65fb03dfa0d5f95cb3832/model.safetensors
 ASSEMBLY_RAW=data/metaworld_longtraj_assembly-v3.pt
 DOOR_RAW=data/metaworld_longtraj_door-unlock-v3.pt
@@ -24,14 +25,14 @@ BATCH=${2:-3}
 GATE_STEPS=(50 300 1000)
 CONTINUE_STEPS=(1000 3000 6000 9000 12000 15000 18000 20000)
 
-usage(){ printf 'usage: bash %s {prepare|preflight|smoke10|pilot300|20k|continue20k} [batch-size]\n' "$0" >&2; exit 2; }
+usage(){ printf 'usage: bash %s {prepare|preflight|smoke10|pilot300|20k|continue20k|resume20k} [batch-size]\n' "$0" >&2; exit 2; }
 fail(){ printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 sha(){ sha256sum -- "$1" | cut -d' ' -f1; }
 [[ $# -le 2 ]] || usage
-case "$MODE" in prepare|preflight|smoke10|pilot300|20k|continue20k) ;; *) usage;; esac
+case "$MODE" in prepare|preflight|smoke10|pilot300|20k|continue20k|resume20k) ;; *) usage;; esac
 [[ "$BATCH" =~ ^[1-9][0-9]*$ ]] || fail 'batch-size must be a positive integer'
 
-for path in "$PY" "$ASSEMBLY_RAW" "$DOOR_RAW" "$ALLTASK_H48_REF" train.py \
+for path in "$PY" "$VERIFY_PY" "$ASSEMBLY_RAW" "$DOOR_RAW" "$ALLTASK_H48_REF" train.py \
   scripts/build_longtraj_features.py scripts/split_wam4va_episode_holdout.py; do
   [[ -f "$path" ]] || fail "missing required file: $path"
 done
@@ -156,7 +157,7 @@ PY
 
 verify_checkpoint(){
   local checkpoint=$1 expected_step=$2
-  "$PY" -B - "$checkpoint" "$expected_step" "$SPLIT_MANIFEST" <<'PY'
+  "$VERIFY_PY" -B - "$checkpoint" "$expected_step" "$SPLIT_MANIFEST" <<'PY'
 from pathlib import Path
 import json, sys, torch
 path = Path(sys.argv[1]).resolve(strict=True); expected_step = int(sys.argv[2])
@@ -264,6 +265,19 @@ case "$MODE" in
     printf 'exact continuation of pilot300: 300 -> 1000 -> 3000 -> 6000 -> 9000 -> 12000 -> 15000 -> 18000 -> 20000\n'
     start=300
     for target in "${CONTINUE_STEPS[@]}"; do
+      run_segment "$run_id" "$start" "$target" "$source_checkpoint"
+      source_checkpoint=$(milestone "$run_id" "$target")
+      start=$target
+    done;;
+  resume20k)
+    preflight_h6
+    [[ "$BATCH" == 3 ]] || fail 'step1000 exact continuation requires batch-size 3'
+    run_id=${FAMILY}.pilot300_continue20k
+    source_checkpoint=$(milestone "$run_id" 1000)
+    verify_checkpoint "$source_checkpoint" 1000
+    printf 'recover exact continuation after verifier abort: 1000 -> 3000 -> 6000 -> 9000 -> 12000 -> 15000 -> 18000 -> 20000\n'
+    start=1000
+    for target in 3000 6000 9000 12000 15000 18000 20000; do
       run_segment "$run_id" "$start" "$target" "$source_checkpoint"
       source_checkpoint=$(milestone "$run_id" "$target")
       start=$target

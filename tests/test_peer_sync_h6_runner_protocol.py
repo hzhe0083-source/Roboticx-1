@@ -31,7 +31,7 @@ def test_runner_syntax_and_invalid_mode_fail_before_any_training() -> None:
         env={**os.environ, "PY": "/definitely/missing/python"},
     )
     assert invalid.returncode == 2
-    assert "{prepare|preflight|smoke10|pilot300|20k|continue20k}" in invalid.stderr
+    assert "{prepare|preflight|smoke10|pilot300|20k|continue20k|resume20k}" in invalid.stderr
     assert "scratch-only formal lineage" not in invalid.stdout
 
 
@@ -79,7 +79,7 @@ def test_h6_preparation_rewindows_raw_trajectories_with_exact_identities() -> No
     assert "torch.load" not in prepare
     assert "PARENT_SOURCE" not in text
     assert "prepare) prepare_h6_data; preflight_h6" in text
-    for mode in ("preflight", "smoke10", "pilot300", "20k", "continue20k"):
+    for mode in ("preflight", "smoke10", "pilot300", "20k", "continue20k", "resume20k"):
         case = text.split(f"  {mode})", 1)[1].split(";;", 1)[0]
         assert "prepare_h6_data" not in case
 
@@ -184,3 +184,19 @@ def test_continue20k_resumes_pilot300_with_immutable_milestones() -> None:
     assert 'run_segment "$run_id" "$start" "$target" "$source_checkpoint"' in continuation
     assert "scratch" not in continuation
     assert "prepare_h6_data" not in continuation
+
+
+def test_checkpoint_verifier_is_cpu_isolated_and_resume20k_starts_at_1000() -> None:
+    text = _text()
+    assert "VERIFY_PY=${VERIFY_PY:-/home/ryan/.venvs/pytorch-gpu/bin/python}" in text
+    verify = _block(text, "verify_checkpoint(){", "milestone(){")
+    assert '"$VERIFY_PY" -B - "$checkpoint"' in verify
+    resume = text.split("  resume20k)", 1)[1].split(";;", 1)[0]
+    assert 'run_id=${FAMILY}.pilot300_continue20k' in resume
+    assert 'source_checkpoint=$(milestone "$run_id" 1000)' in resume
+    assert 'verify_checkpoint "$source_checkpoint" 1000' in resume
+    assert "start=1000" in resume
+    assert "for target in 3000 6000 9000 12000 15000 18000 20000" in resume
+    assert 'run_segment "$run_id" "$start" "$target" "$source_checkpoint"' in resume
+    assert "refuse_output_family" not in resume
+    assert "scratch" not in resume
