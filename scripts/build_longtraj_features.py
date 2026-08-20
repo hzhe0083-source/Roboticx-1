@@ -513,7 +513,11 @@ def phase1(horizon: int, *, task: str | None = None,
             tid = ref["metadata"]["tasks"].index(task_text)
         except ValueError as exc:
             raise ValueError(f"{path}: task text absent from reference: {task_text!r}") from exc
-        source_key = _frame_ref_key(path)
+        source_key = (
+            data["task"]
+            if data_contract == PEER_SYNC_H6_CONTRACT
+            else _frame_ref_key(path)
+        )
         for ei, ep in enumerate(data["episodes"]):
             episodes_seen += 1
             frames_jpeg = ep["frames"]      # list[bytes]

@@ -387,7 +387,9 @@ class VACompoundTests(unittest.TestCase):
         self.assertFalse(detached.world_state.belief.requires_grad)
         converted = memory.to(dtype=torch.float64)
         self.assertEqual(converted.layers[0].dtype, torch.float64)
-        self.assertEqual(converted.world_state.world_map.dtype, torch.float64)
+        self.assertEqual(converted.world_state.belief.dtype, torch.float32)
+        self.assertEqual(converted.world_state.innovation.dtype, torch.float32)
+        self.assertEqual(converted.world_state.world_map.dtype, torch.float32)
         selected = memory.index_select(torch.tensor([2, 0]))
         torch.testing.assert_close(selected.layers[0], memory.layers[0][[2, 0]])
         torch.testing.assert_close(

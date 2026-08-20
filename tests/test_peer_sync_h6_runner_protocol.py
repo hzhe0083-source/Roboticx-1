@@ -54,7 +54,7 @@ def test_h6_preparation_rewindows_raw_trajectories_with_exact_identities() -> No
     text = _text()
     prepare = _block(text, "prepare_h6_data(){", "preflight_h6(){")
     assert "ASSEMBLY_RAW=data/metaworld_longtraj_assembly-v3.pt" in text
-    assert "DOOR_RAW=data/metaworld_longtraj_door-unlock-v3_fixed.pt" in text
+    assert "DOOR_RAW=data/metaworld_longtraj_door-unlock-v3.pt" in text
     assert "ALLTASK_H48_REF=data/metaworld_longtraj_windows_h48.pt" in text
     assert "EXPECTED_ASSEMBLY_SHA256=c61f3b2102dea781c9db2a73109472e6e181f46e33536879a5eab181ee190ea0" in text
     assert "EXPECTED_DOOR_SHA256=309726cd679753633bf9bb658635b890affcc666523cb530bab62db4d9699bf1" in text

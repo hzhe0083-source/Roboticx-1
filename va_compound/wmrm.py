@@ -62,10 +62,13 @@ class WAMState:
     ) -> "WAMState":
         if isinstance(device, torch.dtype) and dtype is None:
             dtype, device = device, None
+        # Recurrent state has one storage contract regardless of the surrounding
+        # module/feature dtype. ``dtype`` is accepted for Tensor.to API parity but
+        # intentionally does not alter persisted state precision.
         return WAMState(
-            belief=_tensor_to(self.belief, device, dtype),
-            innovation=_tensor_to(self.innovation, device, dtype),
-            world_map=_tensor_to(self.world_map, device, dtype),
+            belief=_tensor_to(self.belief, device, torch.float32),
+            innovation=_tensor_to(self.innovation, device, torch.float32),
+            world_map=_tensor_to(self.world_map, device, torch.float32),
         )
 
     def index_select(self, index: Tensor) -> "WAMState":
@@ -93,9 +96,8 @@ class WAMState:
         dino_dim: int | None,
         map_size: int,
         device: torch.device,
-        dtype: torch.dtype,
     ) -> None:
-        """Reject incompatible recurrent snapshots before any World computation."""
+        """Reject snapshots outside the canonical device-local FP32 contract."""
         specs = (
             ("belief", self.belief, (batch, n_belief, hidden_dim)),
             ("innovation", self.innovation, (batch, n_evidence, hidden_dim)),
@@ -118,9 +120,9 @@ class WAMState:
                 raise ValueError(
                     f"WAMState.{name} device must be {device}, got {tensor.device}"
                 )
-            if tensor.dtype != dtype:
+            if tensor.dtype != torch.float32:
                 raise ValueError(
-                    f"WAMState.{name} dtype must be {dtype}, got {tensor.dtype}"
+                    f"WAMState.{name} dtype must be torch.float32, got {tensor.dtype}"
                 )
 
     def validate_finite(self, *, boundary: str = "WAM recurrent state") -> None:
@@ -667,17 +669,32 @@ class WAM4VA(nn.Module):
 
     def _project_out(self, current: Tensor, previous: Tensor) -> Tensor:
         """Remove prev only when cosine overlap exceeds ``innov_overlap``."""
-        flat_prev = previous.reshape(previous.shape[0], -1)
-        flat_cur = current.reshape(current.shape[0], -1)
-        cosine = (
-            F.normalize(flat_cur, dim=-1) * F.normalize(flat_prev, dim=-1)
-        ).sum(dim=-1, keepdim=True)
-        denom = flat_prev.square().sum(dim=-1, keepdim=True).clamp_min(1e-8)
-        coeff = (flat_cur * flat_prev).sum(dim=-1, keepdim=True) / denom
-        drop = (cosine > self.innov_overlap).to(dtype=current.dtype)
-        while drop.ndim < current.ndim:
-            drop = drop.unsqueeze(-1)
-        return current - drop * (coeff * flat_prev).view_as(current)
+        if previous.shape != current.shape:
+            raise ValueError(
+                "previous innovation shape must match current innovation, got "
+                f"{tuple(previous.shape)} vs {tuple(current.shape)}"
+            )
+        if previous.device != current.device:
+            raise ValueError(
+                "previous innovation device must match current innovation, got "
+                f"{previous.device} vs {current.device}"
+            )
+        # This recurrent comparison is numerically sensitive and must not inherit
+        # the feature path's incidental autocast dtype.
+        with torch.autocast(device_type=current.device.type, enabled=False):
+            current_fp32 = current.float()
+            previous_fp32 = previous.float()
+            flat_prev = previous_fp32.reshape(previous_fp32.shape[0], -1)
+            flat_cur = current_fp32.reshape(current_fp32.shape[0], -1)
+            cosine = (
+                F.normalize(flat_cur, dim=-1) * F.normalize(flat_prev, dim=-1)
+            ).sum(dim=-1, keepdim=True)
+            denom = flat_prev.square().sum(dim=-1, keepdim=True).clamp_min(1e-8)
+            coeff = (flat_cur * flat_prev).sum(dim=-1, keepdim=True) / denom
+            drop = (cosine > self.innov_overlap).to(dtype=torch.float32)
+            while drop.ndim < current_fp32.ndim:
+                drop = drop.unsqueeze(-1)
+            return current_fp32 - drop * (coeff * flat_prev).view_as(current_fp32)
 
     def _span_ids(self, horizon: int, device: torch.device) -> Tensor:
         n_spans = self.n_spans
@@ -1210,7 +1227,6 @@ class WAM4VA(nn.Module):
             dino_dim=self.dino_dim,
             map_size=self.map_size,
             device=action.device,
-            dtype=action.dtype,
         )
         updated, aux, belief, innovation = self._forward_from_snapshot(
             action,
@@ -1232,11 +1248,16 @@ class WAM4VA(nn.Module):
             if aux.z_tokens is not None and aux.z_tokens.ndim == 4
             else snapshot.world_map
         )
+        # Canonicalize only the persisted peer snapshot. Transient proposal and
+        # auxiliary tensors retain their feature-path dtype for legacy math.
+        state_belief = belief.float()
+        state_innovation = innovation.float()
+        state_world_map = None if next_world_map is None else next_world_map.float()
         return WAMProposal(
             next_world_state=WAMState(
-                belief=belief,
-                innovation=innovation,
-                world_map=next_world_map,
+                belief=state_belief,
+                innovation=state_innovation,
+                world_map=state_world_map,
             ),
             action_delta=action_delta,
             vision_delta=vision_delta,

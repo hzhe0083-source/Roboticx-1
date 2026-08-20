@@ -8,7 +8,7 @@ cd "$(dirname "$0")/.."
 PY=${PY:-/home/ryan/.venvs/openvla/bin/python}
 DINO=/home/ryan/.cache/huggingface/hub/models--timm--vit_large_patch14_reg4_dinov2.lvd142m/snapshots/f3c408e77602bb412aa65fb03dfa0d5f95cb3832/model.safetensors
 ASSEMBLY_RAW=data/metaworld_longtraj_assembly-v3.pt
-DOOR_RAW=data/metaworld_longtraj_door-unlock-v3_fixed.pt
+DOOR_RAW=data/metaworld_longtraj_door-unlock-v3.pt
 ALLTASK_H48_REF=data/metaworld_longtraj_windows_h48.pt
 EXPECTED_ASSEMBLY_SHA256=c61f3b2102dea781c9db2a73109472e6e181f46e33536879a5eab181ee190ea0
 EXPECTED_DOOR_SHA256=309726cd679753633bf9bb658635b890affcc666523cb530bab62db4d9699bf1

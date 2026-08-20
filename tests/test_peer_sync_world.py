@@ -64,9 +64,9 @@ def test_state_is_frozen_and_tensor_operations_cover_all_fields() -> None:
         for tensor in (detached.belief, detached.innovation, detached.world_map)
     )
     converted = state.to(dtype=torch.float64)
-    assert converted.belief.dtype == torch.float64
-    assert converted.innovation.dtype == torch.float64
-    assert converted.world_map.dtype == torch.float64
+    assert converted.belief.dtype == torch.float32
+    assert converted.innovation.dtype == torch.float32
+    assert converted.world_map.dtype == torch.float32
     selected = state.index_select(torch.tensor([2, 0]))
     torch.testing.assert_close(selected.belief, belief[[2, 0]])
     torch.testing.assert_close(selected.innovation, innovation[[2, 0]])
@@ -132,6 +132,71 @@ def test_propose_matches_legacy_forward_bitwise_and_does_not_mutate_snapshot() -
         torch.testing.assert_close(current, original, rtol=0.0, atol=0.0)
 
 
+def _run_peer_state_autocast_regression(device: torch.device, *, stages: int) -> None:
+    config = _peer_config(num_layers=stages)
+    model = VACompoundPolicy(config).to(device).eval()
+    inputs = tuple(tensor.to(device) for tensor in _policy_inputs(config))
+    vision, proprio, previous, language, mask = inputs
+    stage_states: list[WAMState] = []
+    original_propose = model.wmrm.propose
+
+    def record_propose(*args, **kwargs):
+        proposal = original_propose(*args, **kwargs)
+        stage_states.append(proposal.next_world_state)
+        return proposal
+
+    memory = None
+    with (
+        mock.patch.object(model.wmrm, "propose", side_effect=record_propose),
+        torch.no_grad(),
+        torch.autocast(device.type, dtype=torch.bfloat16),
+    ):
+        for _ in range(2):
+            condition, memory = model.encode_condition(
+                vision,
+                proprio,
+                previous,
+                language_hidden=language,
+                language_mask=mask,
+                visual_memory=memory,
+                return_visual_memory=True,
+            )
+
+    assert len(stage_states) == stages * 2
+    for state in stage_states:
+        for tensor in (state.belief, state.innovation, state.world_map):
+            assert tensor is not None
+            assert tensor.device.type == device.type
+            assert tensor.dtype == torch.float32
+            assert bool(torch.isfinite(tensor).all())
+    assert condition.device.type == device.type
+    assert memory is not None and memory.world_state is stage_states[-1]
+
+
+def test_peer_state_is_canonical_fp32_under_cpu_bf16_autocast_tiny() -> None:
+    _run_peer_state_autocast_regression(torch.device("cpu"), stages=2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_peer_state_is_canonical_fp32_across_eight_cuda_bf16_stages() -> None:
+    _run_peer_state_autocast_regression(torch.device("cuda"), stages=8)
+
+
+def test_project_out_is_explicit_fp32_under_bf16_autocast() -> None:
+    block = _block()
+    current = torch.randn(3, 2, 16)
+    previous = torch.randn(3, 2, 16)
+    expected = block._project_out(current, previous)
+
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        actual = block._project_out(current.bfloat16(), previous)
+
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual, block._project_out(current.bfloat16().float(), previous))
+    assert bool(torch.isfinite(actual).all())
+    assert expected.dtype == torch.float32
+
+
 def test_propose_validates_state_contract_and_rejects_reuse_aux() -> None:
     block = _block()
     action, vision, proprio, dino, env_action = _inputs()
@@ -147,6 +212,7 @@ def test_propose_validates_state_contract_and_rejects_reuse_aux() -> None:
         WAMState(innovation=torch.randn(3, 3, 16)),
         WAMState(world_map=torch.randn(3, 8, 3, 2)),
         WAMState(belief=torch.randn(3, 2, 16, dtype=torch.float64)),
+        WAMState(innovation=torch.randn(3, 2, 16, dtype=torch.bfloat16)),
     )
     for state in invalid_states:
         with pytest.raises(ValueError, match="WAMState"):
@@ -289,7 +355,9 @@ def test_visual_memory_world_state_detach_to_index_and_episode_reset() -> None:
     assert not detached.world_state.belief.requires_grad
     converted = memory.to(dtype=torch.float64)
     assert all(layer.dtype == torch.float64 for layer in converted.layers)
-    assert converted.world_state.world_map.dtype == torch.float64
+    assert converted.world_state.belief.dtype == torch.float32
+    assert converted.world_state.innovation.dtype == torch.float32
+    assert converted.world_state.world_map.dtype == torch.float32
     selected = memory.index_select(torch.tensor([2, 0]))
     torch.testing.assert_close(selected.layers[0], layers[0][[2, 0]])
     torch.testing.assert_close(selected.world_state.belief, state.belief[[2, 0]])

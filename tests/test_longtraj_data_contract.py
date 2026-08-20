@@ -259,6 +259,7 @@ class LongTrajBuilderContractTest(unittest.TestCase):
             self.assertEqual(metadata["parent_identity"]["path"], str(ref_path.resolve()))
             self.assertEqual(metadata["source_identities"][0]["path"], str(source.resolve()))
             self.assertEqual(metadata["output_identity"]["path"], str(output.resolve()))
+            self.assertEqual(payload["frame_refs"][0][0], "door-lock-v3")
 
             with self.assertRaisesRegex(ValueError, "requires exact action horizon H6"):
                 build.phase1(

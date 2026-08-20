@@ -2649,7 +2649,6 @@ class VACompoundPolicy(nn.Module):
                 dino_dim=self.wmrm.dino_dim,
                 map_size=self.wmrm.map_size,
                 device=action.device,
-                dtype=action.dtype,
             )
             if world_goal is not None:
                 raise ValueError(
