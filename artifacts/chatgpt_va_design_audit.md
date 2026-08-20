@@ -22,7 +22,7 @@
 | F9 | E2E 路径 pair_loss=0、future_loss=0 | `train.py:1645-1648`(e2e 分支 pair_loss 置零) | ✓ |
 | F10 | ~21.4% expert actions 超环境范围被裁剪 | `make_v5_executed_actions.py` 的背景契约(executed-clip-v5)一致;21.4% 具体数字未在日志中找到 | ⚠️ 方向一致,精确数字待核 |
 | F11 | C1=冻结 Qwen 保语义,C2=LoRA 塌陷 | `cosine_libero_e2e_C1_40k.log`(=original)/`C2_40k` 存在 | ✓ |
-| F12 | task-ID 对照:评估时临时编码 "task i" | `eval_mw_lang_ablation.py` 存在 | ✓(行为与描述一致,未深验) |
+| F12 | task-ID 对照:评估时临时编码 "task i" | `scripts/eval/eval_mw_lang_ablation.py` 存在 | ✓(行为与描述一致,未深验) |
 | F13 | 旧 Flow 6/10 vs Direct Head 10/10(button) | `mw_pilot_direct_cl.log` 10/10;旧 Flow 6/10 未在可见日志中直接复现 | ⚠️ 待核 |
 | F14 | MetaWorld 无 same-state command forks,shared-CF 未用于 MW | v5 数据无 pair 结构(`--single-task` 训练),✓;报告亦如此记录 | ✓ |
 | F15 | Evo-1 用 InternVL3 原生多模态、第 14 层中间特征 | 与 Evo-1 论文(2511.04555)一致 | ✓ |
@@ -72,7 +72,7 @@ Qwen 全量 LoRA、PPO(仓库有 `train_ppo_metaworld.py` 但对话建议 IL 达
 ### 3.1 诊断部分(第 2、3 轮)——整体正确,认同
 
 - **"两问题必须分开解决"(表征塌陷 vs 策略不用语言)**:与仓库证据完全吻合(C1 冻结=0.8573 不塌,B40k=0.9994 塌;wrong-instruction 开环敏感但闭环无跨任务泛化)。这是对话最有价值的贡献。
-- **"语言敏感性 ≠ 语言泛化"与 task-ID 对照批评**:正确。`eval_mw_lang_ablation.py` 的 task-ID 条件是 OOD 输入,不能证明"语言内容 > task identity"。仓库论文里相关结论需要降级表述。
+- **"语言敏感性 ≠ 语言泛化"与 task-ID 对照批评**:正确。`scripts/eval/eval_mw_lang_ablation.py` 的 task-ID 条件是 OOD 输入,不能证明"语言内容 > task identity"。仓库论文里相关结论需要降级表述。
 - **"MetaWorld 主要测不到语言理解"**:正确且重要——49 任务场景差异大,视觉足以区分任务;同分布成功率提升主要来自控制/数据。这与项目目标("提升语言理解")存在张力:**MetaWorld 不是检验语言理解的基准**,应靠 LIBERO(仓库已有)和 MetaWorld-CF 检验。
 - **"P(success)≈P(understand)·P(ground)·P(control)·P(recover)"**:框架合理,与 7.1→16.3(数据覆盖)→17.8(语言接口)的增量排序一致。
 

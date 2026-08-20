@@ -11,14 +11,20 @@ instruction_id 曾因分批合并 bug 重叠（每批 0-9，全文件仅 10 个�
   均用归一化动作；附持久性基线对照。
 
 用法（GPU 空闲时）：
-    python eval_mw_lang_ablation.py --checkpoint checkpoints/metaworld_va8_40k.pt \
+    python scripts/eval/eval_mw_lang_ablation.py --checkpoint checkpoints/metaworld_va8_40k.pt \
         --data data/metaworld_features.pt --device cuda
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 import argparse
 from collections import defaultdict
-from pathlib import Path
 
 import torch
 

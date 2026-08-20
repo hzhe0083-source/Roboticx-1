@@ -231,7 +231,7 @@ Euler 8 步产生阶梯感（相邻步跳变 0.0045），32 步降为 0.0004（1
 - 9927 样本 × 4 决策点 = 39708 决策点，宏平均 + 任务级 bootstrap 95% CI（固定种子）。
 
 ### 8.3 语言流消融（错误指令）——待重训后重做
-- 旧结果（~~+0.1%~~，基于 bug 版数据与损坏的 instruction_id）**作废**；重建脚本 `eval_mw_lang_ablation.py`（指令轮转 +1 mod 49 替换，决策点 0 与全序列双口径）已就绪，待重训后运行。
+- 旧结果（~~+0.1%~~，基于 bug 版数据与损坏的 instruction_id）**作废**；重建脚本 `scripts/eval/eval_mw_lang_ablation.py`（指令轮转 +1 mod 49 替换，决策点 0 与全序列双口径）已就绪，待重训后运行。
 
 **多 start 全覆盖数据重训后语言消融（数据源 logs/mw_full_ablation.log，2026-08-06）：**
 
@@ -312,14 +312,14 @@ Euler 8 步产生阶梯感（相邻步跳变 0.0045），32 步降为 0.0004（1
 - **95% CI**：bootstrap 百分位（B=2000、固定 seed=0，重采样单元=任务）
 - **持久性基线并报**（复制上一动作，§3.1 依据 arXiv:2505.09561）
 - **固定种子**：闭环评估 1000×task_index + trial
-- 语言扰动：`evaluate.py --perturb`（blank=语言流置零、swap=指令轮转 +1）、`eval_mw_lang_ablation.py`（MW 消融）
+- 语言扰动：`evaluate.py --perturb`（blank=语言流置零、swap=指令轮转 +1）、`scripts/eval/eval_mw_lang_ablation.py`（MW 消融）
 
 **可复现性审计结果（2026-08-05）**：
 - ✅ §3.2/§3.4（PNPW flat/spatial/深度探针）：实测 0.0492/0.0552/0.0324 vs 报告 0.0497/0.0564/0.0345——一致（8 步口径）
 - ✅ §7.2 语言三件套：新口径（32 步）重测，Blank +13751%（1 场景）/ +2381%（3 场景）——定性结论更强；原数字（+3805%/+1446%）脚本未留存，已废弃
 - ⚠️ §8.2 MW：旧数字基于归一化错乱数据，已勘误；正式数字待重训
 - ⚠️ §5.1 多任务：待复现（B40k 完成后 GPU 评估）
-- 原则：**所有论文数字必须由现有脚本（evaluate.py / scripts/eval/eval_e2e.py / eval_metaworld.py / eval_mw_lang_ablation.py）重新生成**，未留存脚本的数字一律废弃
+- 原则：**所有论文数字必须由现有脚本（evaluate.py / scripts/eval/eval_e2e.py / eval_metaworld.py / scripts/eval/eval_mw_lang_ablation.py）重新生成**，未留存脚本的数字一律废弃
 
 ---
 
