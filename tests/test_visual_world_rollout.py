@@ -13,7 +13,7 @@ from va_compound.model import VACompoundConfig, VACompoundPolicy
 from va_compound.world_supervision import ActionTop10GapLoss
 
 
-def _tiny_world_model() -> VACompoundPolicy:
+def _tiny_world_model(*, va_world_mode: str = "legacy") -> VACompoundPolicy:
     config = VACompoundConfig(
         language_dim=12,
         vision_dim=8,
@@ -38,6 +38,7 @@ def _tiny_world_model() -> VACompoundPolicy:
         wmrm_predictor_heads=4,
         main_vision_frames=1,
         main_vision_grid=2,
+        va_world_mode=va_world_mode,
     )
     return VACompoundPolicy(config).eval()
 
@@ -265,6 +266,124 @@ def test_logged_world_branch_reuses_detached_proposal_entry_memory() -> None:
             proposal_layer, logged_layer, rtol=0.0, atol=0.0
         )
         assert logged_layer.grad_fn is None
+
+
+def test_peer_readout_uses_world_transition_mask_and_final_stage_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _tiny_world_model(va_world_mode="peer_sync_h6")
+    batch, noisy_actions, flow_time = _rollout_batch(transitions_valid=True)
+    batch["actions"].zero_()
+    # The first transition has a complete current H6 but is invalid because the
+    # next decision's first action is missing.  The second transition is valid.
+    batch["action_valid_mask"].fill_(True)
+    batch["action_valid_mask"][0, 1, 0] = False
+    calls = 0
+
+    def staged_readout(action: torch.Tensor) -> torch.Tensor:
+        nonlocal calls
+        calls += 1
+        # Two peer stages per decision: stage 0 predicts 1, final stage predicts 2.
+        stage_value = 1.0 if calls % model.config.num_layers == 1 else 2.0
+        output = action.new_full(
+            (action.shape[0], 6, model.config.action_dim), stage_value
+        )
+        output[0] *= 5.0
+        return output
+
+    monkeypatch.setattr(model.world_action_readout, "forward", staged_readout)
+    rollout_policy(
+        model,
+        batch,
+        noisy_actions,
+        flow_time,
+        visual_world_supervision=True,
+        flow_steps=2,
+    )
+
+    # Smooth-L1(2, 0) = 1.5.  Stage 0 must not enter the reduction, and the
+    # invalid first transition for row 0 must use the same mask as World targets.
+    assert model.last_world_action_readout_loss.item() == pytest.approx(1.5)
+    assert model.last_world_action_readout_rmse.item() == pytest.approx(2.0)
+
+
+def test_peer_rollout_rejects_adep_before_any_model_forward() -> None:
+    model = _tiny_world_model(va_world_mode="peer_sync_h6")
+    batch, noisy_actions, flow_time = _rollout_batch(transitions_valid=True)
+
+    with pytest.raises(ValueError, match="exact same immutable stage snapshot"):
+        rollout_policy(
+            model,
+            batch,
+            noisy_actions,
+            flow_time,
+            visual_world_supervision=True,
+            wmrm_adep_enabled=True,
+            flow_steps=2,
+        )
+
+
+def test_legacy_rollout_keeps_adep_available() -> None:
+    model = _tiny_world_model(va_world_mode="legacy")
+    batch, noisy_actions, flow_time = _rollout_batch(transitions_valid=True)
+    rollout_policy(
+        model,
+        batch,
+        noisy_actions,
+        flow_time,
+        visual_world_supervision=True,
+        wmrm_adep_enabled=True,
+        flow_steps=2,
+    )
+    assert model.last_wmrm_adep_loss is not None
+    assert torch.isfinite(model.last_wmrm_adep_loss)
+
+
+def test_peer_rollout_uses_one_main_encode_and_explicit_snapshot_overrides() -> None:
+    model = _tiny_world_model(va_world_mode="peer_sync_h6")
+    batch, noisy_actions, flow_time = _rollout_batch(transitions_valid=True)
+    encode_calls = 0
+    proposal_actions: list[torch.Tensor] = []
+    original_encode = model.encode_condition
+    original_propose = model.wmrm.propose
+
+    def record_encode(*args, **kwargs):
+        nonlocal encode_calls
+        encode_calls += 1
+        return original_encode(*args, **kwargs)
+
+    def record_propose(*args, **kwargs):
+        proposal_actions.append(kwargs["env_action"].detach().clone())
+        return original_propose(*args, **kwargs)
+
+    model.encode_condition = record_encode
+    model.wmrm.propose = record_propose
+    rollout_policy(
+        model,
+        batch,
+        noisy_actions,
+        flow_time,
+        visual_world_supervision=True,
+        flow_steps=2,
+    )
+
+    assert encode_calls == batch["actions"].shape[1]
+    assert len(proposal_actions) == 14
+    for time_index in range(2):
+        offset = time_index * 6
+        main = proposal_actions[offset : offset + 2]
+        logged = proposal_actions[offset + 2 : offset + 4]
+        assert not any(
+            torch.equal(action, batch["actions"][:, time_index, :6])
+            for action in main
+        )
+        assert all(
+            torch.equal(action, batch["actions"][:, time_index, :6])
+            for action in logged
+        )
+    assert model.last_world_action_readout_loss is not None
+    assert model.last_world_action_readout_loss.requires_grad
+    assert torch.isfinite(model.last_world_action_readout_rmse)
 
 
 def test_action_gap_reduces_only_distinct_shuffle_mask(

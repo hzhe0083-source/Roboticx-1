@@ -14,11 +14,124 @@ enter ``wmrm_world_loss``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
+
+
+def _require_finite(tensor: Tensor, name: str, *, boundary: str) -> None:
+    """Fail at peer boundaries before non-finite values enter recurrent state."""
+    if not bool(torch.isfinite(tensor).all()):
+        raise FloatingPointError(
+            f"{boundary}: {name} contains NaN or Inf values; "
+            "check the immediately upstream peer computation"
+        )
+
+
+def _tensor_to(
+    tensor: Tensor | None,
+    device: torch.device | str | torch.dtype | None,
+    dtype: torch.dtype | None,
+) -> Tensor | None:
+    if tensor is None:
+        return None
+    return tensor.to(device=device, dtype=dtype)
+
+
+@dataclass(frozen=True)
+class WAMState:
+    """Immutable recurrent World snapshot used by peer-synchronous stages."""
+
+    belief: Tensor | None = None
+    innovation: Tensor | None = None
+    world_map: Tensor | None = None
+
+    def detach(self) -> "WAMState":
+        return WAMState(
+            belief=None if self.belief is None else self.belief.detach(),
+            innovation=None if self.innovation is None else self.innovation.detach(),
+            world_map=None if self.world_map is None else self.world_map.detach(),
+        )
+
+    def to(
+        self,
+        device: torch.device | str | torch.dtype | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> "WAMState":
+        if isinstance(device, torch.dtype) and dtype is None:
+            dtype, device = device, None
+        return WAMState(
+            belief=_tensor_to(self.belief, device, dtype),
+            innovation=_tensor_to(self.innovation, device, dtype),
+            world_map=_tensor_to(self.world_map, device, dtype),
+        )
+
+    def index_select(self, index: Tensor) -> "WAMState":
+        if index.ndim != 1:
+            raise ValueError(f"index must be one-dimensional, got {tuple(index.shape)}")
+
+        def select(tensor: Tensor | None) -> Tensor | None:
+            if tensor is None:
+                return None
+            return tensor.index_select(0, index.to(device=tensor.device, dtype=torch.long))
+
+        return WAMState(
+            belief=select(self.belief),
+            innovation=select(self.innovation),
+            world_map=select(self.world_map),
+        )
+
+    def validate_for(
+        self,
+        *,
+        batch: int,
+        hidden_dim: int,
+        n_belief: int,
+        n_evidence: int,
+        dino_dim: int | None,
+        map_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        """Reject incompatible recurrent snapshots before any World computation."""
+        specs = (
+            ("belief", self.belief, (batch, n_belief, hidden_dim)),
+            ("innovation", self.innovation, (batch, n_evidence, hidden_dim)),
+            (
+                "world_map",
+                self.world_map,
+                None if dino_dim is None else (batch, dino_dim, map_size, map_size),
+            ),
+        )
+        for name, tensor, expected in specs:
+            if tensor is None:
+                continue
+            if expected is None:
+                raise ValueError(f"WAMState.{name} requires dino_dim to be configured")
+            if tuple(tensor.shape) != expected:
+                raise ValueError(
+                    f"WAMState.{name} must have shape {expected}, got {tuple(tensor.shape)}"
+                )
+            if tensor.device != device:
+                raise ValueError(
+                    f"WAMState.{name} device must be {device}, got {tensor.device}"
+                )
+            if tensor.dtype != dtype:
+                raise ValueError(
+                    f"WAMState.{name} dtype must be {dtype}, got {tensor.dtype}"
+                )
+
+    def validate_finite(self, *, boundary: str = "WAM recurrent state") -> None:
+        for name, tensor in (
+            ("belief", self.belief),
+            ("innovation", self.innovation),
+            ("world_map", self.world_map),
+        ):
+            if tensor is not None:
+                _require_finite(tensor, f"WAMState.{name}", boundary=boundary)
+
 
 @dataclass(frozen=True)
 class WMRMAux:
@@ -41,6 +154,118 @@ class WMRMAux:
     # post-prediction/handshake state and is therefore not valid for an
     # action-counterfactual re-evaluation of the final World stage.
     predict_belief: Tensor | None = None
+
+    def _map_tensors(self, transform) -> "WMRMAux":
+        return WMRMAux(
+            **{
+                field.name: (
+                    transform(value) if isinstance(value, Tensor) else value
+                )
+                for field in fields(self)
+                for value in (getattr(self, field.name),)
+            }
+        )
+
+    def detach(self) -> "WMRMAux":
+        return self._map_tensors(Tensor.detach)
+
+    def to(
+        self,
+        device: torch.device | str | torch.dtype | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> "WMRMAux":
+        if isinstance(device, torch.dtype) and dtype is None:
+            dtype, device = device, None
+        return self._map_tensors(lambda tensor: tensor.to(device=device, dtype=dtype))
+
+    def index_select(self, index: Tensor) -> "WMRMAux":
+        if index.ndim != 1:
+            raise ValueError(f"index must be one-dimensional, got {tuple(index.shape)}")
+        return self._map_tensors(
+            lambda tensor: tensor.index_select(
+                0, index.to(device=tensor.device, dtype=torch.long)
+            )
+        )
+
+
+@dataclass(frozen=True)
+class WAMProposal:
+    """Immutable output computed from one unmodified peer snapshot."""
+
+    next_world_state: WAMState
+    action_delta: Tensor
+    vision_delta: Tensor
+    aux: WMRMAux
+
+    def detach(self) -> "WAMProposal":
+        return WAMProposal(
+            next_world_state=self.next_world_state.detach(),
+            action_delta=self.action_delta.detach(),
+            vision_delta=self.vision_delta.detach(),
+            aux=self.aux.detach(),
+        )
+
+    def to(
+        self,
+        device: torch.device | str | torch.dtype | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> "WAMProposal":
+        if isinstance(device, torch.dtype) and dtype is None:
+            dtype, device = device, None
+        return WAMProposal(
+            next_world_state=self.next_world_state.to(device=device, dtype=dtype),
+            action_delta=self.action_delta.to(device=device, dtype=dtype),
+            vision_delta=self.vision_delta.to(device=device, dtype=dtype),
+            aux=self.aux.to(device=device, dtype=dtype),
+        )
+
+    def index_select(self, index: Tensor) -> "WAMProposal":
+        if index.ndim != 1:
+            raise ValueError(f"index must be one-dimensional, got {tuple(index.shape)}")
+
+        def select(tensor: Tensor) -> Tensor:
+            return tensor.index_select(0, index.to(device=tensor.device, dtype=torch.long))
+
+        return WAMProposal(
+            next_world_state=self.next_world_state.index_select(index),
+            action_delta=select(self.action_delta),
+            vision_delta=select(self.vision_delta),
+            aux=self.aux.index_select(index),
+        )
+
+    def validate_finite(self, *, boundary: str = "WAM proposal") -> None:
+        _require_finite(self.action_delta, "action_delta", boundary=boundary)
+        _require_finite(self.vision_delta, "vision_delta", boundary=boundary)
+        self.next_world_state.validate_finite(boundary=boundary)
+
+
+class ExecutableActionReadout(nn.Module):
+    """Deterministic bounded H6 action belief for the World peer."""
+
+    def __init__(self, hidden_dim: int, action_dim: int = 4, horizon: int = 6) -> None:
+        super().__init__()
+        if hidden_dim < 1 or action_dim < 1:
+            raise ValueError("hidden_dim and action_dim must be positive")
+        if horizon != 6:
+            raise ValueError(f"ExecutableActionReadout requires H6, got H{horizon}")
+        self.hidden_dim = hidden_dim
+        self.action_dim = action_dim
+        self.horizon = horizon
+        self.proj = nn.Linear(hidden_dim, action_dim)
+
+    def forward(self, action: Tensor) -> Tensor:
+        expected = (self.horizon, self.hidden_dim)
+        if action.ndim != 3 or tuple(action.shape[1:]) != expected:
+            raise ValueError(
+                f"action must be [B, {self.horizon}, {self.hidden_dim}], "
+                f"got {tuple(action.shape)}"
+            )
+        _require_finite(action, "action", boundary="executable action readout input")
+        logits = self.proj(action)
+        _require_finite(logits, "readout", boundary="executable action readout output")
+        readout = torch.tanh(logits)
+        _require_finite(readout, "readout", boundary="executable action readout output")
+        return readout
 
 
 class _CrossAttn(nn.Module):
@@ -807,7 +1032,7 @@ class WAM4VA(nn.Module):
         shuf = F.mse_loss(z_hat_shuf, z_future.detach())
         return torch.relu(z_hat.new_tensor(margin) - (shuf - real))
 
-    def forward(
+    def _forward_from_snapshot(
         self,
         action: Tensor,
         vision: Tensor,
@@ -827,6 +1052,11 @@ class WAM4VA(nn.Module):
             raise ValueError(
                 "world_goal is sealed: realized futures must not enter the "
                 "forward mixer; pass them only to wmrm_world_loss"
+            )
+        if reuse_aux is not None:
+            raise ValueError(
+                "reuse_aux is unsupported: reusing predictor outputs with newly "
+                "computed evidence/belief creates a hybrid snapshot"
             )
         if action.ndim != 3 or action.shape[-1] != self.hidden_dim:
             raise ValueError(
@@ -888,35 +1118,23 @@ class WAM4VA(nn.Module):
             )
             task_summary = task_tokens.mean(dim=1)
 
-        if reuse_aux is not None:
-            z_hat = reuse_aux.z_hat
-            z_spans = reuse_aux.z_spans
-            progress = reuse_aux.progress
-            z_tokens = reuse_aux.z_tokens
-            world_tokens = reuse_aux.world_tokens
-            predict_belief = (
-                reuse_aux.predict_belief
-                if reuse_aux.predict_belief is not None
-                else reuse_aux.belief
-            )
-        else:
-            predict_belief = belief.detach()
-            z_hat, z_spans, progress, z_tokens = self.predict_world(
-                action,
-                proprio,
-                belief,
-                task_summary,
-                dino_tokens=dino_tokens,
-                env_action=env_action,
-                previous_map=previous_map,
-            )
-            world_tokens = None
-            if (
-                z_tokens is not None
-                and z_tokens.ndim == 4
-                and self.dino_to_hid is not None
-            ):
-                world_tokens = self.encode_world_tokens(z_tokens)
+        predict_belief = belief.detach()
+        z_hat, z_spans, progress, z_tokens = self.predict_world(
+            action,
+            proprio,
+            belief,
+            task_summary,
+            dino_tokens=dino_tokens,
+            env_action=env_action,
+            previous_map=previous_map,
+        )
+        world_tokens = None
+        if (
+            z_tokens is not None
+            and z_tokens.ndim == 4
+            and self.dino_to_hid is not None
+        ):
+            world_tokens = self.encode_world_tokens(z_tokens)
         if world_tokens is not None:
             belief = belief + self.belief_from_world(belief, world_tokens)
         elif self.dino_to_hid is not None:
@@ -968,6 +1186,94 @@ class WAM4VA(nn.Module):
             predict_belief=predict_belief,
         )
         return updated, aux, belief, innovation
+
+    def propose(
+        self,
+        action: Tensor,
+        vision: Tensor,
+        proprio: Tensor,
+        *,
+        state: WAMState | None = None,
+        language_keys: Tensor | None = None,
+        dino_tokens: Tensor | None = None,
+        env_action: Tensor | None = None,
+        reuse_aux: WMRMAux | None = None,
+        stage_index: int = 0,
+    ) -> WAMProposal:
+        """Compute a World proposal without mutating or advancing the snapshot."""
+        snapshot = WAMState() if state is None else state
+        snapshot.validate_for(
+            batch=action.shape[0],
+            hidden_dim=self.hidden_dim,
+            n_belief=self.n_belief,
+            n_evidence=self.n_evidence,
+            dino_dim=self.dino_dim,
+            map_size=self.map_size,
+            device=action.device,
+            dtype=action.dtype,
+        )
+        updated, aux, belief, innovation = self._forward_from_snapshot(
+            action,
+            vision,
+            proprio,
+            belief=snapshot.belief,
+            prev_innovation=snapshot.innovation,
+            language_keys=language_keys,
+            dino_tokens=dino_tokens,
+            env_action=env_action,
+            reuse_aux=reuse_aux,
+            stage_index=stage_index,
+            previous_map=snapshot.world_map,
+        )
+        action_delta = updated - action
+        vision_delta = self.mix_world_into_vision(vision, aux) - vision
+        next_world_map = (
+            aux.z_tokens
+            if aux.z_tokens is not None and aux.z_tokens.ndim == 4
+            else snapshot.world_map
+        )
+        return WAMProposal(
+            next_world_state=WAMState(
+                belief=belief,
+                innovation=innovation,
+                world_map=next_world_map,
+            ),
+            action_delta=action_delta,
+            vision_delta=vision_delta,
+            aux=aux,
+        )
+
+    def forward(
+        self,
+        action: Tensor,
+        vision: Tensor,
+        proprio: Tensor,
+        *,
+        belief: Tensor | None = None,
+        prev_innovation: Tensor | None = None,
+        language_keys: Tensor | None = None,
+        world_goal: Tensor | None = None,
+        dino_tokens: Tensor | None = None,
+        env_action: Tensor | None = None,
+        reuse_aux: WMRMAux | None = None,
+        stage_index: int = 0,
+        previous_map: Tensor | None = None,
+    ) -> tuple[Tensor, WMRMAux, Tensor, Tensor]:
+        """Legacy wrapper; preserves the historical return structure and math."""
+        return self._forward_from_snapshot(
+            action,
+            vision,
+            proprio,
+            belief=belief,
+            prev_innovation=prev_innovation,
+            language_keys=language_keys,
+            world_goal=world_goal,
+            dino_tokens=dino_tokens,
+            env_action=env_action,
+            reuse_aux=reuse_aux,
+            stage_index=stage_index,
+            previous_map=previous_map,
+        )
 
     def mix_world_into_vision(self, vision: Tensor, aux: WMRMAux) -> Tensor:
         """WM → next VA: gated spatial world message, zero at initialization."""

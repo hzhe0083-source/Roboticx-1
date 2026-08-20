@@ -109,6 +109,10 @@ class VACompoundConfig:
     wmrm_predictor_depth: int = 6
     wmrm_predictor_width: int = 384
     wmrm_predictor_heads: int = 12
+    # VA↔World execution topology.  ``legacy`` preserves the historical
+    # sequential writeback exactly; ``peer_sync_h6`` uses one pre-stage
+    # snapshot for both proposals and a deterministic H6 executable readout.
+    va_world_mode: str = "legacy"  # "legacy" | "peer_sync_h6"
     # 顺序式 A→V→A 耦合（2026-08-07 审阅落地④）：每 N 层使用
     # proposal→reorganize→correction 三遍注意力；0 = 全层同步联合（旧行为）。
     sequential_coupling: int = 0
@@ -355,6 +359,19 @@ class VACompoundConfig:
             raise ValueError("wmrm_predictor_heads must be positive")
         if self.wmrm_predictor_width % self.wmrm_predictor_heads != 0:
             raise ValueError("wmrm_predictor_width must be divisible by wmrm_predictor_heads")
+        if self.va_world_mode not in {"legacy", "peer_sync_h6"}:
+            raise ValueError("va_world_mode must be legacy|peer_sync_h6")
+        if self.va_world_mode == "peer_sync_h6":
+            if not self.wmrm:
+                raise ValueError("peer_sync_h6 requires wmrm=true")
+            if self.action_horizon != 6:
+                raise ValueError("peer_sync_h6 requires action_horizon=6")
+            if self.wmrm_cycle_steps != 6:
+                raise ValueError("peer_sync_h6 requires wmrm_cycle_steps=6")
+            if self.action_dim != 4:
+                raise ValueError("peer_sync_h6 requires action_dim=4")
+            if self.wmrm_inject != "all":
+                raise ValueError("peer_sync_h6 requires wmrm_inject=all")
 
 
 @dataclass(frozen=True)
@@ -431,6 +448,7 @@ class VisualMemory:
     task_spec: Tensor | None = None
     pending_future: Tensor | None = None
     gate: float | None = None  # EVSM commit-gate mean at this step (diagnostics)
+    world_state: object | None = None  # WAMState; object avoids importing optional WMRM here
 
     def __init__(
         self,
@@ -440,6 +458,7 @@ class VisualMemory:
         task_spec: Tensor | None = None,
         pending_future: Tensor | None = None,
         gate: float | None = None,
+        world_state: object | None = None,
     ) -> None:
         object.__setattr__(self, "layers", layers)
         object.__setattr__(self, "evidence", evidence)
@@ -447,6 +466,7 @@ class VisualMemory:
         object.__setattr__(self, "task_spec", task_spec)
         object.__setattr__(self, "pending_future", pending_future)
         object.__setattr__(self, "gate", gate)
+        object.__setattr__(self, "world_state", world_state)
 
     def detach(self) -> "VisualMemory":
         return VisualMemory(
@@ -458,6 +478,9 @@ class VisualMemory:
                 self.pending_future.detach() if self.pending_future is not None else None
             ),
             gate=self.gate,
+            world_state=(
+                self.world_state.detach() if self.world_state is not None else None
+            ),
         )
 
     def to(
@@ -478,6 +501,36 @@ class VisualMemory:
                 else None
             ),
             gate=self.gate,
+            world_state=(
+                self.world_state.to(device=device, dtype=dtype)
+                if self.world_state is not None
+                else None
+            ),
+        )
+
+    def index_select(self, index: Tensor) -> "VisualMemory":
+        if index.ndim != 1:
+            raise ValueError(f"index must be one-dimensional, got {tuple(index.shape)}")
+
+        def select(tensor: Tensor | None) -> Tensor | None:
+            if tensor is None:
+                return None
+            return tensor.index_select(
+                0, index.to(device=tensor.device, dtype=torch.long)
+            )
+
+        return VisualMemory(
+            layers=tuple(select(layer) for layer in self.layers),
+            evidence=select(self.evidence),
+            task=select(self.task),
+            task_spec=select(self.task_spec),
+            pending_future=select(self.pending_future),
+            gate=self.gate,
+            world_state=(
+                self.world_state.index_select(index)
+                if self.world_state is not None
+                else None
+            ),
         )
 
 
@@ -1959,6 +2012,24 @@ class VACompoundPolicy(nn.Module):
                 )
         else:
             self.wmrm = None
+        if config.va_world_mode == "peer_sync_h6":
+            from va_compound.wmrm import ExecutableActionReadout
+
+            with torch.random.fork_rng(devices=[]):
+                self.world_action_readout = ExecutableActionReadout(
+                    config.hidden_dim,
+                    action_dim=config.action_dim,
+                    horizon=config.action_horizon,
+                )
+                self.peer_current_vision = nn.Linear(
+                    config.hidden_dim, config.hidden_dim, bias=False
+                )
+                nn.init.eye_(self.peer_current_vision.weight)
+                self.peer_current_vision_gain = nn.Parameter(torch.tensor(0.01))
+        else:
+            self.world_action_readout = None
+            self.peer_current_vision = None
+            self.register_parameter("peer_current_vision_gain", None)
         self.last_wmrm = None
         self.last_wmrm_pi_kl = None
         self.action_queries = nn.Parameter(torch.empty(config.action_horizon, config.hidden_dim))
@@ -2559,6 +2630,33 @@ class VACompoundPolicy(nn.Module):
         next_memory = []
         belief = None
         prev_innovation = None
+        peer_mode = self.config.va_world_mode == "peer_sync_h6"
+        if peer_mode:
+            from va_compound.wmrm import WAMState
+
+            world_state = (
+                visual_memory.world_state
+                if visual_memory is not None and visual_memory.world_state is not None
+                else WAMState()
+            )
+            if not isinstance(world_state, WAMState):
+                raise ValueError("visual memory world_state must be a WAMState")
+            world_state.validate_for(
+                batch=action.shape[0],
+                hidden_dim=self.config.hidden_dim,
+                n_belief=self.wmrm.n_belief,
+                n_evidence=self.wmrm.n_evidence,
+                dino_dim=self.wmrm.dino_dim,
+                map_size=self.wmrm.map_size,
+                device=action.device,
+                dtype=action.dtype,
+            )
+            if world_goal is not None:
+                raise ValueError(
+                    "world_goal is sealed: realized futures must not enter the peer forward"
+                )
+        else:
+            world_state = None
         self.last_wmrm = None
         self.last_wmrm_pi_kl = None
         self.last_wmrm_auxes: list = []
@@ -2570,14 +2668,24 @@ class VACompoundPolicy(nn.Module):
         )
         last_inject = max(inject_layers) if inject_layers else -1
         previous_map = None
+        if peer_mode:
+            # Inject the observed-current-vision correction once per decision,
+            # not once per VA layer. Every peer stage then snapshots the same
+            # controlled correction without its magnitude scaling with depth.
+            current = shared_eye.mean(dim=1, keepdim=True)
+            action = action + self.peer_current_vision_gain * self.peer_current_vision(
+                current
+            )
         for index, (layer, layer_cache) in enumerate(
             zip(self.layers, language_cache.layers, strict=True)
         ):
             previous_visual = None if visual_memory is None else visual_memory.layers[index]
+            snapshot_action = action
+            snapshot_vision = vision
             if layer.sequential:
-                vision, action, _ = layer.forward_sequential(
-                    vision,
-                    action,
+                va_vision, va_action, _ = layer.forward_sequential(
+                    snapshot_vision,
+                    snapshot_action,
                     layer_cache,
                     language_cache.attention_mask,
                     visual_memory=previous_visual,
@@ -2585,15 +2693,16 @@ class VACompoundPolicy(nn.Module):
                     action_dense_input=action_dense_input,
                 )
             else:
-                vision, action, _ = layer(
-                    vision,
-                    action,
+                va_vision, va_action, _ = layer(
+                    snapshot_vision,
+                    snapshot_action,
                     layer_cache,
                     language_cache.attention_mask,
                     visual_memory=previous_visual,
                     dense_input=dense_input,
                     action_dense_input=action_dense_input,
                 )
+            vision, action = va_vision, va_action
             next_memory.append(vision)
             if (
                 self.wmrm is not None
@@ -2608,53 +2717,90 @@ class VACompoundPolicy(nn.Module):
                 mask = language_cache.attention_mask
                 if mask is not None:
                     language_keys = language_keys * mask.to(dtype=language_keys.dtype)[:, :, None]
-                updated, aux, belief, prev_innovation = self.wmrm(
-                    action,
-                    vision,
-                    proprio.to(dtype=action.dtype),
-                    belief=belief,
-                    prev_innovation=prev_innovation,
-                    language_keys=language_keys,
-                    world_goal=world_goal,
-                    dino_tokens=vision_tokens.to(dtype=target_dtype),
-                    env_action=env_action,
-                    stage_index=index,
-                    previous_map=previous_map,
-                )
-                if aux.z_tokens is not None and aux.z_tokens.ndim == 4:
-                    previous_map = (
-                        aux.z_tokens.detach()
-                        if detach_wmrm_stage_state
-                        else aux.z_tokens
+                if peer_mode:
+                    # A caller-supplied executable action is authoritative; the
+                    # deterministic readout is only the no-override fallback.
+                    snapshot_env_action = (
+                        self.world_action_readout(snapshot_action)
+                        if env_action is None
+                        else env_action
                     )
-                if self.config.wmrm_handshake:
-                    if wmrm_action_write:
-                        action = updated
-                    if wmrm_vision_write:
-                        vision = self.wmrm.mix_world_into_vision(
-                            vision, aux
+                    proposal = self.wmrm.propose(
+                        snapshot_action,
+                        snapshot_vision,
+                        proprio.to(dtype=snapshot_action.dtype),
+                        state=world_state,
+                        language_keys=language_keys,
+                        dino_tokens=vision_tokens.to(dtype=target_dtype),
+                        env_action=snapshot_env_action,
+                        stage_index=index,
+                    )
+                    proposal.validate_finite(boundary=f"peer stage {index} proposal")
+                    aux = proposal.aux
+                    world_state = proposal.next_world_state
+                    if detach_wmrm_stage_state:
+                        world_state = world_state.detach()
+                    belief = world_state.belief
+                    prev_innovation = world_state.innovation
+                    previous_map = world_state.world_map
+                    if self.config.wmrm_handshake:
+                        if wmrm_action_write:
+                            action = action + proposal.action_delta
+                        if wmrm_vision_write:
+                            vision = vision + proposal.vision_delta
+                            next_memory[-1] = vision
+                else:
+                    updated, aux, belief, prev_innovation = self.wmrm(
+                        action,
+                        vision,
+                        proprio.to(dtype=action.dtype),
+                        belief=belief,
+                        prev_innovation=prev_innovation,
+                        language_keys=language_keys,
+                        world_goal=world_goal,
+                        dino_tokens=vision_tokens.to(dtype=target_dtype),
+                        env_action=env_action,
+                        stage_index=index,
+                        previous_map=previous_map,
+                    )
+                    if aux.z_tokens is not None and aux.z_tokens.ndim == 4:
+                        previous_map = (
+                            aux.z_tokens.detach()
+                            if detach_wmrm_stage_state
+                            else aux.z_tokens
                         )
-                        next_memory[-1] = vision
+                    if self.config.wmrm_handshake:
+                        if wmrm_action_write:
+                            action = updated
+                        if wmrm_vision_write:
+                            vision = self.wmrm.mix_world_into_vision(
+                                vision, aux
+                            )
+                            next_memory[-1] = vision
+                regularizer_action = snapshot_action if peer_mode else pre_action
                 self.last_wmrm = aux
                 self.last_wmrm_auxes.append(aux)
-                self.last_wmrm_pre_actions.append(pre_action)
+                self.last_wmrm_pre_actions.append(regularizer_action)
                 if (
                     self.training
                     and self.config.wmrm_handshake
                     and index == last_inject
                 ):
-                    inject_kl = self.wmrm.pi_kl_from_aux(pre_action, aux)
+                    inject_kl = self.wmrm.pi_kl_from_aux(regularizer_action, aux)
                     self.last_wmrm_pi_kls.append(inject_kl)
                     self.last_wmrm_pi_kl = inject_kl
                     self.last_wmrm_meds.append(
                         self.wmrm.fm_condition_hinge(
-                            pre_action, aux, self.action_norm,
+                            regularizer_action, aux, self.action_norm,
                             margin=self.config.wmrm_med_margin,
                         )
                     )
         action_condition = self.action_norm(action)
         if return_visual_memory:
-            return action_condition, VisualMemory(layers=tuple(next_memory))
+            return action_condition, VisualMemory(
+                layers=tuple(next_memory),
+                world_state=world_state if peer_mode else None,
+            )
         return action_condition
 
     def flow_velocity(

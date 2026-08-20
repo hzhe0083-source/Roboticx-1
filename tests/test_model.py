@@ -4,7 +4,13 @@ import torch
 from torch import nn
 
 from va_compound.backbones import VJEPA21Backbone
-from va_compound.model import VACompoundConfig, VACompoundPolicy, VACouplingLayer
+from va_compound.model import (
+    VACompoundConfig,
+    VACompoundPolicy,
+    VACouplingLayer,
+    VisualMemory,
+)
+from va_compound.wmrm import WAMState
 
 
 def tiny_config(mode: str = "bidir_va") -> VACompoundConfig:
@@ -352,6 +358,41 @@ class VACompoundTests(unittest.TestCase):
     def test_flow_matching_loss_is_zero_for_exact_velocity(self) -> None:
         velocity = torch.randn(2, 5, 6)
         self.assertEqual(VACompoundPolicy.flow_matching_loss(velocity, velocity).item(), 0.0)
+
+    def test_va_world_mode_defaults_legacy_and_validates_peer_h6(self) -> None:
+        self.assertEqual(tiny_config().va_world_mode, "legacy")
+        with self.assertRaisesRegex(ValueError, "va_world_mode"):
+            VACompoundConfig(**{**tiny_config().__dict__, "va_world_mode": "bogus"})
+        with self.assertRaisesRegex(ValueError, "requires wmrm"):
+            VACompoundConfig(
+                **{
+                    **tiny_config().__dict__,
+                    "action_horizon": 6,
+                    "action_dim": 4,
+                    "wmrm_cycle_steps": 6,
+                    "va_world_mode": "peer_sync_h6",
+                }
+            )
+
+    def test_visual_memory_world_state_transforms_and_indexes(self) -> None:
+        memory = VisualMemory(
+            layers=(torch.randn(3, 4, 8, requires_grad=True),),
+            world_state=WAMState(
+                belief=torch.randn(3, 2, 8, requires_grad=True),
+                innovation=torch.randn(3, 2, 8, requires_grad=True),
+                world_map=torch.randn(3, 5, 2, 2, requires_grad=True),
+            ),
+        )
+        detached = memory.detach()
+        self.assertFalse(detached.world_state.belief.requires_grad)
+        converted = memory.to(dtype=torch.float64)
+        self.assertEqual(converted.layers[0].dtype, torch.float64)
+        self.assertEqual(converted.world_state.world_map.dtype, torch.float64)
+        selected = memory.index_select(torch.tensor([2, 0]))
+        torch.testing.assert_close(selected.layers[0], memory.layers[0][[2, 0]])
+        torch.testing.assert_close(
+            selected.world_state.belief, memory.world_state.belief[[2, 0]]
+        )
 
     def test_unfreeze_zero_keeps_vjepa_frozen(self) -> None:
         class FakeVJEPA(nn.Module):

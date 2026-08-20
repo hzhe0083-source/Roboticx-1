@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -11,6 +12,7 @@ from scripts.eval_wam4va_world_action import (
     _load_model_and_metric,
     _negate_ci,
     _proposal_pre_step_memory,
+    _validate_fixed_eval_payload,
     _world_forward,
     check_target_permutation_invariance,
     evaluate_go_no_go,
@@ -19,11 +21,14 @@ from scripts.eval_wam4va_world_action import (
     task_macro_paired_episode_bootstrap,
 )
 from va_compound.model import VisualMemory
+from va_compound.wmrm import WAMState
 
 
 class _TinyMemoryWorld:
     def __init__(self) -> None:
-        self.config = SimpleNamespace(action_horizon=48, action_dim=4)
+        self.config = SimpleNamespace(
+            action_horizon=48, action_dim=4, va_world_mode="legacy"
+        )
         self.current_memories: list[VisualMemory | None] = []
         self.decode_noises: list[torch.Tensor] = []
         self.last_wmrm_auxes: list[SimpleNamespace] = []
@@ -45,8 +50,17 @@ class _TinyMemoryWorld:
                 if memory is None
                 else memory.layers[0]
             )
+            prior_world_state = (
+                None if memory is None else memory.world_state
+            )
+            prior_belief = (
+                torch.zeros(batch, 1, 2, dtype=vision.dtype, requires_grad=True)
+                if prior_world_state is None or prior_world_state.belief is None
+                else prior_world_state.belief
+            )
             next_memory = VisualMemory(
-                layers=(prior + vision[:, :1, :2] + 1.0,)
+                layers=(prior + vision[:, :1, :2] + 1.0,),
+                world_state=WAMState(belief=prior_belief + 1.0),
             )
             return condition, next_memory
 
@@ -142,6 +156,11 @@ def test_index_visual_memory_selects_every_tensor_field() -> None:
         task_spec=base + 40,
         pending_future=base[:, 0] + 50,
         gate=0.25,
+        world_state=WAMState(
+            belief=base + 60,
+            innovation=base + 70,
+            world_map=torch.arange(24, dtype=torch.float32).reshape(3, 2, 2, 2),
+        ),
     )
 
     selected = _index_visual_memory(memory, torch.tensor([2, 0]))
@@ -154,6 +173,52 @@ def test_index_visual_memory_selects_every_tensor_field() -> None:
     torch.testing.assert_close(selected.task, (base + 30)[[2, 0]])
     torch.testing.assert_close(selected.task_spec, (base + 40)[[2, 0]])
     torch.testing.assert_close(selected.pending_future, (base[:, 0] + 50)[[2, 0]])
+    torch.testing.assert_close(
+        selected.world_state.belief, (base + 60)[[2, 0]]
+    )
+    torch.testing.assert_close(
+        selected.world_state.innovation, (base + 70)[[2, 0]]
+    )
+    torch.testing.assert_close(
+        selected.world_state.world_map,
+        torch.arange(24, dtype=torch.float32).reshape(3, 2, 2, 2)[[2, 0]],
+    )
+
+
+def test_peer_proposal_history_uses_one_encode_and_no_decode() -> None:
+    model = _TinyMemoryWorld()
+    model.config.va_world_mode = "peer_sync_h6"
+    batch, history_steps = 2, 3
+    sequence_steps = history_steps + 1
+    vision = torch.ones(batch, sequence_steps, 2, 2)
+    proprio = torch.zeros(batch, sequence_steps, 4)
+    previous_action = torch.zeros(batch, sequence_steps, 4)
+
+    memory = _proposal_pre_step_memory(
+        model,
+        vision,
+        proprio,
+        previous_action,
+        object(),
+        None,
+        None,
+        None,
+        torch.tensor([3, 5]),
+        history_steps,
+        seed=17,
+    )
+
+    assert memory is not None
+    assert len(model.decode_noises) == 0
+    assert len(model.current_memories) == 0
+    torch.testing.assert_close(
+        memory.layers[0], torch.full((batch, 1, 2), 6.0)
+    )
+    assert memory.world_state is not None
+    torch.testing.assert_close(
+        memory.world_state.belief, torch.full((batch, 1, 2), 3.0)
+    )
+    assert not memory.world_state.belief.requires_grad
 
 
 @pytest.mark.parametrize(
@@ -194,6 +259,127 @@ def test_model_loader_rejects_non_gate_architecture(
         _load_model_and_metric(
             {"config": config, "model": {}}, torch.device("cpu")
         )
+
+
+def _formal_model_config(*, va_world_mode: str = "legacy") -> dict:
+    return {
+        "wmrm": True,
+        "wmrm_target": "dino",
+        "wmrm_cycle_steps": 6,
+        "main_vision_grid": 16,
+        "main_vision_frames": 4,
+        "main_vision_tokens": 1024,
+        "main_vision_dim": 1024,
+        "num_layers": 8,
+        "action_horizon": 6 if va_world_mode == "peer_sync_h6" else 48,
+        "action_dim": 4,
+        "wmrm_inject": "all",
+        "wmrm_handshake": True,
+        "wmrm_predictor": "st_blocks",
+        "wmrm_map_size": 16,
+        "wmrm_map_channels": 1024,
+        "wmrm_world_grid": 16,
+        "va_world_mode": va_world_mode,
+    }
+
+
+def test_production_loader_accepts_formal_peer_h6_config_and_strict_state() -> None:
+    loaded: dict[str, object] = {}
+
+    class _LoadedPolicy:
+        def __init__(self, config) -> None:
+            loaded["config"] = config
+
+        def to(self, device):
+            loaded["device"] = device
+            return self
+
+        def eval(self):
+            loaded["eval"] = True
+            return self
+
+        def load_state_dict(self, state, *, strict):
+            loaded["state"] = state
+            loaded["strict"] = strict
+
+    state = {"world_action_readout.proj.weight": torch.ones(1)}
+    with mock.patch(
+        "scripts.eval_wam4va_world_action.VACompoundPolicy", _LoadedPolicy
+    ):
+        model, metric_head, relation_encoder, config = _load_model_and_metric(
+            {
+                "config": _formal_model_config(va_world_mode="peer_sync_h6"),
+                "model": state,
+            },
+            torch.device("cpu"),
+        )
+
+    assert model is not None
+    assert metric_head is None
+    assert relation_encoder is None
+    assert config.va_world_mode == "peer_sync_h6"
+    assert config.action_horizon == 6
+    assert loaded["state"] is state
+    assert loaded["strict"] is True
+
+
+def test_production_loader_preserves_strict_legacy_h48() -> None:
+    config = _formal_model_config()
+    config["action_horizon"] = 6
+    with pytest.raises(
+        ValueError,
+        match="peer_sync_h6 requires action_horizon=6|action_horizon",
+    ):
+        _load_model_and_metric(
+            {"config": config, "model": {}}, torch.device("cpu")
+        )
+
+
+def test_fixed_eval_action_shape_branches_by_va_world_mode() -> None:
+    payload = {
+        "actions": torch.zeros(1, 2, 6, 4),
+        "previous_action": torch.zeros(1, 2, 4),
+        "proprio": torch.zeros(1, 2, 3),
+        "language_hidden": torch.zeros(1, 2, 1, 4),
+        "instruction_id": torch.tensor([0]),
+        "episode_id": torch.tensor([10]),
+        "action_valid_mask": torch.ones(1, 2, 6, dtype=torch.bool),
+        "recovery_mask": torch.zeros(1, 2, 6, dtype=torch.bool),
+        "frame_refs": [["assembly-v3"]],
+        "metadata": {},
+    }
+
+    with pytest.raises(ValueError, match="split_name"):
+        _validate_fixed_eval_payload(
+            payload, [0], va_world_mode="peer_sync_h6"
+        )
+    with pytest.raises(ValueError, match=r"\[N,T,48,4\]"):
+        _validate_fixed_eval_payload(payload, [0], va_world_mode="legacy")
+
+
+def test_checkpoint_world_contract_requires_peer_topology_and_action_source() -> None:
+    checkpoint = {
+        "config": {"va_world_mode": "peer_sync_h6"},
+        "training_contract": {
+            "world_supervision": "visual_motion_v1",
+            "world_logged_branch": "matched_context_full_forward_v1",
+            "va_world_mode": "peer_sync_h6",
+            "peer_world_topology": "pre_stage_snapshot_parallel_va_world_v1",
+            "peer_world_action_source": (
+                "deterministic_readout_main_explicit_env_override_supervision_v1"
+            ),
+        },
+    }
+    assert _checkpoint_world_contract(checkpoint, allow_unmarked=False)[2] is True
+
+    for field in ("peer_world_topology", "peer_world_action_source"):
+        invalid = {
+            **checkpoint,
+            "training_contract": dict(checkpoint["training_contract"]),
+        }
+        invalid["training_contract"][field] = "legacy"
+        with pytest.raises(ValueError, match=field):
+            _checkpoint_world_contract(invalid, allow_unmarked=False)
 
 
 def test_checkpoint_world_contract_requires_matched_context_logged_branch() -> None:

@@ -40,6 +40,15 @@ WORLD_LOSS_COMPONENT_WEIGHTS = {
 WORLD_STAGE_AUXILIARY_DECAY = 0.25
 WORLD_LOGGED_BRANCH_CONTRACT = "matched_context_full_forward_v1"
 WORLD_ACTION_DONOR_CONTRACT = "train_split_task_cross_episode_proprio_nearest_v1"
+PEER_WORLD_TOPOLOGY_CONTRACT = "pre_stage_snapshot_parallel_va_world_v1"
+PEER_WORLD_ACTION_SOURCE_CONTRACT = "deterministic_readout_main_explicit_env_override_supervision_v1"
+PEER_WORLD_READOUT_CONTRACT = {
+    "loss": "smooth_l1_logged_h6_v1",
+    "validity": "world_transition_mask_all_h6_current_and_next_first_v1",
+    "stage_supervision": "final_peer_stage_only_v1",
+    "reduction": "masked_mean_over_valid_transitions_v1",
+    "diagnostic": "rmse_same_mask_and_stage_v1",
+}
 FEATURE_AUTOCAST_CONTRACT = "bf16_nograd_decode_cache_isolated_v1"
 WORLD_NO_REGRESSION = {
     "all_ratio": 1.0,
@@ -1279,6 +1288,7 @@ def validate_visual_world_resume_contract(
     action_ranking: dict[str, object] | None = None,
     static_constraint_weight: float = 4.0,
     migration_id: str | None = None,
+    va_world_mode: str = "legacy",
 ) -> None:
     """Reject exact continuation from an old or differently split loss graph."""
 
@@ -1310,6 +1320,15 @@ def validate_visual_world_resume_contract(
         "split_manifest_sha256": split_identity["manifest_sha256"],
         "split_source_sha256": split_identity["source_sha256"],
     }
+    if va_world_mode == "peer_sync_h6":
+        expected.update(
+            {
+                "va_world_mode": va_world_mode,
+                "peer_world_topology": PEER_WORLD_TOPOLOGY_CONTRACT,
+                "peer_world_action_source": PEER_WORLD_ACTION_SOURCE_CONTRACT,
+                "peer_world_readout": PEER_WORLD_READOUT_CONTRACT,
+            }
+        )
     mismatches = {
         key: (contract.get(key), value)
         for key, value in expected.items()
@@ -1589,6 +1608,12 @@ def build_exact_run_contract(
             "roi_checkpoint_identity": roi_identity,
         },
     }
+    if getattr(args, "va_world_mode", "legacy") == "peer_sync_h6":
+        contract["peer_world"] = {
+            "topology": PEER_WORLD_TOPOLOGY_CONTRACT,
+            "action_source": PEER_WORLD_ACTION_SOURCE_CONTRACT,
+            "readout": PEER_WORLD_READOUT_CONTRACT,
+        }
     if getattr(args, "feature_autocast_bf16", False):
         contract["feature_autocast"] = {
             "contract": FEATURE_AUTOCAST_CONTRACT,
@@ -1651,6 +1676,11 @@ def _normalize_legacy_exact_run_contract(contract: dict) -> dict:
     model_config = normalized.get("model_config")
     if isinstance(model_config, dict):
         model_config.setdefault("wmrm_detach_proposal_stage_state", False)
+        # Checkpoints predating the peer core are exactly the legacy topology.
+        # Normalizing this absent field is compatibility, not a migration to peer.
+        model_config.setdefault("va_world_mode", "legacy")
+    if isinstance(arguments, dict):
+        arguments.setdefault("va_world_mode", "legacy")
     return normalized
 
 
@@ -4191,6 +4221,12 @@ def rollout_policy(
         raise ValueError("world_action_rank_step must be non-negative")
     if world_action_rank_stage not in {"final", "cycle"}:
         raise ValueError("world_action_rank_stage must be 'final' or 'cycle'")
+    peer_world_mode = getattr(model.config, "va_world_mode", "legacy") == "peer_sync_h6"
+    if peer_world_mode and wmrm_adep_enabled:
+        raise ValueError(
+            "peer_sync_h6 rejects nonzero wmrm_adep until action-dependence "
+            "counterfactuals use the exact same immutable stage snapshot"
+        )
     if model.config.plan_resampler:
         # Plan-Cache 方案 B：首决策场景摘要（vision 全局均值）→ plan tokens，
         # cat 进语言序列后统一 build 缓存（与闭环"episode 首帧建缓存"语义一致）。
@@ -4241,6 +4277,8 @@ def rollout_policy(
         list[tuple[Tensor, Tensor, Tensor]]
     ] = []
     visual_world_action_shuffle_records: list[tuple[Tensor, Tensor, Tensor]] = []
+    peer_readout_loss_records: list[tuple[Tensor, Tensor]] = []
+    peer_readout_squared_error_records: list[tuple[Tensor, Tensor]] = []
     visual_world_final_records: list[dict[str, Tensor]] = []
     wmrm_pi_kl_terms: list[Tensor] = []
     wmrm_adep_terms: list[Tensor] = []
@@ -4348,7 +4386,15 @@ def rollout_policy(
                     f"WAM4VA needs {cycle} executable actions, "
                     f"but the training chunk has {batch['actions'].shape[2]}"
                 )
-            if getattr(model.config, "wmrm_handshake", True):
+            if peer_world_mode:
+                # Peer mode owns its deterministic executable-action readout inside
+                # the single main encode.  A preliminary Flow decode would create a
+                # second, stale snapshot and violate the peer topology contract.
+                if cycle != 6 or model.config.action_horizon != 6:
+                    raise ValueError("peer_sync_h6 rollout requires exact H6")
+                if getattr(model, "world_action_readout", None) is None:
+                    raise ValueError("peer_sync_h6 requires world_action_readout")
+            elif getattr(model.config, "wmrm_handshake", True):
                 proposal_cond, _ = model.encode_condition(
                     vision_in,
                     batch["proprio"][:, time_index],
@@ -4374,19 +4420,33 @@ def rollout_policy(
                 world_action = decoded[:, :cycle].clamp(-1.0, 1.0)
             else:
                 world_action = batch["actions"][:, time_index, :cycle].clamp(-1.0, 1.0)
-        condition, visual_memory = model.encode_condition(
-            vision_in,
-            batch["proprio"][:, time_index],
-            batch["previous_action"][:, time_index],
-            language_cache=language_cache,
-            visual_memory=pre_step_visual_memory,
-            return_visual_memory=True,
-            env_action=world_action,
-            detach_wmrm_stage_state=bool(
-                getattr(model.config, "wmrm_detach_proposal_stage_state", False)
-            ),
-            **mtvj_kwargs,
-        )
+        peer_stage_snapshots: list[tuple[tuple, dict]] = []
+        original_peer_propose = None
+        if peer_world_mode:
+            original_peer_propose = model.wmrm.propose
+
+            def record_peer_snapshot(*proposal_args, **proposal_kwargs):
+                peer_stage_snapshots.append((proposal_args, dict(proposal_kwargs)))
+                return original_peer_propose(*proposal_args, **proposal_kwargs)
+
+            model.wmrm.propose = record_peer_snapshot
+        try:
+            condition, visual_memory = model.encode_condition(
+                vision_in,
+                batch["proprio"][:, time_index],
+                batch["previous_action"][:, time_index],
+                language_cache=language_cache,
+                visual_memory=pre_step_visual_memory,
+                return_visual_memory=True,
+                env_action=world_action,
+                detach_wmrm_stage_state=bool(
+                    getattr(model.config, "wmrm_detach_proposal_stage_state", False)
+                ),
+                **mtvj_kwargs,
+            )
+        finally:
+            if original_peer_propose is not None:
+                model.wmrm.propose = original_peer_propose
         proposal_auxes = list(getattr(model, "last_wmrm_auxes", None) or ())
         if not proposal_auxes and getattr(model, "last_wmrm", None) is not None:
             proposal_auxes = [model.last_wmrm]
@@ -4422,51 +4482,93 @@ def rollout_policy(
                 logged_action = batch["actions"][
                     :, time_index, : model.wmrm.cycle_steps
                 ]
-                logged_visual_memory = (
-                    None
-                    if pre_step_visual_memory is None
-                    else pre_step_visual_memory.detach()
-                )
-                try:
-                    logged_condition = model.encode_condition(
-                        vision_in,
-                        batch["proprio"][:, time_index],
-                        batch["previous_action"][:, time_index],
-                        language_cache=language_cache,
-                        visual_memory=logged_visual_memory,
-                        env_action=logged_action,
-                        detach_wmrm_stage_state=True,
-                        **mtvj_kwargs,
+                if peer_world_mode:
+                    logged_auxes = list(proposal_auxes)
+                    # The main peer encode already consumed the one authoritative
+                    # pre-stage snapshot per layer.  Supervision changes only the
+                    # executable action supplied to the predictor; it must not
+                    # rerun VA, mutate VisualMemory, or advance WAMState again.
+                    logged_pres = proposal_pres
+                    # Readout supervision follows the exact World transition-valid
+                    # mask and has one explicit aggregation contract: supervise only
+                    # the final peer stage, then average all H6 action coordinates.
+                    final_readout = proposal_auxes[-1].env_action
+                    if final_readout is None:
+                        raise RuntimeError(
+                            "final peer World stage did not expose deterministic readout"
+                        )
+                    logged_readout = logged_action.to(dtype=final_readout.dtype)
+                    readout_error = F.smooth_l1_loss(
+                        final_readout,
+                        logged_readout,
+                        reduction="none",
+                    ).mean(dim=(-1, -2))
+                    readout_squared = (
+                        final_readout - logged_readout
+                    ).square().mean(dim=(-1, -2))
+                    peer_readout_loss_records.append((valid, readout_error))
+                    peer_readout_squared_error_records.append(
+                        (valid, readout_squared)
                     )
-                    logged_auxes = list(
-                        getattr(model, "last_wmrm_auxes", None) or ()
+                else:
+                    logged_visual_memory = (
+                        None
+                        if pre_step_visual_memory is None
+                        else pre_step_visual_memory.detach()
                     )
-                    logged_pres = list(
-                        getattr(model, "last_wmrm_pre_actions", None) or ()
-                    )
-                    del logged_condition
-                finally:
-                    # The independent logged-action branch must not replace the
-                    # proposal branch consumed by Flow/handshake regularizers.
-                    model.last_wmrm = proposal_last
-                    model.last_wmrm_auxes = proposal_auxes
-                    model.last_wmrm_pre_actions = proposal_pres
-                    model.last_wmrm_meds = proposal_meds
-                    model.last_wmrm_pi_kls = proposal_kls
-                    model.last_wmrm_pi_kl = proposal_last_kl
-                if len(logged_auxes) != len(proposal_auxes):
-                    raise RuntimeError(
-                        "logged/proposal World stage counts differ: "
-                        f"{len(logged_auxes)} vs {len(proposal_auxes)}"
-                    )
-                if len(logged_pres) != len(logged_auxes):
-                    raise RuntimeError(
-                        "logged World pre-action/stage counts differ: "
-                        f"{len(logged_pres)} vs {len(logged_auxes)}"
-                    )
+                    try:
+                        logged_condition = model.encode_condition(
+                            vision_in,
+                            batch["proprio"][:, time_index],
+                            batch["previous_action"][:, time_index],
+                            language_cache=language_cache,
+                            visual_memory=logged_visual_memory,
+                            env_action=logged_action,
+                            detach_wmrm_stage_state=True,
+                            **mtvj_kwargs,
+                        )
+                        logged_auxes = list(
+                            getattr(model, "last_wmrm_auxes", None) or ()
+                        )
+                        logged_pres = list(
+                            getattr(model, "last_wmrm_pre_actions", None) or ()
+                        )
+                        del logged_condition
+                    finally:
+                        # The independent logged-action branch must not replace the
+                        # proposal branch consumed by Flow/handshake regularizers.
+                        model.last_wmrm = proposal_last
+                        model.last_wmrm_auxes = proposal_auxes
+                        model.last_wmrm_pre_actions = proposal_pres
+                        model.last_wmrm_meds = proposal_meds
+                        model.last_wmrm_pi_kls = proposal_kls
+                        model.last_wmrm_pi_kl = proposal_last_kl
+                    if len(logged_auxes) != len(proposal_auxes):
+                        raise RuntimeError(
+                            "logged/proposal World stage counts differ: "
+                            f"{len(logged_auxes)} vs {len(proposal_auxes)}"
+                        )
+                    if len(logged_pres) != len(logged_auxes):
+                        raise RuntimeError(
+                            "logged World pre-action/stage counts differ: "
+                            f"{len(logged_pres)} vs {len(logged_auxes)}"
+                        )
                 final_visual = None
                 logged_visuals = []
                 for inject_i, aux in enumerate(logged_auxes):
+                    if peer_world_mode:
+                        if len(peer_stage_snapshots) != len(proposal_auxes):
+                            raise RuntimeError(
+                                "peer snapshot/stage counts differ: "
+                                f"{len(peer_stage_snapshots)} vs {len(proposal_auxes)}"
+                            )
+                        snapshot_args, snapshot_kwargs = peer_stage_snapshots[inject_i]
+                        snapshot_kwargs["env_action"] = logged_action
+                        logged_proposal = model.wmrm.propose(
+                            *snapshot_args, **snapshot_kwargs
+                        )
+                        aux = logged_proposal.aux
+                        logged_auxes[inject_i] = aux
                     logged_map = aux.z_tokens
                     if logged_map is None or logged_map.shape != target.shape:
                         raise ValueError(
@@ -4555,15 +4657,33 @@ def rollout_policy(
                         and logged_auxes[rank_stage - 1].z_tokens is not None
                         else None
                     )
-                    _, _, _, shuffled_map = model.wmrm.predict_world(
-                        logged_pres[rank_stage],
-                        rank_aux.proprio,
-                        rank_aux.predict_belief,
-                        rank_aux.task_summary,
-                        dino_tokens=rank_aux.dino_tokens,
-                        env_action=rank_shuffle_actions[:, time_index],
-                        previous_map=previous_map,
-                    )
+                    if peer_world_mode:
+                        snapshot_args, snapshot_kwargs = peer_stage_snapshots[rank_stage]
+                        snapshot_kwargs["env_action"] = rank_shuffle_actions[:, time_index]
+                        shuffled_map = model.wmrm.propose(
+                            *snapshot_args, **snapshot_kwargs
+                        ).aux.z_tokens
+                        # Zero is diagnostic-only in the v7 ranking objective, but
+                        # peer mode still evaluates it as an explicit env-action
+                        # override on the exact same immutable stage snapshot.
+                        snapshot_kwargs["env_action"] = torch.zeros_like(logged_action)
+                        zero_map = model.wmrm.propose(
+                            *snapshot_args, **snapshot_kwargs
+                        ).aux.z_tokens
+                        if zero_map is None or zero_map.shape != target.shape:
+                            raise ValueError(
+                                "zero-action World prediction must be the full DINO map"
+                            )
+                    else:
+                        _, _, _, shuffled_map = model.wmrm.predict_world(
+                            logged_pres[rank_stage],
+                            rank_aux.proprio,
+                            rank_aux.predict_belief,
+                            rank_aux.task_summary,
+                            dino_tokens=rank_aux.dino_tokens,
+                            env_action=rank_shuffle_actions[:, time_index],
+                            previous_map=previous_map,
+                        )
                     if shuffled_map is None or shuffled_map.shape != target.shape:
                         raise ValueError(
                             "action-gap World prediction must be the full DINO map"
@@ -4840,6 +4960,19 @@ def rollout_policy(
         action_zero_loss = objective_world_loss * 0.0
         action_strong_loss = objective_world_loss * 0.0
         action_rank_loss = action_shuffle_loss
+        if peer_readout_loss_records:
+            readout_loss = masked_world_reduction(
+                [value for _, value in peer_readout_loss_records],
+                [mask for mask, _ in peer_readout_loss_records],
+            )
+            readout_mse = masked_world_reduction(
+                [value for _, value in peer_readout_squared_error_records],
+                [mask for mask, _ in peer_readout_squared_error_records],
+            )
+            readout_rmse = readout_mse.clamp_min(0.0).sqrt()
+        else:
+            readout_loss = objective_world_loss * 0.0
+            readout_rmse = objective_world_loss.detach() * 0.0
         model.last_wmrm_base_loss = base_world_loss
         model.last_world_no_regression_loss = no_regression_loss
         model.last_world_static_constraint_loss = static_constraint_loss
@@ -4847,11 +4980,14 @@ def rollout_policy(
         model.last_world_action_shuffle_loss = action_shuffle_loss
         model.last_world_action_zero_loss = action_zero_loss
         model.last_world_action_strong_loss = action_strong_loss
+        model.last_world_action_readout_loss = readout_loss
+        model.last_world_action_readout_rmse = readout_rmse
         model.last_wmrm_loss = (
             objective_world_loss
             + float(wmrm_static_constraint_weight)
             * static_constraint_loss
             + float(WORLD_ACTION_RANKING["weight"]) * action_rank_loss
+            + readout_loss
         )
         model.last_visual_world_metrics = _summarize_visual_world_metrics(
             visual_world_final_records,
@@ -4866,6 +5002,8 @@ def rollout_policy(
         model.last_world_action_shuffle_loss = model.last_wmrm_loss * 0.0
         model.last_world_action_zero_loss = model.last_wmrm_loss * 0.0
         model.last_world_action_strong_loss = model.last_wmrm_loss * 0.0
+        model.last_world_action_readout_loss = model.last_wmrm_loss * 0.0
+        model.last_world_action_readout_rmse = model.last_wmrm_loss.detach() * 0.0
         model.last_visual_world_metrics = {}
     else:
         model.last_wmrm_loss = None
@@ -4876,6 +5014,8 @@ def rollout_policy(
         model.last_world_action_shuffle_loss = None
         model.last_world_action_zero_loss = None
         model.last_world_action_strong_loss = None
+        model.last_world_action_readout_loss = None
+        model.last_world_action_readout_rmse = None
         model.last_visual_world_metrics = {}
     if wmrm_pi_kl_terms:
         model.last_wmrm_pi_kl_loss = torch.stack(wmrm_pi_kl_terms).mean()
@@ -5353,6 +5493,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         dest="wmrm",
         help="WAM4VA：同 --wmrm。WAM 向 VA 注入未来信息，动作仍由 VA 发出",
+    )
+    parser.add_argument(
+        "--va-world-mode",
+        choices=("legacy", "peer_sync_h6"),
+        default="legacy",
+        help=(
+            "VA/World topology: legacy preserves sequential writeback; "
+            "peer_sync_h6 uses one shared pre-stage snapshot and a deterministic H6 "
+            "executable-action readout"
+        ),
     )
     parser.add_argument(
         "--wmrm-target",
@@ -6266,6 +6416,46 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "--resume-exact-contract-migration requires --resume-exact"
         )
+    peer_world = getattr(args, "va_world_mode", "legacy") == "peer_sync_h6"
+    if peer_world:
+        required = {
+            "--wam4va": bool(getattr(args, "wmrm", False)),
+            "--wmrm-cycle-steps 6": int(getattr(args, "wmrm_cycle_steps", 0)) == 6,
+            "--flow-prefix-steps 6": int(getattr(args, "flow_prefix_steps", 0)) == 6,
+            "--wmrm-inject all": getattr(args, "wmrm_inject", None) == "all",
+        }
+        missing = [name for name, enabled in required.items() if not enabled]
+        if missing:
+            raise ValueError(
+                "--va-world-mode peer_sync_h6 missing required settings: "
+                + ", ".join(missing)
+            )
+        if args.resume is not None or getattr(args, "resume_weights", None) is not None:
+            raise ValueError(
+                "peer_sync_h6 training may only start scratch or use --resume-exact"
+            )
+        if getattr(args, "wmrm_only", False):
+            raise ValueError(
+                "--wmrm-only with peer_sync_h6 has unsupported readout ownership; "
+                "use legacy or train the full peer policy"
+            )
+        if float(getattr(args, "wmrm_adep_weight", 0.0)) != 0.0:
+            raise ValueError(
+                "peer_sync_h6 requires --wmrm-adep-weight 0 until "
+                "same-snapshot action-dependence counterfactuals are implemented"
+            )
+        if getattr(args, "resume_exact", None) is not None:
+            peer_checkpoint = torch.load(
+                args.resume_exact, map_location="cpu", weights_only=True
+            )
+            saved_mode = (peer_checkpoint.get("config") or {}).get(
+                "va_world_mode", "legacy"
+            )
+            if saved_mode != "peer_sync_h6":
+                raise ValueError(
+                    "--resume-exact peer_sync_h6 requires a peer_sync_h6 checkpoint; "
+                    f"checkpoint mode is {saved_mode!r}"
+                )
     visual_world = bool(getattr(args, "visual_world_supervision", False))
     split_manifest = getattr(args, "world_split_manifest", None)
     if visual_world:
@@ -7278,6 +7468,10 @@ def _feature_optimizer_groups(args, model, vision_backbone):
         )
         return [{"params": action_params, "lr": args.lr_action_vision}]
     if getattr(args, "wmrm_only", False):
+        if getattr(model.config, "va_world_mode", "legacy") != "legacy":
+            raise ValueError(
+                "--wmrm-only does not support peer readout ownership; use legacy"
+            )
         if getattr(model, "wmrm", None) is None:
             raise ValueError("--wmrm-only requires a constructed WAM4VA module")
         wmrm_params, frozen_names = [], []
@@ -7848,6 +8042,22 @@ def save_checkpoint(
                 "world_action_source": "logged_cycle6",
                 "world_target_stop_gradient": True,
                 "world_logged_branch": WORLD_LOGGED_BRANCH_CONTRACT,
+                "va_world_mode": getattr(args, "va_world_mode", "legacy"),
+                "peer_world_topology": (
+                    PEER_WORLD_TOPOLOGY_CONTRACT
+                    if getattr(args, "va_world_mode", "legacy") == "peer_sync_h6"
+                    else None
+                ),
+                "peer_world_action_source": (
+                    PEER_WORLD_ACTION_SOURCE_CONTRACT
+                    if getattr(args, "va_world_mode", "legacy") == "peer_sync_h6"
+                    else None
+                ),
+                "peer_world_readout": (
+                    PEER_WORLD_READOUT_CONTRACT
+                    if getattr(args, "va_world_mode", "legacy") == "peer_sync_h6"
+                    else None
+                ),
                 "split_manifest_id": split_identity["manifest_id"],
                 "split_manifest_path": split_identity["manifest_path"],
                 "split_manifest_sha256": split_identity["manifest_sha256"],
@@ -8138,6 +8348,7 @@ def main() -> None:
             flow_semantic=args.flow_semantic,
             wam_joint=args.wam_joint,
             wmrm=args.wmrm,
+            va_world_mode=args.va_world_mode,
             wmrm_inject=args.wmrm_inject,
             wmrm_target=getattr(args, "wmrm_target", "dino"),
             wmrm_world_dim=(
@@ -8444,6 +8655,7 @@ def main() -> None:
             flow_semantic=args.flow_semantic,
             wam_joint=args.wam_joint,
             wmrm=args.wmrm,
+            va_world_mode=args.va_world_mode,
             wmrm_inject=args.wmrm_inject,
             wmrm_target=getattr(args, "wmrm_target", "dino"),
             wmrm_world_dim=(
@@ -8741,6 +8953,7 @@ def main() -> None:
             flow_semantic=args.flow_semantic,
             wam_joint=args.wam_joint,
             wmrm=args.wmrm,
+            va_world_mode=args.va_world_mode,
             wmrm_inject=args.wmrm_inject,
             wmrm_target=getattr(args, "wmrm_target", "dino"),
             wmrm_world_dim=(
@@ -9219,6 +9432,7 @@ def main() -> None:
                     ),
                     float(getattr(args, "wmrm_static_constraint_weight", 4.0)),
                     args.resume_exact_contract_migration,
+                    getattr(args, "va_world_mode", "legacy"),
                 )
             # Fail before restoring model/optimizer/sampler/RNG if any data,
             # objective, sampler, architecture or optimizer semantic changed.
@@ -9234,6 +9448,7 @@ def main() -> None:
             "action_dim",
             "proprio_dim",
             "mode",
+            "va_world_mode",
             "wmrm_predictor",
             "wmrm_predictor_depth",
             "wmrm_predictor_width",
@@ -9242,6 +9457,8 @@ def main() -> None:
             if key.startswith("wmrm_") and not getattr(config, "wmrm", False):
                 continue
             left = resume_config.get(key)
+            if key == "va_world_mode" and left is None:
+                left = "legacy"
             right = getattr(config, key, None)
             if key.startswith("wmrm_") and left is None:
                 left = {

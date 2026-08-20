@@ -215,6 +215,12 @@ ORACLE_STGAP_WORLD_ACTION_RANKINGS = tuple(
 )
 DEFAULT_CYCLE_STEPS = 6
 PROPOSAL_FLOW_STEPS = 8
+LEGACY_VA_WORLD_MODE = "legacy"
+PEER_VA_WORLD_MODE = "peer_sync_h6"
+PEER_WORLD_TOPOLOGY_CONTRACT = "pre_stage_snapshot_parallel_va_world_v1"
+PEER_WORLD_ACTION_SOURCE_CONTRACT = (
+    "deterministic_readout_main_explicit_env_override_supervision_v1"
+)
 DEFAULT_TASK_IDS = (0, 16)
 DEFAULT_TASK_NAMES = {0: "assembly-v3", 16: "door-unlock-v3"}
 CI_LEVEL = 0.95
@@ -698,9 +704,23 @@ def _checkpoint_world_contract(
     contract = checkpoint.get("training_contract") or {}
     supervision = contract.get("world_supervision")
     logged_branch = contract.get("world_logged_branch")
+    va_world_mode = (checkpoint.get("config") or {}).get(
+        "va_world_mode", LEGACY_VA_WORLD_MODE
+    )
+    peer_contract_valid = bool(
+        va_world_mode != PEER_VA_WORLD_MODE
+        or (
+            contract.get("va_world_mode") == PEER_VA_WORLD_MODE
+            and contract.get("peer_world_topology")
+            == PEER_WORLD_TOPOLOGY_CONTRACT
+            and contract.get("peer_world_action_source")
+            == PEER_WORLD_ACTION_SOURCE_CONTRACT
+        )
+    )
     base_valid = bool(
         supervision in SUPPORTED_WORLD_SUPERVISION_CONTRACTS
         and logged_branch == WORLD_LOGGED_BRANCH_CONTRACT
+        and peer_contract_valid
     )
     if supervision in {
         PREVIOUS_WORLD_SUPERVISION_CONTRACT,
@@ -793,7 +813,11 @@ def _checkpoint_world_contract(
             f"{contract.get('world_static_copy_anchor')!r}, "
             "world_static_copy_constraint="
             f"{contract.get('world_static_copy_constraint')!r}, "
-            f"world_action_ranking={contract.get('world_action_ranking')!r}"
+            f"world_action_ranking={contract.get('world_action_ranking')!r}, "
+            f"va_world_mode={va_world_mode!r}, "
+            f"peer_world_topology={contract.get('peer_world_topology')!r}, "
+            "peer_world_action_source="
+            f"{contract.get('peer_world_action_source')!r}"
         )
     return supervision, logged_branch, valid
 
@@ -1027,7 +1051,10 @@ def _stable_seed(base: int, label: str) -> int:
 
 
 def _validate_fixed_eval_payload(
-    payload: Mapping[str, Any], expected_task_ids: Sequence[int]
+    payload: Mapping[str, Any],
+    expected_task_ids: Sequence[int],
+    *,
+    va_world_mode: str = LEGACY_VA_WORLD_MODE,
 ) -> dict[str, Any]:
     from scripts.split_wam4va_episode_holdout import (
         MANIFEST_CONTRACT,
@@ -1050,12 +1077,23 @@ def _validate_fixed_eval_payload(
     missing = [key for key in required if key not in payload]
     if missing:
         raise ValueError(f"fixed eval dataset missing keys: {missing}")
+    if va_world_mode not in {LEGACY_VA_WORLD_MODE, PEER_VA_WORLD_MODE}:
+        raise ValueError(f"unsupported va_world_mode: {va_world_mode!r}")
+    expected_horizon = 6 if va_world_mode == PEER_VA_WORLD_MODE else 48
     actions = torch.as_tensor(payload["actions"])
-    if actions.ndim != 4 or tuple(actions.shape[2:]) != (48, 4):
-        raise ValueError(f"eval actions must be [N,T,48,4], got {tuple(actions.shape)}")
+    expected_action_shape = (expected_horizon, 4)
+    if actions.ndim != 4 or tuple(actions.shape[2:]) != expected_action_shape:
+        raise ValueError(
+            "eval actions must be "
+            f"[N,T,{expected_horizon},4] for va_world_mode={va_world_mode!r}, "
+            f"got {tuple(actions.shape)}"
+        )
     mask = torch.as_tensor(payload["action_valid_mask"])
     if mask.dtype != torch.bool or mask.shape != actions.shape[:-1]:
-        raise ValueError("action_valid_mask must be bool [N,T,48]")
+        raise ValueError(
+            "action_valid_mask must be bool "
+            f"[N,T,{expected_horizon}] for va_world_mode={va_world_mode!r}"
+        )
     episodes = _as_1d_tensor(payload["episode_id"], name="episode_id").to(torch.int64)
     task_ids = _as_1d_tensor(payload["instruction_id"], name="instruction_id").to(
         torch.int64
@@ -1234,7 +1272,11 @@ def _load_model_and_metric(
         raise ValueError("held-out protocol requires native 4x16x16x1024 DINO input")
     formal_gate_config = {
         "num_layers": 8,
-        "action_horizon": 48,
+        "action_horizon": (
+            DEFAULT_CYCLE_STEPS
+            if config.va_world_mode == PEER_VA_WORLD_MODE
+            else 48
+        ),
         "wmrm_inject": "all",
         "wmrm_handshake": True,
         "wmrm_predictor": "st_blocks",
@@ -1319,20 +1361,7 @@ def _index_visual_memory(
         return None
     if indices.ndim != 1:
         raise ValueError("visual-memory indices must be 1-D")
-
-    def select(value: Tensor | None) -> Tensor | None:
-        if value is None:
-            return None
-        return value.index_select(0, indices.to(device=value.device))
-
-    return VisualMemory(
-        layers=tuple(select(layer) for layer in memory.layers),
-        evidence=select(memory.evidence),
-        task=select(memory.task),
-        task_spec=select(memory.task_spec),
-        pending_future=select(memory.pending_future),
-        gate=memory.gate,
-    )
+    return memory.index_select(indices)
 
 
 def _proposal_noise(
@@ -1397,48 +1426,56 @@ def _proposal_pre_step_memory(
             None if metric_tokens is None else metric_tokens[:, history_time]
         )
         history_metric_g = None if metric_g is None else metric_g[:, history_time]
-        proposal_condition, _ = model.encode_condition(
-            vision_tokens[:, history_time],
-            proprio[:, history_time],
-            previous_action[:, history_time],
+        encode_kwargs = dict(
             language_cache=language_cache,
             visual_memory=visual_memory,
             return_visual_memory=True,
-            skip_wmrm=True,
             dense_evidence=history_dense,
             metric_tokens=history_metric,
             metric_g=history_metric_g,
         )
-        noise = _proposal_noise(
-            model,
-            rows,
-            history_time,
-            seed,
-            device=proposal_condition.device,
-            dtype=proposal_condition.dtype,
-        )
-        proposal_action = model.decode_actions(
-            proposal_condition,
-            steps=flow_steps,
-            noise=noise,
-        )
-        if proposal_action.shape[1] < DEFAULT_CYCLE_STEPS:
-            raise RuntimeError(
-                "proposal action horizon is shorter than the cycle-6 handshake"
+        if getattr(model.config, "va_world_mode", "legacy") == "peer_sync_h6":
+            # Peer checkpoints derive the executable H6 action inside the single
+            # synchronous VA/World encode. No preliminary flow proposal exists.
+            _, visual_memory = model.encode_condition(
+                vision_tokens[:, history_time],
+                proprio[:, history_time],
+                previous_action[:, history_time],
+                **encode_kwargs,
             )
-        proposal_action = proposal_action[:, :DEFAULT_CYCLE_STEPS].clamp(-1.0, 1.0)
-        _, visual_memory = model.encode_condition(
-            vision_tokens[:, history_time],
-            proprio[:, history_time],
-            previous_action[:, history_time],
-            language_cache=language_cache,
-            visual_memory=visual_memory,
-            return_visual_memory=True,
-            dense_evidence=history_dense,
-            metric_tokens=history_metric,
-            metric_g=history_metric_g,
-            env_action=proposal_action,
-        )
+        else:
+            proposal_condition, _ = model.encode_condition(
+                vision_tokens[:, history_time],
+                proprio[:, history_time],
+                previous_action[:, history_time],
+                skip_wmrm=True,
+                **encode_kwargs,
+            )
+            noise = _proposal_noise(
+                model,
+                rows,
+                history_time,
+                seed,
+                device=proposal_condition.device,
+                dtype=proposal_condition.dtype,
+            )
+            proposal_action = model.decode_actions(
+                proposal_condition,
+                steps=flow_steps,
+                noise=noise,
+            )
+            if proposal_action.shape[1] < DEFAULT_CYCLE_STEPS:
+                raise RuntimeError(
+                    "proposal action horizon is shorter than the cycle-6 handshake"
+                )
+            proposal_action = proposal_action[:, :DEFAULT_CYCLE_STEPS].clamp(-1.0, 1.0)
+            _, visual_memory = model.encode_condition(
+                vision_tokens[:, history_time],
+                proprio[:, history_time],
+                previous_action[:, history_time],
+                env_action=proposal_action,
+                **encode_kwargs,
+            )
 
     return None if visual_memory is None else visual_memory.detach()
 
@@ -1700,7 +1737,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     )
     payload = torch.load(eval_path, map_location="cpu", weights_only=True)
-    split_summary = _validate_fixed_eval_payload(payload, args.task_ids)
+    va_world_mode = (checkpoint.get("config") or {}).get(
+        "va_world_mode", LEGACY_VA_WORLD_MODE
+    )
+    split_summary = _validate_fixed_eval_payload(
+        payload, args.task_ids, va_world_mode=va_world_mode
+    )
     manifest_path = Path(str(split_summary["manifest_path"])).expanduser().resolve(
         strict=True
     )

@@ -7,6 +7,7 @@ import torch
 
 from va_compound.model import VACompoundConfig, VACompoundPolicy
 from va_compound.wmrm import (
+    WAMState,
     WorldMediatedResidualModulation,
     action_dependency_scores,
     matched_no_fixed_point_perm,
@@ -248,6 +249,59 @@ def test_evaluator_world_forward_matches_full_logged_forward_stage_maps() -> Non
     torch.testing.assert_close(
         full_forward_maps, evaluator_maps, rtol=0.0, atol=0.0
     )
+
+
+def test_peer_readout_is_peer_only_and_legacy_state_keys_are_unchanged() -> None:
+    legacy = VACompoundPolicy(_tiny_config(wmrm=True))
+    peer = VACompoundPolicy(
+        _tiny_config(
+            wmrm=True,
+            action_horizon=6,
+            action_dim=4,
+            wmrm_cycle_steps=6,
+            va_world_mode="peer_sync_h6",
+        )
+    )
+    assert legacy.world_action_readout is None
+    assert peer.world_action_readout is not None
+    assert not any(key.startswith("world_action_readout.") for key in legacy.state_dict())
+    assert any(key.startswith("world_action_readout.") for key in peer.state_dict())
+    latent = torch.randn(2, 6, peer.config.hidden_dim)
+    readout = peer.world_action_readout(latent)
+    assert readout.shape == (2, 6, peer.config.action_dim)
+    assert float(readout.detach().abs().max()) <= 1.0
+
+
+def test_peer_snapshot_stage_uses_readout_and_current_vision_correction() -> None:
+    config = _tiny_spatial_config()
+    config = VACompoundConfig(**{**config.__dict__, "va_world_mode": "peer_sync_h6"})
+    model = VACompoundPolicy(config).eval()
+    vision, proprio, previous, language, mask, _logged_action = _spatial_inputs(config)
+    cache = model.build_language_cache(language, mask)
+    with torch.no_grad():
+        condition_a, memory = model.encode_condition(
+            vision,
+            proprio,
+            previous,
+            language_cache=cache,
+            return_visual_memory=True,
+            wmrm_action_write=False,
+            wmrm_vision_write=False,
+        )
+        condition_b = model.encode_condition(
+            vision + 0.5,
+            proprio,
+            previous,
+            language_cache=cache,
+            visual_memory=memory,
+            wmrm_action_write=False,
+            wmrm_vision_write=False,
+        )
+    assert memory.world_state is not None
+    assert memory.world_state.belief is not None
+    assert model.last_wmrm.env_action is not None
+    assert model.last_wmrm.env_action.shape == (2, 6, config.action_dim)
+    assert not torch.allclose(condition_a, condition_b)
 
 
 def test_off_path_matches_legacy_encode() -> None:
@@ -821,6 +875,18 @@ def test_each_forward_emits_full_spatial_map() -> None:
     assert float(block.st_predictor.in_proj.weight.grad.norm()) > 0
 
 
+def test_wam_state_finite_validation_names_corrupt_recurrent_field() -> None:
+    state = WAMState(
+        belief=torch.zeros(2, 8, 32),
+        innovation=torch.full((2, 8, 32), float("nan")),
+    )
+    with pytest.raises(
+        FloatingPointError,
+        match="proposal commit.*WAMState.innovation.*NaN or Inf",
+    ):
+        state.validate_finite(boundary="proposal commit")
+
+
 def test_env_action_requires_exact_cycle_and_dimension() -> None:
     block = WorldMediatedResidualModulation(
         32, world_dim=8, rank=4, proprio_dim=9, cycle_steps=6, env_action_dim=4
@@ -957,6 +1023,33 @@ def test_cli_wmrm_only_forces_med_off(tmp_path) -> None:
     assert args.wmrm_adep_weight == 0.0
     assert args.wmrm_handshake is False
     assert args.mtvj_train_metric_head is False
+
+
+def test_wmrm_only_peer_mode_fails_closed() -> None:
+    from argparse import Namespace
+
+    from train import _feature_optimizer_groups, parse_args, validate_args
+
+    args = parse_args(
+        ["--wam4va", "--wmrm-only", "--va-world-mode", "peer_sync_h6"]
+    )
+    with pytest.raises(ValueError, match="unsupported readout ownership"):
+        validate_args(args)
+
+    model = VACompoundPolicy(
+        _tiny_config(
+            wmrm=True,
+            action_horizon=6,
+            action_dim=4,
+            wmrm_cycle_steps=6,
+            va_world_mode="peer_sync_h6",
+        )
+    )
+    optimizer_args = Namespace(
+        wmrm_only=True, lr=1e-4, action_vision_only=False, head_only=False
+    )
+    with pytest.raises(ValueError, match="readout ownership"):
+        _feature_optimizer_groups(optimizer_args, model, None)
 
 
 def test_wmrm_only_freezes_va_and_flow() -> None:

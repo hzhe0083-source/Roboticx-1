@@ -1,10 +1,18 @@
 import unittest
+from unittest import mock
 
 import numpy as np
 import torch
 
 from va_compound.model import VACompoundConfig, VACompoundPolicy
-from train_ppo_metaworld import FlowNoiseSchedule, ValueHead, compute_gae
+from va_compound.wmrm import WAMState
+from train_ppo_metaworld import (
+    FlowNoiseSchedule,
+    ValueHead,
+    _stack_visual_memories,
+    _validate_ppo_checkpoint_config,
+    compute_gae,
+)
 
 
 def tiny_config() -> VACompoundConfig:
@@ -186,6 +194,133 @@ class FlowPPOTests(unittest.TestCase):
             not torch.equal(before[k], v) for k, v in self.model.named_parameters()
         )
         self.assertTrue(moved, "actor parameters did not update")
+
+    def test_ppo_regrouping_restores_interleaved_minibatch_order(self) -> None:
+        """Recomputed logps must be paired with the same original mb indices."""
+        import torch.nn as nn
+        import train_ppo_metaworld as ppo
+        from va_compound.model import VisualMemory
+
+        class IndexedPolicy(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.offset = nn.Parameter(torch.zeros(()))
+
+            def encode_condition(self, tokens, *args, **kwargs):
+                return tokens.float() + self.offset
+
+            def flow_trajectory_log_prob(self, path, cond, sigma):
+                return cond[:, 0, 0]
+
+        class IndexedValue(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.bias = nn.Parameter(torch.zeros(()))
+
+            def forward(self, cond):
+                return cond[:, 0, :1] * 0.0 + self.bias
+
+        buffer = ppo.RolloutBuffer()
+        memory = VisualMemory(layers=(torch.zeros(1, 1, 1),))
+        for index in range(4):
+            logp = float(index + 1)
+            buffer.frames.append(
+                (
+                    torch.tensor([[[logp]]], dtype=torch.float16),
+                    torch.zeros(1, 1),
+                    torch.zeros(1, 1),
+                    memory if index % 2 else None,
+                )
+            )
+            buffer.lang_hidden.append(torch.zeros(1, 1))
+            buffer.lang_mask.append(torch.ones(1, dtype=torch.bool))
+            buffer.paths.append([torch.zeros(1, 1, 1), torch.zeros(1, 1, 1)])
+            buffer.old_logp.append(logp)
+            buffer.rewards.append(0.0)
+            buffer.dones.append(False)
+            buffer.values.append(0.0)
+            buffer.returns.append(0.0)
+            buffer.advantages.append(float(index + 1))
+
+        policy = IndexedPolicy()
+        value = IndexedValue()
+        noise = FlowNoiseSchedule(steps=1, action_dim=1)
+        actor_opt = torch.optim.SGD(
+            list(policy.parameters()) + list(noise.parameters()), lr=0.0
+        )
+        critic_opt = torch.optim.SGD(value.parameters(), lr=0.0)
+        with (
+            mock.patch.object(ppo, "PPO_EPOCHS", 1),
+            mock.patch.object(ppo, "MINIBATCH", 4),
+            mock.patch.object(ppo.random, "shuffle", lambda values: None),
+        ):
+            actor_loss, _ = ppo.ppo_update(
+                buffer,
+                policy,
+                noise,
+                value,
+                actor_opt,
+                critic_opt,
+                torch.device("cpu"),
+            )
+
+        self.assertAlmostEqual(actor_loss, 0.0, places=6)
+
+    def test_peer_sync_h6_checkpoint_is_rejected_fail_closed(self) -> None:
+        config = mock.Mock(va_world_mode="peer_sync_h6")
+        with self.assertRaisesRegex(
+            ValueError,
+            "peer_sync_h6.*exploratory Flow action.*legacy PPO",
+        ):
+            _validate_ppo_checkpoint_config(config)
+
+    def test_legacy_checkpoint_remains_supported(self) -> None:
+        _validate_ppo_checkpoint_config(mock.Mock(va_world_mode="legacy"))
+        _validate_ppo_checkpoint_config(mock.Mock(spec=[]))
+
+    def test_stack_visual_memories_preserves_world_and_optional_state(self) -> None:
+        from va_compound.model import VisualMemory
+
+        memories = []
+        for index in range(3):
+            value = float(index)
+            memories.append(
+                VisualMemory(
+                    layers=(torch.full((1, 2, 3), value),),
+                    evidence=torch.full((1, 2, 3), value + 10),
+                    task=torch.full((1, 1, 3), value + 20),
+                    task_spec=torch.full((1, 1, 3), value + 30),
+                    pending_future=torch.full((1, 3), value + 40),
+                    gate=0.5,
+                    world_state=WAMState(
+                        belief=torch.full((1, 2, 3), value + 50),
+                        innovation=torch.full((1, 2, 3), value + 60),
+                        world_map=torch.full((1, 4, 2, 2), value + 70),
+                    ),
+                )
+            )
+
+        stacked = _stack_visual_memories(memories)
+
+        self.assertEqual(stacked.layers[0].shape[0], 3)
+        self.assertEqual(stacked.gate, 0.5)
+        self.assertIsNotNone(stacked.world_state)
+        for index, memory in enumerate(memories):
+            selected = stacked.index_select(torch.tensor([index]))
+            torch.testing.assert_close(selected.layers[0], memory.layers[0])
+            torch.testing.assert_close(selected.evidence, memory.evidence)
+            torch.testing.assert_close(selected.task, memory.task)
+            torch.testing.assert_close(selected.task_spec, memory.task_spec)
+            torch.testing.assert_close(selected.pending_future, memory.pending_future)
+            torch.testing.assert_close(
+                selected.world_state.belief, memory.world_state.belief
+            )
+            torch.testing.assert_close(
+                selected.world_state.innovation, memory.world_state.innovation
+            )
+            torch.testing.assert_close(
+                selected.world_state.world_map, memory.world_state.world_map
+            )
 
     def test_batched_condition_memory_split(self) -> None:
         """VA2 (memory_split): a stacked (evidence, task) memory must equal

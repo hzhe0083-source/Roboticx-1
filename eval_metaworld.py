@@ -3891,6 +3891,18 @@ def main() -> None:
                             )
                         world_action = None
                         proposal_noise = None
+                        decoded_proposal = None
+                        peer_checkpoint = (
+                            getattr(config, "va_world_mode", "legacy")
+                            == "peer_sync_h6"
+                        )
+                        if (
+                            peer_checkpoint
+                            and args.wmrm_ablation_mode == "proposal-only"
+                        ):
+                            raise ValueError(
+                                "proposal-only is supported only for legacy WMRM checkpoints"
+                            )
                         if getattr(model, "wmrm", None) is not None:
                             if (
                                 model.wmrm.cycle_steps
@@ -3904,46 +3916,48 @@ def main() -> None:
                                 )
                             if args.flow_samples != 1:
                                 raise ValueError(
-                                    "WAM4VA closed loop requires --flow-samples 1 so the "
-                                    "world-conditioned proposal and executed decode share noise"
+                                    "WAM4VA closed loop requires --flow-samples 1"
                                 )
-                            proposal_cond, _ = model.encode_condition(
-                                vision_in,
-                                proprio[0],
-                                previous[0],
-                                language_cache=task_caches[local_task_index],
-                                visual_memory=memory,
-                                return_visual_memory=True,
-                                skip_wmrm=True,
-                                **dense_kwargs,
-                            )
-                            proposal_noise = torch.randn(
-                                proposal_cond.shape[0],
-                                config.action_horizon,
-                                config.action_dim,
-                                device=proposal_cond.device,
-                                dtype=proposal_cond.dtype,
-                            )
-                            decoded_proposal = model.decode_actions(
-                                proposal_cond,
-                                steps=flow_steps,
-                                noise=proposal_noise,
-                                semantic_context=(
-                                    vision_in
-                                    if (
-                                        getattr(config, "flow_semantic", False)
-                                        and not config.direct_head
+                            if not peer_checkpoint:
+                                # Legacy WMRM deployment needs a preliminary flow
+                                # proposal as the World action handshake input.
+                                proposal_cond, _ = model.encode_condition(
+                                    vision_in,
+                                    proprio[0],
+                                    previous[0],
+                                    language_cache=task_caches[local_task_index],
+                                    visual_memory=memory,
+                                    return_visual_memory=True,
+                                    skip_wmrm=True,
+                                    **dense_kwargs,
+                                )
+                                proposal_noise = torch.randn(
+                                    proposal_cond.shape[0],
+                                    config.action_horizon,
+                                    config.action_dim,
+                                    device=proposal_cond.device,
+                                    dtype=proposal_cond.dtype,
+                                )
+                                decoded_proposal = model.decode_actions(
+                                    proposal_cond,
+                                    steps=flow_steps,
+                                    noise=proposal_noise,
+                                    semantic_context=(
+                                        vision_in
+                                        if (
+                                            getattr(config, "flow_semantic", False)
+                                            and not config.direct_head
+                                        )
+                                        else None
+                                    ),
+                                )
+                                cycle = model.wmrm.cycle_steps
+                                if decoded_proposal.shape[1] < cycle:
+                                    raise ValueError(
+                                        f"decoded action horizon {decoded_proposal.shape[1]} "
+                                        f"is shorter than WAM4VA cycle {cycle}"
                                     )
-                                    else None
-                                ),
-                            )
-                            cycle = model.wmrm.cycle_steps
-                            if decoded_proposal.shape[1] < cycle:
-                                raise ValueError(
-                                    f"decoded action horizon {decoded_proposal.shape[1]} "
-                                    f"is shorter than WAM4VA cycle {cycle}"
-                                )
-                            world_action = decoded_proposal[:, :cycle].clamp(-1.0, 1.0)
+                                world_action = decoded_proposal[:, :cycle].clamp(-1.0, 1.0)
                         cond, memory = model.encode_condition(
                             vision_in,
                             proprio[0],
@@ -3987,8 +4001,14 @@ def main() -> None:
                                 args.wam_alpha,
                             )
                         if args.wmrm_ablation_mode == "proposal-only":
-                            if getattr(model, "wmrm", None) is None or proposal_noise is None:
-                                raise ValueError("proposal-only requires a WMRM checkpoint")
+                            if (
+                                getattr(model, "wmrm", None) is None
+                                or proposal_noise is None
+                                or decoded_proposal is None
+                            ):
+                                raise ValueError(
+                                    "proposal-only requires a legacy WMRM checkpoint"
+                                )
                             decoded = decoded_proposal
                         elif args.flow_samples == 1:
                             decoded = model.decode_actions(

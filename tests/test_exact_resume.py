@@ -18,6 +18,7 @@ from train import (
     WORLD_LOGGED_BRANCH_CONTRACT,
     WORLD_LOSS_COMPONENT_WEIGHTS,
     WORLD_NO_REGRESSION,
+    PEER_WORLD_READOUT_CONTRACT,
     WORLD_STAGE_AUXILIARY_DECAY,
     WORLD_STATIC_COPY_CONSTRAINT,
     WORLD_SUPERVISION_CONTRACT,
@@ -475,6 +476,104 @@ def test_exact_contract_rejects_changed_objective_args(
     )
     with pytest.raises(ValueError, match=field):
         validate_exact_run_contract(baseline, current)
+
+
+def test_va_world_mode_cli_and_peer_scratch_resume_rules(tmp_path) -> None:
+    assert parse_args([]).va_world_mode == "legacy"
+    peer = parse_args(["--wam4va", "--va-world-mode", "peer_sync_h6"])
+    validate_args(peer)
+
+    with pytest.raises(ValueError, match="scratch or use --resume-exact"):
+        validate_args(
+            parse_args(
+                [
+                    "--wam4va",
+                    "--va-world-mode",
+                    "peer_sync_h6",
+                    "--resume",
+                    "legacy.pt",
+                ]
+            )
+        )
+    legacy_path = tmp_path / "legacy.pt"
+    torch.save({"config": {}}, legacy_path)
+    with pytest.raises(ValueError, match="requires a peer_sync_h6 checkpoint"):
+        validate_args(
+            parse_args(
+                [
+                    "--wam4va",
+                    "--va-world-mode",
+                    "peer_sync_h6",
+                    "--resume-exact",
+                    str(legacy_path),
+                    "--data",
+                    str(legacy_path),
+                    "--single-task",
+                    "--task-sampling",
+                    "weighted",
+                    "--dino-main-vision",
+                ]
+            )
+        )
+
+
+def test_peer_rejects_nonzero_adep_weight_but_legacy_preserves_it() -> None:
+    peer = parse_args(
+        [
+            "--wam4va",
+            "--va-world-mode",
+            "peer_sync_h6",
+            "--wmrm-adep-weight",
+            "0.1",
+        ]
+    )
+    with pytest.raises(ValueError, match="same-snapshot action-dependence"):
+        validate_args(peer)
+
+    legacy = parse_args(["--wam4va", "--wmrm-adep-weight", "0.1"])
+    validate_args(legacy)
+    assert legacy.wmrm_adep_weight == pytest.approx(0.1)
+
+
+def test_peer_exact_contract_binds_readout_mask_and_stage_aggregation() -> None:
+    _, optimizer = _model_and_optimizer()
+    args = parse_args(["--wam4va", "--va-world-mode", "peer_sync_h6"])
+    config = SimpleNamespace(
+        num_layers=8,
+        action_horizon=6,
+        wmrm=True,
+        va_world_mode="peer_sync_h6",
+    )
+    contract = build_exact_run_contract(args, config, optimizer, _sampler())
+
+    assert contract["peer_world"]["readout"] == PEER_WORLD_READOUT_CONTRACT
+    assert contract["peer_world"]["readout"]["validity"].startswith(
+        "world_transition_mask"
+    )
+    assert contract["peer_world"]["readout"]["stage_supervision"] == (
+        "final_peer_stage_only_v1"
+    )
+
+    changed = copy.deepcopy(contract)
+    changed["peer_world"]["readout"]["stage_supervision"] = "all_stages_v0"
+    with pytest.raises(ValueError, match="peer_world.readout.stage_supervision"):
+        validate_exact_run_contract(contract, changed)
+
+
+def test_old_exact_contract_normalizes_to_legacy_world_mode() -> None:
+    saved = _contract()
+    current = copy.deepcopy(saved)
+    current["arguments"]["va_world_mode"] = "legacy"
+    current["model_config"]["va_world_mode"] = "legacy"
+    snapshot = copy.deepcopy(saved)
+    validate_exact_run_contract(saved, current)
+    assert saved == snapshot
+
+    peer = copy.deepcopy(current)
+    peer["arguments"]["va_world_mode"] = "peer_sync_h6"
+    peer["model_config"]["va_world_mode"] = "peer_sync_h6"
+    with pytest.raises(ValueError, match="va_world_mode"):
+        validate_exact_run_contract(saved, peer)
 
 
 def test_exact_contract_binds_wmrm_proposal_stage_detach() -> None:
@@ -945,6 +1044,29 @@ def test_visual_world_exact_resume_binds_fixed_action_donors() -> None:
     }
     checkpoint = {"training_contract": contract}
     validate_visual_world_resume_contract(checkpoint, identity)
+
+    peer_contract = {
+        **contract,
+        "va_world_mode": "peer_sync_h6",
+        "peer_world_topology": "pre_stage_snapshot_parallel_va_world_v1",
+        "peer_world_action_source": (
+            "deterministic_readout_main_explicit_env_override_supervision_v1"
+        ),
+        "peer_world_readout": PEER_WORLD_READOUT_CONTRACT,
+    }
+    validate_visual_world_resume_contract(
+        {"training_contract": peer_contract},
+        identity,
+        va_world_mode="peer_sync_h6",
+    )
+    stale_peer = copy.deepcopy(peer_contract)
+    stale_peer["peer_world_readout"] = "masked_smooth_l1_logged_h6_v1"
+    with pytest.raises(ValueError, match="peer_world_readout"):
+        validate_visual_world_resume_contract(
+            {"training_contract": stale_peer},
+            identity,
+            va_world_mode="peer_sync_h6",
+        )
 
     cap_ranking = world_action_ranking_contract("cycle", 0.2)
     with pytest.raises(ValueError, match="world_action_ranking"):
