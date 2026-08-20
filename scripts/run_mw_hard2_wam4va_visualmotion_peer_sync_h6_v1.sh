@@ -22,12 +22,13 @@ LOCK=/tmp/ora0_wam4va_visualmotion_train.lock
 MODE=${1:-}
 BATCH=${2:-3}
 GATE_STEPS=(50 300 1000)
+CONTINUE_STEPS=(1000 3000 6000 9000 12000 15000 18000 20000)
 
-usage(){ printf 'usage: bash %s {prepare|preflight|smoke10|pilot300|20k} [batch-size]\n' "$0" >&2; exit 2; }
+usage(){ printf 'usage: bash %s {prepare|preflight|smoke10|pilot300|20k|continue20k} [batch-size]\n' "$0" >&2; exit 2; }
 fail(){ printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 sha(){ sha256sum -- "$1" | cut -d' ' -f1; }
 [[ $# -le 2 ]] || usage
-case "$MODE" in prepare|preflight|smoke10|pilot300|20k) ;; *) usage;; esac
+case "$MODE" in prepare|preflight|smoke10|pilot300|20k|continue20k) ;; *) usage;; esac
 [[ "$BATCH" =~ ^[1-9][0-9]*$ ]] || fail 'batch-size must be a positive integer'
 
 for path in "$PY" "$ASSEMBLY_RAW" "$DOOR_RAW" "$ALLTASK_H48_REF" train.py \
@@ -253,4 +254,18 @@ case "$MODE" in
     preflight_h6; run_id=${FAMILY}.long20k; refuse_output_family "$run_id"
     printf 'scratch-only formal lineage: 0 -> 50 -> 300 -> 1000 -> 20000\n'
     run_lineage "$run_id" "${GATE_STEPS[@]}" 20000;;
+  continue20k)
+    preflight_h6
+    [[ "$BATCH" == 3 ]] || fail 'pilot300 exact continuation requires batch-size 3'
+    run_id=${FAMILY}.pilot300_continue20k
+    refuse_output_family "$run_id"
+    source_checkpoint=$(milestone "${FAMILY}.pilot300" 300)
+    verify_checkpoint "$source_checkpoint" 300
+    printf 'exact continuation of pilot300: 300 -> 1000 -> 3000 -> 6000 -> 9000 -> 12000 -> 15000 -> 18000 -> 20000\n'
+    start=300
+    for target in "${CONTINUE_STEPS[@]}"; do
+      run_segment "$run_id" "$start" "$target" "$source_checkpoint"
+      source_checkpoint=$(milestone "$run_id" "$target")
+      start=$target
+    done;;
 esac

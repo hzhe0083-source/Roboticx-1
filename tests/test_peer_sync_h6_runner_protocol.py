@@ -31,7 +31,7 @@ def test_runner_syntax_and_invalid_mode_fail_before_any_training() -> None:
         env={**os.environ, "PY": "/definitely/missing/python"},
     )
     assert invalid.returncode == 2
-    assert "{prepare|preflight|smoke10|pilot300|20k}" in invalid.stderr
+    assert "{prepare|preflight|smoke10|pilot300|20k|continue20k}" in invalid.stderr
     assert "scratch-only formal lineage" not in invalid.stdout
 
 
@@ -79,7 +79,7 @@ def test_h6_preparation_rewindows_raw_trajectories_with_exact_identities() -> No
     assert "torch.load" not in prepare
     assert "PARENT_SOURCE" not in text
     assert "prepare) prepare_h6_data; preflight_h6" in text
-    for mode in ("preflight", "smoke10", "pilot300", "20k"):
+    for mode in ("preflight", "smoke10", "pilot300", "20k", "continue20k"):
         case = text.split(f"  {mode})", 1)[1].split(";;", 1)[0]
         assert "prepare_h6_data" not in case
 
@@ -169,3 +169,18 @@ def test_milestones_are_immutable_and_short_modes_stop_short() -> None:
     assert 'run_lineage "$run_id" "${GATE_STEPS[@]}" 20000' in formal
     assert "no automatic long continuation" in smoke
     assert "STOP at 300" in pilot
+
+
+def test_continue20k_resumes_pilot300_with_immutable_milestones() -> None:
+    text = _text()
+    continuation = text.split("  continue20k)", 1)[1].split(";;", 1)[0]
+    assert '[[ "$BATCH" == 3 ]]' in continuation
+    assert "pilot300 exact continuation requires batch-size 3" in continuation
+    assert "run_id=${FAMILY}.pilot300_continue20k" in continuation
+    assert 'source_checkpoint=$(milestone "${FAMILY}.pilot300" 300)' in continuation
+    assert 'verify_checkpoint "$source_checkpoint" 300' in continuation
+    assert "CONTINUE_STEPS=(1000 3000 6000 9000 12000 15000 18000 20000)" in text
+    assert 'for target in "${CONTINUE_STEPS[@]}"' in continuation
+    assert 'run_segment "$run_id" "$start" "$target" "$source_checkpoint"' in continuation
+    assert "scratch" not in continuation
+    assert "prepare_h6_data" not in continuation
