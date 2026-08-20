@@ -213,6 +213,63 @@ class LongTrajBuilderContractTest(unittest.TestCase):
                     legacy_policy="error",
                 )
 
+    def test_peer_h6_build_emits_explicit_identity_protocol(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ref_path = root / "ref.pt"
+            source = root / "metaworld_longtraj_door-lock-v3.pt"
+            output = root / "peer_h6.pt"
+            task_text = build.ENV_TO_TASK["door-lock-v3"]
+            torch.save({
+                "normalization": self._normalization(),
+                "metadata": {"tasks": [task_text]},
+                "instruction_id": torch.tensor([0]),
+                "language_hidden": torch.zeros(1, 2, 3),
+                "language_mask": torch.ones(1, 2, dtype=torch.bool),
+            }, ref_path)
+            n = 40
+            jpeg = collect.compress_frames(np.zeros((1, 2, 2, 3), dtype=np.uint8))[0]
+            torch.save({
+                "task": "door-lock-v3",
+                "episodes": [{
+                    "frames": [jpeg] * n,
+                    "actions": np.zeros((n, 4), dtype=np.float32),
+                    "states": np.zeros((n, 4), dtype=np.float32),
+                    "first_success": n - 1,
+                    "action_executed": np.ones(n, dtype=bool),
+                    "action_supervision_valid": np.ones(n, dtype=bool),
+                    "recovery_mask": np.zeros(n, dtype=bool),
+                }],
+            }, source)
+
+            build.phase1(
+                6,
+                task="door-lock-v3",
+                input_paths=[source],
+                output_path=output,
+                ref_path=ref_path,
+                legacy_policy="error",
+                data_contract=build.PEER_SYNC_H6_CONTRACT,
+            )
+            payload = torch.load(output, map_location="cpu", weights_only=True)
+            metadata = payload["metadata"]
+            self.assertEqual(tuple(payload["actions"].shape[1:]), (4, 6, 4))
+            self.assertEqual(metadata["contract"], build.PEER_SYNC_H6_CONTRACT)
+            self.assertEqual(metadata["logged_action_chunk"], "full_h6")
+            self.assertEqual(metadata["parent_identity"]["path"], str(ref_path.resolve()))
+            self.assertEqual(metadata["source_identities"][0]["path"], str(source.resolve()))
+            self.assertEqual(metadata["output_identity"]["path"], str(output.resolve()))
+
+            with self.assertRaisesRegex(ValueError, "requires exact action horizon H6"):
+                build.phase1(
+                    48,
+                    task="door-lock-v3",
+                    input_paths=[source],
+                    output_path=root / "bad.pt",
+                    ref_path=ref_path,
+                    data_contract=build.PEER_SYNC_H6_CONTRACT,
+                )
+
     def test_legacy_contract_warns_or_fails_explicitly(self):
         n = 30
         ep = {

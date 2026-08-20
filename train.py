@@ -1134,11 +1134,14 @@ def validate_visual_world_training_split(
     payload: dict,
     data_path: Path,
     manifest_path: Path,
+    *,
+    va_world_mode: str = "legacy",
 ) -> dict[str, str]:
     """Validate the immutable episode-level train split before model startup."""
 
     from scripts.split_wam4va_episode_holdout import (
         MANIFEST_CONTRACT,
+        PEER_SYNC_H6_CONTRACT,
         canonical_manifest_sha256,
         transition_mask as split_transition_mask,
     )
@@ -1175,10 +1178,33 @@ def validate_visual_world_training_split(
         raise ValueError("visual World actions must be [N,T,H,A]")
     if not actions.is_floating_point() or not bool(torch.isfinite(actions).all()):
         raise ValueError("visual World actions must be finite floating-point values")
-    if tuple(actions.shape[1:]) != (4, 48, 4):
+    peer_mode = va_world_mode == "peer_sync_h6"
+    expected_shape = (4, 6, 4) if peer_mode else (4, 48, 4)
+    expected_protocol = PEER_SYNC_H6_CONTRACT if peer_mode else MANIFEST_CONTRACT
+    metadata_contract = metadata.get("contract")
+    manifest_protocol = (manifest.get("data_protocol") or {}).get("contract")
+    if tuple(actions.shape[1:]) != expected_shape:
+        label = "peer_sync_h6" if peer_mode else "legacy visual World"
         raise ValueError(
-            "visual World training requires T=4/H=48/A=4, got "
-            f"{tuple(actions.shape[1:])}"
+            f"{label} training requires T={expected_shape[0]}/H={expected_shape[1]}/"
+            f"A={expected_shape[2]}, got {tuple(actions.shape[1:])}"
+        )
+    if peer_mode:
+        if metadata_contract != PEER_SYNC_H6_CONTRACT:
+            raise ValueError(
+                f"peer_sync_h6 requires metadata.contract={PEER_SYNC_H6_CONTRACT!r}"
+            )
+        if metadata.get("logged_action_chunk") != "full_h6":
+            raise ValueError("peer_sync_h6 requires the full logged H6 action chunk")
+        for key in ("parent_identity", "source_identities", "output_identity"):
+            if not metadata.get(key):
+                raise ValueError(f"peer_sync_h6 requires metadata.{key}")
+    elif metadata_contract == PEER_SYNC_H6_CONTRACT:
+        raise ValueError("legacy visual World rejects peer_sync_h6 data")
+    if manifest_protocol != expected_protocol:
+        raise ValueError(
+            f"World split data protocol mismatch: expected {expected_protocol!r}, "
+            f"got {manifest_protocol!r}"
         )
     expected_mask_shape = actions.shape[:-1]
     for name, value in (
@@ -1216,6 +1242,15 @@ def validate_visual_world_training_split(
         raise ValueError("World split train output_path does not match --data")
     if int(train_contract.get("windows", -1)) != int(actions.shape[0]):
         raise ValueError("World split train window count mismatch")
+    if metadata.get("output_identity") != train_contract.get("output_identity"):
+        raise ValueError("World split training output identity mismatch")
+    source_contract = manifest.get("source") or {}
+    if metadata.get("parent_identity") != source_contract:
+        raise ValueError("World split training parent identity mismatch")
+    if metadata.get("source_identities") != (
+        source_contract.get("payload_source_identities") or []
+    ):
+        raise ValueError("World split training source identities mismatch")
     actual_episodes = sorted(int(value) for value in torch.unique(episode_ids).tolist())
     declared_episodes = sorted(int(value) for value in train_contract.get("episode_ids", []))
     if actual_episodes != declared_episodes:
@@ -8496,6 +8531,7 @@ def main() -> None:
                 dataset.payload,
                 args.data,
                 args.world_split_manifest,
+                va_world_mode=getattr(args, "va_world_mode", "legacy"),
             )
             donor_identity = prepare_visual_world_action_ranking(dataset.payload)
             args.visual_world_split_identity.update(donor_identity)

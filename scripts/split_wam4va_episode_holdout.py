@@ -15,7 +15,10 @@ from torch import Tensor
 
 
 MANIFEST_CONTRACT = "wam4va_episode_holdout_manifest_v1"
+PEER_SYNC_H6_CONTRACT = "peer_sync_h6_world_windows_v1"
 MANIFEST_VERSION = 1
+LEGACY_SHAPE = (4, 48, 4)
+PEER_SHAPE = (4, 6, 4)
 TRANSITION_PREFIX_STEPS = 6
 TRANSITION_RULE = {
     "contract": "wam4va_world_transition_mask_v1",
@@ -67,6 +70,21 @@ def canonical_manifest_sha256(manifest: dict) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _payload_protocol(payload: dict) -> tuple[str, tuple[int, int, int]]:
+    metadata = payload.get("metadata") or {}
+    contract = metadata.get("contract")
+    if contract == PEER_SYNC_H6_CONTRACT:
+        if int(metadata.get("contract_version", -1)) != 1:
+            raise ValueError(f"{PEER_SYNC_H6_CONTRACT} requires contract_version=1")
+        if metadata.get("logged_action_chunk") != "full_h6":
+            raise ValueError(f"{PEER_SYNC_H6_CONTRACT} requires full logged H6 chunk")
+        for key in ("parent_identity", "source_identities", "output_identity"):
+            if not metadata.get(key):
+                raise ValueError(f"{PEER_SYNC_H6_CONTRACT} requires metadata.{key}")
+        return PEER_SYNC_H6_CONTRACT, PEER_SHAPE
+    return MANIFEST_CONTRACT, LEGACY_SHAPE
+
+
 def _validate_payload(payload: dict) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     required = (
         "actions",
@@ -86,9 +104,16 @@ def _validate_payload(payload: dict) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     recovery = payload["recovery_mask"]
     if not isinstance(actions, Tensor) or actions.ndim != 4:
         raise ValueError("actions must be a tensor with shape [N,T,H,A]")
-    n, sequence, horizon, _ = actions.shape
-    if n == 0 or sequence < 2 or horizon < TRANSITION_PREFIX_STEPS:
-        raise ValueError("actions require N>0, T>=2 and H>=6")
+    n, sequence, horizon, action_dim = actions.shape
+    protocol, expected_shape = _payload_protocol(payload)
+    if n == 0:
+        raise ValueError("actions require N>0")
+    if (sequence, horizon, action_dim) != expected_shape:
+        label = "peer" if protocol == PEER_SYNC_H6_CONTRACT else "legacy H48"
+        raise ValueError(
+            f"{label} split requires exact T{expected_shape[0]}/H{expected_shape[1]}/"
+            f"A{expected_shape[2]}, got T{sequence}/H{horizon}/A{action_dim}"
+        )
     for name, value in (("instruction_id", task), ("episode_id", episode)):
         if (
             not isinstance(value, Tensor)
@@ -293,8 +318,14 @@ def _selection_summary(
                 "mask_stats": mask_stats(payload, task_indices),
             }
         )
+    resolved_output = str(output_path.expanduser().resolve(strict=False))
     return {
-        "output_path": str(output_path.expanduser().resolve(strict=False)),
+        "output_path": resolved_output,
+        "output_identity": {
+            "path": resolved_output,
+            "windows": int(indices.numel()),
+            "episode_ids": sorted({int(value) for value in episode[indices].tolist()}),
+        },
         "episode_ids": sorted({int(value) for value in episode[indices].tolist()}),
         "episodes": sum(len(item["episode_ids"]) for item in per_task),
         "windows": int(indices.numel()),
@@ -315,6 +346,7 @@ def _build_manifest(
     seed: int,
 ) -> dict:
     task, episode, _, _ = _validate_payload(payload)
+    data_protocol, expected_shape = _payload_protocol(payload)
     task_names = _task_names(payload, task)
     train = _selection_summary(
         payload, plan["train_indices"], task_names, output_path=train_output
@@ -359,8 +391,28 @@ def _build_manifest(
         "contract_version": MANIFEST_VERSION,
         "manifest_hash_contract": MANIFEST_HASH_CONTRACT,
         "manifest_path": str(manifest_output.expanduser().resolve(strict=False)),
+        "data_protocol": {
+            "contract": data_protocol,
+            "shape": {
+                "sequence_length": expected_shape[0],
+                "action_horizon": expected_shape[1],
+                "action_dim": expected_shape[2],
+            },
+            "logged_action_chunk": (
+                "full_h6" if data_protocol == PEER_SYNC_H6_CONTRACT else "full_h48"
+            ),
+        },
         "source": {
             **source,
+            "payload_output_identity": copy.deepcopy(
+                (payload.get("metadata") or {}).get("output_identity")
+            ),
+            "payload_parent_identity": copy.deepcopy(
+                (payload.get("metadata") or {}).get("parent_identity")
+            ),
+            "payload_source_identities": copy.deepcopy(
+                (payload.get("metadata") or {}).get("source_identities")
+            ),
             "n_windows": int(len(task)),
             "mask_stats": mask_stats(payload, all_indices),
         },
@@ -380,6 +432,7 @@ def _build_manifest(
             "episode_disjoint": True,
             "rows_disjoint": True,
             "rows_exhaustive": True,
+            "full_logged_action_chunk": True,
         },
     }
     digest = canonical_manifest_sha256(manifest)
@@ -434,6 +487,11 @@ def _subset_payload(
             "split_manifest_id": manifest["manifest_id"],
             "split_manifest_sha256": manifest["manifest_sha256"],
             "split_contract": copy.deepcopy(manifest),
+            "parent_identity": copy.deepcopy(manifest["source"]),
+            "source_identities": copy.deepcopy(
+                manifest["source"].get("payload_source_identities") or []
+            ),
+            "output_identity": copy.deepcopy(split["output_identity"]),
         }
     )
     output["metadata"] = metadata

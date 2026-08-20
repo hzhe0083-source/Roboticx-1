@@ -22,6 +22,7 @@ from PIL import Image
 
 ROOT = Path(__file__).resolve().parent.parent
 ACTION_MASK_KEYS = ("action_valid_mask", "horizon_mask")
+PEER_SYNC_H6_CONTRACT = "peer_sync_h6_world_windows_v1"
 
 
 def mtvj_collate(batch: list[dict]) -> dict:
@@ -66,9 +67,24 @@ class LongTrajFramesDataset:
         missing = [k for k in self.REQUIRED if k not in self.payload]
         if missing:
             raise ValueError(f"missing tensors in dataset: {missing}")
-        self.length = int(self.payload["actions"].shape[0])
+        actions = self.payload["actions"]
+        if not isinstance(actions, torch.Tensor) or actions.ndim != 4:
+            raise ValueError("actions must have shape [N,T,H,A]")
+        self.length = int(actions.shape[0])
         if self.length == 0:
             raise ValueError("training dataset is empty")
+        metadata = self.payload.get("metadata") or {}
+        if metadata.get("contract") == PEER_SYNC_H6_CONTRACT:
+            if tuple(actions.shape[1:]) != (4, 6, 4):
+                raise ValueError(
+                    f"{PEER_SYNC_H6_CONTRACT} requires exact T4/H6/A4, "
+                    f"got {tuple(actions.shape[1:])}"
+                )
+            if metadata.get("logged_action_chunk") != "full_h6":
+                raise ValueError(f"{PEER_SYNC_H6_CONTRACT} requires full logged H6 chunk")
+            for key in ("parent_identity", "source_identities", "output_identity"):
+                if not metadata.get(key):
+                    raise ValueError(f"{PEER_SYNC_H6_CONTRACT} requires metadata.{key}")
         self.refs = self.payload["frame_refs"]  # [(task_file, ep_idx, frame_idx[T,W])]
         if len(self.refs) != self.length:
             raise ValueError("frame_refs 长度与样本数不一致")

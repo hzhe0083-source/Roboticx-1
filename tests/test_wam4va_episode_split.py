@@ -28,8 +28,8 @@ def _payload(episodes_per_task: int = 10, windows_per_episode: int = 2) -> dict:
                 frame_refs.append((names[task_id], local_episode, [[window]] * 3))
 
     n = len(task_ids)
-    actions = torch.zeros(n, 3, 8, 4)
-    valid = torch.ones(n, 3, 8, dtype=torch.bool)
+    actions = torch.zeros(n, 4, 48, 4)
+    valid = torch.ones(n, 4, 48, dtype=torch.bool)
     valid[::2, 0, 0] = False
     valid[::3, 2, 0] = False
     recovery = torch.zeros_like(valid)
@@ -39,8 +39,8 @@ def _payload(episodes_per_task: int = 10, windows_per_episode: int = 2) -> dict:
     descriptions[16] = "Unlock the door by rotating the lock counter-clockwise"
     return {
         "actions": actions,
-        "previous_action": torch.zeros(n, 3, 4),
-        "proprio": torch.zeros(n, 3, 4),
+        "previous_action": torch.zeros(n, 4, 4),
+        "proprio": torch.zeros(n, 4, 4),
         "instruction_id": torch.tensor(task_ids, dtype=torch.long),
         "episode_id": torch.tensor(episode_ids, dtype=torch.long),
         "pair_id": torch.arange(n),
@@ -53,6 +53,25 @@ def _payload(episodes_per_task: int = 10, windows_per_episode: int = 2) -> dict:
             "subset_task_ids": [0, 16],
         },
     }
+
+
+def _peer_payload() -> dict:
+    payload = _payload()
+    n = len(payload["actions"])
+    payload["actions"] = torch.zeros(n, 4, 6, 4)
+    payload["action_valid_mask"] = torch.ones(n, 4, 6, dtype=torch.bool)
+    payload["recovery_mask"] = torch.zeros(n, 4, 6, dtype=torch.bool)
+    payload["metadata"].update(
+        {
+            "contract": "peer_sync_h6_world_windows_v1",
+            "contract_version": 1,
+            "logged_action_chunk": "full_h6",
+            "parent_identity": {"path": "/parent", "sha256": "p"},
+            "source_identities": [{"path": "/source", "sha256": "s"}],
+            "output_identity": {"path": "/windows", "shape": {"action_horizon": 6}},
+        }
+    )
+    return payload
 
 
 def _direct_mask_stats(payload: dict) -> dict:
@@ -95,6 +114,12 @@ def test_builds_task_stratified_split_and_shared_manifest(tmp_path) -> None:
         "episode_disjoint": True,
         "rows_disjoint": True,
         "rows_exhaustive": True,
+        "full_logged_action_chunk": True,
+    }
+    assert manifest["data_protocol"] == {
+        "contract": "wam4va_episode_holdout_manifest_v1",
+        "shape": {"sequence_length": 4, "action_horizon": 48, "action_dim": 4},
+        "logged_action_chunk": "full_h48",
     }
 
     source_episodes = set(payload["episode_id"].tolist())
@@ -189,6 +214,44 @@ def test_rejects_episode_id_shared_by_multiple_tasks() -> None:
     payload["episode_id"][task16_row] = payload["episode_id"][0]
     with pytest.raises(ValueError, match="belongs to multiple tasks"):
         build_split_plan(payload)
+
+
+def test_peer_h6_manifest_preserves_protocol_identities_and_episode_disjointness(tmp_path) -> None:
+    source = tmp_path / "peer_source.pt"
+    train_path = tmp_path / "peer_train.pt"
+    eval_path = tmp_path / "peer_eval.pt"
+    manifest_path = tmp_path / "peer_split.json"
+    torch.save(_peer_payload(), source)
+
+    manifest = build_split_artifacts(source, train_path, eval_path, manifest_path)
+    train = torch.load(train_path, map_location="cpu", weights_only=True)
+    eval_payload = torch.load(eval_path, map_location="cpu", weights_only=True)
+
+    assert manifest["data_protocol"]["contract"] == "peer_sync_h6_world_windows_v1"
+    assert manifest["data_protocol"]["shape"] == {
+        "sequence_length": 4, "action_horizon": 6, "action_dim": 4
+    }
+    assert manifest["data_protocol"]["logged_action_chunk"] == "full_h6"
+    assert manifest["source"]["payload_parent_identity"]["path"] == "/parent"
+    assert manifest["source"]["payload_source_identities"][0]["path"] == "/source"
+    assert manifest["source"]["payload_output_identity"]["path"] == "/windows"
+    assert train["metadata"]["output_identity"] == manifest["splits"]["train"]["output_identity"]
+    assert eval_payload["metadata"]["output_identity"] == manifest["splits"]["eval"]["output_identity"]
+    assert set(train["episode_id"].tolist()).isdisjoint(eval_payload["episode_id"].tolist())
+
+
+def test_legacy_split_rejects_non_h48_and_peer_requires_complete_identity() -> None:
+    legacy = _payload()
+    legacy["actions"] = torch.zeros(len(legacy["actions"]), 4, 6, 4)
+    legacy["action_valid_mask"] = torch.ones(len(legacy["actions"]), 4, 6, dtype=torch.bool)
+    legacy["recovery_mask"] = torch.zeros_like(legacy["action_valid_mask"])
+    with pytest.raises(ValueError, match="legacy H48 split requires exact T4/H48/A4"):
+        build_split_plan(legacy)
+
+    peer = _peer_payload()
+    del peer["metadata"]["parent_identity"]
+    with pytest.raises(ValueError, match="requires metadata.parent_identity"):
+        build_split_plan(peer)
 
 
 def test_refuses_overwrite_before_writing_any_other_output(tmp_path) -> None:

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import io
 import sys
 import time
@@ -43,6 +44,8 @@ VISION_STRIDE = 2
 REF = ROOT / "data" / "metaworld_fullframe_executed.pt"
 ST_NPY_DIR = Path("/media/ryan/robot-data")
 LEGACY_PERTURB_SETTLE_STEPS = 12
+PEER_SYNC_H6_CONTRACT = "peer_sync_h6_world_windows_v1"
+PEER_SYNC_H6_VERSION = 1
 
 
 def win_out(horizon: int, task: str | None = None) -> Path:
@@ -54,6 +57,24 @@ def st_paths(horizon: int, task: str | None = None) -> tuple[Path, Path]:
     suffix = "" if task is None else f"_{task}"
     return (ST_NPY_DIR / f"longtraj_st288_h{horizon}{suffix}.npy",
             ST_NPY_DIR / f"longtraj_st288_h{horizon}{suffix}_meta.pt")
+
+
+def _sha256_file(path: Path, block_bytes: int = 8 * 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(block_bytes), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _file_identity(path: Path) -> dict[str, object]:
+    resolved = path.expanduser().resolve(strict=True)
+    stat = resolved.stat()
+    return {
+        "path": str(resolved),
+        "sha256": _sha256_file(resolved),
+        "size_bytes": int(stat.st_size),
+    }
 
 
 def _frame_ref_key(path: Path) -> str:
@@ -413,6 +434,7 @@ def phase1(horizon: int, *, task: str | None = None,
            output_path: Path | None = None,
            ref_path: Path = REF,
            legacy_policy: str = "warn",
+           data_contract: str | None = None,
            overwrite: bool = False) -> Path:
     """窗口切片（动作/状态/prev/帧索引），无 GPU。horizon=action chunk 长度。
 
@@ -420,6 +442,14 @@ def phase1(horizon: int, *, task: str | None = None,
     output, so a door-lock repair cannot replace the all-task H48 dataset.
     ``input_paths`` can select a clean collector file explicitly.
     """
+    if data_contract not in {None, PEER_SYNC_H6_CONTRACT}:
+        raise ValueError(f"unknown data_contract={data_contract!r}")
+    if data_contract == PEER_SYNC_H6_CONTRACT and horizon != 6:
+        raise ValueError(
+            f"{PEER_SYNC_H6_CONTRACT} requires exact action horizon H6, got H{horizon}"
+        )
+
+    ref_path = Path(ref_path).expanduser().resolve(strict=True)
     ref = torch.load(ref_path, map_location="cpu", weights_only=True)
     aq01, aq99 = ref["normalization"]["action_q01"], ref["normalization"]["action_q99"]
     sq01, sq99 = ref["normalization"]["state_q01"], ref["normalization"]["state_q99"]
@@ -458,6 +488,7 @@ def phase1(horizon: int, *, task: str | None = None,
             path for name in ENV_TO_TASK
             if (path := ROOT / "data" / f"metaworld_longtraj_{name}.pt").is_file()
         )
+    files = [path.expanduser().resolve(strict=False) for path in files]
     missing_files = [str(path) for path in files if not path.is_file()]
     if missing_files:
         raise FileNotFoundError(f"longtraj input files not found: {missing_files}")
@@ -559,6 +590,14 @@ def phase1(horizon: int, *, task: str | None = None,
         raise ValueError("phase1 produced zero windows with valid action supervision")
     print(f"phase1(h={horizon}): {n} windows, tasks={len(set(w['task_id'] for w in W))}")
     instruction_id = torch.tensor([w["task_id"] for w in W], dtype=torch.long)
+    output_identity = {
+        "contract": data_contract or "language_conditioned_mt50_longtraj_v2",
+        "path": str(out_path.expanduser().resolve(strict=False)),
+        "shape": {"windows": n, "sequence_length": SEQUENCE_LENGTH,
+                  "action_horizon": horizon, "action_dim": 4},
+    }
+    parent_identity = _file_identity(ref_path)
+    source_identities = [_file_identity(path) for path in files]
     payload = {
         "actions": torch.from_numpy(np.stack([w["actions"] for w in W])),
         "previous_action": torch.from_numpy(np.stack([w["prev"] for w in W])),
@@ -590,12 +629,22 @@ def phase1(horizon: int, *, task: str | None = None,
         "language_mask": task_language_mask_t[instruction_id],
         "normalization": norm,
         "metadata": {
-            "contract": "language_conditioned_mt50_longtraj_v2",
-            "contract_version": 2,
+            "contract": data_contract or "language_conditioned_mt50_longtraj_v2",
+            "contract_version": (
+                PEER_SYNC_H6_VERSION if data_contract == PEER_SYNC_H6_CONTRACT else 2
+            ),
             "tasks": ref["metadata"]["tasks"],
             "fps": FPS, "control_stride": CONTROL_STRIDE,
+            "sequence_length": SEQUENCE_LENGTH,
             "action_horizon": horizon,
+            "action_dim": 4,
             "action_contract": "executed-clip-fullframe",
+            "logged_action_chunk": (
+                "full_h6" if data_contract == PEER_SYNC_H6_CONTRACT else "full_horizon"
+            ),
+            "parent_identity": parent_identity,
+            "source_identities": source_identities,
+            "output_identity": output_identity,
             "observation_action_alignment": "frame/state[i] is pre-action; action[i] executed once",
             "action_valid_mask": (
                 "[N,T,H], excludes settle, actions after first_success, and recovery "
@@ -774,6 +823,10 @@ if __name__ == "__main__":
     ap.add_argument("--st-npy", type=Path, help="phase2 特征 memmap 输出")
     ap.add_argument("--st-meta", type=Path, help="phase2 metadata 输出")
     ap.add_argument(
+        "--data-contract", choices=(PEER_SYNC_H6_CONTRACT,),
+        help=(f"emit the explicit {PEER_SYNC_H6_CONTRACT} protocol; requires --horizon 6"),
+    )
+    ap.add_argument(
         "--legacy-policy", choices=("warn", "error", "infer"), default="warn",
         help=("旧数据策略：warn 保持兼容性警告；error 拒绝；infer 严格识别旧采集器"
               "唯一的12步零动作扰动块并修正 success/mask（歧义时失败）"),
@@ -789,6 +842,7 @@ if __name__ == "__main__":
             output_path=args.output,
             ref_path=args.ref,
             legacy_policy=args.legacy_policy,
+            data_contract=args.data_contract,
             overwrite=args.overwrite,
         )
     else:
