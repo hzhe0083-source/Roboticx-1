@@ -29,4 +29,4 @@ The exact protected SHA snapshot is stored in `sha256/protected_before.sha256` a
 
 ## Logs
 
-No file under `logs/` may be deleted, moved, renamed, or rewritten. The complete pre-cleanup inventory is stored in `sha256/logs_before.tsv` and compared byte-for-byte by path and size after cleanup.
+No file under `logs/` may be deleted, moved, renamed, truncated, or rewritten by the cleanup. The pre-cleanup inventory is stored in `sha256/logs_before.tsv` and records paths and sizes. Post-cleanup verification found the same 549 paths with no missing or extra files. Two monitor outputs grew by normal system-cron append activity at 2026-08-20 15:20:03 +0800: `task35_fm_train_monitor.cron.log` (+2,099 bytes) and `task35_fm_train_monitor.history.jsonl` (+147 bytes). The other 547 paths retained their recorded sizes. The snapshot does not claim content hashes for logs.
