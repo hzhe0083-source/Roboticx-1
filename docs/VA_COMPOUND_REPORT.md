@@ -308,7 +308,7 @@ Euler 8 步产生阶梯感（相邻步跳变 0.0045），32 步降为 0.0004（1
 **评估口径（论文统一声明）**：
 - **flow_steps=32**（Euler 部署步数，§3.5 实测 8 步阶梯感 0.0045 vs 32 步 0.0004；32 步亦显著改善 chunk_mae，如 LIBERO 3 场景 0.196→0.037）
 - 指标：chunk_mae_norm / chunk_mse_norm（归一化动作全块误差）、first_mae_norm、success（首步 <0.05 阈值）
-- **宏平均**：任务（instruction_id）等权，任务内样本先平均（`stats_ci.macro_bootstrap_ci`）
+- **宏平均**：任务（instruction_id）等权，任务内样本先平均（`va_compound.statistics.macro_bootstrap_ci`）
 - **95% CI**：bootstrap 百分位（B=2000、固定 seed=0，重采样单元=任务）
 - **持久性基线并报**（复制上一动作，§3.1 依据 arXiv:2505.09561）
 - **固定种子**：闭环评估 1000×task_index + trial

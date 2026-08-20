@@ -4156,7 +4156,7 @@ def main() -> None:
         if len(scores) == 1:
             # 单任务无法按 task bootstrap：唯一 task 被重复抽样只会产生 [p,p]
             # 的伪窄区间。此时不确定性单位应是独立 trial，使用 Wilson 区间。
-            from stats_ci import binomial_wilson_ci
+            from va_compound.statistics import binomial_wilson_ci
 
             est, lo, hi = binomial_wilson_ci(total, trials)
             ci_kind, ci_estimate, ci_low, ci_high = "wilson", est, lo, hi
@@ -4166,7 +4166,7 @@ def main() -> None:
             )
         else:
             # 多任务宏平均：以 task 为有放回重采样单元（固定种子）。
-            from stats_ci import macro_bootstrap_ci
+            from va_compound.statistics import macro_bootstrap_ci
 
             group_ids = np.arange(len(scores))
             est, lo, hi = macro_bootstrap_ci(

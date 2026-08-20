@@ -7,7 +7,7 @@
   有放回重采样单元做 percentile bootstrap（默认 B=2000、固定 seed）。
 
 用法：
-    from stats_ci import binomial_wilson_ci, macro_bootstrap_ci
+    from va_compound.statistics import binomial_wilson_ci, macro_bootstrap_ci
     est, lo, hi = binomial_wilson_ci(successes=1, trials=10)
     macro, lo, hi = macro_bootstrap_ci(values, group_ids, seed=0)
 """

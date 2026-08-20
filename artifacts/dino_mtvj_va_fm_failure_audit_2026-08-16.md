@@ -256,7 +256,7 @@
 - FM sample-mean probe：`logs/e7_dino_grid16_15k_flowmean8_stage_diag_3x.log`
 - 当前 10-trial rerun：`logs/e7_dino_grid16_15k_repro_1x10.log`
 - 新增 eval diagnostics：`eval_metaworld.py` 的 `--debug-stage-metrics`、`--flow-samples`
-- 单任务 CI 修复：`stats_ci.py`、`tests/test_stats_ci.py`
+- 单任务 CI 修复：`va_compound/statistics.py`、`tests/test_stats_ci.py`
 
 ## 最终表述边界
 
