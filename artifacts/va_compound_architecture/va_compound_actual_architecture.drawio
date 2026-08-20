@@ -193,7 +193,7 @@
         <mxCell id="training_note" value="&lt;b&gt;重要边界：train.py --data&lt;/b&gt; 直接读取预计算的 vision_tokens / language_hidden；Qwen 与 V-JEPA 保持冻结，不参与端到端骨干微调。" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontFamily=Helvetica;fontSize=12;fontColor=#475569;" vertex="1" parent="1">
           <mxGeometry x="60" y="995" width="1080" height="42" as="geometry" />
         </mxCell>
-        <mxCell id="source_note" value="来源：README.md · VA_COMPOUND_REPORT.md · backbones.py · model.py · train.py" style="text;html=1;strokeColor=none;fillColor=none;align=right;verticalAlign=middle;whiteSpace=wrap;fontFamily=Helvetica;fontSize=11;fontColor=#64748B;" vertex="1" parent="1">
+        <mxCell id="source_note" value="来源：README.md · docs/VA_COMPOUND_REPORT.md · backbones.py · model.py · train.py" style="text;html=1;strokeColor=none;fillColor=none;align=right;verticalAlign=middle;whiteSpace=wrap;fontFamily=Helvetica;fontSize=11;fontColor=#64748B;" vertex="1" parent="1">
           <mxGeometry x="1160" y="995" width="700" height="42" as="geometry" />
         </mxCell>
 

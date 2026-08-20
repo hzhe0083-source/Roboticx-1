@@ -10,7 +10,7 @@
 | id | source | type | role | priority | notes |
 |---|---|---|---|---|---|
 | S1 | `README.md` | documentation | content + structure | must | runtime cache/memory lifecycle, tensor contracts, frozen-backbone statement |
-| S2 | `VA_COMPOUND_REPORT.md` | design note | semantics | must | bidirectional VA equations and comparison mode |
+| S2 | `docs/VA_COMPOUND_REPORT.md` | design note | semantics | must | bidirectional VA equations and comparison mode |
 | S3 | `va_compound/backbones.py` | code | content + structure | must | Qwen text wrapper, V-JEPA input, pooling and freezing |
 | S4 | `va_compound/model.py` | code | content + structure | must | exact dimensions, projections, caches, attention role mask, memory and action head |
 | S5 | `train.py` | code | content + structure | must | precomputed-feature dataset, paired sampler, temporal rollout, losses and optimizer |

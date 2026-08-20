@@ -2,7 +2,7 @@
 
 - **审查日期**:2026-08-07
 - **审查对象**:`artifacts/chatgpt_va_design_discussion.md`(ChatGPT Pro 三轮对话存档)
-- **对照代码**:`va_compound/model.py`、`va_compound/backbones.py`、`train.py`、`eval_metaworld.py`、`logs/*`、`VA_COMPOUND_REPORT.md`
+- **对照代码**:`va_compound/model.py`、`va_compound/backbones.py`、`train.py`、`eval_metaworld.py`、`logs/*`、`docs/VA_COMPOUND_REPORT.md`
 - **审查方法**:对话断言逐一与仓库代码/日志核对;建议按"已实现 / 部分实现 / 未实现"分类;给出独立判断与优先级
 
 ---
@@ -13,7 +13,7 @@
 |---|---|---|---|
 | F1 | 70M V-JEPA | 代码用 V-JEPA 2.1 ViT-B/384(`backbones.py:170`) | ⚠️ 非 70M 档,是 ViT-B 级(约 90M+ 参数量级);对话与代码口径不一,需澄清目标 |
 | F2 | Qwen3.5-4B | 代码默认/缓存均为 `Qwen/Qwen3.5-2B`(`backbones.py:215`) | ⚠️ **仓库是 2B 不是 4B**;若用户计划换 4B,对话并未在仓库中落地 |
-| F3 | 约 43M VA Core | `VA_COMPOUND_REPORT.md:551`:43.5M trainable | ✓ |
+| F3 | 约 43M VA Core | `docs/VA_COMPOUND_REPORT.md:551`:43.5M trainable | ✓ |
 | F4 | 单 start 2488 样本 → multi-start 9927 | 报告 208/231 行;v5 数据实测 9927×4 决策点 | ✓ |
 | F5 | 闭环 7.1% → 16.3% → 17.8% | `mw_numbers_ledger.md`:7.1(35/490,已废弃) → 16.3(80/490,已废弃) → AQC 17.8(87/490) | ✓(注意:仓库最新重测口径为 13.9%,修复评估缺陷后 CI 重叠,17.8 是 AQC 口径) |
 | F6 | Evo-1 80.6%,每任务 50 demo,10 trials×5 runs | 报告 267/433/533 行一致 | ✓ |

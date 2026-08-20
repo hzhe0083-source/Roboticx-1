@@ -1,7 +1,7 @@
 # Paper Figure Plan (ORA0 VA compound)
 
 All figures must be generated from actual run logs / checkpoints; numbers
-cross-checked against VA_COMPOUND_REPORT.md. Style: matplotlib, HarmonyOS
+cross-checked against docs/VA_COMPOUND_REPORT.md. Style: matplotlib, HarmonyOS
 Sans SC, dpi 130 (existing scripts in artifacts/figures/).
 
 ## Fig 1 — Architecture (illustration, hand-drawn or diagram)
