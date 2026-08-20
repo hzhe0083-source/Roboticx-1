@@ -12,14 +12,21 @@ Baselines printed for reference:
   - B40k LoRA-collapsed:         ~0.9992
 
 Usage:
-  python measure_qwen_cosine.py --checkpoint checkpoints/libero_e2e_C2_40k.pt \
+  python scripts/analysis/measure_qwen_cosine.py --checkpoint checkpoints/libero_e2e_C2_40k.pt \
       --data data/libero_video_v2.pt
-  python measure_qwen_cosine.py --none  # original Qwen only
+  python scripts/analysis/measure_qwen_cosine.py --none  # original Qwen only
 """
 from __future__ import annotations
 
-import argparse
+import sys
 from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+
+import argparse
 
 import torch
 

@@ -126,7 +126,7 @@ def rollout_task(
                     action_chunk = action_chunk.cpu().numpy()
                     chunk_start_step = step_count
             # Execute receding-horizon steps of the latest chunk. 模型输出即归一化动作：
-            # 与训练标签一致裁剪到 [-1,1]（prepare_libero.py robust_normalize 存盘即
+            # 与训练标签一致裁剪到 [-1,1]（scripts/data/prepare_libero.py robust_normalize 存盘即
             # clip），prev 反馈（last_action）同样用裁剪值，避免分布外输入。
             if action_chunk is not None:
                 action = np.clip(

@@ -46,7 +46,7 @@ Sans SC, dpi 130 (existing scripts in artifacts/figures/).
 - Status: DONE (paper/fig7_2x2.png).
 
 ## Fig 8 — L_m same-scene dual-objective verdict
-- Data: eval_libero_Lm.py output (5 pairs × D/O, bootstrap CI) for A and B40k.
+- Data: scripts/eval/eval_libero_language.py output (5 pairs × D/O, bootstrap CI) for A and B40k.
 - Script: artifacts/figures/make_fig_lm.py — READY (TBD slots).
 - Status: script ready, numbers pending queue step 4/5.
 

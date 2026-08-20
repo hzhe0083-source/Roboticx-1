@@ -26,7 +26,7 @@ PNPW是50条、18,464帧、30 FPS的单任务双臂示范。先使用环境相�
 准备实际模型约需5.8 GiB：
 
 ```bash
-/home/ryan/.venvs/pytorch-gpu/bin/python prepare_models.py
+/home/ryan/.venvs/pytorch-gpu/bin/python scripts/data/prepare_models.py
 ```
 
 模型固定为`Qwen/Qwen3.5-2B`与官方V-JEPA 2.1 ViT-B/16（384px，80M）。P0使用4帧窗口：encoder产生768维密集token，再固定池化为64个token；是否损伤细粒度动作信息必须在真实数据中验证。`--vision-pooling`选择特征变体：`flat`（1D自适应池化，历史A）或`spatial`（时间均值后2D网格池化，B）；`spatiotemporal`（C）保留时间轴但token数随帧数线性增长、不受64预算约束，尚未接入训练/评估管线。视觉输入接口为`[B,T,3,384,384]`，使用ImageNet均值方差预先归一化。

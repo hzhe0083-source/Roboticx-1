@@ -13,15 +13,22 @@ This script writes *new* files (v3) so all prior checkpoints/results remain
 reproducible against the untouched originals.
 
 Usage:
-  python prepare_prev_fix.py --input data/libero_3scene.pt \
+  python scripts/migrations/prepare_prev_fix_v3.py --input data/libero_3scene.pt \
       --output data/libero_3scene_v3.pt
-  python prepare_prev_fix.py --input data/metaworld_features_v2_full.pt \
+  python scripts/migrations/prepare_prev_fix_v3.py --input data/metaworld_features_v2_full.pt \
       --output data/metaworld_features_v3_prevfix.pt
 """
 from __future__ import annotations
 
-import argparse
+import sys
 from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+
+import argparse
 
 import torch
 

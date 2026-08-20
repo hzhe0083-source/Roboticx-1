@@ -6,6 +6,16 @@ interface (encode_condition + sample_actions, visual memory chain), samples
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+
+import argparse
+
 import torch
 import matplotlib
 
@@ -15,15 +25,23 @@ import matplotlib.pyplot as plt
 from va_compound import VACompoundConfig, VACompoundPolicy
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--checkpoint", type=Path, default=Path("checkpoints/pnpw_flow.pt"))
+    parser.add_argument("--data", type=Path, default=Path("data/pnpw_features.pt"))
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    checkpoint = torch.load("checkpoints/pnpw_flow.pt", map_location="cpu", weights_only=True)
+    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     config = VACompoundConfig(**checkpoint["config"])
     model = VACompoundPolicy(config)
     model.load_state_dict(checkpoint["model"])
     model.eval().to(device)
 
-    payload = torch.load("data/pnpw_features.pt", map_location="cpu", weights_only=True)
+    payload = torch.load(args.data, map_location="cpu", weights_only=True)
     q01 = payload["normalization"]["action_q01"]
     q99 = payload["normalization"]["action_q99"]
 

@@ -5,14 +5,21 @@
 频率 = 1 / 单决策点墙钟时间。不包含 V-JEPA/Qwen 编码（预计算特征，见报告 §9）。
 
 用法（GPU 空闲时）：
-    python bench_inference.py --checkpoint checkpoints/libero_e2e_B40k.pt
-    python bench_inference.py --layers 4 --flow-steps 32 --device cuda
+    python scripts/benchmarks/bench_inference.py --checkpoint checkpoints/libero_e2e_B40k.pt
+    python scripts/benchmarks/bench_inference.py --layers 4 --flow-steps 32 --device cuda
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+
 import argparse
 import time
-from pathlib import Path
 
 import torch
 

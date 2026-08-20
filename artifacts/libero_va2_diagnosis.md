@@ -23,7 +23,7 @@
   敏感度（blank +11.2% / swap +4.2%）远低于 C1 且被未见即败掩盖。
 
 ## 修复方向（LIBERO 修复链，Stage B 之后执行）
-1. **数据重建必须严格 train/val 分离**：v4 重建脚本（prepare_libero_paired.py / v4 链）
+1. **数据重建必须严格 train/val 分离**：v4 重建脚本（scripts/data/prepare_libero_paired.py / v4 链）
    把训练 episode 混入 eval 集是 bug；重建后评估集与训练集 episode 零重叠（验证脚本：
    parity_visdist 方法，见 /tmp/check_episodes.py、/tmp/parity_visdist.py 思路）。
 2. VA2 重训走 single-task FM-only 协议（与 Stage B 同构）或修正 pair 契约后再跑；
@@ -37,11 +37,11 @@
   数据不同源，需另行核验其评估集是否含训练 episode（待 LIBERO 修复链时一并检查）。
 
 ## 2026-08-09 核验结果：e2e 链与 LIBERO-100 链同样无 held-out
-已读代码确认（resume_queue_v2.sh / next_phase.sh / evaluate.py / prepare_libero_video.py）：
+已读代码确认（resume_queue_v2.sh / next_phase.sh / evaluate.py / scripts/data/prepare_libero_video.py）：
 - **C1/C2/B40k e2e 链**：训练与评估都用 `data/libero_video_v2.pt` 全量 360 样本
   （E2EDataset 无 split；next_phase.sh 的 eval_e2e/eval_libero_Lm 全部 --data 同一文件）。
   → 开环 MAE / 三件套 / C_OL 数字全部在训练数据上测得，不能作为泛化证据。
-- **LIBERO-100 链**（resume_queue_v2.sh）：`prepare_libero.py --max-tasks 100` 后
+- **LIBERO-100 链**（resume_queue_v2.sh）：`scripts/data/prepare_libero.py --max-tasks 100` 后
   直接 `train.py --data libero_100_full.pt`，评估 `evaluate.py --val-episodes -1`
   （evaluate.py:241-244 语义 = 全部 episode，无 held-out 机制）→ 同样无 held-out。
 - **不受影响的部分**：闭环评估（eval_libero_closedloop.py 在 LIBERO 模拟器上 rollout）
@@ -53,7 +53,7 @@
 输出 train/heldout 两个独立文件；metadata["split"] 记录协议；
 train ∩ heldout episode 断言零重叠。下游训练/评估脚本零改动，一律用 --data 指向。
 `--aligned-heldout`：所有任务留出同一组 episode ordinal → 每任务第 r 行 = 同一原始
-episode，prepare_libero_paired.py 的"按行位置配对"在切分输出上保持有效
+episode，scripts/data/prepare_libero_paired.py 的"按行位置配对"在切分输出上保持有效
 （2026-08-09 实测：非对齐版本配对 0 组存活，对齐后 29 组存活）。
 
 **重要数据契约发现（2026-08-09）**：`data/libero_3scene.pt`（8月4日基准）的
@@ -83,7 +83,7 @@ previous_action 是旧契约（首决策为真实前一动作，pair 间 max dif
 tests/test_semantic_adapter.py +2 用例（trivial → pairs={}，真 pair → 构建）。
 
 ## 待办（2026-08-08 预检登记，LIBERO 修复链时执行）
-1. **重建必须显式分离 train/eval episode**：`prepare_libero_paired.py` 目前无
+1. **重建必须显式分离 train/eval episode**：`scripts/data/prepare_libero_paired.py` 目前无
    episode 级 split 参数（v4 泄漏根因）。重建时按 episode 先切 held-out（如每任务
    留 5-8 ep），再跑配对门控；评估集与训练集 episode 零重叠（用 episode_id 断言，
    与 Stage A v4 泄漏检查同款脚本）。

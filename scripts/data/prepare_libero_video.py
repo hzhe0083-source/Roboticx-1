@@ -1,16 +1,23 @@
 """Prepare LIBERO same-scene subsets as raw video frames + instructions.
 
-Extension of prepare_libero.py for end-to-end fine-tuning: stores the causal
+Extension of scripts/data/prepare_libero.py for end-to-end fine-tuning: stores the causal
 4-frame windows as uint8 pixels (pnpw_video.pt format) so V-JEPA and Qwen can
 be trained online.  Three scenes x four tasks (12 instructions) are merged
 into one dataset with a single Qwen re-encode.
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+
 import argparse
 import glob
 import io
-from pathlib import Path
 
 import numpy as np
 import pyarrow.parquet as pq

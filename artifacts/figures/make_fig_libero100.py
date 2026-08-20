@@ -1,6 +1,6 @@
 """Fig 11: LIBERO-100 full-scale (100 tasks) — open loop + language trio.
 
-Data: prepare_libero.py --scene ALL output + evaluate.py --perturb on
+Data: scripts/data/prepare_libero.py --scene ALL output + evaluate.py --perturb on
 checkpoints/libero_100_va8_10k.pt.
 Run: python artifacts/figures/make_fig_libero100.py
 """

@@ -918,14 +918,14 @@ class VJEPA21Backbone(nn.Module):
         if local_files_only:
             if not repo_dir.is_dir():
                 raise FileNotFoundError(
-                    f"V-JEPA 2.1 source is missing at {repo_dir}; run prepare_models.py"
+                    f"V-JEPA 2.1 source is missing at {repo_dir}; run scripts/data/prepare_models.py"
                 )
             if (
                 not checkpoint_path.is_file()
                 or checkpoint_path.stat().st_size != VJEPA21_CHECKPOINT_BYTES
             ):
                 raise FileNotFoundError(
-                    f"V-JEPA 2.1 checkpoint is missing at {checkpoint_path}; run prepare_models.py"
+                    f"V-JEPA 2.1 checkpoint is missing at {checkpoint_path}; run scripts/data/prepare_models.py"
                 )
             source = str(repo_dir)
             source_kind = "local"

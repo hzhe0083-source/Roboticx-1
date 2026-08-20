@@ -7,15 +7,22 @@ Outputs (data disk, memmap-friendly):
                           metadata{tasks, sequences_per_episode}
 
 Usage:
-  python prepare_metaworld_video.py --max-tasks 12 --output /media/ryan/robot-data/mw_e2e_pilot
+  python scripts/data/prepare_metaworld_video.py --max-tasks 12 --output /media/ryan/robot-data/mw_e2e_pilot
 """
 from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 
 import argparse
 import glob
 import os
 from collections import OrderedDict
-from pathlib import Path
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -28,9 +35,9 @@ from prepare_metaworld import (
     ACTION_HORIZON,
     VISION_WINDOW,
     VISION_STRIDE,
-    MAX_CACHE_FRAMES,
 )
-from prepare_metaworld import robust_normalize
+
+MAX_CACHE_FRAMES = 26000
 
 
 def parse_args() -> argparse.Namespace:

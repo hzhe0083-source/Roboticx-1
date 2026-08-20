@@ -4,15 +4,21 @@
 - 渲染：EGL（metaworld rgb_array, corner2 相机，与训练数据同款）
 - 输出：MP4（drawer-close-v3 / reach-v3 / push-v3）
 
-用法: python demo_mujoco_video.py [--tasks ...] [--out demo_mw_rollout.mp4] [--max-steps 240] [--device cpu|cuda]
+用法: python scripts/demos/demo_mujoco_video.py [--tasks ...] [--out demo_mw_rollout.mp4] [--max-steps 240] [--device cpu|cuda]
 """
 from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 
 import argparse
 import os
 import subprocess
-import sys
-from pathlib import Path
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("EGL_PLATFORM", "surfaceless")

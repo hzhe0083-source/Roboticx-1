@@ -1,6 +1,6 @@
 """v4 previous-action rebuild (2026-08-07): undo the v3 prev-fix leak.
 
-v3 bug (prepare_prev_fix.py): `fixed[:, 1:] = actions[:, :-1, -1]` sets the
+v3 bug (scripts/migrations/prepare_prev_fix_v3.py): `fixed[:, 1:] = actions[:, :-1, -1]` sets the
 previous action of decision t to the LAST step of chunk t-1.  With
 CONTROL_STRIDE=6 and ACTION_HORIZON=8 the chunk windows overlap, so
 actions[t-1, -1] is the SAME raw time step as actions[t, 1] -- a precise
@@ -27,13 +27,20 @@ reproducible against their own data versions):
     /tmp/smoke_pairs_v4.pt                 (from /tmp/smoke_pairs.pt, stride=6)
 
 Usage:
-  python prepare_prev_v4.py
-  python prepare_prev_v4.py --input FILE --output FILE --stride N
+  python scripts/migrations/prepare_prev_v4.py
+  python scripts/migrations/prepare_prev_v4.py --input FILE --output FILE --stride N
 """
 from __future__ import annotations
 
-import argparse
+import sys
 from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+
+import argparse
 
 import torch
 

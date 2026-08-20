@@ -15,9 +15,16 @@ checkpoint when one is provided.
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+
 import argparse
 import os
-from pathlib import Path
 
 os.environ.setdefault("EGL_PLATFORM", "surfaceless")
 os.environ.setdefault("PYBULLET_EGL", "1")
@@ -181,7 +188,7 @@ def main() -> None:
                     )
                     chunk = model.sample_actions(cond, steps=8)[0].cpu().numpy()
             # execute the planned action for this step (re-plan every DECISION_STRIDE)
-            # 与训练标签一致裁剪模型输出到 [-1,1]（prepare_calvin.py 存盘即 clip），
+            # 与训练标签一致裁剪模型输出到 [-1,1]（scripts/data/prepare_calvin.py 存盘即 clip），
             # 再反归一化；prev 反馈（last_norm）同样用裁剪值，避免分布外输入
             a_norm = np.clip(chunk[step % DECISION_STRIDE], -1.0, 1.0).astype(np.float32)
             last_norm = a_norm

@@ -9,17 +9,23 @@
 - chunk 采样 32 步，按 chunk_start_step 相位取模 ACTION_HORIZON=8 执行；
 - previous_action 用模型自身上一归一化动作（自激）；state=obs[:4] 分位数归一化。
 
-用法: python demo_mw_live.py [--checkpoint ...] [--features ...] [--tasks ...] [--out ...]
+用法: python scripts/demos/demo_mw_live.py [--checkpoint ...] [--features ...] [--tasks ...] [--out ...]
 默认: mw_va2_v4_40k.pt / metaworld_features_v4.pt / CPU
 """
 from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 
 import argparse
 import json
 import os
 import subprocess
-import sys
-from pathlib import Path
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("EGL_PLATFORM", "surfaceless")

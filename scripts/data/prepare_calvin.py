@@ -1,6 +1,6 @@
 """Prepare CALVIN debug dataset features for VA training.
 
-Builds the same feature-cache contract as prepare_libero.py / prepare_metaworld.py:
+Builds the same feature-cache contract as scripts/data/prepare_libero.py / prepare_metaworld.py:
   vision_tokens [N, T=4, 64, 768]   (V-JEPA features, window stride 2)
   language_hidden [N, 1, 2048] + language_mask
   proprio [N, T, 9]                 (tcp pos/ori euler + gripper width + gripper action + 0)
@@ -15,9 +15,16 @@ benchmark split.
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+
 import argparse
 import os
-from pathlib import Path
 
 import numpy as np
 import torch

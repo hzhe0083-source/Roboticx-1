@@ -11,16 +11,22 @@
 随后释放，GPU 上仅常驻 V-JEPA(fp16) + VA(fp32) ≈ 0.7GB —— 与两个闭环评估共存。
 
 窗口：MuJoCo viewer（corner2 固定相机，与训练/评估同款视角）；关窗即停止。
-用法: python demo_mw_viewer.py [--tasks ...] [--trials 1] [--device cuda|cpu]
+用法: python scripts/demos/demo_mw_viewer.py [--tasks ...] [--trials 1] [--device cuda|cpu]
 """
 from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 
 import argparse
 import json
 import os
-import sys
 import time
-from pathlib import Path
 
 # 窗口化渲染必须用 glfw 后端；必须在任何 mujoco/gym 导入之前设置
 os.environ["MUJOCO_GL"] = "glfw"

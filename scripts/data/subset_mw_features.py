@@ -1,17 +1,24 @@
 """从 metaworld_features_v2_full.pt 按任务描述提取子集（VLA-RL pilot/MT10 评估用）。
 
 用法:
-  python subset_mw_features.py --tasks "Push and close a drawer,Reach a goal position,Push the puck to a goal" \
+  python scripts/data/subset_mw_features.py --tasks "Push and close a drawer,Reach a goal position,Push the puck to a goal" \
       --output data/mw_subset_pilot.pt
-  python subset_mw_features.py --n 10 --output data/mw_subset_mt10.pt   # 取 metadata 前 10 任务
+  python scripts/data/subset_mw_features.py --n 10 --output data/mw_subset_mt10.pt   # 取 metadata 前 10 任务
 
 输出与原始文件同构（instruction_id 重编号为 0..k-1，metadata.tasks = 选中描述）。
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+
 import argparse
 import json
-from pathlib import Path
 
 import torch
 

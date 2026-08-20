@@ -7,7 +7,7 @@ training / eval scripts take the output files via --data unchanged — no
 training-loop or eval-script changes needed.
 
 Pair safety: if the payload's pair_id forms groups of size > 1 (e.g. the
-4-row same-state fork groups produced by prepare_libero_paired.py), groups
+4-row same-state fork groups produced by scripts/data/prepare_libero_paired.py), groups
 are treated as indivisible units so a pair is never torn across the split.
 For the base feature file (pair size 1) the unit is the episode.
 
@@ -41,7 +41,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--aligned-heldout", action="store_true",
                    help="hold out the same episode ordinals for every task "
                         "(restores row-position alignment across tasks, so "
-                        "prepare_libero_paired.py's k-th-row pairing stays valid "
+                        "scripts/data/prepare_libero_paired.py's k-th-row pairing stays valid "
                         "on the split output)")
     p.add_argument("--max-tasks", type=int, default=0,
                    help="only split the first N tasks (dry-run validation)")
@@ -99,7 +99,7 @@ def split_rows(
     if aligned_heldout:
         # One shared heldout ordinal set across tasks: restores row-position
         # alignment (the r-th kept row of every task is the same original
-        # episode ordinal), which keeps prepare_libero_paired.py's k-th-row
+        # episode ordinal), which keeps scripts/data/prepare_libero_paired.py's k-th-row
         # pairing valid on split outputs.
         if unit != "episode":
             raise ValueError("--aligned-heldout requires episode-unit splits")

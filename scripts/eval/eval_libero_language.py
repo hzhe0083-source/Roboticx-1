@@ -17,14 +17,21 @@ Verdicts:
   L_m < 0  -> inverse effect
 
 Usage:
-  python eval_libero_Lm.py --checkpoint checkpoints/libero_uni_a_va8_20k.pt \
+  python scripts/eval/eval_libero_language.py --checkpoint checkpoints/libero_uni_a_va8_20k.pt \
       --data data/libero_video.pt --device cuda --max-pairs 2 --trials-per-task 5
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+
 import argparse
 import os
-from pathlib import Path
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("EGL_PLATFORM", "surfaceless")

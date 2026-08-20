@@ -97,7 +97,7 @@ Euler 8 步产生阶梯感（相邻步跳变 0.0045），32 步降为 0.0004（1
 
 ## 4. 端到端微调管线（已就绪，待服务器额度）
 
-- `prepare_pnpw_video.py`：原始视频帧 + 指令文本（data/pnpw_video.pt，9.85 GiB）
+- `scripts/data/prepare_pnpw_video.py`：原始视频帧 + 指令文本（data/pnpw_video.pt，9.85 GiB）
 - `va_compound/backbones.py`：手写 LoRA（LoRALinear/apply_lora，96 层适配器）
 - `va_compound/end_to_end.py`：Qwen3.5 (LoRA) + V-JEPA 2.1 (全量解冻) + VA/Flow 全量
 - `train.py --e2e-data`：端到端训练模式（冒烟通过）
@@ -114,7 +114,7 @@ Euler 8 步产生阶梯感（相邻步跳变 0.0045），32 步降为 0.0004（1
 | Hold the toothbrush cup... | 111 | 54,409 |
 | 合计 | 289 | 118,241 |
 
-`prepare_multi_task.py` 已就绪（合并特征提取 + 跨任务统一归一化，data/multi_task_features.pt，9602 样本）。多任务训练使语言不再是常数，语言流可学习（文献：LIBERO 2306.03310 每任务 50 条即可；RoboTwin 2506.18088 10 真机+合成）。
+`scripts/data/prepare_multi_task.py` 已就绪（合并特征提取 + 跨任务统一归一化，data/multi_task_features.pt，9602 样本）。多任务训练使语言不再是常数，语言流可学习（文献：LIBERO 2306.03310 每任务 50 条即可；RoboTwin 2506.18088 10 真机+合成）。
 
 ### 5.1 多任务实验结果（8 层@20k）
 
@@ -156,7 +156,7 @@ Euler 8 步产生阶梯感（相邻步跳变 0.0045），32 步降为 0.0004（1
 
 ### 7.1 数据
 
-本地 benchmark_data 发现 LIBERO-100（26GB，100 任务 × 50 episodes，LeRobot 格式，图像内嵌 parquet）与 MetaWorld MT50（43GB，49 任务，80FPS）。`prepare_libero.py` 支持 parquet 内嵌 PNG 解码 → V-JEPA 特征。
+本地 benchmark_data 发现 LIBERO-100（26GB，100 任务 × 50 episodes，LeRobot 格式，图像内嵌 parquet）与 MetaWorld MT50（43GB，49 任务，80FPS）。`scripts/data/prepare_libero.py` 支持 parquet 内嵌 PNG 解码 → V-JEPA 特征。
 
 - 1 场景子集：LIVING_ROOM_SCENE2 下 4 任务（alphabet soup / butter / milk / orange juice），各 30 样本，共 120 样本（data/libero_features.pt）
 - 3 场景子集：+ KITCHEN_SCENE2 + STUDY_SCENE1，12 任务 360 样本（data/libero_3scene.pt，统一 Qwen 编码）
@@ -319,7 +319,7 @@ Euler 8 步产生阶梯感（相邻步跳变 0.0045），32 步降为 0.0004（1
 - ✅ §7.2 语言三件套：新口径（32 步）重测，Blank +13751%（1 场景）/ +2381%（3 场景）——定性结论更强；原数字（+3805%/+1446%）脚本未留存，已废弃
 - ⚠️ §8.2 MW：旧数字基于归一化错乱数据，已勘误；正式数字待重训
 - ⚠️ §5.1 多任务：待复现（B40k 完成后 GPU 评估）
-- 原则：**所有论文数字必须由现有脚本（evaluate.py / eval_e2e.py / eval_metaworld.py / eval_mw_lang_ablation.py）重新生成**，未留存脚本的数字一律废弃
+- 原则：**所有论文数字必须由现有脚本（evaluate.py / scripts/eval/eval_e2e.py / eval_metaworld.py / eval_mw_lang_ablation.py）重新生成**，未留存脚本的数字一律废弃
 
 ---
 
@@ -379,7 +379,7 @@ Euler 8 步产生阶梯感（相邻步跳变 0.0045），32 步降为 0.0004（1
 C1/C2/B 三格只差 Qwen/V-JEPA 解冻组合 → 定位坍塌来源。
 
 **判决实验优先级**：
-1. Open-loop 筛查（零训练成本）：NMAE + 输出位移 C_OL（`eval_e2e_col.py`，已实现）+ 持久性基线；每 perturb 重算 K/V、重置循环记忆；按 trajectory 聚合；重点看 episode 初期/动作分叉点（teacher-forcing 后半段掩盖语言效应）
+1. Open-loop 筛查（零训练成本）：NMAE + 输出位移 C_OL（`scripts/eval/eval_e2e_col.py`，已实现）+ 持久性基线；每 perturb 重算 K/V、重置循环记忆；按 trajectory 聚合；重点看 episode 初期/动作分叉点（teacher-forcing 后半段掩盖语言效应）
 2. 同场景可执行 swap 闭环（主判决）：预选 4-6 个 A 上 clean 高、swap 效应大的任务；L_m = ½[P(g1|l1)−P(g1|l2) + P(g2|l2)−P(g2|l1)]；换目标成功=服从，双失败=OOD 脆弱，同目标=语言选择性缺失
 3. held-out command-fork（同视觉初态双可执行指令）
 4. V-JEPA checkpoint 漂移（fixed frames，normalized cosine / linear CKA）
@@ -401,14 +401,14 @@ C1/C2/B 三格只差 Qwen/V-JEPA 解冻组合 → 定位坍塌来源。
 **Codex v2 定稿补充（2026-08-05 夜）**：
 - **C 必须分段训练对齐 B**（B = 10k + resume 30k）：C1/C2 均 `10k → resume 30k`（脚本 /tmp/run_config_c1.sh、/tmp/run_config_c2.sh），不能从头连续 40k（resume 不恢复 AdamW/RNG，属 warm start，两段式是 B 的实际协议）
 - **冻结 V-JEPA 保持 eval()**：train.py 已修（`e2e_model.train()` 后对无可训参数的子模块置 eval）
-- **C_OL 定稿公式**（eval_e2e_col.py 已重写）：clean/swap 每决策点复用同一 flow 噪声 z；主指标 = 首执行动作位移 `C_exec = mean|a^clean_{t,0} - a^swap_{t,0}|`，次指标 = 完整 chunk；同噪声报 E_clean/E_swap/配对绝对差；任务级重采样配对 bootstrap CI；聚合 decision→trajectory→task 宏平均
+- **C_OL 定稿公式**（scripts/eval/eval_e2e_col.py 已重写）：clean/swap 每决策点复用同一 flow 噪声 z；主指标 = 首执行动作位移 `C_exec = mean|a^clean_{t,0} - a^swap_{t,0}|`，次指标 = 完整 chunk；同噪声报 E_clean/E_swap/配对绝对差；任务级重采样配对 bootstrap CI；聚合 decision→trajectory→task 宏平均
 - **L_m 定稿**：D=½[P(g1|l1)+P(g2|l2)]，O=½[P(g1|l2)+P(g2|l1)]，L_m=D−O；CI 重采样完整 matched trial block；每个语言 rollout 同时跑两个 goal scorer
 - **锚定正则定稿**：锚 V-JEPA block 11 final post-norm 的 post-flat-pooling 64 tokens（VA 实际消费接口）；norm = per-token channel L2，loss = mean‖u_θ−sg(u_0)‖²；f_0 用 eval+no_grad 固定、由 prepare 缓存 fp16 target；λ pilot {0.01, 0.1, 1.0} 首选 0.1，以视觉参数上 anchor/FM 梯度范数比 0.1–0.5 校准；机制阶段保持 pair=0；**判决门：若 C2 的 Qwen cosine 仍 ~0.999 → 主因是 LoRA+FM-only，放弃视觉 anchor 转向语言主干隔离/L_pair**
 - **论文表述边界**：现在只能写"B40k 出现命令表征区分度丧失（cos 0.9992），不证明端到端 VLA 普遍语义坍塌"；B/C matched 完成后才可写"V-JEPA 12 block 更新降低反事实行为选择性"；Anchor 赢过 drift-matched Low-LR 后才可写锚定有效性。对照表：Standard(12,1e-5,λ=0) / Low-LR(12,3e-6~3e-7,0) / Anchor(12,1e-5,λ*) / C(0,–,0)，正式报告 ≥3 matched seeds，统一分组梯度裁剪。
 
 ---
 
-## 11. 轻量对比（2026-08-05 实测，bench_inference.py）
+## 11. 轻量对比（2026-08-05 实测，scripts/benchmarks/bench_inference.py）
 
 | 项 | 值 |
 |---|---|
@@ -499,13 +499,13 @@ C1/C2/B 三格只差 Qwen/V-JEPA 解冻组合 → 定位坍塌来源。
 - **修复方案落定（2026-08-06 13:30 梳理）**：**C1（Qwen 全冻结 + VA 全量 + V-JEPA 冻结）即"语言隔离"最简实现**——cosine 保持 0.7647（Qwen 本体未参与训练，嵌入空间零漂移）+ 行为敏感性保持（blank +33.0%/swap +42.2%，远强于 B40k 的 +1.5%/+2.7%）；`build_language_cache(detach=True)` 钩子已就位（model.py:419）供残留风险（VA 层语言投影漂移）备用；与 A/B40k 的完整对照（开环 chunk_mae + 三件套 + C_OL）已排入 v2 队列 0b 段，fig5/fig7 回填后即闭环
 
 ### 11.10 CPU 侧工程推进（2026-08-06 上午，C2 等待期间）
-- **L_m 判决脚本完成（eval_libero_Lm.py）**：同场景双目标四条件 matched-block 判决；5/5 配对匹配验证（study_back_front/study_left_right/kitchen_back_front/living_soup_butter/living_milk_juice，benchmark 显式绑定 libero_90/libero_object 防跨布局误配）；D/O 对比同 env 同 init 仅语言不同 = 严格 matched；block bootstrap 95% CI
+- **L_m 判决脚本完成（scripts/eval/eval_libero_language.py）**：同场景双目标四条件 matched-block 判决；5/5 配对匹配验证（study_back_front/study_left_right/kitchen_back_front/living_soup_butter/living_milk_juice，benchmark 显式绑定 libero_90/libero_object 防跨布局误配）；D/O 对比同 env 同 init 仅语言不同 = 严格 matched；block bootstrap 95% CI
   - **修复**：eval_libero_closedloop.py 的 build_task_envs 缺 libero_object/libero_goal → LIVING 场景任务匹配不到（B40k 闭环评估漏任务隐患）
 - **VLA-RL 实施完成（ReinFlow-lite PPO）**：model.py 新增 sample_flow_trajectory/flow_trajectory_log_prob（增广 Markov flow 策略，逐 Euler 转移注入可学习噪声 σ=0.02+0.06·sigmoid(α)，32 参数）；train_ppo_metaworld.py（FlowNoiseSchedule + ValueHead 零初始化 + GAE 成功/终止不 bootstrap 时间截断 bootstrap + TBPTT=1 detached memory + 每更新重建语言 cache）；tests/test_flow_ppo.py 6 测（确定性路径=经典采样器、零 log-ratio、梯度流、噪声界、GAE terminal、零奖励）；**pytest 50 全绿**
-- **LIBERO-100 全量链就绪**：prepare_libero.py 新增 --scene ALL（默认路径更新到 /mnt/robot-data/datasets/benchmark_data）；dry-run 100 任务 × 20 ep × 2 seq = 4000 样本/8 万帧
+- **LIBERO-100 全量链就绪**：scripts/data/prepare_libero.py 新增 --scene ALL（默认路径更新到 /mnt/robot-data/datasets/benchmark_data）；dry-run 100 任务 × 20 ep × 2 seq = 4000 样本/8 万帧
 - **自动队列 /tmp/c2_after_queue.sh**（nohup 已启动，PID 1270240）：等待 C2 → LoRA 判决（CPU）→ 记录 §11.9 → MW 多 start 全链（含 VLA-RL smoke 3 任务 120 iter）→ L_m A → L_m B40k → LIBERO-100 特征 → 训练 10k → 开环+三件套
 - **论文初稿 paper/ora0_paper.md**：摘要/引言/方法（架构+两级 loss+机制段）/实验设置/结果 5.1-5.5/结论 + references.bib 42 条（arXiv API 抓取 + Grok 验证 V-JEPA2.1=2603.14482/ReinFlow=2505.22094/DPPO=2409.00588/RoboTwin2.0=2506.18088/GR00T=2503.14734/Qwen3=2505.09388）；待填：L_m、VLA-RL、MW 多 start、LIBERO-100
-- **VLA-RL 审查修复（2026-08-06 上午，agent 审计 7 项全修）**：① ppo_update proprio/previous 多一维（硬崩溃）；② eval_libero_Lm.py main 3 元组解包（硬崩溃）；③ chunk 相位 `%8→%DECISION_STRIDE`（先执行计划尾部）；④ memory off-by-one（存输出→存输入，TBPTT=1 严格一致）；⑤ GAE 跨 env 污染（按 env 分算再拼接）；⑥ noise_schedule 梯度被 critic_opt.zero_grad 清零（σ 并入 actor_opt——σ 是策略参数）；⑦ model.py logp 归一化缺 H·A 常数（σ 可训练后 ratio 有偏，已修 `H*A*log2π + H*Σlogσ²`）；⑧ 附带：rollout 改 no_grad（inference tensor 不能进 autograd）、trunc 后 break、state 归一化、noise 形状校验。验证：σ-α 梯度连接 4.8e0 ✓、memory 首决策 None ✓、ppo_update 集成跑通 ✓、pytest 50 全绿
+- **VLA-RL 审查修复（2026-08-06 上午，agent 审计 7 项全修）**：① ppo_update proprio/previous 多一维（硬崩溃）；② scripts/eval/eval_libero_language.py main 3 元组解包（硬崩溃）；③ chunk 相位 `%8→%DECISION_STRIDE`（先执行计划尾部）；④ memory off-by-one（存输出→存输入，TBPTT=1 严格一致）；⑤ GAE 跨 env 污染（按 env 分算再拼接）；⑥ noise_schedule 梯度被 critic_opt.zero_grad 清零（σ 并入 actor_opt——σ 是策略参数）；⑦ model.py logp 归一化缺 H·A 常数（σ 可训练后 ratio 有偏，已修 `H*A*log2π + H*Σlogσ²`）；⑧ 附带：rollout 改 no_grad（inference tensor 不能进 autograd）、trunc 后 break、state 归一化、noise 形状校验。验证：σ-α 梯度连接 4.8e0 ✓、memory 首决策 None ✓、ppo_update 集成跑通 ✓、pytest 50 全绿
 - **CALVIN 适配评估（Grok 查证）**：CALVIN 无需 Coppelia（PyBullet+EGL），debug 集 1.3G，完整集无 HF 官方镜像；RLBench 需 Coppelia+PyRep（一周+改造）→ 后置；轻量 VLA 主报 LIBERO（Turbo/Evo/Smol），CALVIN 锚点 FLOWER ~4.5。决策：CALVIN debug 集优先，RLBench 候选
 
 ### 11.11 CALVIN 完整链路决策记录（2026-08-06 13:10，Grok 二次查证）
@@ -517,11 +517,11 @@ C1/C2/B 三格只差 Qwen/V-JEPA 解冻组合 → 定位坍塌来源。
 
 ### 11.12 CPU 侧验证与复现性修复（2026-08-06 13:20，MW 重训等待期）
 - **v2 队列全接口验证**：resume_queue_v2.sh 的 C2 col / L_m A/B / LIBERO-100 prepare / train / evaluate 参数与脚本 argparse 全匹配；`py_compile` 全部通过
-- **C2 col 冒烟 PASS**（eval_e2e_col.py，2 样本 CPU 116s）：加载/数据/rollout/C_OL 指标链全通——此前两次"545 字节即断"确认为 GPU 占用等环境问题而非代码问题（队列已有 non-fatal 保护）
+- **C2 col 冒烟 PASS**（scripts/eval/eval_e2e_col.py，2 样本 CPU 116s）：加载/数据/rollout/C_OL 指标链全通——此前两次"545 字节即断"确认为 GPU 占用等环境问题而非代码问题（队列已有 non-fatal 保护）
 - **复现性缺口修复**：C1 三件套日志随 /tmp 清理丢失（数字仅存 todo），C2 行为评估（开环+三件套）从未跑过 → 队列新增 0b 段：C1+C2 各 openloop/blank/swap 共 6 个评估，fig5/fig7 的 C1/C2 行数字来源落盘 logs/
 - **VLA-RL 训练器审查**（train_ppo_metaworld.py）：rollout 用 language_cache 与 update 用 language_hidden 两条路径等价（encode_condition 内部统一走 build_language_cache，old_logp 不失真）；GAE/稀疏奖励/成功终止不 bootstrap/时间截断 bootstrap/TBPTT=1 memory 图一致全部确认；清理一处死代码（重复计算未使用的 value_loss）；编译验证通过
 - **LIBERO-100 数据源验证**：kevin_libero100_lerobot 26G（LeRobot 格式 data/meta）就绪，数据盘 350G 可用
-- **论文初稿方法章节核对**：§3.1-3.4 与代码一致（Qwen/Qwen3.5-2B ✓、Q/K/U 公式 ✓、L_pair=0 口径与日志 pair=0.000000 一致 ✓）；§5.6/5.7 协议描述与 eval_libero_Lm.py / train_ppo_metaworld.py 实现全匹配
+- **论文初稿方法章节核对**：§3.1-3.4 与代码一致（Qwen/Qwen3.5-2B ✓、Q/K/U 公式 ✓、L_pair=0 口径与日志 pair=0.000000 一致 ✓）；§5.6/5.7 协议描述与 scripts/eval/eval_libero_language.py / train_ppo_metaworld.py 实现全匹配
 - **MW 重训实测速度 ~464 步/分钟**（12:41 启动，非交接笔记的 130 步/分——该数字属 LIBERO B40k 口径）→ 预计 ~14:10 完成训练、~17:00 闭环出数字；loss 收敛趋势 0.39→0.25→0.21→0.19（2k 步区间均值，单调下降）
 
 ### 11.13 基线数字 Grok 二次查证定稿（2026-08-06 14:45，论文对比表最终口径）
@@ -590,7 +590,7 @@ C1/C2/B 三格只差 Qwen/V-JEPA 解冻组合 → 定位坍塌来源。
 **论文口径**：16.3% 数字待重测后更新（tex/fig9 当前为旧值，重测后回填）。
 
 ### 11.17 修复扩散（2026-08-06 16:10）
-- eval_calvin.py 同源缺陷已修（首决策前反归一化零动作 = 动作区间中点）；CALVIN 零样本评估待 GPU 队列尾部执行
+- scripts/eval/eval_calvin.py 同源缺陷已修（首决策前反归一化零动作 = 动作区间中点）；CALVIN 零样本评估待 GPU 队列尾部执行
 - eval_libero_closedloop.py 无需修：robosuite 归一化动作接口，warm-up 用真零动作（无反归一化问题）
 - 重测队列 logs/mw_eval_fix_retest.sh 就绪（smoke6 → full49，同一 checkpoint）
 - 数字台账 logs/mw_numbers_ledger.md 建立（论文唯一数据源）
