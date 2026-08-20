@@ -1011,8 +1011,93 @@ def wmrm_ablation_provenance(mode: str) -> dict[str, Any]:
 
 
 VISION_WINDOW = 4
-DECISION_STRIDE = 6  # 80 FPS, decide every 6 frames (13.3 Hz), matches training
+OBSERVATION_STRIDE = 2
+LEGACY_TRAINING_CONTROL_STRIDE = 6
+LEGACY_EXECUTION_HORIZON = 6
+EXPECTED_WMRM_WORLD_HORIZON = 6
 ACTION_HORIZON = 8
+SUPPORTED_EXECUTION_HORIZONS = (1, 2, 3, 6)
+
+
+@dataclasses.dataclass(frozen=True)
+class Plan:
+    """A decoded action plan indexed by absolute environment time."""
+
+    start_step: int
+    actions: np.ndarray
+
+    def __post_init__(self) -> None:
+        actions = np.asarray(self.actions)
+        if self.start_step < 0:
+            raise ValueError("plan start_step must be non-negative")
+        if actions.ndim != 2 or actions.shape[0] < 1:
+            raise ValueError("plan actions must have shape [time, action_dim]")
+        object.__setattr__(self, "actions", actions)
+
+    @property
+    def stop_step(self) -> int:
+        return self.start_step + self.actions.shape[0]
+
+    def action_at(self, step: int) -> np.ndarray:
+        if not self.start_step <= step < self.stop_step:
+            raise IndexError(
+                f"step {step} is outside plan [{self.start_step}, {self.stop_step})"
+            )
+        return self.actions[step - self.start_step]
+
+
+class SynchronousPlanQueue:
+    """Absolute-time queue with synchronous, hard plan replacement."""
+
+    def __init__(self, execution_horizon: int) -> None:
+        if execution_horizon not in SUPPORTED_EXECUTION_HORIZONS:
+            raise ValueError(
+                "execution_horizon must be one of "
+                f"{SUPPORTED_EXECUTION_HORIZONS}, got {execution_horizon}"
+            )
+        self.execution_horizon = execution_horizon
+        self._plan: Plan | None = None
+
+    def needs_plan(self, step: int) -> bool:
+        return self._plan is None or step >= self._plan.stop_step
+
+    def replace(self, step: int, actions: np.ndarray) -> Plan:
+        decoded = np.asarray(actions)
+        if decoded.ndim != 2 or decoded.shape[0] < self.execution_horizon:
+            raise ValueError(
+                "decoded plan must have shape [time, action_dim] and contain at least "
+                f"execution_horizon={self.execution_horizon} actions"
+            )
+        self._plan = Plan(step, decoded[: self.execution_horizon])
+        return self._plan
+
+    @property
+    def plan(self) -> Plan | None:
+        """The active plan, exposed read-only for telemetry and tests."""
+        return self._plan
+
+    def action_at(self, step: int) -> np.ndarray:
+        if self._plan is None:
+            raise RuntimeError("no active plan")
+        return self._plan.action_at(step)
+
+
+def resolve_execution_horizon(args: argparse.Namespace) -> int:
+    explicit = getattr(args, "execution_horizon", None)
+    legacy = getattr(args, "execute_steps", None)
+    if explicit is not None and legacy is not None and explicit != legacy:
+        raise ValueError(
+            "--execution-horizon and legacy --execute-steps disagree: "
+            f"{explicit} != {legacy}"
+        )
+    value = LEGACY_EXECUTION_HORIZON if explicit is None and legacy is None else int(
+        explicit if explicit is not None else legacy
+    )
+    if value not in SUPPORTED_EXECUTION_HORIZONS:
+        raise ValueError(
+            f"--execution-horizon must be one of {SUPPORTED_EXECUTION_HORIZONS}"
+        )
+    return value
 
 
 def parse_args() -> argparse.Namespace:
@@ -1215,11 +1300,17 @@ def parse_args() -> argparse.Namespace:
         "自激对照（2026-08-06 Codex 16-task panel 条件）",
     )
     parser.add_argument(
+        "--execution-horizon",
+        type=int,
+        default=None,
+        choices=SUPPORTED_EXECUTION_HORIZONS,
+        help="部署时每次硬替换执行的动作数；仅支持 1/2/3/6。WMRM world_horizon/cycle_steps 保持 6。",
+    )
+    parser.add_argument(
         "--execute-steps",
         type=int,
-        default=DECISION_STRIDE,
-        help="每决策执行 chunk 的原始步数（决策节奏 = 此值）。SmolVLA 每个原始步都重新"
-        "推理（execute=1），我们默认 6 步/决策——协议差距探针（2026-08-06 Codex）",
+        default=None,
+        help="legacy alias for --execution-horizon (default 6); retained for old launchers.",
     )
     parser.add_argument(
         "--direct-head",
@@ -1234,7 +1325,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="C² 部署（Codex 修正 5）：VA 生成 {ū,c̄,K} 的重规划间隔（原始步）。"
-        "默认 6 = DECISION_STRIDE；token 0..5 顺序消费后重规划",
+        "默认 6，与该 legacy checkpoint 的训练控制步幅一致；token 0..5 顺序消费后重规划",
     )
     parser.add_argument(
         "--feedback-stride",
@@ -2088,9 +2179,9 @@ def run_c2_recovery_eval(
             img = env.render()
             frame_buffer.append(img)
             if step == 0:
-                while len(frame_buffer) < (VISION_WINDOW - 1) * DECISION_STRIDE + 1:
+                while len(frame_buffer) < (VISION_WINDOW - 1) * LEGACY_TRAINING_CONTROL_STRIDE + 1:
                     frame_buffer.insert(0, img)
-            if len(frame_buffer) > (VISION_WINDOW - 1) * DECISION_STRIDE + 1:
+            if len(frame_buffer) > (VISION_WINDOW - 1) * LEGACY_TRAINING_CONTROL_STRIDE + 1:
                 frame_buffer.pop(0)
             indices = list(range(-2 * VISION_WINDOW + 1, 0, 2))
             frames = [frame_buffer[len(frame_buffer) + i] for i in indices]
@@ -2317,6 +2408,9 @@ def build_plan_language_cache(
 
 def main() -> None:
     args = parse_args()
+    args.execution_horizon = resolve_execution_horizon(args)
+    # Keep the old field available to existing validation/reporting callers.
+    args.execute_steps = args.execution_horizon
     wmrm_action_write, wmrm_vision_write = wmrm_ablation_writes(args.wmrm_ablation_mode)
     if args.flow_samples < 1:
         raise ValueError("--flow-samples must be >= 1")
@@ -2775,6 +2869,20 @@ def main() -> None:
     )
 
     features = torch.load(args.features, map_location="cpu", weights_only=True)
+    feature_metadata = features.get("metadata") or {}
+    try:
+        training_control_stride = int(feature_metadata["control_stride"])
+        control_hz = int(feature_metadata["fps"])
+        training_prediction_horizon = int(feature_metadata["action_horizon"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "feature metadata must define integer control_stride, fps, and action_horizon"
+        ) from exc
+    if training_prediction_horizon != config.action_horizon:
+        raise ValueError(
+            "feature/checkpoint action horizon mismatch: "
+            f"{training_prediction_horizon} != {config.action_horizon}"
+        )
     if args.task35_precision_contract or args.task35_causal_ablation != "none":
         all_tasks = features["metadata"]["tasks"]
         selected_early = select_eval_tasks(all_tasks, args.task_ids, args.max_tasks)
@@ -2797,7 +2905,9 @@ def main() -> None:
         # chunk 一次），feedback_stride=1（每原始步刷新读出并消费 token，
         # Codex 修正 5）。
         args.plan_stride = (
-            args.plan_stride if args.plan_stride is not None else DECISION_STRIDE
+            args.plan_stride
+            if args.plan_stride is not None
+            else LEGACY_EXECUTION_HORIZON
         )
         args.feedback_stride = (
             args.feedback_stride if args.feedback_stride is not None else 1
@@ -3131,7 +3241,6 @@ def main() -> None:
                 if servo_runtime is not None
                 else np.zeros((ACTION_HORIZON, 4))
             )
-            chunk_start_step = 0  # 2026-08-06：--execute-steps 变节奏时 chunk 相位
             memory = None
             metric_g_prev = None  # MT-VJ：上一决策的 g_t（ν_t = g_t − g_{t−1}，每 trial 重置）
             success = False
@@ -3145,6 +3254,7 @@ def main() -> None:
             }
             decision_count = 0  # 2026-08-06：--memory-reset-every 的决策计数器
             recorded_chunks: list[list[list[float]]] = []
+            plan_queue = SynchronousPlanQueue(args.execution_horizon)
             plan_step = None  # C²/伺服：上次规划的原始步
             c2_token = 0  # C²/伺服：自规划以来消费的 token 索引
             c2_params = None  # C²：缓存的 {ū, c̄, K}
@@ -3172,9 +3282,9 @@ def main() -> None:
                     # 用首帧重复填充窗口使 step 0 立即推理：与训练首决策窗口同分布
                     # （prepare 的 clip_frame_indices 以 max(0, d-offset*stride)
                     # 钳制，episode 首窗口本身由重复帧组成）。
-                    while len(frame_buffer) < (VISION_WINDOW - 1) * DECISION_STRIDE + 1:
+                    while len(frame_buffer) < (VISION_WINDOW - 1) * LEGACY_TRAINING_CONTROL_STRIDE + 1:
                         frame_buffer.insert(0, img)
-                if len(frame_buffer) > (VISION_WINDOW - 1) * DECISION_STRIDE + 1:
+                if len(frame_buffer) > (VISION_WINDOW - 1) * LEGACY_TRAINING_CONTROL_STRIDE + 1:
                     frame_buffer.pop(0)
                 # 与训练一致的时间升序 [d-6, d-4, d-2, d]（clip_frame_indices 返回
                 # video_start + max(0, d - offset*stride)，offset 升序 → 最老帧在前）
@@ -3583,7 +3693,7 @@ def main() -> None:
                         c2_token += 1
                     else:
                         norm_action = last_norm
-                elif step % args.execute_steps == 0 and len(frame_buffer) >= VISION_WINDOW:
+                elif plan_queue.needs_plan(step) and len(frame_buffer) >= VISION_WINDOW:
                     if (
                         args.memory_reset_every > 0
                         and decision_count > 0
@@ -3782,10 +3892,15 @@ def main() -> None:
                         world_action = None
                         proposal_noise = None
                         if getattr(model, "wmrm", None) is not None:
-                            if model.wmrm.cycle_steps != args.execute_steps:
+                            if (
+                                model.wmrm.cycle_steps
+                                != EXPECTED_WMRM_WORLD_HORIZON
+                            ):
                                 raise ValueError(
-                                    "WAM4VA cycle_steps must equal closed-loop execute_steps: "
-                                    f"{model.wmrm.cycle_steps} != {args.execute_steps}"
+                                    "WAM4VA world_horizon must remain the six-step "
+                                    "training cycle: "
+                                    f"{model.wmrm.cycle_steps} != "
+                                    f"{EXPECTED_WMRM_WORLD_HORIZON}"
                                 )
                             if args.flow_samples != 1:
                                 raise ValueError(
@@ -3896,14 +4011,17 @@ def main() -> None:
                                 ]
                             ).mean(dim=0)
                         chunk = decoded[0].cpu().numpy()
+                        # Standard evaluation uses an absolute-time synchronous plan;
+                        # execution_horizon controls the hard replacement prefix while
+                        # WMRM always consumes its independent six-step world prefix.
+                        plan_queue.replace(step, chunk)
                         if args.record_action_chunks:
                             recorded_chunks.append(chunk.astype(float).tolist())
-                        chunk_start_step = step
                         if args.debug_first_action and not _DEBUG_FA_DONE.get("x"):
                             _DEBUG_FA_DONE["x"] = True
                             print(f"DEBUG first chunk0={np.round(chunk[0], 4)}")
                             if args.align_init and _ALIGN_ACTS is not None:
-                                dc = (step // DECISION_STRIDE)
+                                dc = step // LEGACY_EXECUTION_HORIZON
                                 if dc < len(_ALIGN_ACTS):
                                     ref = _ALIGN_ACTS[dc][0]
                                     print(
@@ -3916,13 +4034,13 @@ def main() -> None:
                 # 存盘即 clip），再反归一化到环境原始动作空间；prev 反馈同样用裁剪值。
                 # servo 部署的 norm_action 由伺服分支给出（clip(ā + correction)），
                 # 不能再用 chunk 覆盖。
-                norm_action = (
-                    np.clip(
-                        chunk[(step - chunk_start_step) % ACTION_HORIZON], -1.0, 1.0
-                    )
-                    if (not config.c2_controller and servo_runtime is None)
-                    else norm_action
-                )
+                if not config.c2_controller and servo_runtime is None:
+                    if plan_queue.needs_plan(step):
+                        raise RuntimeError(
+                            f"synchronous action plan missing at environment step {step}"
+                        )
+                    norm_action = np.clip(plan_queue.action_at(step), -1.0, 1.0)
+
                 action = norm_action * (aq99 - aq01) / 2 + (aq99 + aq01) / 2
                 obs, reward, terminated, truncated, info = env.step(action)
                 last_norm = norm_action
@@ -4059,7 +4177,25 @@ def main() -> None:
                 "low_95": None if ci_low is None else float(ci_low),
                 "high_95": None if ci_high is None else float(ci_high),
             },
-            "execute_steps": int(args.execute_steps),
+            "execute_steps": int(args.execution_horizon),
+            "prediction_horizon": int(config.action_horizon),
+            "execution_horizon": int(args.execution_horizon),
+            "world_horizon": (
+                int(model.wmrm.cycle_steps)
+                if getattr(model, "wmrm", None) is not None
+                else None
+            ),
+            "flow_solver_steps": int(flow_steps),
+            "control_hz": int(control_hz),
+            "training_control_stride": int(training_control_stride),
+            "control_stride": int(training_control_stride),
+            "observation_stride": int(OBSERVATION_STRIDE),
+            "memory_reset_every": int(args.memory_reset_every),
+            "wmrm_mode": (
+                args.wmrm_ablation_mode
+                if getattr(model, "wmrm", None) is not None
+                else "disabled"
+            ),
             "horizon": int(args.horizon),
             "flow_samples": int(args.flow_samples),
             "wam": args.wam,

@@ -7,12 +7,16 @@ PY=${PY:-/home/ryan/.venvs/pytorch-gpu/bin/python}
 CHECKPOINT=${CHECKPOINT:-checkpoints/mw_hard2_wam4va_visualmotion_actionrankcap02_v1.formal_12330_to_20000_s15000.pt}
 FEATURES=${FEATURES:-data/metaworld_longtraj_windows_h48_asm_doorunlock.pt}
 DINO=${DINO:-/home/ryan/.cache/huggingface/hub/models--timm--vit_large_patch14_reg4_dinov2.lvd142m/snapshots/f3c408e77602bb412aa65fb03dfa0d5f95cb3832/model.safetensors}
-TRIALS=${TRIALS:-3}
-HORIZON=${HORIZON:-60}
-EXECUTE_STEPS=${EXECUTE_STEPS:-6}
+# MetaWorld closed-loop validity: use the same episode budget as the formal
+# H=500 protocol. H=60 and n=3 produced the 0/6 floor effect in v1/v2 because
+# e.g. task16 seed 16003 only succeeds after step 60, and the first three
+# task16 seeds are known zero-success under this checkpoint.
+TRIALS=${TRIALS:-10}
+HORIZON=${HORIZON:-500}
+EXECUTION_HORIZON=${EXECUTION_HORIZON:-6}
 TASK_IDS=${TASK_IDS:-0,16}
 DEVICE=${DEVICE:-cuda}
-OUT_PREFIX=${OUT_PREFIX:-logs/wmrm_ablation_step15000}
+OUT_PREFIX=${OUT_PREFIX:-logs/wmrm_ablation_step15000_h500_v3}
 DRY_RUN=${DRY_RUN:-0}
 LOCK=${LOCK:-/tmp/ora0_wam4va_visualmotion_train.lock}
 MODES=(normal action-off vision-off both-off proposal-only)
@@ -26,10 +30,11 @@ for path in "$CHECKPOINT" "$FEATURES" "$DINO" eval_metaworld.py; do
 done
 [[ "$TRIALS" =~ ^[1-9][0-9]*$ ]] || fail "TRIALS must be a positive integer"
 [[ "$HORIZON" =~ ^[1-9][0-9]*$ ]] || fail "HORIZON must be a positive integer"
-[[ "$EXECUTE_STEPS" == 6 ]] || fail "EXECUTE_STEPS must remain 6 for this WMRM protocol"
+[[ "$HORIZON" -ge 500 ]] || fail "HORIZON must be >= 500 for this formal MetaWorld ablation (H=60 truncated known-success seeds)"
+[[ "$EXECUTION_HORIZON" =~ ^(1|2|3|6)$ ]] || fail "EXECUTION_HORIZON must be one of 1,2,3,6"
 [[ "$DRY_RUN" == 0 || "$DRY_RUN" == 1 ]] || fail "DRY_RUN must be 0 or 1"
 
-"$PY" -B - "$CHECKPOINT" "$EXECUTE_STEPS" <<'PY'
+"$PY" -B - "$CHECKPOINT" <<'PY'
 import sys, torch
 payload = torch.load(sys.argv[1], map_location="cpu", weights_only=True)
 config = payload.get("config") or {}
@@ -38,9 +43,9 @@ if step != 15000:
     raise SystemExit(f"checkpoint must be fixed step15000, got global_step={step!r}")
 if not config.get("wmrm"):
     raise SystemExit("checkpoint config does not enable WMRM")
-if int(config.get("wmrm_cycle_steps", -1)) != int(sys.argv[2]):
-    raise SystemExit("checkpoint wmrm_cycle_steps does not match execute steps")
-print("checkpoint contract: step15000, WMRM enabled, cycle=6", flush=True)
+if int(config.get("wmrm_cycle_steps", -1)) != 6:
+    raise SystemExit("checkpoint wmrm_cycle_steps/world_horizon must remain 6")
+print("checkpoint contract: step15000, WMRM enabled, world_horizon=6", flush=True)
 PY
 
 exec 9>"$LOCK"
@@ -102,13 +107,13 @@ for mode in "${MODES[@]}"; do
     printf 'dry-run mode=%s evaluator-mode=%s log=%s json=%s\n' "$mode" "$evaluator_mode" "$log" "$json"
     continue
   fi
-  printf 'starting mode=%s trials=%s tasks=%s horizon=%s execute=%s\n' "$mode" "$TRIALS" "$TASK_IDS" "$HORIZON" "$EXECUTE_STEPS" | tee "$log"
+  printf 'starting mode=%s trials=%s tasks=%s horizon=%s execute=%s\n' "$mode" "$TRIALS" "$TASK_IDS" "$HORIZON" "$EXECUTION_HORIZON" | tee "$log"
   set -o pipefail
   PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     "$PY" -u -B eval_metaworld.py \
       --checkpoint "$CHECKPOINT" --features "$FEATURES" --main-vision-checkpoint "$DINO" \
-      --task-ids "$TASK_IDS" --trials-per-task "$TRIALS" --execute-steps "$EXECUTE_STEPS" \
+      --task-ids "$TASK_IDS" --trials-per-task "$TRIALS" --execution-horizon "$EXECUTION_HORIZON" \
       --horizon "$HORIZON" --flow-samples 1 --wam off --record-action-chunks \
       --wmrm-ablation-mode "$evaluator_mode" --device "$DEVICE" \
       --output-json "$json" 2>&1 | tee -a "$log"

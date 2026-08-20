@@ -30,10 +30,28 @@ def _load(path: Path) -> dict[str, Any]:
     payload = json.loads(path.read_text())
     if payload.get("contract") != "metaworld_closed_loop_trials_v1":
         raise ValueError(f"unsupported result contract: {path}")
-    required = ("checkpoint_sha256", "task_ids", "trials_per_task", "execute_steps", "horizon", "trials")
+    required = (
+        "checkpoint_sha256", "task_ids", "trials_per_task", "execute_steps",
+        "prediction_horizon", "execution_horizon", "world_horizon",
+        "flow_solver_steps", "control_hz", "training_control_stride",
+        "control_stride", "observation_stride", "memory_reset_every",
+        "wmrm_mode", "horizon", "trials",
+    )
     missing = [key for key in required if key not in payload]
     if missing:
         raise ValueError(f"{path} missing fields: {missing}")
+    if payload["execute_steps"] != payload["execution_horizon"]:
+        raise ValueError(
+            f"execution horizon alias mismatch: {path}; "
+            f"execute_steps={payload['execute_steps']!r}, "
+            f"execution_horizon={payload['execution_horizon']!r}"
+        )
+    if payload["control_stride"] != payload["training_control_stride"]:
+        raise ValueError(
+            f"training control stride alias mismatch: {path}; "
+            f"control_stride={payload['control_stride']!r}, "
+            f"training_control_stride={payload['training_control_stride']!r}"
+        )
     return payload
 
 
@@ -59,6 +77,19 @@ def _validate_provenance(payload: dict[str, Any], path: Path, mode: str) -> None
     )
     expected = MODE_PROVENANCE[mode]
     actual = tuple(payload.get(field) for field in fields)
+    expected_wmrm_mode = {
+        "normal": "normal",
+        "action-off": "action-write-off",
+        "vision-off": "vision-write-off",
+        "both-off": "both-write-off",
+        "proposal-only": "proposal-only",
+    }[mode]
+    if payload.get("wmrm_mode") != expected_wmrm_mode:
+        raise ValueError(
+            f"WMRM mode provenance mismatch for mode {mode}: {path}; "
+            f"expected wmrm_mode={expected_wmrm_mode!r}, "
+            f"got {payload.get('wmrm_mode')!r}"
+        )
     if any(type(value) is not bool for value in actual) or actual != expected:
         raise ValueError(
             f"WMRM provenance mismatch for mode {mode}: {path}; "
@@ -88,9 +119,15 @@ def analyze(paths: list[Path]) -> dict[str, Any]:
         raise ValueError("normal baseline JSON is required")
 
     base_path, base = by_mode["normal"]
+    protocol_fields = (
+        "prediction_horizon", "execution_horizon", "world_horizon",
+        "flow_solver_steps", "control_hz", "training_control_stride",
+        "control_stride", "observation_stride", "memory_reset_every",
+    )
     identity = (
         base["checkpoint_sha256"], tuple(base["task_ids"]), int(base["trials_per_task"]),
         int(base["execute_steps"]), int(base["horizon"]),
+        tuple(base[field] for field in protocol_fields),
     )
     base_trials = {_trial_key(row): row for row in base["trials"]}
     if len(base_trials) != len(base["trials"]):
@@ -103,6 +140,7 @@ def analyze(paths: list[Path]) -> dict[str, Any]:
         "trials_per_task": identity[2],
         "execute_steps": identity[3],
         "horizon": identity[4],
+        **dict(zip(protocol_fields, identity[5], strict=True)),
         "baseline": str(base_path),
         "modes": [],
     }
@@ -113,6 +151,7 @@ def analyze(paths: list[Path]) -> dict[str, Any]:
         candidate_identity = (
             payload["checkpoint_sha256"], tuple(payload["task_ids"]), int(payload["trials_per_task"]),
             int(payload["execute_steps"]), int(payload["horizon"]),
+            tuple(payload[field] for field in protocol_fields),
         )
         if candidate_identity != identity:
             raise ValueError(f"protocol/checkpoint mismatch: {path}")
@@ -135,16 +174,25 @@ def analyze(paths: list[Path]) -> dict[str, Any]:
         first_l1: list[float] = []
         chunk_l1: list[float] = []
         paired_chunks = 0
+        truncated_pairs = 0
         for key in sorted(trials):
             base_chunks, candidate_chunks = _chunks(base_trials[key]), _chunks(trials[key])
             if base_chunks is None or candidate_chunks is None:
                 continue
-            if candidate_chunks.shape != base_chunks.shape:
+            # Trials can terminate at different decisions (success/truncation).
+            # Compare the overlapping prefix so one early success does not make
+            # the paired action-divergence summary fail.
+            if candidate_chunks.shape[1:] != base_chunks.shape[1:]:
                 raise ValueError(
-                    f"action chunk shape mismatch for mode {mode}, trial {key}: "
-                    f"{path} has {candidate_chunks.shape}, baseline has {base_chunks.shape}"
+                    f"action chunk per-decision shape mismatch for mode {mode}, "
+                    f"trial {key}: {path} has {candidate_chunks.shape[1:]}, "
+                    f"baseline has {base_chunks.shape[1:]}"
                 )
-            diff = np.abs(candidate_chunks - base_chunks)
+            paired_decisions = min(base_chunks.shape[0], candidate_chunks.shape[0])
+            if paired_decisions == 0:
+                continue
+            truncated_pairs += int(candidate_chunks.shape != base_chunks.shape)
+            diff = np.abs(candidate_chunks[:paired_decisions] - base_chunks[:paired_decisions])
             first_l1.append(float(diff[0, 0].mean()))
             chunk_l1.append(float(diff.mean()))
             paired_chunks += 1
@@ -158,6 +206,8 @@ def analyze(paths: list[Path]) -> dict[str, Any]:
         mode_row["action_divergence"] = {
             "supported": paired_chunks == len(trials),
             "paired_trials": paired_chunks,
+            "truncated_trials": truncated_pairs,
+            "comparison": "overlapping decision prefix",
             "first_action_l1_mean": float(np.mean(first_l1)) if first_l1 else None,
             "chunk_l1_mean": float(np.mean(chunk_l1)) if chunk_l1 else None,
         }
