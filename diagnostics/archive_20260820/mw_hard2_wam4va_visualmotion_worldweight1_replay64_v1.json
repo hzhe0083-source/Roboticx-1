@@ -1,0 +1,34 @@
+{
+  "arm": "A",
+  "contract": "visualmotion_world_weight_ab_64_v1",
+  "end_step": 12074,
+  "log": "/home/ryan/Documents/robot/ORA0/logs/mw_hard2_wam4va_visualmotion_worldweight1_replay64_v1.train.log",
+  "metrics": {
+    "flow": {
+      "max": 0.428778,
+      "median": 0.178782,
+      "min": 0.059354,
+      "p95": 0.33139854999999974
+    },
+    "grad": {
+      "max": 10.706285,
+      "median": 1.9245459999999999,
+      "min": 0.596468,
+      "p95": 3.905163399999999
+    },
+    "static": {
+      "max": 0.0315,
+      "median": 0.01525,
+      "min": 0.00439,
+      "p95": 0.02810899999999999
+    },
+    "world": {
+      "max": 7.48342,
+      "median": 0.243409,
+      "min": 0.073979,
+      "p95": 5.762796249999999
+    }
+  },
+  "start_step": 12011,
+  "updates": 64
+}

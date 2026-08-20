@@ -1,0 +1,27 @@
+{
+  "checkpoint": "/home/ryan/Documents/robot/ORA0/checkpoints/mw_hard2_wam4va_visualmotion_staticweight2_validation64_v1.pt",
+  "contract": "visualmotion_static_weight_2_validation_64_v1",
+  "decision": "NO-GO",
+  "gates": {
+    "any_16_grad_over_20_count_le_1": true,
+    "final32_flow_finite": true,
+    "finite_and_error_free": true,
+    "grad_max_le_50": true,
+    "last32_static_max_le_0_02": false,
+    "world_last16_over_first16_le_2": true
+  },
+  "log": "/home/ryan/Documents/robot/ORA0/logs/mw_hard2_wam4va_visualmotion_staticweight2_validation64_v1.train.log",
+  "observed": {
+    "flow_final32_median": 0.1563585,
+    "grad_max": 5.006327,
+    "grad_over_20_max_in_16": 0,
+    "last32_static_max": 0.0332,
+    "last32_static_max_by_task": {
+      "assembly-v3": 0.0332,
+      "door-unlock-v3": 0.02266
+    },
+    "world_ratio": 0.9939430674792538
+  },
+  "passed": false,
+  "updates": 64
+}

@@ -1,0 +1,39 @@
+{
+  "checkpoint": "/home/ryan/Documents/robot/ORA0/checkpoints/mw_hard2_wam4va_visualmotion_actionrankcap02_validation256_v1.pt",
+  "contract": "visualmotion_action_rank_cap_02_validation_256_v1",
+  "decision": "PASS",
+  "gates": {
+    "finite_and_error_free": true,
+    "flow_final32_finite": true,
+    "flow_median_le_2x_previous_static2": true,
+    "grad_max_le_50": true,
+    "per_task_final32_static_median_le_0_025": true,
+    "per_task_final32_static_median_le_2x_early": true,
+    "raw_static_emergency_max_le_0_05": true,
+    "repeated_grad_over_20_le_1_per_16": true,
+    "world_trend_le_2": true
+  },
+  "log": "/home/ryan/Documents/robot/ORA0/logs/mw_hard2_wam4va_visualmotion_actionrankcap02_validation256_v1.train.log",
+  "observed": {
+    "early32_static_median_by_task": {
+      "assembly-v3": 0.02002,
+      "door-unlock-v3": 0.013590000000000001
+    },
+    "final32_static_median_by_task": {
+      "assembly-v3": 0.019084999999999998,
+      "door-unlock-v3": 0.01352
+    },
+    "final_to_early_static_ratio_by_task": {
+      "assembly-v3": 0.9532967032967032,
+      "door-unlock-v3": 0.9948491537895511
+    },
+    "flow_final32_median": 0.16019450000000002,
+    "grad_max": 4.486231,
+    "grad_over_20_max_count_in_16": 0,
+    "previous_static2_flow_final32_median": 0.1563585,
+    "raw_static_max": 0.0294,
+    "world_final32_over_early32": 0.8763659426034565
+  },
+  "passed": true,
+  "updates": 256
+}
