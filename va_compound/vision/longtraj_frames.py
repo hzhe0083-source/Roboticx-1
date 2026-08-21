@@ -20,7 +20,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent
 ACTION_MASK_KEYS = ("action_valid_mask", "horizon_mask")
 PEER_SYNC_H6_CONTRACT = "peer_sync_h6_world_windows_v1"
 
