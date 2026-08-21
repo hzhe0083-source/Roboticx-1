@@ -1,10 +1,12 @@
-"""C²-IRF v2 Step 4：多层输出（encode_multi）与高频残差（residuals.py）。
+"""C²-IRF v2 Step 4：多层输出（encode_multi）。
 
 设计文档（artifacts/c2irf_v2_vision_ablation.md §五/§七/§九）：H⁵/H¹¹ 一次
-前向取回（官方原生 out_layers，返回列表顺序与 out_layers 一致），
-R_t⁵ = P_5(H_t⁵) − Up(Pool(P_5(H_t⁵))) 作为 value 侧高频残差；V-JEPA 权重
+前向取回（官方原生 out_layers，返回列表顺序与 out_layers 一致）；V-JEPA 权重
 冻结，多层输出只作只读 evidence。全部用例 CPU 可跑——伪官方 V-JEPA 模拟
 blocks/norm/out_layers 契约，不加载真实 checkpoint。
+
+高频残差部件（``HighFreqResidual``/``ResidualValueConcat``）已归档到
+``archives/c2irf_v2_step4/``。
 """
 from __future__ import annotations
 
@@ -24,7 +26,6 @@ from va_compound.live_vjepa import (
     VISION_WINDOW,
     encode_live_frames,
 )
-from va_compound.residuals import HighFreqResidual, ResidualValueConcat
 
 DIM = 16  # 伪 V-JEPA 特征维（越小越快，CPU 即可跑）
 
@@ -181,109 +182,6 @@ class TestEncodeMulti(unittest.TestCase):
             backbone.encode_multi(torch.randn(2, 3, 3, 16, 16))  # 帧数非偶
 
 
-class TestHighFreqResidual(unittest.TestCase):
-    def _head(self, in_dim: int = 8, aux_dim: int = 8, grid=(24, 24)) -> HighFreqResidual:
-        return HighFreqResidual(in_dim=in_dim, aux_dim=aux_dim, grid=grid)
-
-    def test_output_shape(self) -> None:
-        R5 = self._head()(torch.randn(2, 1152, 8))
-        assert tuple(R5.shape) == (2, 1152, 8)
-
-    def test_288_token_grid_supported(self) -> None:
-        """ST288（12×12）网格同样可用（t_grid 推断，2 时间片）。"""
-        R5 = HighFreqResidual(in_dim=8, aux_dim=4, grid=(12, 12))(torch.randn(1, 288, 8))
-        assert tuple(R5.shape) == (1, 288, 4)
-
-    def test_constant_cells_vanish(self) -> None:
-        """2×2 胞内空间常数 → Pool 后上采样还原 → 残差恒 0（高频残差的定义）。"""
-        head = self._head()
-        with torch.no_grad():
-            head.proj.bias.zero_()
-        base = torch.randn(2, 2, 12, 12, 8)
-        H5 = base.repeat_interleave(2, dim=2).repeat_interleave(2, dim=3).reshape(2, 1152, 8)
-        R5 = head(H5)
-        assert torch.allclose(R5, torch.zeros_like(R5), atol=1e-6)
-
-    def test_checkerboard_recovered_exactly(self) -> None:
-        """±1 棋盘（每 2×2 胞均值 0）→ Up(Pool(·)) = 0 → 残差 == P_5 投影本身。"""
-        head = self._head()
-        with torch.no_grad():
-            head.proj.bias.zero_()
-        rows = []
-        for y in range(24):
-            for x in range(24):
-                rows.append(1.0 if (y + x) % 2 == 0 else -1.0)
-        checker = torch.tensor(rows).view(1, 1, 24, 24, 1)
-        checker = checker.expand(1, 2, 24, 24, 8).reshape(1, 1152, 8)
-        H5 = checker * torch.arange(1, 9).view(1, 1, 8)  # 各通道不同幅度，防退化
-        R5 = head(H5)
-        with torch.no_grad():
-            expected = head.proj(H5)
-        assert torch.allclose(R5, expected, atol=1e-5)
-
-    def test_grid_alignment_with_dense_coords(self) -> None:
-        """残差 token 顺序与 _dense_coords 同一 t→y→x 网格：单点脉冲的 2×2 胞足迹。"""
-        from va_compound.live_vjepa import _dense_coords
-
-        head = HighFreqResidual(in_dim=4, aux_dim=4)
-        with torch.no_grad():
-            head.proj.bias.zero_()
-        coords = _dense_coords()  # [1152, 3]
-        t, y, x = 1, 10, 12
-        idx = t * 24 * 24 + y * 24 + x
-        half = (24 - 1) / 2
-        assert np.allclose(coords[idx], [t * 2.0 - 1.0, (y - half) / half, (x - half) / half])
-        H5 = torch.zeros(1, 1152, 4)
-        H5[0, idx] = torch.tensor([1.0, -1.0, 2.0, 0.5])
-        R5 = head(H5)
-        cy, cx = (y // 2) * 2, (x // 2) * 2  # 脉冲所在 2×2 胞的左上角
-        in_cell = torch.zeros(1, 1152, dtype=torch.bool)
-        for dy in range(2):
-            for dx in range(2):
-                in_cell[0, t * 576 + (cy + dy) * 24 + (cx + dx)] = True
-        assert bool(R5[0][in_cell[0]].abs().sum() > 0)  # 胞内非零（脉冲 + 均值泄漏）
-        assert bool(R5[0][~in_cell[0]].abs().sum() == 0)  # 胞外精确为零
-
-    def test_gradients_flow_to_proj(self) -> None:
-        head = self._head(in_dim=8, aux_dim=8).train()
-        head(torch.randn(2, 1152, 8)).pow(2).mean().backward()
-        assert head.proj.weight.grad is not None
-        assert bool(head.proj.weight.grad.abs().sum() > 0)
-        assert head.proj.bias.grad is not None
-
-    def test_validation_errors(self) -> None:
-        with pytest.raises(ValueError, match="multiple"):
-            HighFreqResidual(in_dim=8, aux_dim=4, grid=(24, 24))(torch.randn(2, 288, 8))
-        with pytest.raises(ValueError, match="even"):
-            HighFreqResidual(in_dim=8, aux_dim=4, grid=(23, 24))
-        with pytest.raises(ValueError, match=r"\[B, N, in_dim\]"):
-            HighFreqResidual(in_dim=8, aux_dim=4)(torch.randn(2, 1152, 8, 8))
-
-
-class TestResidualValueConcat(unittest.TestCase):
-    def test_concat_shapes_and_values(self) -> None:
-        concat = ResidualValueConcat(h11_dim=16, value_dim=8)
-        H11 = torch.randn(2, 1152, 16)
-        R5 = torch.randn(2, 1152, 8)
-        V = concat(H11, R5)
-        assert tuple(V.shape) == (2, 1152, 16)  # value_dim + aux_dim
-        assert torch.allclose(V[..., 8:], R5)  # R5 原样拼接
-        with torch.no_grad():
-            expected = concat.proj(H11)
-        assert torch.allclose(V[..., :8], expected)  # H11 侧经 P_V 投影
-
-    def test_shape_mismatch_rejected(self) -> None:
-        concat = ResidualValueConcat(h11_dim=16, value_dim=8)
-        with pytest.raises(ValueError, match="batch/token"):
-            concat(torch.randn(2, 1152, 16), torch.randn(3, 1152, 8))
-        with pytest.raises(ValueError, match="batch/token"):
-            concat(torch.randn(2, 1152, 16), torch.randn(2, 288, 8))
-
-    def test_gradients_flow_through_both_inputs(self) -> None:
-        concat = ResidualValueConcat(h11_dim=16, value_dim=8).train()
-        concat(torch.randn(2, 1152, 16), torch.randn(2, 1152, 8)).pow(2).mean().backward()
-        assert concat.proj.weight.grad is not None
-        assert bool(concat.proj.weight.grad.abs().sum() > 0)
 
 
 class _FakeBackboneMulti:
