@@ -8,6 +8,7 @@ future-visual shortcut to the predictor.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import math
 
 import torch
@@ -690,6 +691,190 @@ def visual_world_loss(
         top10_mask=top10_mask.view(prediction.shape[0], prediction.shape[2], prediction.shape[3]),
         static_mask=static_mask.view(prediction.shape[0], prediction.shape[2], prediction.shape[3]),
     )
+
+
+def _world_task_ids(
+    batch: dict[str, Tensor], time_index: int, device: torch.device
+) -> Tensor:
+    task_id = batch.get("task_id")
+    if task_id is None:
+        task_id = batch.get("task_ids")
+    if task_id is None:
+        task_id = batch.get("instruction_id")
+    if task_id is None:
+        raise ValueError("visual World supervision requires per-sample task ids")
+    task_id = torch.as_tensor(task_id, device=device)
+    if task_id.ndim > 1:
+        task_id = task_id[:, time_index]
+    if task_id.ndim != 1 or task_id.shape[0] != batch["actions"].shape[0]:
+        raise ValueError("World task ids must have shape [B] or [B,T]")
+    return task_id.to(dtype=torch.long)
+
+
+def _nearest_cross_episode_donors(
+    proprio: Tensor,
+    task_ids: Tensor,
+    episode_ids: Tensor,
+    eligible: Tensor,
+) -> Tensor:
+    """Return deterministic proprio-nearest cross-episode donor indices."""
+
+    batch = proprio.shape[0]
+    if proprio.ndim != 2:
+        raise ValueError("proprio must be [B,P]")
+    if task_ids.ndim != 1 or task_ids.shape[0] != batch:
+        raise ValueError("task_ids must be [B]")
+    if episode_ids.ndim != 1 or episode_ids.shape[0] != batch:
+        raise ValueError("episode_ids must be [B]")
+    if eligible.ndim != 1 or eligible.shape[0] != batch or eligible.dtype != torch.bool:
+        raise ValueError("eligible must be bool [B]")
+
+    state = proprio.detach().to(device="cpu", dtype=torch.float64)
+    task = task_ids.detach().to(device="cpu", dtype=torch.int64)
+    episode = episode_ids.detach().to(device="cpu", dtype=torch.int64)
+    eligible = eligible.detach().to(device="cpu", dtype=torch.bool)
+    donors = torch.full((batch,), -1, dtype=torch.int64)
+    for row in range(batch):
+        if not bool(eligible[row]):
+            continue
+        candidate = eligible & task.eq(task[row]) & ~episode.eq(episode[row])
+        if not bool(candidate.any()):
+            continue
+        distance = (state - state[row]).square().sum(dim=-1)
+        distance.masked_fill_(~candidate, float("inf"))
+        donors[row] = int(distance.argmin())
+    return donors
+
+
+def prepare_visual_world_action_ranking(
+    payload: dict,
+    *,
+    planning_stride: int = 6,
+) -> dict[str, object]:
+    """Attach the fixed train-split shuffled-action table to a dataset payload."""
+
+    from va_compound.world_contract import (
+        PEER_PLANNING_STRIDES,
+        WORLD_ACTION_DONOR_CONTRACT,
+    )
+
+    if planning_stride not in PEER_PLANNING_STRIDES:
+        raise ValueError("planning_stride must be one of 1/2/3/6")
+
+    actions = torch.as_tensor(payload["actions"])
+    proprio = torch.as_tensor(payload["proprio"])
+    task_ids = torch.as_tensor(payload["instruction_id"], dtype=torch.int64)
+    episode_ids = torch.as_tensor(payload["episode_id"], dtype=torch.int64)
+    valid = transition_mask(
+        torch.as_tensor(payload["action_valid_mask"]),
+        cycle_steps=planning_stride,
+    )
+    rows, times = torch.nonzero(valid, as_tuple=True)
+    flat_actions = actions[rows, times, :planning_stride]
+    flat_proprio = proprio[rows, times]
+    flat_tasks = task_ids[rows]
+    flat_episodes = episode_ids[rows]
+    donors = _nearest_cross_episode_donors(
+        flat_proprio,
+        flat_tasks,
+        flat_episodes,
+        torch.ones(rows.numel(), dtype=torch.bool),
+    )
+    if bool((donors < 0).any()):
+        raise ValueError("visual World action ranking found a transition without a donor")
+    shuffled = flat_actions.index_select(0, donors)
+    distinct = shuffled.ne(flat_actions).any(dim=(1, 2))
+    table = actions.new_zeros(
+        (
+            actions.shape[0],
+            actions.shape[1] - 1,
+            planning_stride,
+            actions.shape[-1],
+        )
+    )
+    table[rows, times] = shuffled
+    rank_mask = torch.zeros_like(valid)
+    rank_mask[rows, times] = distinct
+    payload["world_rank_shuffle_action"] = table
+    payload["world_rank_shuffle_mask"] = rank_mask
+
+    identity = torch.stack((rows, times, donors, distinct.to(torch.int64)), dim=1)
+    digest = hashlib.sha256(identity.contiguous().numpy().tobytes()).hexdigest()
+    return {
+        "world_action_donor_contract": WORLD_ACTION_DONOR_CONTRACT,
+        "world_action_donor_sha256": digest,
+        "world_action_donor_transitions": int(rows.numel()),
+        "world_action_rank_transitions": int(distinct.sum()),
+    }
+
+
+def _summarize_visual_world_metrics(
+    final_records: list[dict[str, Tensor]],
+    stage_records: list[list[tuple[Tensor, Tensor, Tensor]]],
+) -> dict[int, dict[str, object]]:
+    """Reduce final-stage World/copy metrics independently for each task."""
+
+    if not final_records:
+        return {}
+    task_values = sorted(
+        {
+            int(value)
+            for record in final_records
+            for value in torch.unique(record["task_ids"]).detach().cpu()
+        }
+    )
+    output: dict[int, dict[str, object]] = {}
+    metric_names = (
+        "world_all",
+        "copy_all",
+        "world_motion",
+        "copy_motion",
+        "world_top10",
+        "copy_top10",
+        "world_static",
+        "copy_static",
+        "motion_energy",
+    )
+    for task_id in task_values:
+        masks = [
+            record["valid"] & record["task_ids"].eq(task_id)
+            for record in final_records
+        ]
+        reduced = {
+            name: float(
+                masked_reduction(
+                    [record[name] for record in final_records], masks
+                ).detach()
+            )
+            for name in metric_names
+        }
+        reduced["gain_all"] = reduced["copy_all"] - reduced["world_all"]
+        reduced["gain_motion"] = (
+            reduced["copy_motion"] - reduced["world_motion"]
+        )
+        copy_top10 = float(reduced["copy_top10"])
+        reduced["relative_gain_top10"] = (
+            (copy_top10 - float(reduced["world_top10"])) / copy_top10
+            if copy_top10 > 0.0
+            else 0.0
+        )
+        reduced["transitions"] = sum(int(mask.sum().item()) for mask in masks)
+        per_stage = []
+        for records in stage_records:
+            stage_masks = [
+                valid & task_ids.eq(task_id)
+                for task_ids, valid, _ in records
+            ]
+            per_stage.append(
+                float(
+                    masked_reduction(
+                        [value for _, _, value in records], stage_masks
+                    ).detach()
+                )
+            )
+        reduced["stage_losses"] = per_stage
+        output[task_id] = reduced
+    return output
 
 
 __all__ = [
