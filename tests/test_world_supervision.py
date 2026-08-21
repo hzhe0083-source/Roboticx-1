@@ -1037,7 +1037,10 @@ def test_v9_penalties_keep_empty_transition_reduction_connected() -> None:
 
 
 def test_stage_weights_decay_toward_the_final_refinement() -> None:
-    assert stage_supervision_weights(4) == (0.25**3, 0.25**2, 0.25, 1.0)
+    assert stage_supervision_weights(4, floor=0.0) == (0.25**3, 0.25**2, 0.25, 1.0)
+    assert stage_supervision_weights(4) == (0.1, 0.1, 0.25, 1.0)
+    assert stage_supervision_weights(8)[0] == 0.1
+    assert stage_supervision_weights(8)[-1] == 1.0
     assert stage_supervision_weights(1) == (1.0,)
     assert stage_supervision_weights(0) == ()
 

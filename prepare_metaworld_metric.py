@@ -57,9 +57,16 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))  # 仓库根绝对 import 兼容（契约「开发约定」）
 
-os.environ.setdefault("MUJOCO_GL", "egl")
-os.environ.setdefault("EGL_PLATFORM", "surfaceless")
-os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+# PYOPENGL_PLATFORM has to follow the resolved MUJOCO_GL, not default
+# independently: mujoco.gl_context refuses to import when MUJOCO_GL=osmesa while
+# PYOPENGL_PLATFORM=egl, and every training launcher exports MUJOCO_GL=osmesa
+# (no /dev/dri in this container, so EGL falls back to llvmpipe anyway).  A
+# hard-coded egl default here only surfaces at the first
+# --mtvj-visual-aux-every step, i.e. tens of minutes into a run.
+_MUJOCO_GL = os.environ.setdefault("MUJOCO_GL", "egl")
+if _MUJOCO_GL == "egl":
+    os.environ.setdefault("EGL_PLATFORM", "surfaceless")
+    os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
 from scripts.build_longtraj_features import ENV_TO_TASK  # noqa: E402
 

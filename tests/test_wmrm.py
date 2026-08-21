@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 
@@ -973,7 +975,15 @@ def test_st_predictor_recurrent_map_uses_stable_residual_gradient() -> None:
     )
 
 
-def test_belief_recurrence_uses_identity_gradient_and_trains_current_update() -> None:
+def test_belief_recurrence_is_gated_and_keeps_crediting_earlier_stages() -> None:
+    """门控写入取代了原来的恒等 credit path，但 credit 仍然到得了上一 stage。
+
+    原契约是 ``belief = belief + f``，对上一 stage 的梯度精确等于 cotangent（I）。
+    该形式实测谱半径 1.331 而在闭环第 159 个决策点发散到 NaN，现改为
+    ``belief <- norm(g*update + (1-g)*belief)``。代价是梯度不再恒等（凸组合的
+    ``1-g < 1`` 是收缩的），换来的是前向有界，以及门能看见已积累的记忆——
+    "根据已有记忆决定写多少"从此可学。
+    """
     block = WAM4VA(
         32,
         world_dim=8,
@@ -1008,11 +1018,139 @@ def test_belief_recurrence_uses_identity_gradient_and_trains_current_update() ->
     cotangent = torch.randn_like(proposal.next_world_state.belief)
     (proposal.next_world_state.belief * cotangent).sum().backward()
 
-    torch.testing.assert_close(previous_belief.grad, cotangent)
+    assert previous_belief.grad is not None
+    assert torch.isfinite(previous_belief.grad).all()
+    assert float(previous_belief.grad.abs().sum()) > 0
+    assert not torch.allclose(previous_belief.grad, cotangent)
     assert block.belief_write.o.weight.grad is not None
     assert float(block.belief_write.o.weight.grad.abs().sum()) > 0
     assert block.evidence_from_belief.weight.grad is not None
     assert float(block.evidence_from_belief.weight.grad.abs().sum()) > 0
+    # 门收到梯度 == "根据已积累的记忆决定写多少"是被优化的量。
+    assert block.belief_gate.weight.grad is not None
+    assert float(block.belief_gate.weight.grad.abs().sum()) > 0
+
+
+def test_belief_gate_output_lies_between_memory_and_update() -> None:
+    """门控写入是逐通道凸组合，输出必须夹在记忆与更新之间。"""
+    from va_compound.wmrm import _gate_fuse
+
+    torch.manual_seed(0)
+    gate = torch.nn.Linear(2 * 16, 16)
+    memory = torch.randn(3, 4, 16)
+    update = torch.randn(3, 4, 16)
+    fused = _gate_fuse(gate, memory, update)
+
+    lower = torch.minimum(memory, update)
+    upper = torch.maximum(memory, update)
+    assert bool((fused >= lower - 1e-6).all())
+    assert bool((fused <= upper + 1e-6).all())
+
+
+def test_stage_embed_is_not_written_into_persistent_belief() -> None:
+    """Stage embed is MemoryVLA-style query-time PE, not a bank entry.
+
+    If it were added into WAMState.belief, a constant channel shift would
+    survive RMSNorm as near-zero per-token std.  The persistent state must
+    keep the structure of the gated update instead.
+    """
+    torch.manual_seed(0)
+    block = WAM4VA(32, world_dim=8, proprio_dim=9)
+    with torch.no_grad():
+        block.stage_embed.weight.zero_()
+        block.stage_embed.weight[3].fill_(4.0)
+    previous = torch.zeros(2, 8, 32)
+    proposal = block.propose(
+        torch.randn(2, 5, 32),
+        torch.randn(2, 6, 32),
+        torch.randn(2, 9),
+        state=WAMState(belief=previous),
+        stage_index=3,
+    )
+    persisted = proposal.next_world_state.belief
+    assert torch.isfinite(persisted).all()
+    assert float(persisted.detach().std(dim=-1).mean()) > 0.05
+
+
+def test_stage0_reanchors_world_map_to_current_observation() -> None:
+    """Each decision starts map residual from the current DINO last frame.
+
+    Stages 1-7 still refine the in-decision map.  A huge previous_map must
+    not leak into stage 0's residual base.
+    """
+    torch.manual_seed(0)
+    block = WAM4VA(
+        32,
+        world_dim=8,
+        proprio_dim=9,
+        dino_dim=8,
+        map_size=4,
+        map_frames=2,
+        map_grid=4,
+        world_grid=4,
+        env_action_dim=4,
+        predictor="st_blocks",
+        predictor_depth=1,
+        predictor_width=32,
+        predictor_heads=4,
+    )
+    action = torch.randn(2, 6, 32)
+    vision = torch.randn(2, 7, 32)
+    proprio = torch.randn(2, 9)
+    tokens = torch.randn(2, 32, 8)
+    env = torch.randn(2, 6, 4)
+    stale = torch.full((2, 8, 4, 4), 50.0)
+    fresh = WAMState(world_map=stale)
+    stage0 = block.propose(
+        action, vision, proprio, state=fresh, dino_tokens=tokens,
+        env_action=env, stage_index=0,
+    )
+    stage1 = block.propose(
+        action, vision, proprio, state=fresh, dino_tokens=tokens,
+        env_action=env, stage_index=1,
+    )
+    assert stage0.aux.z_tokens is not None and stage1.aux.z_tokens is not None
+    assert float(stage0.aux.z_tokens.detach().abs().mean()) < 10.0
+    assert float(stage1.aux.z_tokens.detach().abs().mean()) > 20.0
+
+
+def test_belief_stays_bounded_past_deployment_recursion_depth() -> None:
+    """闭环递推深度远超训练窗口时 belief 仍有界。
+
+    纯加法写入展开是 ``belief <- (I - KH) belief + K evidence``，稳定条件
+    ``rho(I - KH) < 1`` 从未被约束。闭环实测 rho = 1.331（每决策点），训练只展开
+    4 个决策点即 1.331^4 = 3.14 倍所以看不见，而决策点 145 时 |belief| = 1.76e19、
+    146 溢出 float32、159 时 world_message 变 NaN。
+
+    这里把放大器 ``evidence_from_belief`` 显式放大 20 倍（加法写入下必然更快爆），
+    门权重也给成非常数，再跑 1200 次 propose = 150 个决策点，超过实测发散点。
+    """
+    torch.manual_seed(0)
+    block = WAM4VA(32, world_dim=8, proprio_dim=9)
+    with torch.no_grad():
+        block.evidence_from_belief.weight.mul_(20.0)
+        block.belief_gate.weight.normal_(std=0.5)
+    block.eval()
+    action = torch.randn(2, 5, 32)
+    vision = torch.randn(2, 6, 32)
+    proprio = torch.randn(2, 9)
+
+    norms: list[float] = []
+    state = None
+    with torch.no_grad():
+        for step in range(1200):
+            proposal = block.propose(
+                action, vision, proprio, state=state, stage_index=step % 8
+            )
+            state = proposal.next_world_state
+            norms.append(float(state.belief.norm()))
+
+    assert all(math.isfinite(value) for value in norms)
+    early, late = max(norms[:80]), max(norms[800:])
+    assert late <= 2.0 * early, (
+        f"belief grew {late / early:.2f}x over 150 decisions "
+        f"(early={early:.3f}, late={late:.3f})"
+    )
 
 
 def test_world_loss_still_trains_belief_update_after_stable_recurrence() -> None:
@@ -1085,3 +1223,85 @@ def test_previous_map_is_read_not_only_added() -> None:
     )
     assert not torch.allclose(za, zb)
     assert not torch.allclose(za - prev_a, zb - prev_b)
+
+
+def test_belief_read_is_live_so_write_depends_on_accumulated_memory() -> None:
+    """``belief_write`` 的输入不再是常量，"该记什么"因此可学。
+
+    原来 ``belief_context = (belief + stage_embed).detach()``，于是
+    ``evidence_from_belief`` 和 ``belief_write`` 都把已积累的记忆当常量：能学到
+    "这次的加写对后面有没有用"，学不到"根据已有记忆决定写什么"。这里用两个只在
+    传入 belief 上不同的前向，验证同一份证据在不同记忆下产生不同的写入量。
+    """
+    torch.manual_seed(0)
+    block = WAM4VA(32, world_dim=8, proprio_dim=9)
+    block.eval()
+    action = torch.randn(2, 5, 32)
+    vision = torch.randn(2, 6, 32)
+    proprio = torch.randn(2, 9)
+
+    def written_delta(belief: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            proposal = block.propose(
+                action, vision, proprio, state=WAMState(belief=belief), stage_index=1
+            )
+        return proposal.next_world_state.belief - block.belief_norm(belief)
+
+    low = torch.zeros(2, 8, 32)
+    high = torch.randn(2, 8, 32) * 3.0
+    assert not torch.allclose(written_delta(low), written_delta(high), atol=1e-4)
+
+
+def test_world_map_gets_gradient_from_the_belief_memory_path() -> None:
+    """world_map 被优化成"好用的记忆"，而不只是"准确的重建"。
+
+    ``belief_from_world(belief.detach(), world_tokens.detach())`` 曾把两个输入都
+    切断，于是塑造 world_map 的只有重建损失和 VA 消息——唯一能表达"这张图作为跨
+    stage 记忆好不好用"的目标从来到不了它。这里只对最终 belief 求梯度（不碰
+    z_tokens、不碰 world_message），要求梯度仍然穿到 map predictor。
+
+    ``belief_from_world`` 是 ``zero_output()`` 零初始化的，所以在第 0 步到
+    ``world_tokens`` 的雅可比恒为零——撤销 detach 在初始时刻不改变任何梯度。这条路
+    是自启动的：``belief_from_world.o`` 自己能收到梯度（下面一并断言），一旦它离开
+    零点，map 就开始收到"作为记忆好不好用"的信号。测试因此先打破零初始化，验证的
+    是路径存在，而不是初始时刻的数值。
+    """
+    block = WAM4VA(
+        32,
+        world_dim=8,
+        proprio_dim=9,
+        dino_dim=8,
+        map_size=4,
+        map_frames=2,
+        map_grid=4,
+        world_grid=4,
+        env_action_dim=4,
+        predictor="st_blocks",
+        predictor_depth=1,
+        predictor_width=32,
+        predictor_heads=4,
+    )
+    with torch.no_grad():
+        block.belief_from_world.o.weight.normal_(std=0.1)
+    previous_map = torch.randn(2, 8, 4, 4, requires_grad=True)
+    proposal = block.propose(
+        torch.randn(2, 6, 32),
+        torch.randn(2, 7, 32),
+        torch.randn(2, 9),
+        state=WAMState(
+            belief=torch.randn(2, 8, 32),
+            innovation=torch.randn(2, 8, 32),
+            world_map=previous_map,
+        ),
+        dino_tokens=torch.randn(2, 32, 8),
+        env_action=torch.randn(2, 6, 4),
+        stage_index=1,
+    )
+    proposal.next_world_state.belief.square().mean().backward()
+
+    assert block.belief_from_world.o.weight.grad is not None
+    assert float(block.belief_from_world.o.weight.grad.abs().sum()) > 0
+    assert block.st_predictor.out_proj.weight.grad is not None
+    assert float(block.st_predictor.out_proj.weight.grad.abs().sum()) > 0
+    assert previous_map.grad is not None
+    assert float(previous_map.grad.abs().sum()) > 0

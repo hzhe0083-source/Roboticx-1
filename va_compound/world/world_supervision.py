@@ -184,15 +184,24 @@ def stage_supervision_weights(
     num_stages: int,
     *,
     auxiliary_decay: float = 0.25,
+    floor: float = 0.1,
 ) -> tuple[float, ...]:
-    """Final refinement has weight 1; earlier auxiliary stages decay."""
+    """Final refinement has weight 1; earlier auxiliary stages decay to ``floor``.
+
+    Unfloored ``0.25**(n-1-i)`` spans 16384x across 8 stages, so stage 0-3
+    were effectively unsupervised.  Measured log-weight vs log-error Pearson
+    r = -0.868: unweighted stages diverged to 3000x copy error and those
+    maps were still published into VA layers 0-4.
+    """
 
     if num_stages < 1:
         return ()
     if not 0.0 < auxiliary_decay < 1.0:
         raise ValueError("auxiliary_decay must be in (0,1)")
+    if not 0.0 <= floor <= 1.0:
+        raise ValueError("floor must be in [0,1]")
     return tuple(
-        auxiliary_decay ** (num_stages - 1 - index)
+        max(floor, auxiliary_decay ** (num_stages - 1 - index))
         for index in range(num_stages)
     )
 

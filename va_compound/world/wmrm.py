@@ -19,38 +19,69 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 
-# 循环状态数值稳定性（无参数，兼容 strict checkpoint 加载）。
+# belief 循环的有界性（门控融合）。
 #
-# belief 与 world_map 是跨 8 个 stage × T 个决策点持久化的循环状态。两者原来
-# 都是无约束的纯加法残差（``belief = belief + f``、``z_map = base + delta``），
-# 在 sequence_length=4 的短窗口训练下勉强有限，但长 horizon 闭环（horizon=500，
-# 约 4000 次 propose）会把同一段非收缩递推推到 NaN；训练后期 world_action_rank
-# 的尖峰震荡也源于早期 stage 的循环状态幅度单调漂移。
+# belief 跨 8 个 stage × T 个决策点持久化。原来的写入是纯加法残差
+# ``belief = belief + belief_write(belief, evidence - evidence_from_belief(belief))``，
+# 展开就是 ``belief <- (I - KH) belief + K evidence``——Kalman 形式的更新，稳定
+# 条件是 rho(I - KH) < 1。训练只展开 4 个决策点（32 次 propose），任何 rho 稍大
+# 于 1 都被掩盖，所以学出来的增益从未被施加稳定性压力。
 #
-# 收缩只作用于前向值：用 straight-through 让梯度对 base/delta 恒等，保住
-# ``belief = belief + f`` 原有的 identity credit path 契约（早期 stage 通过
-# 恒等路径收到不衰减的梯度），同时前向的 ``retention<1`` 让循环有不动点。
-_BELIEF_RETENTION = 0.9  # belief 循环的遗忘保留系数（<1 即收缩，防发散）
-_MAP_RETENTION = 0.9     # world_map 循环 stage 的保留系数（<1 使循环有不动点）
-_MAP_DELTA_GAIN = 0.5    # world_map 残差的固定缩放（8-stage 累加不失控）
+# 闭环实测（scripts/diag_belief_growth.py，s3000 checkpoint，door-unlock）：
+# |belief| 每个决策点恒定 x1.331（每 12 个决策点 31 倍，从第 20 步到溢出倍率不
+# 变），即 rho = 1.331 —— 过度校正。决策点 145 时 |belief| = 1.76e19，146 溢出
+# float32，159 时 world_message 变 NaN。训练窗口内只有 1.331^4 = 3.14 倍，完全
+# 看不见；一集 250 个决策点是 1.331^250 ~ 1e31。
+#
+# 固定收缩（曾用的 retention=0.9 常数）实测有害：同一 checkpoint 15% -> 5%。原因
+# 是常数门把有用的更新和有害的更新等比例衰减。改用逐通道、内容相关的学习门控
+# （MemoryVLA 的 gate fusion，式 7-8）：``g * update + (1 - g) * memory``，让
+# "根据已积累的记忆决定写多少"成为可学量。
+#
+# 但门控单独不够。MemoryVLA 的凸组合能保证有界，是因为它的 H 来自对一个存放历史
+# 条目的 bank 做注意力，与当前工作记忆的幅度无关。这里的 ``belief_update`` 却是
+# belief 自己的线性函数：``_CrossAttn`` 全程没有任何 normalization（纯线性投影 +
+# softmax），而 ``innovation = evidence - evidence_from_belief(belief)`` 在 belief
+# 很大时被 belief 项主导，于是递推矩阵是 ``(1 - g)I - g*KH``，谱半径依然可以 > 1。
+#
+# 所以两件事都要做：门控消掉线性漂移（常数输入 + 几何衰减 = 有界不动点），
+# normalization 消掉几何爆炸（切断"belief 越大 -> update 越大"的正反馈）。
+# normalization 作用在被持久化的状态本身而不是各个读取点——belief 还有
+# ``world_from_belief`` / ``belief_to_pred`` / ``WAMProposal`` 等多个下游消费者，
+# 漏掉任何一个都会重新把幅度传出去（原始 NaN 正是从 world_message 那条路爆的）。
+#
+# 有界性由这两者保证之后，belief 读取路径上原有的 detach 才被撤掉：见
+# ``_forward_from_snapshot``。此前那些 detach 是唯一的稳定性手段，代价是记忆学不到
+# "该记什么"、world_map 学不到"怎样才算好用的记忆"。
+#
+# 注意：这引入了新的 nn.Parameter，旧 checkpoint 无法再 strict load。
+_BELIEF_GATE_BIAS = -3.0
+"""``belief_gate`` 偏置初值：sigmoid(-3) = 0.047，即每次 propose 保留 0.953。
+
+时间常数 1/g ~ 21 次 propose ~ 2.7 个决策点；4 个决策点的训练窗口上恒等路径
+残余 0.953^32 = 0.22（梯度不消失），而前向 ``(1-g)b + g*u`` 是凸组合，无论 g
+取何值都有界。权重零初始化，所以门一开始与内容无关、纯漏积分，再学内容相关性。
+"""
+
+_BELIEF_WORLD_GATE_BIAS = -6.0
+"""``belief_from_world_gate`` 偏置初值：sigmoid(-6) = 0.0025。
+
+``belief_from_world`` 用 ``zero_output()`` 零初始化，语义是"初始为恒等无操作"。
+门控若从 0.047 起步会让这一路在初始就把 belief 每次乘 0.953，破坏该契约；用更
+负的偏置使初始接近恒等，训练再自行放开。
+"""
 
 
-def _st_scale_residual(
-    base: Tensor,
-    delta: Tensor,
-    *,
-    base_scale: float,
-    delta_scale: float,
-) -> Tensor:
-    """Straight-through 缩放残差：前向 ``base_scale*base + delta_scale*delta``。
+def _gate_fuse(gate: nn.Module, memory: Tensor, update: Tensor) -> Tensor:
+    """凸组合写入 ``g * update + (1 - g) * memory``，g 逐通道由内容决定。
 
-    梯度对 ``base`` 和 ``delta`` 均恒等（I），因此循环的 identity credit path
-    设计契约不变——早期 stage 通过恒等路径收到不衰减的梯度，而缩放只改变前向
-    值，用于抑制跨 stage / 跨决策点的无界累积。``delta`` 本身在调用点用
-    ``base.detach()`` 计算，所以非线性 reader 的 Jacobian 不会跨 stage 连乘。
+    ``memory`` 不 detach：门必须看见已积累的记忆，"该记什么"才是可学的。sigmoid
+    导数 <= 0.25、``1 - g < 1``，所以这条路的递归雅可比是收缩的（与 LSTM/GRU 门控
+    稳定的论证相同）。有界性还需要调用点对结果做 normalization，见文件头说明。
     """
-    scaled = base_scale * base + delta_scale * delta
-    return (base + delta) + (scaled - base - delta).detach()
+    gate_input = torch.cat((memory, update), dim=-1)
+    weight = torch.sigmoid(gate(gate_input))
+    return weight * update + (1.0 - weight) * memory
 
 
 def _require_finite(tensor: Tensor, name: str, *, boundary: str) -> None:
@@ -463,18 +494,13 @@ class _DeepWorldPredictor(nn.Module):
         base = clip[:, -1] if previous_map is None else previous_map
         if previous_map is None:
             # 首决策点 stage 0 的锚是真实 DINO 最后一帧，保持语义不衰减。
-            return _st_scale_residual(
-                base, delta, base_scale=1.0, delta_scale=_MAP_DELTA_GAIN
-            )
-        # 循环项（上一 stage / 上一决策点的 map）：8 个 stage 复用同一个
-        # predictor，每个 stage 都在上一 stage 的 map 上累加 delta，且跨决策点
-        # 经 WAMState.world_map 持续累积。纯加法对应训练日志里前几个 stage 能量
-        # 6→26→47 的单调抬升，长 horizon 下无界。保留系数 <1 使循环有不动点，
-        # 固定缩放把每阶段 refine 量压回有界范围；straight-through 保证 base 的
-        # 恒等梯度不因收缩而衰减。
-        return _st_scale_residual(
-            base, delta, base_scale=_MAP_RETENTION, delta_scale=_MAP_DELTA_GAIN
-        )
+            return base + delta
+        # 循环项（上一 stage 的 map）：8 个 stage 复用同一个 predictor，
+        # 每个 stage 都在上一 stage 的 map 上累加 delta。跨决策点的开环
+        # 在 propose() 里切断——stage 0 不传入 previous_map，残差基底回到
+        # 当前 DINO 最后一帧。固定收缩实测有害（同一 checkpoint 15% -> 5%），
+        # 所以这里保持纯加法。
+        return base + delta
 
 
 class WAM4VA(nn.Module):
@@ -556,8 +582,19 @@ class WAM4VA(nn.Module):
         self.evidence_read = _CrossAttn(hidden_dim, num_heads)
         self.evidence_from_belief = nn.Linear(hidden_dim, hidden_dim)
         self.belief_write = _CrossAttn(hidden_dim, num_heads)
+        # 持久化 belief 的尺度归一化：切断"belief 越大 -> innovation 越大 ->
+        # update 越大"的正反馈。RMSNorm 只规范尺度、不减均值，保留方向语义。
+        self.belief_norm = nn.RMSNorm(hidden_dim)
+        self.belief_gate = nn.Linear(2 * hidden_dim, hidden_dim)
+        nn.init.zeros_(self.belief_gate.weight)
+        nn.init.constant_(self.belief_gate.bias, _BELIEF_GATE_BIAS)
         self.belief_from_world = _CrossAttn(hidden_dim, num_heads)
         self.belief_from_world.zero_output()
+        self.belief_from_world_gate = nn.Linear(2 * hidden_dim, hidden_dim)
+        nn.init.zeros_(self.belief_from_world_gate.weight)
+        nn.init.constant_(
+            self.belief_from_world_gate.bias, _BELIEF_WORLD_GATE_BIAS
+        )
 
         self.world_from_env = nn.Linear(hidden_dim, hidden_dim)
         self.world_from_state = nn.Linear(proprio_dim, hidden_dim)
@@ -1023,23 +1060,26 @@ class WAM4VA(nn.Module):
         stage = int(stage_index)
         if not 0 <= stage < self.max_stages:
             raise ValueError(f"stage_index must be in [0, {self.max_stages}), got {stage}")
-        belief = belief + self.stage_embed.weight[stage]
-        # Belief is a recurrent residual state across 8 stages x T decisions.
-        # Read the incoming value as memory, then publish a differentiable
-        # residual update.  This keeps an identity credit path to earlier
-        # stages while preventing the shared nonlinear reader Jacobians from
-        # being multiplied through the full recurrent chain.
-        belief_context = belief.detach()
-        predicted = self.evidence_from_belief(belief_context)
+        # Stage embed is working-memory positional encoding, like MemoryVLA's
+        # TE(t): added at read/condition time, never stored in the bank.
+        # Persisting it made |belief| grow 504x over one closed-loop episode
+        # (250 decisions x 8 stages) from geometry alone.
+        stage_cond = self.stage_embed.weight[stage]
+        working = belief + stage_cond
+        # The read is live: "what to write, given what is already held" is the
+        # dependency a memory has to learn, and detaching here made it a
+        # constant.  The chain this opens is 32 steps deep (8 stages x T=4
+        # decisions, all differentiable because wmrm_detach_proposal_stage_state
+        # defaults off and visual_memory is not detached across decisions), so it
+        # is only safe now that belief_norm bounds the activations and the convex
+        # gate contributes a <1 Jacobian per step instead of truncation.
+        predicted = self.evidence_from_belief(working)
         innovation = evidence - predicted
         if prev_innovation is not None:
             innovation = self._project_out(innovation, prev_innovation)
-        belief_update = self.belief_write(belief_context, innovation)
-        belief = _st_scale_residual(
-            belief,
-            belief_update,
-            base_scale=_BELIEF_RETENTION,
-            delta_scale=1.0 - _BELIEF_RETENTION,
+        belief_update = self.belief_write(working, innovation)
+        belief = self.belief_norm(
+            _gate_fuse(self.belief_gate, belief, belief_update)
         )
 
         if language_keys is None:
@@ -1059,11 +1099,12 @@ class WAM4VA(nn.Module):
             )
             task_summary = task_tokens.mean(dim=1)
 
-        predict_belief = belief.detach()
+        conditioned = belief + stage_cond
+        predict_belief = conditioned.detach()
         z_hat, z_spans, progress, z_tokens = self.predict_world(
             action,
             proprio,
-            belief,
+            conditioned,
             task_summary,
             dino_tokens=dino_tokens,
             env_action=env_action,
@@ -1077,17 +1118,16 @@ class WAM4VA(nn.Module):
         ):
             world_tokens = self.encode_world_tokens(z_tokens)
         if world_tokens is not None:
-            # The predicted map has its own differentiable loss/message paths.
-            # Here it is read as recurrent memory so the belief recurrence also
-            # remains an identity residual rather than another I + J product.
-            belief_update = self.belief_from_world(
-                belief.detach(), world_tokens.detach()
-            )
-            belief = _st_scale_residual(
-                belief,
-                belief_update,
-                base_scale=_BELIEF_RETENTION,
-                delta_scale=1.0 - _BELIEF_RETENTION,
+            # Both inputs are live.  Detaching world_tokens left the map with no
+            # gradient telling it to be a *useful memory* -- only the
+            # reconstruction loss and the VA message shaped it -- so the one
+            # objective that could make world_map worth carrying across stages
+            # never reached it.  This adds a second backward path through the
+            # depth-6 predictor, which costs activation memory; batch size has to
+            # be re-checked against the 44.5 GiB card after this change.
+            belief_update = self.belief_from_world(belief, world_tokens)
+            belief = self.belief_norm(
+                _gate_fuse(self.belief_from_world_gate, belief, belief_update)
             )
         elif self.dino_to_hid is not None:
             # Intermediate VA↔WM exchanges use the recurrent WM belief as
@@ -1150,7 +1190,11 @@ class WAM4VA(nn.Module):
             env_action=env_action,
             reuse_aux=reuse_aux,
             stage_index=stage_index,
-            previous_map=snapshot.world_map,
+            # Perceptual stream re-anchors every decision (stage 0): residual
+            # base is the current DINO last frame, not last decision's
+            # prediction.  Stages 1-7 still refine inside the decision.
+            # Cognitive stream (belief) persists across decisions.
+            previous_map=None if stage_index == 0 else snapshot.world_map,
         )
         next_world_map = (
             aux.z_tokens

@@ -186,6 +186,28 @@ def evaluation_episode_seed(global_task_id: int, trial: int) -> int:
     return 1000 * int(global_task_id) + int(trial)
 
 
+def parse_trial_range(spec: str | None, trials_per_task: int) -> tuple[int, int]:
+    """Parse ``START:END`` into a half-open trial slice for sharded evaluation.
+
+    Seeds come from ``evaluation_episode_seed(task, trial)`` alone, so a shard
+    reproduces exactly the trials a serial run would produce for those indices.
+    """
+    if spec is None:
+        return 0, int(trials_per_task)
+    text = spec.strip()
+    if text.count(":") != 1:
+        raise ValueError(f"--trial-range must be START:END, got {spec!r}")
+    start_text, stop_text = (part.strip() for part in text.split(":"))
+    start = 0 if not start_text else int(start_text)
+    stop = int(trials_per_task) if not stop_text else int(stop_text)
+    if not 0 <= start < stop <= int(trials_per_task):
+        raise ValueError(
+            f"--trial-range {spec!r} must satisfy "
+            f"0 <= start < stop <= --trials-per-task ({trials_per_task})"
+        )
+    return start, stop
+
+
 TASK35_EVAL50_SEEDS = tuple(range(35000, 35050))
 
 
@@ -1062,6 +1084,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--trials-per-task", type=int, default=10)
     parser.add_argument(
+        "--trial-range",
+        type=str,
+        default=None,
+        help="分片评测的 trial 半开区间 START:END（缺省 = 全部）。每个 trial 开头都用 "
+        "evaluation_episode_seed 重新播种 numpy/env/torch，跨 trial 无 RNG 依赖，"
+        "因此分片结果与串行逐 trial 完全一致。用于把 trial 拆到多进程并行：闭环"
+        "评测 GPU 利用率仅 0~6%%，瓶颈是单线程软件渲染（容器无 /dev/dri，EGL 退回 "
+        "llvmpipe，硬件渲染不可用），并行是唯一的大幅加速手段。",
+    )
+    parser.add_argument(
         "--show-window",
         action="store_true",
         help="实时显示闭环 corner2 RGB 画面；按 q 可提前关闭显示窗口",
@@ -1149,6 +1181,16 @@ def parse_args() -> argparse.Namespace:
         "（每步 8 stage propose）；peer_sync_h6 长 horizon 闭环把同一段无约束 belief "
         "循环推到数千次 propose 而发散到 NaN。此参数把部署的 world 递归深度截断回"
         "训练分布，是零训练代价的分布对齐（对应 --memory-reset-every 但只动 world）。",
+    )
+    parser.add_argument(
+        "--world-map-reset-every",
+        type=int,
+        default=0,
+        help="每 N 个决策点只把 world_map 置 None、保留 belief（0 = 不重置）。"
+        "wmrm.py 的 map 基底是 previous_map，跨 stage 与跨决策点持续累积，一集 2000 "
+        "次 propose 全在自己上一次预测上加残差、从不重锚真实观测；--world-reset-every "
+        "压住了这个发散，但代价是 belief 每 4 个决策点一起被清空。此参数用 N=1 把 map "
+        "的开环深度截断到单个决策点的 8 个 stage，同时让 belief 跨整集存活。",
     )
     parser.add_argument(
         "--prev-zero",
@@ -1400,6 +1442,24 @@ def _reset_world_state(memory):
     if memory is None or getattr(memory, "world_state", None) is None:
         return memory
     return dataclasses.replace(memory, world_state=None)
+
+
+def _reset_world_map(memory):
+    """只把 ``WAMState.world_map`` 置 None，保留 belief。
+
+    ``world_map`` 的残差基底是 ``clip[:, -1] if previous_map is None else
+    previous_map``（wmrm.py），所以置 None 让下一个 stage 重新锚定到真实 DINO 帧。
+    ``--world-reset-every`` 清整个 ``WAMState``，belief 一起没了（250 决策点 / 4 =
+    每集 62 次），而 belief 正是 WAM 存在的理由。此参数只截断 map 的开环深度。
+    """
+    if memory is None:
+        return memory
+    world_state = getattr(memory, "world_state", None)
+    if world_state is None or getattr(world_state, "world_map", None) is None:
+        return memory
+    return dataclasses.replace(
+        memory, world_state=dataclasses.replace(world_state, world_map=None)
+    )
 
 
 def c2_schedule(
@@ -3117,6 +3177,15 @@ def main() -> None:
     per_task = {}
     trial_records: list[dict[str, Any]] = []
     completed_trials = 0
+    trial_start, trial_stop = parse_trial_range(
+        args.trial_range, args.trials_per_task
+    )
+    if (trial_start, trial_stop) != (0, args.trials_per_task):
+        print(
+            f"eval: trial shard [{trial_start}, {trial_stop}) of "
+            f"{args.trials_per_task} per task",
+            flush=True,
+        )
     for local_task_index, (global_task_index, task_text) in enumerate(selected_tasks):
         env_name = descriptions_to_env.get(task_text)
         if env_name is None:
@@ -3133,7 +3202,7 @@ def main() -> None:
         env.model.cam_pos[2] = [0.75, 0.075, 0.7]  # corner2 位置（lerobot 采集同款）
         env._freeze_rand_vec = False
         wins = 0
-        for trial in range(args.trials_per_task):
+        for trial in range(trial_start, trial_stop):
             episode_seed = evaluation_episode_seed(global_task_index, trial)
             # MetaWorld v3 的 reset_model 在部分版本仍读全局 NumPy RNG；
             # 仅传 env.reset(seed=...) 不足以固定任务布局。显式同步后，基线与
@@ -3628,6 +3697,12 @@ def main() -> None:
                         # peer_sync_h6 长 horizon：world_state 对齐训练 4 步窗口，
                         # 只重置 WAMState（保留 VA 视觉记忆），避免 belief 发散。
                         memory = _reset_world_state(memory)
+                    if (
+                        args.world_map_reset_every > 0
+                        and decision_count > 0
+                        and decision_count % args.world_map_reset_every == 0
+                    ):
+                        memory = _reset_world_map(memory)
                     decision_count += 1
                     # 与训练一致的时间升序 [d-6, d-4, d-2, d]（clip_frame_indices 返回
                     # video_start + max(0, d - offset*stride)，offset 升序 → 最老帧在前）

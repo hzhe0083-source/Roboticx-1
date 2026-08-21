@@ -33,6 +33,7 @@ WORLD_LOSS_COMPONENT_WEIGHTS = {
     "top20": 0.50,
 }
 WORLD_STAGE_AUXILIARY_DECAY = 0.25
+WORLD_STAGE_AUXILIARY_FLOOR = 0.1
 WORLD_LOGGED_BRANCH_CONTRACT = "matched_context_full_forward_v1"
 WORLD_ACTION_DONOR_CONTRACT = "train_split_task_cross_episode_proprio_nearest_v1"
 PEER_WORLD_TOPOLOGY_CONTRACT = "one_stage_delayed_bidirectional_state_kv_v1"
@@ -425,6 +426,7 @@ def validate_visual_world_resume_contract(
         ),
         "world_loss_weights": WORLD_LOSS_COMPONENT_WEIGHTS,
         "world_stage_auxiliary_decay": WORLD_STAGE_AUXILIARY_DECAY,
+        "world_stage_auxiliary_floor": WORLD_STAGE_AUXILIARY_FLOOR,
         "world_no_regression": WORLD_NO_REGRESSION,
         "world_static_copy_constraint": {
             **WORLD_STATIC_COPY_CONSTRAINT,

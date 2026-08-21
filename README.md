@@ -1,79 +1,77 @@
-# VA Compound
+# ORA0 — VA-World 视觉动作模型
 
-最小实现只包含：Qwen3.5语言缓存、V-JEPA 2.1视觉接口、上一时刻目标视觉记忆、双向VA Attention和条件Flow Matching动作头。`bidir_va`是主结构，`uni_a`是禁止Memory/Action/Language写入Vision的等参数对照。
+MetaWorld 视觉-动作策略：**VA（Vision-Action）流 + World 流（WAM4VA）** 通过 peer-sync 双向交换，动作由 Flow Matching 解码。主视觉为冻结 DINOv2（已取代 V-JEPA）。
+
+## 架构
+
+- **VA 流**：双向 Transformer（`bidir_va`），语言条件 + 视觉记忆，8 层。
+- **World 流（WAM4VA）**：`peer_sync_h6` 模式，在 VA 的 8 层之间逐层交换。World 用 `belief`/`world_map` 两个循环状态预测未来 DINO 特征图，把 `world_message` 作为 K/V 注入下一层 VA 的注意力。
+- **动作解码**：条件 Flow Matching（8 步 Euler），前 2 步 weight 1.0、后 4 步 weight 0.036。
+- **World 监督**：DINO map 回归 + 静态区约束 + 动作排序（`--world-action-rank-stage final`）。
+
+## 目录结构
+
+`va_compound/` 按功能域分子包，顶层保留向后兼容 shim（旧 `from va_compound.X import` 仍可用）：
+
+```
+va_compound/
+├── policy/    model.py（VACompoundPolicy）, end_to_end.py
+├── world/     wmrm.py（WAM4VA）, world_supervision.py, world_contract.py
+├── vision/    backbones.py, live_vjepa.py, metric_roi.py,
+│              metric_visual_head.py, fovea.py, longtraj_frames.py
+├── control/   servo.py, local_control_slots.py
+└── utils/     exact_resume.py, flow.py, statistics.py
+```
 
 ## 运行
 
-复用现有GPU环境，不需要重新安装PyTorch：
+### 环境
 
 ```bash
-/home/ryan/.venvs/pytorch-gpu/bin/python -m unittest discover -s tests -v
-/home/ryan/.venvs/pytorch-gpu/bin/python train.py --mode bidir_va --steps 3 --batch-size 4 --sequence-length 4 --flow-steps 8
-/home/ryan/.venvs/pytorch-gpu/bin/python train.py --mode uni_a --steps 3 --batch-size 4
+python=/home/ryan/Documents/robot/ORA/.venv/bin/python
 ```
 
-PNPW是50条、18,464帧、30 FPS的单任务双臂示范。先使用环境相机生成冻结特征，再运行单任务Flow过拟合：
+### 训练（peer_sync_h6，hard2 双任务）
 
 ```bash
-/home/ryan/.venvs/pytorch-gpu/bin/python prepare_pnpw_features.py --output data/pnpw_features.pt --batch-size 8  # 同时产出 flat 与 spatial 两套特征
-/home/ryan/.venvs/pytorch-gpu/bin/python train.py --data data/pnpw_features.pt --single-task --steps 10000 --batch-size 8 --save checkpoints/pnpw_flow.pt
-/home/ryan/.venvs/pytorch-gpu/bin/python train.py --data data/pnpw_features.pt --single-task --vision-pooling spatial --steps 10000 --batch-size 8 --save checkpoints/pnpw_flow_spatial.pt
-/home/ryan/.venvs/pytorch-gpu/bin/python evaluate.py --checkpoint checkpoints/pnpw_flow_spatial.pt --data data/pnpw_features.pt  # 池化方式默认从 checkpoint contract 读取
+bash scripts/run_mw_hard2_wam4va_visualmotion_peer_sync_h6_v1.sh joint 30000 18
 ```
 
-转换器使用每3帧一个决策点、4个决策点的训练序列、4帧因果视觉窗口和8帧动作块；动作与状态按全数据1%/99%分位数归一化。PNPW只有`pick white cube into the basket`一个指令，因此该实验只验证任务过拟合与动作生成，不能验证语言切换创新。
+`MODE` 可为 `prepare`（数据准备）、`preflight`（契约校验）、`joint`（训练）。训练脚本内部调用 `train.py`，关键超参：DINO 主视觉（grid 16 × 4 帧）、WMRM st_blocks predictor（6 层 × 384 宽）、batch 18、lr 1e-4。
 
-准备实际模型约需5.8 GiB：
+### 评测（闭环，10 trials/task）
 
 ```bash
-/home/ryan/.venvs/pytorch-gpu/bin/python scripts/data/prepare_models.py
+bash scripts/eval_mw_hard2_wam4va.sh <checkpoint.pt> data/hard2_peer_h6_p2_eval_v1.pt
 ```
 
-模型固定为`Qwen/Qwen3.5-2B`与官方V-JEPA 2.1 ViT-B/16（384px，80M）。P0使用4帧窗口：encoder产生768维密集token，再固定池化为64个token；是否损伤细粒度动作信息必须在真实数据中验证。`--vision-pooling`选择特征变体：`flat`（1D自适应池化，历史A）或`spatial`（时间均值后2D网格池化，B）；`spatiotemporal`（C）保留时间轴但token数随帧数线性增长、不受64预算约束，尚未接入训练/评估管线。视觉输入接口为`[B,T,3,384,384]`，使用ImageNet均值方差预先归一化。
+自动编排脚本：`auto_eval_on_snapshot.sh`（快照评测）、`auto_transition_to_all49.sh`（hard2 → all49 切换）。
 
-RTX 3080 Laptop上的单批次烟雾测试：V-JEPA 2.1约22.8ms，FP16 VA条件编码约3.06ms，8步Flow Head约5.12ms；不含视觉编码时VA+动作生成约8.19ms（122Hz），记忆仅0.25MiB。真实机器人频率仍以相机、数据搬运和控制器整链路为准。
+### 测试
 
-训练时每个样本包含连续短序列，语言K/V只生成一次；VA逐时刻返回`VisualMemory`并在序列内反传。部署时使用无梯度语言缓存；每次新视觉只运行一次VA得到动作条件，随后仅运行轻量Flow Head。命令变化时将视觉记忆设为`None`。
-
-```python
-memory = None  # 新命令开始时清空
-with torch.inference_mode():
-    condition, memory = policy.encode_condition(
-        vision, proprio, previous_action,
-        language_cache=language_cache,
-        visual_memory=memory,
-        return_visual_memory=True,
-    )
-    actions = policy.sample_actions(condition, steps=8)
+```bash
+/home/ryan/Documents/robot/ORA/.venv/bin/python -m pytest tests/ -q
 ```
 
-## 训练数据接口
+部分测试需要 `av`、`metaworld`、`timm`、`einops`，均已加入本地 venv。
 
-`train.py --data features.pt`读取一个成对多指令tensor字典（维度由数据决定，脚本从数据推断config；PNPW实际为12维动作/状态）：
+## 训练数据契约
 
-- `vision_tokens [N,T,64,768]`（flat池化）与可选`vision_tokens_spatial [N,T,64,768]`（时间均值+2D网格池化）
-- `language_hidden [N,Nl,2048]`
-- `proprio [N,T,12]`
-- `previous_action [N,T,12]`
-- `actions [N,T,H,12]`
-- `pair_id [N]`与`instruction_id [N]`
-- 可选`language_mask [N,Nl]`
+peer_sync_h6 数据为 T4/H6/A4 窗口（`sequence_length=4`、`action_horizon=6`、`action_dim=4`），
+VA 与 World 使用**不相交的 episode**（`validate_peer_data_isolation` 保证）。
 
-`actions`必须先按每个动作维度归一化。默认要求`T>=4`。主Flow Matching训练独立采样高斯噪声$\epsilon$和时间$\tau$：
+## 循环状态稳定性
 
-$$
-a^\tau=(1-\tau)\epsilon+\tau a,\qquad u^*=a-\epsilon,
-$$
+`wmrm.py` 的 `belief` 与 `world_map` 是跨 8 stage × T 决策点持久化的循环状态。
 
-$$
-\mathcal L_{FM}=\|v_\theta(a^\tau,\tau\mid C)-u^*\|_2^2.
-$$
+`belief` 的写入原为纯加法残差，展开是 `belief <- (I - KH) belief + K evidence`（Kalman 形式），稳定条件 `rho(I - KH) < 1` 从未被约束——训练只展开 4 个决策点，`1.331^4 = 3.14` 倍完全看不见。闭环实测（`scripts/diag_belief_growth.py`）`rho = 1.331`：每决策点恒定 ×1.331，决策点 145 时 `|belief| = 1.76e19`，146 溢出 float32，159 时 `world_message` 变 NaN。
 
-同一`pair_id`的两个互斥指令在第0时刻拥有完全相同的视觉、状态和上一动作。辅助分支再令二者共享同一噪声$\epsilon_p$并固定$\tau=0$，所以$a_i^0=a_j^0=\epsilon_p$，Flow输入也完全相同：
+修法是**门控融合**（`_gate_fuse`，对应 MemoryVLA 式 7-8）：`g = sigmoid(Linear([belief, update]))`、`belief <- g*update + (1-g)*belief`。凸组合让 `rho <= 1` 成为构造保证，且门看得见已积累的记忆，"该记什么"成为可学量。曾用的固定收缩（常数 `retention=0.9`）实测有害（同一 checkpoint 15% → 5%），因为常数门等比例衰减有用与有害的更新。**新增参数，旧 checkpoint 不能再 strict load。**
 
-$$
-\mathcal L=\mathcal L_{FM}+\lambda_{pair}\operatorname{Huber}
-\left[(v_\theta(\epsilon_p,0\mid C_i)-v_\theta(\epsilon_p,0\mid C_j)),(a_i-a_j)\right].
-$$
+`world_map` 保持纯加法；它的开环深度由部署侧 `--world-map-reset-every 1` 截断到单个决策点的 8 个 stage（实测 159 个决策点触发 158 次重锚）。
 
-因此配对分支只有语言不同，模型不能从带噪动作中偷看专家目标。多指令实验默认执行该契约；只有显式传入`--single-task`才会关闭配对损失，用于PNPW这类单任务过拟合。当前脚本训练预计算特征后的VA复合体和Flow Head；Qwen与V-JEPA保持冻结。
+## 当前主线
+
+- 训练：`run_mw_hard2_wam4va_visualmotion_peer_sync_h6_v1.sh`
+- 评测：`eval_metaworld.py`（闭环，`--world-reset-every 4` 对齐训练窗口）
+- 数据：`data/hard2_peer_h6_p2_*`（VA/World/eval 三份不相交切分）

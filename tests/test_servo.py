@@ -431,7 +431,11 @@ def test_gradient_flow_through_servo_and_reader():
 
 def test_servo_validate_args_requires_multi_mode():
     """--servo 前置校验：无 --multi-mode 报错；--servo-dls 无 --servo 报错。"""
-    base = dict(
+    from train import parse_args
+
+    # 真实 parser 默认值打底，避免每次 validate_args 新读一个字段就要手工补夹具。
+    base = vars(parse_args([]))
+    base.update(
         steps=1, flow_steps=8, lr=1e-4, pair_loss_weight=0.0, batch_size=2,
         single_task=True, mode="bidir_va", attention_variant="flat",
         action_query_cond=False, memory_split=False, evidence_tokens=16,
@@ -470,6 +474,8 @@ def test_servo_validate_args_requires_multi_mode():
     )
     base.pop("multi_mode")
     base.pop("local_slots_data")
+    for _key in ("servo", "servo_only", "servo_dls", "servo_rank", "servo_lambda"):
+        base.pop(_key, None)
     args = argparse.Namespace(**base, servo=True, servo_only=False,
                               servo_dls=False, servo_rank=2, servo_lambda=1e-2,
                               multi_mode=False, local_slots_data=None)

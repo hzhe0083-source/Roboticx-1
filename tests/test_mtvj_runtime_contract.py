@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -30,6 +31,45 @@ from train import (
 )
 from va_compound.backbones import pool_mtvj_coarse_tokens
 from va_compound.metric_visual_head import LanguageMetricField, RelationStateEncoder
+
+
+def test_metric_module_import_keeps_gl_backend_self_consistent() -> None:
+    """``prepare_metaworld_metric`` 不能把 GL 后端设成与 MUJOCO_GL 矛盾的值。
+
+    该模块在导入时设默认后端，而 ``--mtvj-visual-aux-every`` 是第一次真正建
+    MuJoCo env 的地方——训练启动几十分钟后。曾经它无条件把 PYOPENGL_PLATFORM 设为
+    egl，而所有启动脚本导出 MUJOCO_GL=osmesa，于是 ``mujoco.gl_context`` 拒绝导入，
+    长训练在第 10 步崩掉。
+
+    子进程必须复现启动脚本的完整环境，``LD_PRELOAD`` 那一项不是可选的：不带它
+    PyOpenGL 加载不到系统 libOSMesa（conda 自带 libstdc++ 与之 ABI 冲突），失败方式
+    不同、会掩盖这里要测的东西。
+    """
+    import os
+    import subprocess
+    import sys
+
+    preload = Path("/usr/lib/x86_64-linux-gnu/libstdc++.so.6")
+    if not preload.exists():
+        pytest.skip(f"launcher LD_PRELOAD not present: {preload}")
+    probe = (
+        "import os, prepare_metaworld_metric, mujoco;"
+        "print(os.environ.get('MUJOCO_GL'), os.environ.get('PYOPENGL_PLATFORM'))"
+    )
+    env = dict(os.environ, MUJOCO_GL="osmesa", LD_PRELOAD=str(preload))
+    env.pop("PYOPENGL_PLATFORM", None)
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=Path(__file__).resolve().parent.parent,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    backend, pyopengl = result.stdout.split()[-2:]
+    assert backend == "osmesa"
+    assert pyopengl != "egl"
 
 
 def test_mtvj_h11_pool16_matches_historical_training_formula() -> None:

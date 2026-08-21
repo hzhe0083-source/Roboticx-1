@@ -148,3 +148,57 @@ def test_balanced_sampler_state_rejects_sampling_mode_change() -> None:
 
     with pytest.raises(ValueError, match="sampling_mode"):
         weighted.load_state_dict(balanced.state_dict())
+
+
+def test_data_parallel_shards_keep_the_same_task_and_are_disjoint() -> None:
+    instruction = torch.tensor([0] * 30 + [1] * 30)
+    episode = torch.tensor(
+        [ep for ep in range(3) for _ in range(10)]
+        + [10 + ep for ep in range(3) for _ in range(10)]
+    )
+    kwargs = dict(
+        instruction_id=instruction,
+        episode_id=episode,
+        task_weights=torch.ones(2),
+        batch_size=8,
+        seed=11,
+        block_batches=2,
+        sampling_mode="balanced",
+        world_size=2,
+    )
+    rank0 = TaskLocalityWeightedSampler(**kwargs, rank=0)
+    rank1 = TaskLocalityWeightedSampler(**kwargs, rank=1)
+    global_sampler = TaskLocalityWeightedSampler(
+        instruction, episode, torch.ones(2), 8, seed=11,
+        block_batches=2, sampling_mode="balanced",
+    )
+    local0, local1, full = list(rank0), list(rank1), list(global_sampler)
+    assert len(local0) == len(local1) == len(full) == len(global_sampler)
+    for left, right, parent in zip(local0, local1, full, strict=True):
+        assert len(left) == len(right) == 4
+        assert set(left).isdisjoint(right)
+        assert sorted(left + right) == sorted(parent)
+        tasks = {rank0.task_ids[index] for index in left + right}
+        assert tasks == {rank0.task_ids[parent[0]]}
+
+
+def test_data_parallel_rejects_a_batch_that_does_not_divide() -> None:
+    instruction = torch.arange(8) * 0
+    episode = torch.arange(8)
+    with pytest.raises(ValueError, match="must divide"):
+        TaskLocalityWeightedSampler(
+            instruction, episode, torch.ones(1), batch_size=3, world_size=2
+        )
+
+
+def test_sampler_state_rejects_world_size_change() -> None:
+    instruction = torch.tensor([0] * 8 + [1] * 8)
+    episode = torch.arange(16) // 2
+    single = TaskLocalityWeightedSampler(
+        instruction, episode, torch.ones(2), batch_size=4
+    )
+    dual = TaskLocalityWeightedSampler(
+        instruction, episode, torch.ones(2), batch_size=4, world_size=2
+    )
+    with pytest.raises(ValueError, match="world_size"):
+        dual.load_state_dict(single.state_dict())

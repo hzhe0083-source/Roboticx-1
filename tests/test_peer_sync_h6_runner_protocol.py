@@ -36,12 +36,17 @@ def test_runner_syntax_and_invalid_mode_fail_before_training() -> None:
 def test_prepare_builds_three_episode_disjoint_p2_data_sides() -> None:
     text = _text()
     prepare = _block(text, "prepare_data(){", "preflight(){")
-    assert "SOURCE=data/hard2_peer_h6_p2_source_v1.pt" in text
-    assert "VA_TRAIN_DATA=data/hard2_peer_h6_p2_va_train_v1.pt" in text
-    assert "WORLD_TRAIN_DATA=data/hard2_peer_h6_p2_world_train_v1.pt" in text
-    assert "EVAL_DATA=data/hard2_peer_h6_p2_eval_v1.pt" in text
-    assert "WORLD_POOL=data/hard2_peer_h6_p2_world_pool_v1.pt" in text
-    assert "FAMILY=mw_hard2_va_world_state_exchange_joint_h6_p2_v1" in text
+    # The split family is selectable so an expanded rebuild cannot overwrite the
+    # immutable v1 splits, but the default must still reproduce v1 byte-for-byte
+    # and the checkpoint FAMILY must move with the tag so the two data families
+    # never share a checkpoint namespace.
+    assert "DATA_TAG=${DATA_TAG:-v1}" in text
+    assert "SOURCE=data/hard2_peer_h6_p2_source_${DATA_TAG}.pt" in text
+    assert "VA_TRAIN_DATA=data/hard2_peer_h6_p2_va_train_${DATA_TAG}.pt" in text
+    assert "WORLD_TRAIN_DATA=data/hard2_peer_h6_p2_world_train_${DATA_TAG}.pt" in text
+    assert "EVAL_DATA=data/hard2_peer_h6_p2_eval_${DATA_TAG}.pt" in text
+    assert "WORLD_POOL=data/hard2_peer_h6_p2_world_pool_${DATA_TAG}.pt" in text
+    assert "FAMILY=mw_hard2_va_world_state_exchange_joint_h6_p2_${DATA_TAG}" in text
     assert "--planning-stride 2" in prepare
     assert "--data-contract peer_sync_h6_p2_world_windows_v1" in prepare
     assert "--control-stride" not in prepare
@@ -81,6 +86,8 @@ def test_joint_run_uses_both_data_streams_without_phase_handoff() -> None:
     assert "--flow-prefix-steps 2" in joint
     assert "--task-sampling balanced" in joint
     assert " train.py --data " not in joint
+    assert "NGPUS=${NGPUS:-1}" in text
+    assert "torch.distributed.run" in joint
     assert "--world-only" not in joint
     assert "--va-only" not in joint
     assert "--resume-weights" not in joint

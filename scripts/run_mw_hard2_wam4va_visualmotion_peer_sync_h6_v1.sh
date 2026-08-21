@@ -6,17 +6,32 @@ cd "$(dirname "$0")/.."
 PY=${PY:-/home/ryan/.venvs/openvla/bin/python}
 VERIFY_PY=${VERIFY_PY:-/home/ryan/.venvs/pytorch-gpu/bin/python}
 DINO=${DINO:-/home/ryan/.cache/huggingface/hub/models--timm--vit_large_patch14_reg4_dinov2.lvd142m/snapshots/f3c408e77602bb412aa65fb03dfa0d5f95cb3832/model.safetensors}
-ASSEMBLY_RAW=data/metaworld_longtraj_assembly-v3.pt
-DOOR_RAW=data/metaworld_longtraj_door-unlock-v3.pt
-ALLTASK_H48_REF=data/metaworld_longtraj_windows_h48.pt
-SOURCE=data/hard2_peer_h6_p2_source_v1.pt
-WORLD_POOL=data/hard2_peer_h6_p2_world_pool_v1.pt
-VA_TRAIN_DATA=data/hard2_peer_h6_p2_va_train_v1.pt
-WORLD_TRAIN_DATA=data/hard2_peer_h6_p2_world_train_v1.pt
-EVAL_DATA=data/hard2_peer_h6_p2_eval_v1.pt
-PARTITION_MANIFEST=data/hard2_peer_h6_p2_va_world_partition_v1.json
-WORLD_SPLIT_MANIFEST=data/hard2_peer_h6_p2_world_split_v1.json
-FAMILY=mw_hard2_va_world_state_exchange_joint_h6_p2_v1
+# FRAMES_DIR holds one JPEG-frame file per task.  The peer_sync_h6 contract keys
+# a window's frame pointer by env name + episode index within that file, so
+# expansion episodes must be merged into these per-task files
+# (scripts/merge_longtraj_expansion.py) rather than passed as extra inputs.
+FRAMES_DIR=${FRAMES_DIR:-data}
+ASSEMBLY_RAW=$FRAMES_DIR/metaworld_longtraj_assembly-v3.pt
+DOOR_RAW=$FRAMES_DIR/metaworld_longtraj_door-unlock-v3.pt
+# Phase 1 reads only normalization/tasks/language from the reference.  Any all-49
+# build carrying identical values is an equivalent substitute; override when the
+# canonical file is unavailable.
+ALLTASK_H48_REF=${ALLTASK_H48_REF:-data/metaworld_longtraj_windows_h48.pt}
+# DATA_TAG selects the immutable split family.  Defaults reproduce v1.
+DATA_TAG=${DATA_TAG:-v1}
+# Resident decoded-task budget; empty keeps train.py's own default.
+DECODE_CACHE_TASKS=${DECODE_CACHE_TASKS:-}
+# 1 = single process; >1 launches torchrun over that many local GPUs.  Global
+# --batch-size is split across ranks (48 on 2 GPUs is 24 per card).
+NGPUS=${NGPUS:-1}
+SOURCE=data/hard2_peer_h6_p2_source_${DATA_TAG}.pt
+WORLD_POOL=data/hard2_peer_h6_p2_world_pool_${DATA_TAG}.pt
+VA_TRAIN_DATA=data/hard2_peer_h6_p2_va_train_${DATA_TAG}.pt
+WORLD_TRAIN_DATA=data/hard2_peer_h6_p2_world_train_${DATA_TAG}.pt
+EVAL_DATA=data/hard2_peer_h6_p2_eval_${DATA_TAG}.pt
+PARTITION_MANIFEST=data/hard2_peer_h6_p2_va_world_partition_${DATA_TAG}.json
+WORLD_SPLIT_MANIFEST=data/hard2_peer_h6_p2_world_split_${DATA_TAG}.json
+FAMILY=mw_hard2_va_world_state_exchange_joint_h6_p2_${DATA_TAG}
 LOCK=/tmp/ora0_va_world_state_exchange_joint_h6_p2_v1.lock
 
 MODE=${1:-}
@@ -25,6 +40,7 @@ BATCH=${3:-3}
 RESUME_EXACT=${RESUME_EXACT:-}
 RUN_ID=${RUN_ID:-}
 SAVE_EVERY=${SAVE_EVERY:-1500}
+CHECKPOINT_DIR=${CHECKPOINT_DIR:-checkpoints}
 
 usage(){
   printf 'usage: bash %s {prepare|preflight|joint} [steps] [batch-size]\n' "$0" >&2
@@ -45,11 +61,13 @@ for path in "$PY" "$VERIFY_PY" "$ASSEMBLY_RAW" "$DOOR_RAW" "$ALLTASK_H48_REF" \
 done
 
 prepare_data(){
+  local inputs=(--input "$ASSEMBLY_RAW" --input "$DOOR_RAW")
+  printf 'phase 1 frame dir: %s\n' "$FRAMES_DIR"
   if [[ ! -f "$SOURCE" ]]; then
     "$PY" -B scripts/build_longtraj_features.py \
       --phase 1 --horizon 6 --planning-stride 2 \
       --data-contract peer_sync_h6_p2_world_windows_v1 \
-      --legacy-policy infer --input "$ASSEMBLY_RAW" --input "$DOOR_RAW" \
+      --legacy-policy infer "${inputs[@]}" \
       --ref "$ALLTASK_H48_REF" --output "$SOURCE"
   fi
   for path in "$WORLD_POOL" "$VA_TRAIN_DATA" "$WORLD_TRAIN_DATA" \
@@ -269,23 +287,37 @@ PY
 
 run_joint(){
   local run_id=${RUN_ID:-${FAMILY}.scratch.s${STEPS}}
-  local save=checkpoints/${run_id}.pt log=logs/${run_id}.log
+  local save=${CHECKPOINT_DIR}/${run_id}.pt log=logs/${run_id}.log
   local resume_args=()
   if [[ -n "$RESUME_EXACT" ]]; then
     [[ -f "$RESUME_EXACT" ]] || fail "missing exact-resume checkpoint: $RESUME_EXACT"
     resume_args=(--resume-exact "$RESUME_EXACT")
   fi
+  local frame_args=(--longtraj-dir "$FRAMES_DIR")
+  if [[ -n "$DECODE_CACHE_TASKS" ]]; then
+    frame_args+=(--longtraj-decode-cache-tasks "$DECODE_CACHE_TASKS")
+  fi
   [[ ! -e "$save" && ! -e "$log" ]] || fail "refusing to overwrite $run_id"
-  mkdir -p checkpoints logs
+  mkdir -p "$CHECKPOINT_DIR" logs
   require_no_active_train
-  PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 \
+  local launcher
+  if [[ "$NGPUS" -gt 1 ]]; then
+    [[ "$BATCH" -eq $(( BATCH / NGPUS * NGPUS )) ]] \
+      || fail "batch-size $BATCH must divide across $NGPUS GPUs"
+    launcher=("$PY" -m torch.distributed.run --standalone --nproc_per_node="$NGPUS" --max_restarts=0)
+  else
+    launcher=("$PY" -u -B)
+  fi
+  PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 \
     LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6 \
-    MUJOCO_GL=osmesa PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-    "$PY" -u -B train.py --va-data "$VA_TRAIN_DATA" --world-data "$WORLD_TRAIN_DATA" \
+    MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    "${launcher[@]}" train.py --va-data "$VA_TRAIN_DATA" --world-data "$WORLD_TRAIN_DATA" \
     --visual-world-supervision --world-split-manifest "$WORLD_SPLIT_MANIFEST" \
     --va-world-mode peer_sync_h6 --planning-stride 2 --control-stride 2 \
     --wam4va --wmrm-inject all --wmrm-target dino \
     --wmrm-adep-weight 0 --wmrm-cycle-steps 2 --wmrm-world-weight 1.0 \
+    --world-action-rank-stage final \
     --dino-main-vision --dino-dense-metric --main-vision-checkpoint "$DINO" \
     --main-vision-grid 16 --main-vision-frames 4 --main-vision-temporal \
     --main-vision-temporal-scale 1.0 --main-vision-encode-batch 8 \
@@ -301,7 +333,7 @@ run_joint(){
     --mtvj-train-relation --lr-mtvj-relation 0.00002 \
     --mtvj-visual-aux-every 10 --mtvj-visual-aux-batch 8 \
     --steps "$STEPS" --save-every "$SAVE_EVERY" --save-step-copies --save "$save" \
-    "${resume_args[@]}" 2>&1 | tee "$log"
+    "${frame_args[@]}" "${resume_args[@]}" 2>&1 | tee "$log"
   checkpoint_contract "$save"
 }
 

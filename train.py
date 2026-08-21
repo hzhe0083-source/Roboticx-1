@@ -18,6 +18,15 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, Sampler
 
 from va_compound import VACompoundConfig, VACompoundPolicy
+from va_compound.data_parallel import (
+    DATA_PARALLEL_CONTRACT,
+    barrier as data_parallel_barrier,
+    broadcast_parameters,
+    initialize as initialize_data_parallel,
+    reduce_update_gradients,
+    resolve_world_topology,
+    shutdown as shutdown_data_parallel,
+)
 from va_compound.exact_resume import (
     EXACT_RESUME_VERSION,
     EXACT_RUN_CONTRACT_VERSION,
@@ -72,6 +81,7 @@ from va_compound.world_contract import (
     WORLD_LOSS_COMPONENT_WEIGHTS,
     WORLD_NO_REGRESSION,
     WORLD_STAGE_AUXILIARY_DECAY,
+    WORLD_STAGE_AUXILIARY_FLOOR,
     WORLD_STATIC_COPY_CONSTRAINT,
     WORLD_SUPERVISION_CONTRACT,
     WORLD_TRANSITION_CONTRACT,
@@ -862,11 +872,28 @@ class TaskLocalityWeightedSampler(Sampler[list[int]]):
         seed: int = 0,
         block_batches: int = 16,
         sampling_mode: str = "weighted",
+        *,
+        rank: int = 0,
+        world_size: int = 1,
     ) -> None:
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
         if block_batches < 1:
             raise ValueError("block_batches must be positive")
+        if world_size < 1:
+            raise ValueError("world_size must be positive")
+        if not 0 <= rank < world_size:
+            raise ValueError(f"rank {rank} outside world_size {world_size}")
+        # ``batch_size`` stays the *global* batch so ``__len__`` keeps counting
+        # optimizer steps per epoch and the resume cursor keeps meaning the same
+        # thing on any number of ranks.  Each rank yields a disjoint stride of
+        # every global batch, which keeps both ranks inside the same task block:
+        # a rank drifting onto its own task would double the resident decoded
+        # frames, and two tasks per rank does not fit the host memory budget.
+        if batch_size % world_size:
+            raise ValueError(
+                f"global batch {batch_size} must divide across {world_size} ranks"
+            )
         if instruction_id.ndim != 1 or episode_id.ndim != 1:
             raise ValueError("instruction_id/episode_id must be 1-D")
         if instruction_id.shape != episode_id.shape or instruction_id.numel() == 0:
@@ -882,6 +909,8 @@ class TaskLocalityWeightedSampler(Sampler[list[int]]):
         self.seed = int(seed)
         self.block_batches = int(block_batches)
         self.sampling_mode = sampling_mode
+        self.rank = int(rank)
+        self.world_size = int(world_size)
         self.epoch = 0
         self.batch_cursor = 0
         self.by_task_episode: dict[int, dict[int, list[int]]] = {}
@@ -1004,7 +1033,11 @@ class TaskLocalityWeightedSampler(Sampler[list[int]]):
 
     def __iter__(self) -> Iterator[list[int]]:
         schedule = self._build_epoch()
-        yield from schedule[self.batch_cursor :]
+        if self.world_size == 1:
+            yield from schedule[self.batch_cursor :]
+            return
+        for batch in schedule[self.batch_cursor :]:
+            yield batch[self.rank :: self.world_size]
 
     def advance(self, batches: int = 1) -> None:
         if batches < 0:
@@ -1025,6 +1058,7 @@ class TaskLocalityWeightedSampler(Sampler[list[int]]):
             "dataset_fingerprint": self.dataset_fingerprint,
             "active_tasks": self.tasks,
             "task_weights": [float(self.task_w[task]) for task in self.tasks],
+            "world_size": self.world_size,
         }
 
     def load_state_dict(self, state: dict) -> None:
@@ -1038,6 +1072,15 @@ class TaskLocalityWeightedSampler(Sampler[list[int]]):
             "active_tasks": self.tasks,
             "task_weights": [float(self.task_w[task]) for task in self.tasks],
         }
+        # Absent ``world_size`` is a single-process checkpoint (the field was
+        # added when data-parallel sharding landed).  A changed GPU count must
+        # not silently keep the same cursor: the yielded rows would be a
+        # different disjoint slice of each global batch.
+        if int(state.get("world_size", 1)) != self.world_size:
+            raise ValueError(
+                f"sampler state mismatch on world_size: "
+                f"{state.get('world_size', 1)!r} != {self.world_size!r}"
+            )
         for key, value in expected.items():
             if state.get(key) != value:
                 raise ValueError(
@@ -3596,6 +3639,7 @@ def rollout_policy(
         stage_weights = stage_supervision_weights(
             len(visual_world_stage_records),
             auxiliary_decay=WORLD_STAGE_AUXILIARY_DECAY,
+            floor=WORLD_STAGE_AUXILIARY_FLOOR,
         )
 
         def reduce_stage_records(
@@ -4527,6 +4571,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=1.0,
         help="learned frame embedding 的乘法 gate（训练默认 1；0 仅用于因果消融）。",
+    )
+    parser.add_argument(
+        "--longtraj-dir",
+        type=Path,
+        default=None,
+        help="longtraj JPEG 帧文件所在目录（默认仓库 data/）。扩产数据把分片合进"
+        "每任务一个文件后放在别的目录时用它指过去；exact-resume 的帧指纹随之"
+        "跟到同一目录，不会去 data/ 下认错旧文件。",
+    )
+    parser.add_argument(
+        "--longtraj-decode-cache-tasks",
+        type=int,
+        default=None,
+        help="常驻内存的已解码任务数（默认沿用按模式推断的值）。整任务文件全量"
+        "解码，任务切换即重解码；数据扩产后单任务可达数十 GB 且解码要几分钟，"
+        "设为任务总数可用内存换掉这笔反复开销。",
     )
     parser.add_argument(
         "--dino-feature-cache",
@@ -6771,6 +6831,7 @@ def save_checkpoint(
                 ),
                 "world_loss_weights": dict(WORLD_LOSS_COMPONENT_WEIGHTS),
                 "world_stage_auxiliary_decay": WORLD_STAGE_AUXILIARY_DECAY,
+                "world_stage_auxiliary_floor": WORLD_STAGE_AUXILIARY_FLOOR,
                 "world_no_regression": dict(WORLD_NO_REGRESSION),
                 "world_static_copy_constraint": {
                     **WORLD_STATIC_COPY_CONSTRAINT,
@@ -6923,6 +6984,13 @@ def save_checkpoint(
         )
         if world_sampler is not None:
             payload["world_sampler_state"] = world_sampler.state_dict()
+    if int(getattr(args, "data_parallel_world_size", 1) or 1) > 1:
+        payload["training_contract"]["data_parallel"] = getattr(
+            args, "data_parallel_contract", DATA_PARALLEL_CONTRACT
+        )
+        payload["training_contract"]["data_parallel_world_size"] = int(
+            args.data_parallel_world_size
+        )
     tmp_path = args.save.with_suffix(args.save.suffix + ".tmp")
     torch.save(payload, tmp_path)
     tmp_path.replace(args.save)
@@ -7057,7 +7125,24 @@ def _validate_dino_roi_resume_contract(
 
 def main() -> None:
     args = parse_args()
+    topology = resolve_world_topology()
     validate_args(args)
+    if topology.is_distributed:
+        if getattr(args, "va_world_mode", "legacy") != "peer_sync_h6":
+            raise ValueError(
+                "multi-GPU data parallelism is only wired for "
+                "--va-world-mode peer_sync_h6"
+            )
+        if not str(args.device).startswith("cuda"):
+            raise ValueError("multi-GPU data parallelism requires --device cuda")
+        if int(args.batch_size) % topology.world_size:
+            raise ValueError(
+                f"--batch-size {args.batch_size} must divide across "
+                f"{topology.world_size} ranks"
+            )
+        torch.cuda.set_device(topology.local_rank)
+        args.data_parallel_world_size = topology.world_size
+        args.data_parallel_contract = DATA_PARALLEL_CONTRACT
     if args.training_stage == "c" and not args.vision_unfreeze_all:
         print(
             "hint: --training-stage c recommends --vision-unfreeze-all "
@@ -7067,7 +7152,11 @@ def main() -> None:
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    device = torch.device(args.device)
+    if topology.is_distributed:
+        device = torch.device(f"cuda:{topology.local_rank}")
+    else:
+        device = torch.device(args.device)
+    initialize_data_parallel(topology, device)
 
     dual_peer_data = bool(
         getattr(args, "va_data", None) is not None
@@ -7217,13 +7306,17 @@ def main() -> None:
 
             dataset = LongTrajFramesDataset(
                 primary_data,
+                longtraj_dir=getattr(args, "longtraj_dir", None),
                 min_sequence_length=args.min_sequence_length,
                 decode_cache_tasks=(
-                    1
-                    if dual_peer_data
-                    else 2
-                    if getattr(args, "dino_main_vision", False)
-                    else 1
+                    getattr(args, "longtraj_decode_cache_tasks", None)
+                    or (
+                        1
+                        if dual_peer_data
+                        else 2
+                        if getattr(args, "dino_main_vision", False)
+                        else 1
+                    )
                 ),
                 feature_cache=(
                     args.dino_feature_cache
@@ -7613,6 +7706,8 @@ def main() -> None:
                         args.seed,
                         args.task_locality_block_batches,
                         args.task_sampling,
+                        rank=topology.rank,
+                        world_size=topology.world_size,
                     )
                     if args.save is not None or args.resume_exact is not None:
                         # Full payload hashing happens once here; periodic/final
@@ -7644,6 +7739,8 @@ def main() -> None:
                         args.seed,
                         args.task_locality_block_batches,
                         args.task_sampling,
+                        rank=topology.rank,
+                        world_size=topology.world_size,
                     )
                     loader = DataLoader(
                         dataset,
@@ -7712,8 +7809,11 @@ def main() -> None:
 
             world_dataset = LongTrajFramesDataset(
                 args.world_data,
+                longtraj_dir=getattr(args, "longtraj_dir", None),
                 min_sequence_length=args.min_sequence_length,
-                decode_cache_tasks=1,
+                decode_cache_tasks=(
+                    getattr(args, "longtraj_decode_cache_tasks", None) or 1
+                ),
                 feature_cache=None,
                 include_frames=True,
             )
@@ -7756,6 +7856,8 @@ def main() -> None:
                     args.seed + 1,
                     args.task_locality_block_batches,
                     args.task_sampling,
+                    rank=topology.rank,
+                    world_size=topology.world_size,
                 )
                 if args.save is not None or args.resume_exact is not None:
                     world_sampler.bind_dataset_content_identity(
@@ -8260,6 +8362,17 @@ def main() -> None:
         roi_head,
         world_sampler,
     )
+    broadcast_parameters(
+        [parameter for group in optimizer.param_groups for parameter in group["params"]],
+        topology,
+    )
+    if topology.is_distributed and topology.is_primary:
+        print(
+            f"data_parallel contract={DATA_PARALLEL_CONTRACT} "
+            f"world_size={topology.world_size} global_batch={args.batch_size} "
+            f"local_batch={int(args.batch_size) // topology.world_size}",
+            flush=True,
+        )
 
     if e2e_model is not None:
         e2e_model.train()
@@ -8660,7 +8773,8 @@ def main() -> None:
             world_sampler.advance()
         global_step += 1
         if (
-            args.save is not None
+            topology.is_primary
+            and args.save is not None
             and args.save_every > 0
             and global_step % args.save_every == 0
         ):
@@ -8682,11 +8796,12 @@ def main() -> None:
                 exact_run_contract=runtime_exact_run_contract,
             )
             last_saved_global_step = global_step
-            print(
-                f"step={local_step} global_step={global_step} "
-                f"periodic checkpoint saved to {args.save}",
-                flush=True,
-            )
+            if topology.is_primary:
+                print(
+                    f"step={local_step} global_step={global_step} "
+                    f"periodic checkpoint saved to {args.save}",
+                    flush=True,
+                )
 
     for step in range(1, args.steps + 1):
         rec_batch = None
@@ -9579,6 +9694,7 @@ def main() -> None:
             )
         )
         validate_optimizer_update_state(optimizer, validate_values=False)
+        reduce_update_gradients(update_named_parameters, topology)
         raw_gradient_norm = validate_update_gradients(
             update_named_parameters, max_norm=args.max_gradient_norm
         )
@@ -9770,27 +9886,30 @@ def main() -> None:
             f"cuda={resources['cuda_allocated_mib']:.1f}/"
             f"{resources['cuda_reserved_mib']:.1f}MiB]"
         )
-        print(
-            f"step={global_step} mode={args.mode} contract="
-            f"{'e2e_single' if e2e_model is not None else ('single' if args.single_task else 'paired')} "
-            f"task={task_log} action_valid={float(valid_fraction):.4f} "
-            f"sequence={noisy_actions.shape[1]} "
-            f"loss={total_loss.item():.6f} flow={flow_loss.item():.6f} "
-            f"flow_first{min(args.flow_prefix_steps, noisy_actions.shape[-2])}="
-            f"{flow_prefix_loss.item():.6f} "
-            f"flow_tail{max(noisy_actions.shape[-2] - args.flow_prefix_steps, 0)}="
-            f"{flow_tail_loss.item():.6f} "
-            f"pair={pair_loss.item():.6f} future={future_loss.item():.6f} "
-            f"world_objective={world_action_total.item():.6f} "
-            f"world={float((getattr(model, 'last_wmrm_loss', None) if model is not None else None) or 0.0):.6f} "
-            f"goal_delta={predicted_delta.item():.6f}/"
-            f"{target_delta.item():.6f} grad={float(gradient_norm):.6f}"
-            f"{relation_log}{metric_head_log}{aux_log}{gate_log}{semantic_log}"
-            f"{compile_step_log}{servo_log}{world_task_log}{resource_log}"
-            f"{world_constraint_log}"
-        )
+        if topology.is_primary:
+            print(
+                f"step={global_step} mode={args.mode} contract="
+                f"{'e2e_single' if e2e_model is not None else ('single' if args.single_task else 'paired')} "
+                f"task={task_log} action_valid={float(valid_fraction):.4f} "
+                f"sequence={noisy_actions.shape[1]} "
+                f"loss={total_loss.item():.6f} flow={flow_loss.item():.6f} "
+                f"flow_first{min(args.flow_prefix_steps, noisy_actions.shape[-2])}="
+                f"{flow_prefix_loss.item():.6f} "
+                f"flow_tail{max(noisy_actions.shape[-2] - args.flow_prefix_steps, 0)}="
+                f"{flow_tail_loss.item():.6f} "
+                f"pair={pair_loss.item():.6f} future={future_loss.item():.6f} "
+                f"world_objective={world_action_total.item():.6f} "
+                f"world={float((getattr(model, 'last_wmrm_loss', None) if model is not None else None) or 0.0):.6f} "
+                f"goal_delta={predicted_delta.item():.6f}/"
+                f"{target_delta.item():.6f} grad={float(gradient_norm):.6f}"
+                f"{relation_log}{metric_head_log}{aux_log}{gate_log}{semantic_log}"
+                f"{compile_step_log}{servo_log}{world_task_log}{resource_log}"
+                f"{world_constraint_log}"
+            )
 
-    if final_checkpoint_save_due(
+    if topology.is_distributed:
+        data_parallel_barrier(topology)
+    if topology.is_primary and final_checkpoint_save_due(
         args.save, global_step, last_saved_global_step
     ):
         save_checkpoint(
@@ -9810,6 +9929,7 @@ def main() -> None:
             world_sampler=world_sampler,
             exact_run_contract=runtime_exact_run_contract,
         )
+    shutdown_data_parallel(topology)
 
 
 if __name__ == "__main__":
