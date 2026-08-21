@@ -25,11 +25,32 @@ from torch.nn import functional as F
 # 都是无约束的纯加法残差（``belief = belief + f``、``z_map = base + delta``），
 # 在 sequence_length=4 的短窗口训练下勉强有限，但长 horizon 闭环（horizon=500，
 # 约 4000 次 propose）会把同一段非收缩递推推到 NaN；训练后期 world_action_rank
-# 的尖峰震荡也源于早期 stage 的循环状态幅度单调漂移。这些常量给循环加收缩，
-# 不新增任何 nn.Parameter / buffer，因此旧 checkpoint 的 strict load 不受影响。
+# 的尖峰震荡也源于早期 stage 的循环状态幅度单调漂移。
+#
+# 收缩只作用于前向值：用 straight-through 让梯度对 base/delta 恒等，保住
+# ``belief = belief + f`` 原有的 identity credit path 契约（早期 stage 通过
+# 恒等路径收到不衰减的梯度），同时前向的 ``retention<1`` 让循环有不动点。
 _BELIEF_RETENTION = 0.9  # belief 循环的遗忘保留系数（<1 即收缩，防发散）
 _MAP_RETENTION = 0.9     # world_map 循环 stage 的保留系数（<1 使循环有不动点）
 _MAP_DELTA_GAIN = 0.5    # world_map 残差的固定缩放（8-stage 累加不失控）
+
+
+def _st_scale_residual(
+    base: Tensor,
+    delta: Tensor,
+    *,
+    base_scale: float,
+    delta_scale: float,
+) -> Tensor:
+    """Straight-through 缩放残差：前向 ``base_scale*base + delta_scale*delta``。
+
+    梯度对 ``base`` 和 ``delta`` 均恒等（I），因此循环的 identity credit path
+    设计契约不变——早期 stage 通过恒等路径收到不衰减的梯度，而缩放只改变前向
+    值，用于抑制跨 stage / 跨决策点的无界累积。``delta`` 本身在调用点用
+    ``base.detach()`` 计算，所以非线性 reader 的 Jacobian 不会跨 stage 连乘。
+    """
+    scaled = base_scale * base + delta_scale * delta
+    return (base + delta) + (scaled - base - delta).detach()
 
 
 def _require_finite(tensor: Tensor, name: str, *, boundary: str) -> None:
@@ -442,14 +463,18 @@ class _DeepWorldPredictor(nn.Module):
         base = clip[:, -1] if previous_map is None else previous_map
         if previous_map is None:
             # 首决策点 stage 0 的锚是真实 DINO 最后一帧，保持语义不衰减。
-            return base + _MAP_DELTA_GAIN * delta
+            return _st_scale_residual(
+                base, delta, base_scale=1.0, delta_scale=_MAP_DELTA_GAIN
+            )
         # 循环项（上一 stage / 上一决策点的 map）：8 个 stage 复用同一个
         # predictor，每个 stage 都在上一 stage 的 map 上累加 delta，且跨决策点
         # 经 WAMState.world_map 持续累积。纯加法对应训练日志里前几个 stage 能量
         # 6→26→47 的单调抬升，长 horizon 下无界。保留系数 <1 使循环有不动点，
-        # 固定缩放把每阶段 refine 量压回有界范围；base 仍提供主要幅度、
-        # delta 提供方向性修正。
-        return _MAP_RETENTION * base + _MAP_DELTA_GAIN * delta
+        # 固定缩放把每阶段 refine 量压回有界范围；straight-through 保证 base 的
+        # 恒等梯度不因收缩而衰减。
+        return _st_scale_residual(
+            base, delta, base_scale=_MAP_RETENTION, delta_scale=_MAP_DELTA_GAIN
+        )
 
 
 class WAM4VA(nn.Module):
@@ -1010,9 +1035,11 @@ class WAM4VA(nn.Module):
         if prev_innovation is not None:
             innovation = self._project_out(innovation, prev_innovation)
         belief_update = self.belief_write(belief_context, innovation)
-        belief = (
-            _BELIEF_RETENTION * belief
-            + (1.0 - _BELIEF_RETENTION) * belief_update
+        belief = _st_scale_residual(
+            belief,
+            belief_update,
+            base_scale=_BELIEF_RETENTION,
+            delta_scale=1.0 - _BELIEF_RETENTION,
         )
 
         if language_keys is None:
@@ -1056,9 +1083,11 @@ class WAM4VA(nn.Module):
             belief_update = self.belief_from_world(
                 belief.detach(), world_tokens.detach()
             )
-            belief = (
-                _BELIEF_RETENTION * belief
-                + (1.0 - _BELIEF_RETENTION) * belief_update
+            belief = _st_scale_residual(
+                belief,
+                belief_update,
+                base_scale=_BELIEF_RETENTION,
+                delta_scale=1.0 - _BELIEF_RETENTION,
             )
         elif self.dino_to_hid is not None:
             # Intermediate VA↔WM exchanges use the recurrent WM belief as
