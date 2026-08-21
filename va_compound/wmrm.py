@@ -1,15 +1,12 @@
-"""WAM4VA: world-action model for a VA policy.
+"""WAM4VA: recurrent world state for a VA policy.
 
-WAM predicts the next-cycle last-frame DINO map and writes that spatial
-world into VA's action stream. VA/FM remain the only action emitter.
+VA and WAM keep independent states.  At stage ``i`` both peers read the
+committed state from stage ``i-1``.  WAM publishes world-memory tokens that
+the next VA layer reads as attention K/V; it never adds a correction to VA's
+visual or action outputs.  VA/Flow remain the only action emitter.
 
-Handshake:
-    A' = A + q * mixed(world_tokens, A)
-    q is zero-init, so A' ≡ A at step 0.
-
-World prediction never reads VA's latent A. It reads the logged env-action
-chunk (full cycle, not a mean) plus the T-frame DINO clip. Futures only
-enter ``wmrm_world_loss``.
+World prediction reads the executable action chunk plus the T-frame DINO
+clip.  Realized futures enter only the world-model loss.
 """
 
 from __future__ import annotations
@@ -17,8 +14,22 @@ from __future__ import annotations
 from dataclasses import dataclass, fields
 
 import torch
+import torch.utils.checkpoint
 from torch import Tensor, nn
 from torch.nn import functional as F
+
+
+# 循环状态数值稳定性（无参数，兼容 strict checkpoint 加载）。
+#
+# belief 与 world_map 是跨 8 个 stage × T 个决策点持久化的循环状态。两者原来
+# 都是无约束的纯加法残差（``belief = belief + f``、``z_map = base + delta``），
+# 在 sequence_length=4 的短窗口训练下勉强有限，但长 horizon 闭环（horizon=500，
+# 约 4000 次 propose）会把同一段非收缩递推推到 NaN；训练后期 world_action_rank
+# 的尖峰震荡也源于早期 stage 的循环状态幅度单调漂移。这些常量给循环加收缩，
+# 不新增任何 nn.Parameter / buffer，因此旧 checkpoint 的 strict load 不受影响。
+_BELIEF_RETENTION = 0.9  # belief 循环的遗忘保留系数（<1 即收缩，防发散）
+_MAP_RETENTION = 0.9     # world_map 循环 stage 的保留系数（<1 使循环有不动点）
+_MAP_DELTA_GAIN = 0.5    # world_map 残差的固定缩放（8-stage 累加不失控）
 
 
 def _require_finite(tensor: Tensor, name: str, *, boundary: str) -> None:
@@ -139,8 +150,6 @@ class WAMState:
 class WMRMAux:
     z_hat: Tensor
     z_spans: Tensor
-    pi: Tensor
-    gate: Tensor
     progress: Tensor
     belief: Tensor
     innovation: Tensor
@@ -151,9 +160,8 @@ class WMRMAux:
     dino_tokens: Tensor | None = None
     env_action: Tensor | None = None
     world_tokens: Tensor | None = None
-    vision_gate: Tensor | None = None
     # Belief state exactly at the predictor input. ``belief`` above is the
-    # post-prediction/handshake state and is therefore not valid for an
+    # post-prediction state and is therefore not valid for an
     # action-counterfactual re-evaluation of the final World stage.
     predict_belief: Tensor | None = None
 
@@ -192,18 +200,16 @@ class WMRMAux:
 
 @dataclass(frozen=True)
 class WAMProposal:
-    """Immutable output computed from one unmodified peer snapshot."""
+    """Independent World transition computed from one peer snapshot."""
 
     next_world_state: WAMState
-    action_delta: Tensor
-    vision_delta: Tensor
+    world_message: Tensor
     aux: WMRMAux
 
     def detach(self) -> "WAMProposal":
         return WAMProposal(
             next_world_state=self.next_world_state.detach(),
-            action_delta=self.action_delta.detach(),
-            vision_delta=self.vision_delta.detach(),
+            world_message=self.world_message.detach(),
             aux=self.aux.detach(),
         )
 
@@ -216,8 +222,7 @@ class WAMProposal:
             dtype, device = device, None
         return WAMProposal(
             next_world_state=self.next_world_state.to(device=device, dtype=dtype),
-            action_delta=self.action_delta.to(device=device, dtype=dtype),
-            vision_delta=self.vision_delta.to(device=device, dtype=dtype),
+            world_message=self.world_message.to(device=device, dtype=dtype),
             aux=self.aux.to(device=device, dtype=dtype),
         )
 
@@ -230,14 +235,12 @@ class WAMProposal:
 
         return WAMProposal(
             next_world_state=self.next_world_state.index_select(index),
-            action_delta=select(self.action_delta),
-            vision_delta=select(self.vision_delta),
+            world_message=select(self.world_message),
             aux=self.aux.index_select(index),
         )
 
     def validate_finite(self, *, boundary: str = "WAM proposal") -> None:
-        _require_finite(self.action_delta, "action_delta", boundary=boundary)
-        _require_finite(self.vision_delta, "vision_delta", boundary=boundary)
+        _require_finite(self.world_message, "world_message", boundary=boundary)
         self.next_world_state.validate_finite(boundary=boundary)
 
 
@@ -346,7 +349,7 @@ class _WorldPredictorBlock(nn.Module):
 
 
 class _DeepWorldPredictor(nn.Module):
-    """Full-grid spatiotemporal residual predictor. Initial output copies last frame."""
+    """Full-grid spatiotemporal residual predictor with a near-copy start."""
 
     def __init__(
         self,
@@ -376,7 +379,9 @@ class _DeepWorldPredictor(nn.Module):
         )
         self.out_norm = nn.LayerNorm(width)
         self.out_proj = nn.Linear(width, dino_dim)
-        nn.init.zeros_(self.out_proj.weight)
+        # Keep the initial prediction close to the last frame without closing
+        # the World-loss Jacobian to the condition encoder on the first update.
+        nn.init.normal_(self.out_proj.weight, mean=0.0, std=1e-3)
         nn.init.zeros_(self.out_proj.bias)
 
     def _causal_mask(self, device: torch.device, dtype: torch.dtype) -> Tensor:
@@ -411,7 +416,15 @@ class _DeepWorldPredictor(nn.Module):
         if previous_map is not None:
             if previous_map.shape != (batch, dim, height, width):
                 raise ValueError(f"previous_map shape mismatch: {tuple(previous_map.shape)}")
-            predictor_clip = torch.cat((clip[:, :-1], previous_map[:, None]), dim=1)
+            # The recurrent map remains the differentiable residual base below,
+            # so later World losses still train every earlier stage.  Treat its
+            # second use as predictor context as read-only memory: otherwise the
+            # 6-block nonlinear Jacobian is multiplied through all 8 stages and
+            # 4 decisions, which can make an otherwise finite forward pass have
+            # an arbitrarily large backward pass.
+            predictor_clip = torch.cat(
+                (clip[:, :-1], previous_map.detach()[:, None]), dim=1
+            )
         tokens = predictor_clip.permute(0, 1, 3, 4, 2).reshape(
             batch, frames * height * width, dim
         )
@@ -427,20 +440,27 @@ class _DeepWorldPredictor(nn.Module):
         residual = self.out_proj(self.out_norm(last))
         delta = residual.view(batch, height, width, dim).permute(0, 3, 1, 2)
         base = clip[:, -1] if previous_map is None else previous_map
-        return base + delta
+        if previous_map is None:
+            # 首决策点 stage 0 的锚是真实 DINO 最后一帧，保持语义不衰减。
+            return base + _MAP_DELTA_GAIN * delta
+        # 循环项（上一 stage / 上一决策点的 map）：8 个 stage 复用同一个
+        # predictor，每个 stage 都在上一 stage 的 map 上累加 delta，且跨决策点
+        # 经 WAMState.world_map 持续累积。纯加法对应训练日志里前几个 stage 能量
+        # 6→26→47 的单调抬升，长 horizon 下无界。保留系数 <1 使循环有不动点，
+        # 固定缩放把每阶段 refine 量压回有界范围；base 仍提供主要幅度、
+        # delta 提供方向性修正。
+        return _MAP_RETENTION * base + _MAP_DELTA_GAIN * delta
 
 
 class WAM4VA(nn.Module):
-    """World-action model that only modulates VA's action stream."""
+    """World-action model that publishes recurrent attention memory to VA."""
 
     def __init__(
         self,
         hidden_dim: int,
         *,
         world_dim: int = 8,
-        rank: int = 4,
         proprio_dim: int = 9,
-        mixer_dropout: float = 0.3,
         num_heads: int = 4,
         n_belief: int = 8,
         n_evidence: int = 8,
@@ -448,7 +468,6 @@ class WAM4VA(nn.Module):
         n_progress: int = 4,
         n_task_queries: int = 4,
         cycle_steps: int = 6,
-        condition_on_action: bool = True,
         dino_dim: int | None = None,
         map_size: int = 16,
         map_channels: int = 32,
@@ -467,12 +486,8 @@ class WAM4VA(nn.Module):
             raise ValueError("hidden_dim must be positive")
         if world_dim < 1:
             raise ValueError("world_dim must be positive")
-        if rank < 1:
-            raise ValueError("rank must be positive")
         if proprio_dim < 1:
             raise ValueError("proprio_dim must be positive")
-        if not 0.0 <= mixer_dropout < 1.0:
-            raise ValueError("mixer_dropout must be in [0, 1)")
         if n_spans < 1 or n_belief < 1 or n_evidence < 1 or n_progress < 1:
             raise ValueError("belief/evidence/span/progress sizes must be positive")
         if n_task_queries < 1:
@@ -493,17 +508,13 @@ class WAM4VA(nn.Module):
             raise ValueError("max_stages must be positive")
         self.hidden_dim = hidden_dim
         self.world_dim = world_dim
-        self.rank = rank
         self.proprio_dim = proprio_dim
-        self.mixer_dropout = mixer_dropout
         self.n_belief = n_belief
         self.n_evidence = n_evidence
         self.n_spans = n_spans
         self.n_progress = n_progress
         self.n_task_queries = n_task_queries
         self.cycle_steps = cycle_steps
-        # Kept for CLI/config compatibility. World prediction never reads VA A.
-        self.condition_on_action = condition_on_action
         self.dino_dim = dino_dim
         self.world_grid = world_grid
         self.predictor = predictor
@@ -522,11 +533,6 @@ class WAM4VA(nn.Module):
         self.belief_write = _CrossAttn(hidden_dim, num_heads)
         self.belief_from_world = _CrossAttn(hidden_dim, num_heads)
         self.belief_from_world.zero_output()
-        self.vision_from_world = _CrossAttn(hidden_dim, num_heads)
-        self.legacy_ungated_vision = False
-        self.vision_gate_proj = nn.Linear(world_dim, 1)
-        nn.init.zeros_(self.vision_gate_proj.weight)
-        nn.init.zeros_(self.vision_gate_proj.bias)
 
         self.world_from_env = nn.Linear(hidden_dim, hidden_dim)
         self.world_from_state = nn.Linear(proprio_dim, hidden_dim)
@@ -537,26 +543,8 @@ class WAM4VA(nn.Module):
         self.world_from_task = nn.Linear(hidden_dim, hidden_dim)
         nn.init.zeros_(self.world_from_task.weight)
         nn.init.zeros_(self.world_from_task.bias)
-        self.mix_stage = nn.Linear(hidden_dim, rank)
-        nn.init.zeros_(self.mix_stage.weight)
-        nn.init.zeros_(self.mix_stage.bias)
         self.span_heads = nn.ModuleList(nn.Linear(hidden_dim, world_dim) for _ in range(n_spans))
         self.progress_head = nn.Linear(hidden_dim * 2, n_progress)
-
-        self.geo_to_token = nn.Linear(world_dim, hidden_dim)
-        self.progress_to_token = nn.Linear(n_progress, hidden_dim)
-        self.ca_belief = _CrossAttn(hidden_dim, num_heads)
-        self.ca_geo = _CrossAttn(hidden_dim, num_heads)
-        self.ca_progress = _CrossAttn(hidden_dim, num_heads)
-        self.source_gates = nn.Parameter(torch.zeros(3))
-
-        context_dim = hidden_dim + hidden_dim + proprio_dim
-        self.basis = nn.Linear(context_dim, rank * hidden_dim)
-        self.mix_world = nn.Linear(world_dim, rank)
-        self.mix_action = nn.Linear(hidden_dim, rank)
-        self.gate_proj = nn.Linear(world_dim, 1)
-        nn.init.zeros_(self.gate_proj.weight)
-        nn.init.zeros_(self.gate_proj.bias)
         if map_size < 1 or map_channels < 1 or map_frames < 1 or map_grid < 1:
             raise ValueError("map_size/channels/frames/grid must be positive")
         self.map_size = map_size
@@ -683,18 +671,48 @@ class WAM4VA(nn.Module):
         # the feature path's incidental autocast dtype.
         with torch.autocast(device_type=current.device.type, enabled=False):
             current_fp32 = current.float()
-            previous_fp32 = previous.float()
+            # ``previous`` is recurrent memory, not a quantity that this local
+            # projection should optimize through.  Differentiating the
+            # scale-invariant projection with respect to a near-zero previous
+            # innovation produces a 1 / ||previous|| Jacobian and can explode
+            # across the 8-stage x T recurrence.  Its value still participates
+            # in the forward pass; only that ill-conditioned backward edge is
+            # removed.
+            previous_fp32 = previous.detach().float()
             flat_prev = previous_fp32.reshape(previous_fp32.shape[0], -1)
             flat_cur = current_fp32.reshape(current_fp32.shape[0], -1)
-            cosine = (
-                F.normalize(flat_cur, dim=-1) * F.normalize(flat_prev, dim=-1)
-            ).sum(dim=-1, keepdim=True)
-            denom = flat_prev.square().sum(dim=-1, keepdim=True).clamp_min(1e-8)
-            coeff = (flat_cur * flat_prev).sum(dim=-1, keepdim=True) / denom
-            drop = (cosine > self.innov_overlap).to(dtype=torch.float32)
+            # Scale before any square/dot reduction.  Deployment carries this
+            # state for far longer than one training window, so even finite
+            # values can otherwise overflow their FP32 energy to Inf.
+            prev_scale = flat_prev.abs().amax(dim=-1, keepdim=True)
+            cur_scale = flat_cur.abs().amax(dim=-1, keepdim=True)
+            safe_prev_scale = prev_scale.clamp_min(1e-20)
+            safe_cur_scale = cur_scale.clamp_min(1e-20)
+            scaled_prev = flat_prev / safe_prev_scale
+            scaled_cur = flat_cur / safe_cur_scale
+            prev_energy = scaled_prev.square().sum(dim=-1, keepdim=True)
+            cur_energy = scaled_cur.square().sum(dim=-1, keepdim=True)
+            dot = (scaled_cur * scaled_prev).sum(dim=-1, keepdim=True)
+            energy_floor = 1e-8
+            cosine = dot / (cur_energy * prev_energy).sqrt().clamp_min(
+                energy_floor
+            )
+            coeff = dot / prev_energy.clamp_min(energy_floor)
+            original_prev_energy = prev_scale.square() * prev_energy
+            drop = (original_prev_energy > energy_floor) & (
+                cosine > self.innov_overlap
+            )
+            projection = (
+                coeff * scaled_prev * cur_scale
+            ).view_as(current_fp32)
             while drop.ndim < current_fp32.ndim:
                 drop = drop.unsqueeze(-1)
-            return current_fp32 - drop * (coeff * flat_prev).view_as(current_fp32)
+            # ``where`` is intentional: a false branch must stay clean even if
+            # an extreme true-branch projection ever overflows.  Multiplying a
+            # false 0 by NaN/Inf would still contaminate the output.
+            return current_fp32 - torch.where(
+                drop, projection, torch.zeros_like(projection)
+            )
 
     def _span_ids(self, horizon: int, device: torch.device) -> Tensor:
         n_spans = self.n_spans
@@ -714,32 +732,6 @@ class WAM4VA(nn.Module):
                 mask = ids == ids[-1]
             spans.append(action[:, mask].mean(dim=1))
         return spans
-
-    def _z_per_step(self, z_hat: Tensor, horizon: int) -> Tensor:
-        """Broadcast the supervised z_hat; do not feed unsupervised span residuals."""
-        if z_hat.ndim != 2:
-            raise ValueError(f"z_hat must be [B, G], got {tuple(z_hat.shape)}")
-        return z_hat[:, None, :].expand(-1, horizon, -1)
-
-    def _pi(
-        self,
-        z_per_step: Tensor,
-        action: Tensor,
-        task_summary: Tensor | None = None,
-        *,
-        apply_dropout: bool | None = None,
-    ) -> Tensor:
-        use_dropout = self.training if apply_dropout is None else apply_dropout
-        world_logits = F.dropout(
-            self.mix_world(z_per_step), p=self.mixer_dropout, training=use_dropout
-        )
-        action_logits = F.dropout(
-            self.mix_action(action), p=self.mixer_dropout, training=use_dropout
-        )
-        logits = world_logits * action_logits
-        if task_summary is not None:
-            logits = logits + self.mix_stage(task_summary)[:, None, :]
-        return torch.softmax(logits, dim=-1)
 
     def encode_env_action(self, env_action: Tensor | None, *, batch: int, dtype: torch.dtype, device: torch.device) -> tuple[Tensor | None, Tensor]:
         """Return (step tokens [B, C, H], ordered flat cond [B, H])."""
@@ -852,7 +844,7 @@ class WAM4VA(nn.Module):
         env_action: Tensor | None = None,
         previous_map: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
-        """Predict the next DINO map from configured executable actions, not VA hidden A."""
+        """Predict the P-step-later DINO map from exactly P executable actions."""
         if env_action is None:
             env_tokens, env_flat = None, action.new_zeros(action.shape[0], self.hidden_dim)
         else:
@@ -863,7 +855,7 @@ class WAM4VA(nn.Module):
                 device=action.device,
             )
         fused, z_spans, progress, _ = self._world_condition(
-            proprio, belief.detach(), task_summary.detach(), env_tokens, env_flat
+            proprio, belief, task_summary, env_tokens, env_flat
         )
         if dino_tokens is None or (
             self.st_predictor is None and self.map_dw1 is None and self.dino_pred is None
@@ -880,7 +872,7 @@ class WAM4VA(nn.Module):
         clip = self.encode_dino_clip(dino_tokens)
         if clip is not None and self.st_predictor is not None:
             cond_parts = [
-                self.belief_to_pred(belief.detach()),
+                self.belief_to_pred(belief),
                 self.fused_to_pred(fused)[:, None, :],
             ]
             if env_tokens is not None:
@@ -940,103 +932,6 @@ class WAM4VA(nn.Module):
         z_hat = self.z_read(query, kv).squeeze(1)
         return z_hat, z_spans, progress, z_tokens
 
-    def mixed_residual(
-        self,
-        action: Tensor,
-        z_hat: Tensor,
-        task_summary: Tensor,
-        evidence: Tensor,
-        belief: Tensor,
-        proprio: Tensor,
-        progress: Tensor,
-        *,
-        apply_dropout: bool | None = None,
-        world_tokens: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """Return (mixed, gate, pi). Geo source is spatial world tokens when present."""
-        horizon = action.shape[1]
-        hidden = action.shape[-1]
-        state = proprio.to(dtype=action.dtype)
-        if world_tokens is None:
-            geo_tokens = self.geo_to_token(z_hat)[:, None, :]
-        else:
-            geo_tokens = world_tokens
-        progress_tokens = self.progress_to_token(progress)[:, None, :]
-        source = torch.stack(
-            (
-                self.ca_belief(action, belief),
-                self.ca_geo(action, geo_tokens),
-                self.ca_progress(action, progress_tokens),
-            ),
-            dim=0,
-        )
-        gates = (1.0 + torch.tanh(self.source_gates)).view(3, 1, 1, 1)
-        sourced = (gates * source).sum(dim=0)
-        context = torch.cat(
-            (
-                action,
-                evidence.mean(dim=1, keepdim=True).expand(-1, horizon, -1),
-                state[:, None, :].expand(-1, horizon, -1),
-            ),
-            dim=-1,
-        )
-        bases = F.normalize(
-            self.basis(context).view(action.shape[0], horizon, self.rank, hidden),
-            dim=-1,
-        )
-        pi = self._pi(
-            self._z_per_step(z_hat, horizon),
-            action,
-            task_summary,
-            apply_dropout=apply_dropout,
-        )
-        mixed = (pi.unsqueeze(-1) * bases).sum(dim=2) + sourced
-        gate = torch.tanh(self.gate_proj(z_hat))
-        return mixed, gate, pi
-
-    def fm_condition_hinge(
-        self,
-        action: Tensor,
-        aux: WMRMAux,
-        action_norm: nn.Module,
-        *,
-        margin: float = 0.05,
-    ) -> Tensor:
-        """Forces z into FM input; signed shift so q=0 has nonzero gate_proj grad."""
-        perm = torch.randperm(aux.z_hat.shape[0], device=aux.z_hat.device)
-        z = aux.z_hat
-        z_shuf = aux.z_hat[perm]
-        world = aux.world_tokens
-        world_shuf = None if world is None else world[perm]
-        mixed, gate, _ = self.mixed_residual(
-            action,
-            z,
-            aux.task_summary,
-            aux.evidence,
-            aux.belief,
-            aux.proprio,
-            aux.progress,
-            apply_dropout=False,
-            world_tokens=world,
-        )
-        mixed_alt, gate_alt, _ = self.mixed_residual(
-            action,
-            z_shuf,
-            aux.task_summary,
-            aux.evidence,
-            aux.belief,
-            aux.proprio,
-            aux.progress,
-            apply_dropout=False,
-            world_tokens=world_shuf,
-        )
-        cond = action_norm(action + gate.unsqueeze(-1) * mixed)
-        cond_alt = action_norm(action + gate_alt.unsqueeze(-1) * mixed_alt)
-        delta_m = (mixed - mixed_alt).flatten(1)
-        d_m = (delta_m / (delta_m.norm(dim=-1, keepdim=True) + 1e-6)).detach()
-        shift = ((cond - cond_alt).flatten(1) * d_m).sum(dim=-1).mean()
-        return torch.relu(cond.new_tensor(margin) - shift)
-
     def action_dep_hinge(
         self,
         z_hat: Tensor,
@@ -1064,7 +959,7 @@ class WAM4VA(nn.Module):
         reuse_aux: WMRMAux | None = None,
         stage_index: int = 0,
         previous_map: Tensor | None = None,
-    ) -> tuple[Tensor, WMRMAux, Tensor, Tensor]:
+    ) -> tuple[WMRMAux, Tensor, Tensor]:
         if world_goal is not None:
             raise ValueError(
                 "world_goal is sealed: realized futures must not enter the "
@@ -1090,15 +985,7 @@ class WAM4VA(nn.Module):
         if action.shape[0] != vision.shape[0] or action.shape[0] != proprio.shape[0]:
             raise ValueError("action, vision, and proprio batch sizes must match")
 
-        batch, horizon, hidden = action.shape
-        # === DIAGNOSTIC: gradient norm prints ===
-        if self.training:
-            for name, param in self.named_parameters():
-                if param.requires_grad and param.grad is not None:
-                    norm = param.grad.norm().item()
-                    if norm > 1e4:
-                        print(f"DIAG: {name} grad norm BEFORE mixed_residual: {norm:.2e}", flush=True)
-        # === END DIAG ===
+        batch, _, hidden = action.shape
 
         queries = self.evidence_queries[None].expand(batch, -1, -1)
         evidence = self.evidence_read(queries, vision)
@@ -1112,11 +999,21 @@ class WAM4VA(nn.Module):
         if not 0 <= stage < self.max_stages:
             raise ValueError(f"stage_index must be in [0, {self.max_stages}), got {stage}")
         belief = belief + self.stage_embed.weight[stage]
-        predicted = self.evidence_from_belief(belief)
+        # Belief is a recurrent residual state across 8 stages x T decisions.
+        # Read the incoming value as memory, then publish a differentiable
+        # residual update.  This keeps an identity credit path to earlier
+        # stages while preventing the shared nonlinear reader Jacobians from
+        # being multiplied through the full recurrent chain.
+        belief_context = belief.detach()
+        predicted = self.evidence_from_belief(belief_context)
         innovation = evidence - predicted
         if prev_innovation is not None:
             innovation = self._project_out(innovation, prev_innovation)
-        belief = belief + self.belief_write(belief, innovation)
+        belief_update = self.belief_write(belief_context, innovation)
+        belief = (
+            _BELIEF_RETENTION * belief
+            + (1.0 - _BELIEF_RETENTION) * belief_update
+        )
 
         if language_keys is None:
             task_summary = torch.zeros(batch, hidden, device=action.device, dtype=action.dtype)
@@ -1153,38 +1050,24 @@ class WAM4VA(nn.Module):
         ):
             world_tokens = self.encode_world_tokens(z_tokens)
         if world_tokens is not None:
-            belief = belief + self.belief_from_world(belief, world_tokens)
+            # The predicted map has its own differentiable loss/message paths.
+            # Here it is read as recurrent memory so the belief recurrence also
+            # remains an identity residual rather than another I + J product.
+            belief_update = self.belief_from_world(
+                belief.detach(), world_tokens.detach()
+            )
+            belief = (
+                _BELIEF_RETENTION * belief
+                + (1.0 - _BELIEF_RETENTION) * belief_update
+            )
         elif self.dino_to_hid is not None:
             # Intermediate VA↔WM exchanges use the recurrent WM belief as
             # spatially addressable memory; the final layer replaces it with
             # the predicted DINO map tokens.
             world_tokens = belief
-        # === DIAGNOSTIC: after predict_world ===
-        if self.training:
-            for name, param in self.named_parameters():
-                if param.requires_grad and param.grad is not None:
-                    norm = param.grad.norm().item()
-                    if norm > 1e4:
-                        print(f"DIAG: {name} grad norm AFTER predict_world: {norm:.2e}", flush=True)
-        # === END DIAG ===
-
-        mixed, gate, pi = self.mixed_residual(
-            action,
-            z_hat,
-            task_summary,
-            evidence,
-            belief,
-            proprio,
-            progress,
-            world_tokens=world_tokens,
-        )
-        updated = action + gate.unsqueeze(-1) * mixed
-        vision_gate = torch.tanh(self.vision_gate_proj(z_hat))
         aux = WMRMAux(
             z_hat=z_hat,
             z_spans=z_spans,
-            pi=pi,
-            gate=gate.detach(),
             progress=progress,
             belief=belief,
             innovation=innovation,
@@ -1199,10 +1082,9 @@ class WAM4VA(nn.Module):
                 else env_action.to(device=action.device, dtype=action.dtype)
             ),
             world_tokens=world_tokens,
-            vision_gate=vision_gate,
             predict_belief=predict_belief,
         )
-        return updated, aux, belief, innovation
+        return aux, belief, innovation
 
     def propose(
         self,
@@ -1228,7 +1110,7 @@ class WAM4VA(nn.Module):
             map_size=self.map_size,
             device=action.device,
         )
-        updated, aux, belief, innovation = self._forward_from_snapshot(
+        aux, belief, innovation = self._forward_from_snapshot(
             action,
             vision,
             proprio,
@@ -1241,8 +1123,6 @@ class WAM4VA(nn.Module):
             stage_index=stage_index,
             previous_map=snapshot.world_map,
         )
-        action_delta = updated - action
-        vision_delta = self.mix_world_into_vision(vision, aux) - vision
         next_world_map = (
             aux.z_tokens
             if aux.z_tokens is not None and aux.z_tokens.ndim == 4
@@ -1259,79 +1139,13 @@ class WAM4VA(nn.Module):
                 innovation=state_innovation,
                 world_map=state_world_map,
             ),
-            action_delta=action_delta,
-            vision_delta=vision_delta,
+            world_message=(
+                aux.world_tokens
+                if aux.world_tokens is not None
+                else belief
+            ),
             aux=aux,
         )
-
-    def forward(
-        self,
-        action: Tensor,
-        vision: Tensor,
-        proprio: Tensor,
-        *,
-        belief: Tensor | None = None,
-        prev_innovation: Tensor | None = None,
-        language_keys: Tensor | None = None,
-        world_goal: Tensor | None = None,
-        dino_tokens: Tensor | None = None,
-        env_action: Tensor | None = None,
-        reuse_aux: WMRMAux | None = None,
-        stage_index: int = 0,
-        previous_map: Tensor | None = None,
-    ) -> tuple[Tensor, WMRMAux, Tensor, Tensor]:
-        """Legacy wrapper; preserves the historical return structure and math."""
-        return self._forward_from_snapshot(
-            action,
-            vision,
-            proprio,
-            belief=belief,
-            prev_innovation=prev_innovation,
-            language_keys=language_keys,
-            world_goal=world_goal,
-            dino_tokens=dino_tokens,
-            env_action=env_action,
-            reuse_aux=reuse_aux,
-            stage_index=stage_index,
-            previous_map=previous_map,
-        )
-
-    def mix_world_into_vision(self, vision: Tensor, aux: WMRMAux) -> Tensor:
-        """WM → next VA: gated spatial world message, zero at initialization."""
-        if aux.world_tokens is None:
-            return vision
-        message = self.vision_from_world(vision, aux.world_tokens)
-        if self.legacy_ungated_vision:
-            return vision + message
-        gate = aux.vision_gate
-        if gate is None:
-            return vision
-        return vision + gate.unsqueeze(-1) * message
-
-    def pi_shuffle_kl(
-        self,
-        action: Tensor,
-        vision: Tensor,
-        proprio: Tensor,
-    ) -> Tensor:
-        """KL(π(z_hat) || π(shuffle z_hat)). Near 0 means mixer ignores the world."""
-        _, aux, _, _ = self.forward(action, vision, proprio)
-        return self.pi_kl_from_aux(action, aux)
-
-    def pi_kl_from_aux(self, action: Tensor, aux: WMRMAux) -> Tensor:
-        perm = torch.randperm(aux.z_hat.shape[0], device=aux.z_hat.device)
-        z_real = self._z_per_step(aux.z_hat, action.shape[1])
-        z_shuf = self._z_per_step(aux.z_hat[perm], action.shape[1])
-        pi_real = self._pi(
-            z_real, action, aux.task_summary, apply_dropout=False
-        ).clamp_min(1e-8)
-        pi_shuf = self._pi(
-            z_shuf, action, aux.task_summary, apply_dropout=False
-        ).clamp_min(1e-8)
-        return (pi_real * (pi_real.log() - pi_shuf.log())).sum(dim=-1).mean()
-
-
-WorldMediatedResidualModulation = WAM4VA
 
 
 def matched_no_fixed_point_perm(

@@ -59,6 +59,7 @@ if str(ROOT) not in sys.path:
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("EGL_PLATFORM", "surfaceless")
+os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
 from scripts.build_longtraj_features import ENV_TO_TASK  # noqa: E402
 

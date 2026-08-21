@@ -1,4 +1,4 @@
-"""P2 WMRM: single-stream world-mediated residual, no candidates, no Δv."""
+"""World-state prediction and VA attention-memory integration."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import torch
 from va_compound.model import VACompoundConfig, VACompoundPolicy
 from va_compound.wmrm import (
     WAMState,
-    WorldMediatedResidualModulation,
+    WAM4VA,
     action_dependency_scores,
     matched_no_fixed_point_perm,
     wmrm_world_loss,
@@ -54,7 +54,6 @@ def _tiny_spatial_config() -> VACompoundConfig:
         wmrm=True,
         wmrm_cycle_steps=6,
         wmrm_inject="all",
-        wmrm_handshake=True,
         wmrm_predictor="st_blocks",
         wmrm_predictor_depth=1,
         wmrm_predictor_width=16,
@@ -86,10 +85,12 @@ def test_encode_condition_stage_map_detach_gradient_contract() -> None:
     config = _tiny_spatial_config()
     model = VACompoundPolicy(config).eval()
     vision, proprio, previous, language, mask, logged_action = _spatial_inputs(config)
-    language_cache = model.build_language_cache(language, mask)
 
     def run(detach: bool | None):
         model.zero_grad(set_to_none=True)
+        # Joint VA↔World gradients make the language cache part of the graph;
+        # each independent forward/backward therefore owns a fresh cache graph.
+        language_cache = model.build_language_cache(language, mask)
         kwargs = {} if detach is None else {"detach_wmrm_stage_state": detach}
         condition = model.encode_condition(
             vision,
@@ -138,7 +139,6 @@ def test_rollout_proposal_stage_detach_is_explicit_and_forward_identical() -> No
         wmrm=True,
         wmrm_cycle_steps=6,
         wmrm_inject="all",
-        wmrm_handshake=True,
         wmrm_detach_proposal_stage_state=True,
         wmrm_predictor="st_blocks",
         wmrm_predictor_depth=1,
@@ -272,38 +272,6 @@ def test_peer_readout_is_peer_only_and_legacy_state_keys_are_unchanged() -> None
     assert float(readout.detach().abs().max()) <= 1.0
 
 
-def test_peer_snapshot_stage_uses_readout_and_current_vision_correction() -> None:
-    config = _tiny_spatial_config()
-    config = VACompoundConfig(**{**config.__dict__, "va_world_mode": "peer_sync_h6"})
-    model = VACompoundPolicy(config).eval()
-    vision, proprio, previous, language, mask, _logged_action = _spatial_inputs(config)
-    cache = model.build_language_cache(language, mask)
-    with torch.no_grad():
-        condition_a, memory = model.encode_condition(
-            vision,
-            proprio,
-            previous,
-            language_cache=cache,
-            return_visual_memory=True,
-            wmrm_action_write=False,
-            wmrm_vision_write=False,
-        )
-        condition_b = model.encode_condition(
-            vision + 0.5,
-            proprio,
-            previous,
-            language_cache=cache,
-            visual_memory=memory,
-            wmrm_action_write=False,
-            wmrm_vision_write=False,
-        )
-    assert memory.world_state is not None
-    assert memory.world_state.belief is not None
-    assert model.last_wmrm.env_action is not None
-    assert model.last_wmrm.env_action.shape == (2, 6, config.action_dim)
-    assert not torch.allclose(condition_a, condition_b)
-
-
 def test_off_path_matches_legacy_encode() -> None:
     config = _tiny_config(wmrm=False)
     model = VACompoundPolicy(config).eval()
@@ -315,49 +283,6 @@ def test_off_path_matches_legacy_encode() -> None:
     assert model.wmrm is None
     assert cond.shape == (2, config.action_horizon, config.hidden_dim)
     assert model.last_wmrm is None
-
-
-def test_zero_gate_is_identity() -> None:
-    torch.manual_seed(3)
-    off = VACompoundPolicy(_tiny_config(wmrm=False)).eval()
-    torch.manual_seed(3)
-    on = VACompoundPolicy(_tiny_config(wmrm=True)).eval()
-    vision, proprio, previous, language, mask = _inputs(off.config)
-    with torch.no_grad():
-        legacy = off.encode_condition(
-            vision, proprio, previous, language_hidden=language, language_mask=mask
-        )
-        treated = on.encode_condition(
-            vision, proprio, previous, language_hidden=language, language_mask=mask
-        )
-    assert on.wmrm is not None
-    torch.testing.assert_close(on.wmrm.gate_proj.weight, torch.zeros_like(on.wmrm.gate_proj.weight))
-    torch.testing.assert_close(treated, legacy, rtol=0.0, atol=0.0)
-
-
-def test_nonzero_gate_changes_condition() -> None:
-    model = VACompoundPolicy(_tiny_config(wmrm=True)).eval()
-    vision, proprio, previous, language, mask = _inputs(model.config)
-    with torch.no_grad():
-        closed = model.encode_condition(
-            vision, proprio, previous, language_hidden=language, language_mask=mask
-        )
-        model.wmrm.gate_proj.bias.fill_(2.0)
-        opened = model.encode_condition(
-            vision, proprio, previous, language_hidden=language, language_mask=mask
-        )
-    assert not torch.allclose(closed, opened)
-    assert model.last_wmrm is not None
-    assert model.last_wmrm.z_hat.shape == (2, model.config.wmrm_world_dim)
-    assert model.last_wmrm.pi.shape == (2, model.config.action_horizon, model.config.wmrm_rank)
-    assert model.last_wmrm.gate.shape == (2, 1)
-    assert torch.isfinite(model.last_wmrm.pi).all()
-    torch.testing.assert_close(
-        model.last_wmrm.pi.sum(dim=-1),
-        torch.ones(2, model.config.action_horizon),
-        atol=1e-5,
-        rtol=1e-5,
-    )
 
 
 def test_world_goal_is_sealed() -> None:
@@ -375,7 +300,7 @@ def test_world_goal_is_sealed() -> None:
 
 
 def test_no_action_shaped_head() -> None:
-    block = WorldMediatedResidualModulation(32, world_dim=8, rank=4, proprio_dim=9)
+    block = WAM4VA(32, world_dim=8, proprio_dim=9)
     assert not block.has_action_shaped_head(action_dim=6)
     for module in block.modules():
         if isinstance(module, torch.nn.Linear):
@@ -391,11 +316,6 @@ def test_world_loss_is_stopgrad_target() -> None:
     assert z_future.grad is None
 
 
-def test_mutex_with_wam_joint() -> None:
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        _tiny_config(wmrm=True, wam_joint=True)
-
-
 def test_action_dependency_probe_detects_linear_action() -> None:
     torch.manual_seed(0)
     n = 80
@@ -405,14 +325,6 @@ def test_action_dependency_probe_detects_linear_action() -> None:
     scores = action_dependency_scores(state, action, target)
     assert scores["mse_state_action"] < scores["mse_state"]
     assert scores["mse_state_action"] < scores["mse_state_shuffled"]
-
-
-def test_cli_mutex() -> None:
-    from train import parse_args, validate_args
-
-    args = parse_args(["--wmrm", "--wam-joint"])
-    with pytest.raises(ValueError, match="wmrm"):
-        validate_args(args)
 
 
 def test_shared_eye_is_pre_va_projection() -> None:
@@ -468,45 +380,22 @@ def test_default_inject_is_every_layer() -> None:
     assert all(aux.z_tokens is not None for aux in model.last_wmrm_auxes)
 
 
-def test_inject_all_zero_gate_still_identity() -> None:
-    torch.manual_seed(3)
-    off = VACompoundPolicy(_tiny_config(wmrm=False)).eval()
-    torch.manual_seed(3)
-    on = VACompoundPolicy(_tiny_config(wmrm=True, wmrm_inject="all")).eval()
-    vision, proprio, previous, language, mask = _inputs(off.config)
-    with torch.no_grad():
-        legacy = off.encode_condition(
-            vision, proprio, previous, language_hidden=language, language_mask=mask
-        )
-        treated = on.encode_condition(
-            vision, proprio, previous, language_hidden=language, language_mask=mask
-        )
-    torch.testing.assert_close(treated, legacy, rtol=0.0, atol=0.0)
-
-
-def test_pi_shuffle_kl_is_finite() -> None:
-    block = WorldMediatedResidualModulation(32, world_dim=8, rank=4, proprio_dim=9)
-    block.eval()
-    action = torch.randn(4, 5, 32)
-    vision = torch.randn(4, 7, 32)
-    proprio = torch.randn(4, 9)
-    with torch.no_grad():
-        kl = block.pi_shuffle_kl(action, vision, proprio)
-    assert torch.isfinite(kl)
-    assert kl.ndim == 0
-
-
-def test_handshake_updates_belief_and_dedups_innovation() -> None:
-    block = WorldMediatedResidualModulation(32, world_dim=8, rank=4, proprio_dim=9)
+def test_world_transition_updates_belief_and_dedups_innovation() -> None:
+    block = WAM4VA(32, world_dim=8, proprio_dim=9)
     block.eval()
     action = torch.randn(2, 5, 32)
     vision = torch.randn(2, 6, 32)
     proprio = torch.randn(2, 9)
     with torch.no_grad():
-        _, aux1, belief1, innov1 = block(action, vision, proprio)
-        _, aux2, belief2, innov2 = block(
-            action, vision, proprio, belief=belief1, prev_innovation=innov1
+        first = block.propose(action, vision, proprio)
+        second = block.propose(
+            action, vision, proprio, state=first.next_world_state, stage_index=1
         )
+    aux1, aux2 = first.aux, second.aux
+    belief1 = first.next_world_state.belief
+    belief2 = second.next_world_state.belief
+    innov1 = first.next_world_state.innovation
+    innov2 = second.next_world_state.innovation
     assert aux1.z_spans.shape == (2, 3, 8)
     assert aux1.progress.shape == (2, 4)
     assert belief1.shape == (2, 8, 32)
@@ -514,33 +403,67 @@ def test_handshake_updates_belief_and_dedups_innovation() -> None:
     assert aux2.belief.shape == belief2.shape
 
 
-def test_language_keys_keep_zero_gate_identity() -> None:
-    block = WorldMediatedResidualModulation(32, world_dim=8, rank=4, proprio_dim=9)
+def test_innovation_projection_reads_previous_as_stable_memory() -> None:
+    block = WAM4VA(32, world_dim=8, proprio_dim=9)
+    previous = torch.randn(2, 8, 32, requires_grad=True)
+    current = (2.0 * previous.detach() + 0.1 * torch.randn_like(previous)).requires_grad_()
+
+    projected = block._project_out(current, previous)
+    flat_projected = projected.flatten(1)
+    flat_previous = previous.detach().flatten(1)
+    overlap = (flat_projected * flat_previous).sum(dim=-1)
+    torch.testing.assert_close(overlap, torch.zeros_like(overlap), atol=2e-4, rtol=0)
+
+    projected.square().mean().backward()
+    assert previous.grad is None
+    assert current.grad is not None
+    assert torch.isfinite(current.grad).all()
+
+
+def test_innovation_projection_skips_near_zero_previous_direction() -> None:
+    block = WAM4VA(32, world_dim=8, proprio_dim=9)
+    current = torch.randn(2, 8, 32, requires_grad=True)
+    previous = torch.full_like(current, 1e-7, requires_grad=True)
+
+    projected = block._project_out(current, previous)
+    torch.testing.assert_close(projected, current)
+    projected.sum().backward()
+    assert previous.grad is None
+    torch.testing.assert_close(current.grad, torch.ones_like(current))
+
+
+def test_innovation_projection_stays_finite_for_large_finite_memory() -> None:
+    block = WAM4VA(32, world_dim=8, proprio_dim=9)
+    previous = torch.full((2, 8, 32), 1.1e18)
+    current = torch.full((2, 8, 32), 1.5e18, requires_grad=True)
+
+    projected = block._project_out(current, previous)
+    assert torch.isfinite(projected).all()
+    projected.mean().backward()
+    assert current.grad is not None
+    assert torch.isfinite(current.grad).all()
+
+
+def test_language_keys_condition_world_transition_without_writing_va() -> None:
+    block = WAM4VA(32, world_dim=8, proprio_dim=9)
     block.eval()
     action = torch.randn(2, 5, 32)
     vision = torch.randn(2, 6, 32)
     proprio = torch.randn(2, 9)
     language = torch.randn(2, 4, 32)
     with torch.no_grad():
-        out_a, aux_a, _, _ = block(action, vision, proprio)
-        out_b, aux_b, _, _ = block(action, vision, proprio, language_keys=language)
-    torch.testing.assert_close(out_a, action, atol=0.0, rtol=0.0)
-    torch.testing.assert_close(out_b, action, atol=0.0, rtol=0.0)
+        plain = block.propose(action, vision, proprio)
+        conditioned = block.propose(
+            action, vision, proprio, language_keys=language
+        )
+    aux_a, aux_b = plain.aux, conditioned.aux
     assert aux_b.task_summary.shape == (2, 32)
-
-
-def test_supervised_z_hat_is_broadcast_to_horizon() -> None:
-    block = WorldMediatedResidualModulation(32, world_dim=8, rank=4, proprio_dim=9, n_spans=3)
-    z_hat = torch.randn(2, 8)
-    per_step = block._z_per_step(z_hat, 8)
-    assert per_step.shape == (2, 8, 8)
-    torch.testing.assert_close(per_step[:, 0], z_hat)
-    torch.testing.assert_close(per_step[:, 7], z_hat)
+    assert not torch.equal(aux_a.task_summary, aux_b.task_summary)
 
 
 def test_span_ids_cover_horizon_when_not_divisible() -> None:
-    block = WorldMediatedResidualModulation(
-        32, world_dim=8, rank=4, proprio_dim=9, n_spans=3, cycle_steps=8
+    block = WAM4VA(
+        32, world_dim=8, proprio_dim=9, n_spans=3, cycle_steps=8
     )
     ids = block._span_ids(8, torch.device("cpu"))
     assert ids.tolist() == [0, 0, 0, 1, 1, 1, 2, 2]
@@ -552,7 +475,7 @@ def test_span_ids_cover_horizon_when_not_divisible() -> None:
 
 
 def test_action_dep_hinge_penalizes_action_independent_z() -> None:
-    block = WorldMediatedResidualModulation(32, world_dim=8, rank=4, proprio_dim=9)
+    block = WAM4VA(32, world_dim=8, proprio_dim=9)
     z = torch.randn(4, 8)
     z_shuf = z.clone()
     future = z + 0.01
@@ -560,66 +483,9 @@ def test_action_dep_hinge_penalizes_action_independent_z() -> None:
     assert float(hinge.item()) == pytest.approx(0.05)
 
 
-def test_fm_condition_hinge_zero_when_gate_closed() -> None:
-    block = WorldMediatedResidualModulation(32, world_dim=8, rank=4, proprio_dim=9)
-    block.eval()
-    action = torch.randn(3, 5, 32)
-    vision = torch.randn(3, 6, 32)
-    proprio = torch.randn(3, 9)
-    norm = torch.nn.LayerNorm(32)
-    with torch.no_grad():
-        _, aux, _, _ = block(action, vision, proprio)
-        hinge = block.fm_condition_hinge(action, aux, norm, margin=0.05)
-    assert float(aux.gate.abs().max()) == 0.0
-    assert float(hinge.item()) == pytest.approx(0.05)
-
-
-def test_source_gates_and_span_heads_exist() -> None:
-    block = WorldMediatedResidualModulation(32, world_dim=8, rank=4, proprio_dim=9)
-    assert block.source_gates.shape == (3,)
+def test_world_span_heads_exist() -> None:
+    block = WAM4VA(32, world_dim=8, proprio_dim=9)
     assert len(block.span_heads) == 3
-    assert block.ca_belief is not block.ca_geo
-
-
-def test_fm_condition_hinge_has_gate_grad_at_zero_init() -> None:
-    torch.manual_seed(0)
-    block = WorldMediatedResidualModulation(32, world_dim=8, rank=4, proprio_dim=9)
-    torch.testing.assert_close(
-        block.gate_proj.weight, torch.zeros_like(block.gate_proj.weight)
-    )
-    torch.testing.assert_close(
-        block.gate_proj.bias, torch.zeros_like(block.gate_proj.bias)
-    )
-    action = torch.randn(3, 5, 32)
-    vision = torch.randn(3, 6, 32)
-    proprio = torch.randn(3, 9)
-    norm = torch.nn.LayerNorm(32)
-    _, aux, _, _ = block(action, vision, proprio)
-    hinge = block.fm_condition_hinge(action, aux, norm, margin=0.05)
-    hinge.backward()
-    assert block.gate_proj.weight.grad is not None
-    assert float(block.gate_proj.weight.grad.norm()) > 0
-    assert float(hinge.item()) == pytest.approx(0.05)
-
-
-def test_fm_condition_hinge_disables_dropout() -> None:
-    torch.manual_seed(1)
-    block = WorldMediatedResidualModulation(
-        32, world_dim=8, rank=4, proprio_dim=9, mixer_dropout=0.9
-    )
-    block.train()
-    action = torch.randn(3, 5, 32)
-    vision = torch.randn(3, 6, 32)
-    proprio = torch.randn(3, 9)
-    norm = torch.nn.LayerNorm(32)
-    with torch.no_grad():
-        _, aux, _, _ = block(action, vision, proprio)
-        values = []
-        for _ in range(5):
-            torch.manual_seed(11)
-            values.append(block.fm_condition_hinge(action, aux, norm, margin=0.05))
-    stacked = torch.stack(values)
-    torch.testing.assert_close(stacked, stacked[:1].expand_as(stacked), rtol=0.0, atol=0.0)
 
 
 def test_dino_target_is_raw_tokens() -> None:
@@ -627,18 +493,21 @@ def test_dino_target_is_raw_tokens() -> None:
 
     model = VACompoundPolicy(_tiny_config(wmrm=True)).eval()
     batch = {
-        "vision_tokens": torch.randn(2, 3, 11, model.config.vision_dim),
+        "vision_tokens": torch.randn(
+            2, 3, 11, model.config.vision_dim, requires_grad=True
+        ),
     }
     got = wmrm_next_feature_target(model, batch, 0)
     torch.testing.assert_close(got, batch["vision_tokens"][:, 1])
     assert got.shape == (2, 11, model.config.vision_dim)
+    assert not got.requires_grad
+    assert got.grad_fn is None
 
 
 def test_dino_map_uses_last_frame_full_channels() -> None:
-    block = WorldMediatedResidualModulation(
+    block = WAM4VA(
         32,
         world_dim=8,
-        rank=4,
         proprio_dim=9,
         dino_dim=8,
         map_size=4,
@@ -671,10 +540,9 @@ def test_dino_map_uses_last_frame_full_channels() -> None:
 
 
 def test_world_pred_uses_executable_env_action() -> None:
-    block = WorldMediatedResidualModulation(
+    block = WAM4VA(
         32,
         world_dim=8,
-        rank=4,
         proprio_dim=9,
         dino_dim=8,
         map_size=4,
@@ -707,8 +575,8 @@ def test_world_pred_uses_executable_env_action() -> None:
 
 
 def test_dino_residual_zero_init_copies_current() -> None:
-    block = WorldMediatedResidualModulation(
-        32, world_dim=8, rank=4, proprio_dim=9, dino_dim=16
+    block = WAM4VA(
+        32, world_dim=8, proprio_dim=9, dino_dim=16
     )
     action = torch.randn(2, 5, 32)
     proprio = torch.randn(2, 9)
@@ -724,8 +592,8 @@ def test_dino_residual_zero_init_copies_current() -> None:
 
 def test_predict_world_uses_logged_env_not_va_hidden() -> None:
     torch.manual_seed(4)
-    block = WorldMediatedResidualModulation(
-        32, world_dim=8, rank=4, proprio_dim=9, cycle_steps=6, env_action_dim=4
+    block = WAM4VA(
+        32, world_dim=8, proprio_dim=9, cycle_steps=6, env_action_dim=4
     )
     block.eval()
     action = torch.randn(2, 12, 32)
@@ -745,31 +613,10 @@ def test_predict_world_uses_logged_env_not_va_hidden() -> None:
     assert not torch.allclose(z1, z4)
 
 
-def test_action_dep_hinge_env_action_has_grad() -> None:
-    torch.manual_seed(2)
-    block = WorldMediatedResidualModulation(
-        32, world_dim=8, rank=4, proprio_dim=9, cycle_steps=6, env_action_dim=4
-    )
-    action = torch.randn(4, 8, 32)
-    proprio = torch.randn(4, 9)
-    belief = torch.randn(4, 8, 32)
-    task = torch.randn(4, 32)
-    env = torch.randn(4, 6, 4)
-    z_hat, *_ = block.predict_world(action, proprio, belief, task, env_action=env)
-    perm = torch.randperm(env.shape[0])
-    z_shuf, *_ = block.predict_world(action, proprio, belief, task, env_action=env[perm])
-    target = torch.randn_like(z_hat)
-    loss = block.action_dep_hinge(z_hat, z_shuf, target)
-    loss.backward()
-    assert block.env_step.weight.grad is not None
-    assert float(block.env_step.weight.grad.norm()) > 0
-
-
-def test_handshake_gets_spatial_world_tokens() -> None:
-    block = WorldMediatedResidualModulation(
+def test_world_transition_publishes_spatial_memory_tokens() -> None:
+    block = WAM4VA(
         32,
         world_dim=8,
-        rank=4,
         proprio_dim=9,
         dino_dim=8,
         map_size=4,
@@ -783,51 +630,21 @@ def test_handshake_gets_spatial_world_tokens() -> None:
     proprio = torch.randn(2, 9)
     tokens = torch.randn(2, 32, 8)
     env = torch.randn(2, 6, 4)
-    _, aux, _, _ = block(
+    transition = block.propose(
         action, vision, proprio, dino_tokens=tokens, env_action=env
     )
+    aux = transition.aux
     assert aux.world_tokens is not None
     assert aux.world_tokens.shape == (2, 16, 32)
+    torch.testing.assert_close(transition.world_message, aux.world_tokens)
     assert aux.z_tokens is not None
     assert aux.z_tokens.shape == (2, 8, 4, 4)
 
 
-def test_zero_vision_gate_can_learn_from_nonzero_world_message() -> None:
-    block = WorldMediatedResidualModulation(
-        32,
-        world_dim=8,
-        rank=4,
-        proprio_dim=9,
-        dino_dim=8,
-        map_size=4,
-        map_frames=2,
-        map_grid=4,
-        world_grid=4,
-        env_action_dim=4,
-    )
-    action = torch.randn(2, 5, 32)
-    vision = torch.randn(2, 6, 32)
-    proprio = torch.randn(2, 9)
-    env = torch.randn(2, 6, 4)
-    _, aux, _, _ = block(
-        action,
-        vision,
-        proprio,
-        dino_tokens=torch.randn(2, 32, 8),
-        env_action=env,
-    )
-    mixed = block.mix_world_into_vision(vision, aux)
-    torch.testing.assert_close(mixed, vision, rtol=0.0, atol=0.0)
-    mixed.square().mean().backward()
-    assert block.vision_gate_proj.weight.grad is not None
-    assert float(block.vision_gate_proj.weight.grad.norm()) > 0
-
-
 def test_each_forward_emits_full_spatial_map() -> None:
-    block = WorldMediatedResidualModulation(
+    block = WAM4VA(
         32,
         world_dim=8,
-        rank=4,
         proprio_dim=9,
         dino_dim=8,
         map_size=4,
@@ -844,31 +661,28 @@ def test_each_forward_emits_full_spatial_map() -> None:
     vision = torch.randn(2, 6, 32)
     proprio = torch.randn(2, 9)
     tokens = torch.randn(2, 32, 8)
-    belief = None
-    innov = None
-    previous_map = None
+    state = None
     env = torch.randn(2, 6, 4)
     maps = []
     with torch.no_grad():
         block.st_predictor.out_proj.weight.normal_(0, 0.05)
     for stage in range(3):
-        _, aux, belief, innov = block(
+        transition = block.propose(
             action,
             vision,
             proprio,
-            belief=belief,
-            prev_innovation=innov,
+            state=state,
             dino_tokens=tokens,
             env_action=env,
             stage_index=stage,
-            previous_map=previous_map,
         )
+        aux = transition.aux
         assert aux.z_tokens is not None
         assert aux.z_tokens.shape == (2, 8, 4, 4)
         assert aux.world_tokens is not None
         assert aux.world_tokens.shape == (2, 16, 32)
         maps.append(aux.z_tokens)
-        previous_map = aux.z_tokens
+        state = transition.next_world_state
     assert not torch.allclose(maps[0], maps[-1])
     maps[-1].square().mean().backward()
     assert block.st_predictor.in_proj.weight.grad is not None
@@ -888,8 +702,8 @@ def test_wam_state_finite_validation_names_corrupt_recurrent_field() -> None:
 
 
 def test_env_action_requires_exact_cycle_and_dimension() -> None:
-    block = WorldMediatedResidualModulation(
-        32, world_dim=8, rank=4, proprio_dim=9, cycle_steps=6, env_action_dim=4
+    block = WAM4VA(
+        32, world_dim=8, proprio_dim=9, cycle_steps=6, env_action_dim=4
     )
     tokens, flat = block.encode_env_action(
         torch.randn(2, 6, 4),
@@ -915,11 +729,32 @@ def test_env_action_requires_exact_cycle_and_dimension() -> None:
         )
 
 
-def test_handshake_keeps_native_16x16() -> None:
-    block = WorldMediatedResidualModulation(
+@pytest.mark.parametrize("cycle_steps", [1, 2, 3, 6])
+def test_world_action_encoding_represents_exact_p_step_cycle(
+    cycle_steps: int,
+) -> None:
+    block = WAM4VA(
         32,
         world_dim=8,
-        rank=4,
+        proprio_dim=9,
+        cycle_steps=cycle_steps,
+        env_action_dim=4,
+    )
+    actions = torch.randn(2, cycle_steps, 4)
+    tokens, flat = block.encode_env_action(
+        actions,
+        batch=2,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    assert tokens.shape == (2, cycle_steps, 32)
+    assert flat.shape == (2, 32)
+
+
+def test_world_memory_keeps_native_16x16() -> None:
+    block = WAM4VA(
+        32,
+        world_dim=8,
         proprio_dim=9,
         dino_dim=8,
         map_size=16,
@@ -994,47 +829,20 @@ def test_cli_wmrm_only_requires_wam4va() -> None:
         validate_args(args)
 
 
-def test_cli_wam4va_defaults_to_handshake() -> None:
+def test_cli_wam4va_uses_state_exchange_without_writeback_flags() -> None:
     from train import parse_args, validate_args
 
     args = parse_args(["--wam4va"])
     validate_args(args)
-    assert getattr(args, "wmrm_handshake", True) is True
+    assert not hasattr(args, "wmrm_handshake")
+    assert not hasattr(args, "wmrm_med_weight")
+    assert not hasattr(args, "wmrm_pi_kl_weight")
 
 
-def test_cli_wmrm_only_forces_med_off(tmp_path) -> None:
-    from train import parse_args, validate_args
-
-    data = tmp_path / "windows.pt"
-    data.write_bytes(b"x")
-    args = parse_args(
-        [
-            "--wam4va",
-            "--wmrm-only",
-            "--wmrm-med-weight",
-            "0.5",
-            "--mtvj-train-metric-head",
-            "--data",
-            str(data),
-        ]
-    )
-    validate_args(args)
-    assert args.wmrm_med_weight == 0.0
-    assert args.wmrm_adep_weight == 0.0
-    assert args.wmrm_handshake is False
-    assert args.mtvj_train_metric_head is False
-
-
-def test_wmrm_only_peer_mode_fails_closed() -> None:
+def test_peer_joint_optimizer_keeps_va_world_and_flow_trainable() -> None:
     from argparse import Namespace
 
-    from train import _feature_optimizer_groups, parse_args, validate_args
-
-    args = parse_args(
-        ["--wam4va", "--wmrm-only", "--va-world-mode", "peer_sync_h6"]
-    )
-    with pytest.raises(ValueError, match="unsupported readout ownership"):
-        validate_args(args)
+    from train import _feature_optimizer_groups
 
     model = VACompoundPolicy(
         _tiny_config(
@@ -1046,10 +854,22 @@ def test_wmrm_only_peer_mode_fails_closed() -> None:
         )
     )
     optimizer_args = Namespace(
-        wmrm_only=True, lr=1e-4, action_vision_only=False, head_only=False
+        wmrm_only=False,
+        va_only=False,
+        lr=1e-4,
+        action_vision_only=False,
+        head_only=False,
+        servo_only=False,
     )
-    with pytest.raises(ValueError, match="readout ownership"):
-        _feature_optimizer_groups(optimizer_args, model, None)
+    groups = _feature_optimizer_groups(optimizer_args, model, None)
+    trainable = {name for name, parameter in model.named_parameters() if parameter.requires_grad}
+    assert trainable
+    assert any(name.startswith("layers.") for name in trainable)
+    assert any(name.startswith("flow_head.") for name in trainable)
+    assert any(name.startswith("wmrm.") for name in trainable)
+    assert any(name.startswith("world_action_readout.") for name in trainable)
+    grouped = {id(parameter) for group in groups for parameter in group["params"]}
+    assert grouped == {id(parameter) for parameter in model.parameters()}
 
 
 def test_wmrm_only_freezes_va_and_flow() -> None:
@@ -1058,7 +878,13 @@ def test_wmrm_only_freezes_va_and_flow() -> None:
     from train import _feature_optimizer_groups
 
     model = VACompoundPolicy(_tiny_config(wmrm=True))
-    args = Namespace(wmrm_only=True, lr=1e-4, action_vision_only=False, head_only=False)
+    args = Namespace(
+        wmrm_only=True,
+        va_only=False,
+        lr=1e-4,
+        action_vision_only=False,
+        head_only=False,
+    )
     groups = _feature_optimizer_groups(args, model, None)
     trainable = {name for name, p in model.named_parameters() if p.requires_grad}
     assert trainable
@@ -1068,33 +894,10 @@ def test_wmrm_only_freezes_va_and_flow() -> None:
     assert groups[0]["lr"] == 1e-4
 
 
-def test_handshake_off_ignores_va_action() -> None:
-    torch.manual_seed(0)
-    model = VACompoundPolicy(_tiny_config(wmrm=True, wmrm_handshake=False)).eval()
-    vision, proprio, previous, language, mask = _inputs(model.config)
-    with torch.no_grad():
-        closed = model.encode_condition(
-            vision, proprio, previous, language_hidden=language, language_mask=mask
-        )
-        model.wmrm.gate_proj.bias.fill_(2.0)
-        still = model.encode_condition(
-            vision, proprio, previous, language_hidden=language, language_mask=mask
-        )
-    torch.testing.assert_close(closed, still, rtol=0.0, atol=0.0)
-    action = torch.randn(2, 5, 32)
-    other = action + 3.0
-    belief = torch.randn(2, 8, 32)
-    task = torch.randn(2, 32)
-    z1, *_ = model.wmrm.predict_world(action, proprio, belief, task)
-    z2, *_ = model.wmrm.predict_world(other, proprio, belief, task)
-    torch.testing.assert_close(z1, z2)
-
-
-def test_st_predictor_copies_last_frame_and_uses_proposal() -> None:
-    block = WorldMediatedResidualModulation(
+def test_st_predictor_starts_near_last_frame_and_uses_proposal() -> None:
+    block = WAM4VA(
         32,
         world_dim=8,
-        rank=4,
         proprio_dim=9,
         dino_dim=8,
         map_size=4,
@@ -1114,7 +917,9 @@ def test_st_predictor_copies_last_frame_and_uses_proposal() -> None:
     tokens = torch.randn(2, 32, 8)
     _, _, _, z_map = block.predict_world(action, proprio, belief, task, dino_tokens=tokens)
     current = block.encode_dino_map(tokens)
-    torch.testing.assert_close(z_map, current, rtol=0.0, atol=0.0)
+    initial_residual = z_map - current
+    residual_mean = float(initial_residual.detach().abs().mean().item())
+    assert 0.0 < residual_mean < 0.05
     assert z_map.shape == (2, 8, 4, 4)
     block.st_predictor.out_proj.weight.data.normal_(0, 0.05)
     env = torch.randn(2, 6, 4)
@@ -1136,11 +941,120 @@ def test_st_predictor_copies_last_frame_and_uses_proposal() -> None:
     assert float(block.env_step.weight.grad.norm()) > 0
 
 
-def test_previous_map_is_read_not_only_added() -> None:
-    block = WorldMediatedResidualModulation(
+def test_st_predictor_recurrent_map_uses_stable_residual_gradient() -> None:
+    """Map values recur, while their nonlinear context Jacobian does not compound."""
+    predictor = WAM4VA(
         32,
         world_dim=8,
-        rank=4,
+        proprio_dim=9,
+        dino_dim=12,
+        predictor="st_blocks",
+        predictor_depth=2,
+        predictor_width=24,
+        predictor_heads=4,
+        map_frames=4,
+        map_size=2,
+    ).st_predictor
+    assert predictor is not None
+    clip = torch.randn(2, 4, 12, 2, 2)
+    cond = torch.randn(2, 5, 24)
+    previous = torch.randn(2, 12, 2, 2, requires_grad=True)
+
+    output = predictor(clip, cond, previous)
+    output.sum().backward()
+
+    # The recurrent value is still the exact residual base, so credit reaches
+    # the prior stage through an identity path rather than a 32-deep product of
+    # predictor Jacobians.  The current predictor itself remains trainable.
+    torch.testing.assert_close(previous.grad, torch.ones_like(previous))
+    assert any(
+        parameter.grad is not None and float(parameter.grad.abs().sum()) > 0
+        for parameter in predictor.parameters()
+    )
+
+
+def test_belief_recurrence_uses_identity_gradient_and_trains_current_update() -> None:
+    block = WAM4VA(
+        32,
+        world_dim=8,
+        proprio_dim=9,
+        dino_dim=8,
+        map_size=4,
+        map_frames=2,
+        map_grid=4,
+        world_grid=4,
+        env_action_dim=4,
+        predictor="st_blocks",
+        predictor_depth=1,
+        predictor_width=32,
+        predictor_heads=4,
+    )
+    previous_belief = torch.randn(2, 8, 32, requires_grad=True)
+    previous_innovation = torch.randn(2, 8, 32)
+    previous_map = torch.randn(2, 8, 4, 4)
+    proposal = block.propose(
+        torch.randn(2, 6, 32),
+        torch.randn(2, 7, 32),
+        torch.randn(2, 9),
+        state=WAMState(
+            belief=previous_belief,
+            innovation=previous_innovation,
+            world_map=previous_map,
+        ),
+        dino_tokens=torch.randn(2, 32, 8),
+        env_action=torch.randn(2, 6, 4),
+        stage_index=1,
+    )
+    cotangent = torch.randn_like(proposal.next_world_state.belief)
+    (proposal.next_world_state.belief * cotangent).sum().backward()
+
+    torch.testing.assert_close(previous_belief.grad, cotangent)
+    assert block.belief_write.o.weight.grad is not None
+    assert float(block.belief_write.o.weight.grad.abs().sum()) > 0
+    assert block.evidence_from_belief.weight.grad is not None
+    assert float(block.evidence_from_belief.weight.grad.abs().sum()) > 0
+
+
+def test_world_loss_still_trains_belief_update_after_stable_recurrence() -> None:
+    block = WAM4VA(
+        32,
+        world_dim=8,
+        proprio_dim=9,
+        dino_dim=8,
+        map_size=4,
+        map_frames=2,
+        map_grid=4,
+        world_grid=4,
+        env_action_dim=4,
+        predictor="st_blocks",
+        predictor_depth=1,
+        predictor_width=32,
+        predictor_heads=4,
+    )
+    proposal = block.propose(
+        torch.randn(2, 6, 32),
+        torch.randn(2, 7, 32),
+        torch.randn(2, 9),
+        state=WAMState(
+            belief=torch.randn(2, 8, 32),
+            innovation=torch.randn(2, 8, 32),
+        ),
+        dino_tokens=torch.randn(2, 32, 8),
+        env_action=torch.randn(2, 6, 4),
+    )
+    assert proposal.aux.z_tokens is not None
+    proposal.aux.z_tokens.square().mean().backward()
+
+    assert block.belief_write.o.weight.grad is not None
+    assert float(block.belief_write.o.weight.grad.abs().sum()) > 0
+    assert block.evidence_from_belief.weight.grad is not None
+    assert float(block.evidence_from_belief.weight.grad.abs().sum()) > 0
+
+
+def test_previous_map_is_read_not_only_added() -> None:
+    block = WAM4VA(
+        32,
+        world_dim=8,
         proprio_dim=9,
         dino_dim=8,
         map_size=4,

@@ -16,6 +16,11 @@ from torch import Tensor
 
 MANIFEST_CONTRACT = "wam4va_episode_holdout_manifest_v1"
 PEER_SYNC_H6_CONTRACT = "peer_sync_h6_world_windows_v1"
+PEER_SYNC_H6_P2_CONTRACT = "peer_sync_h6_p2_world_windows_v1"
+PEER_SYNC_H6_CONTRACTS = frozenset({
+    PEER_SYNC_H6_CONTRACT,
+    PEER_SYNC_H6_P2_CONTRACT,
+})
 MANIFEST_VERSION = 1
 LEGACY_SHAPE = (4, 48, 4)
 PEER_SHAPE = (4, 6, 4)
@@ -27,6 +32,17 @@ TRANSITION_RULE = {
         "action_valid_mask[:, t + 1, 0]"
     ),
     "current_action_prefix_steps": TRANSITION_PREFIX_STEPS,
+    "next_action_index": 0,
+    "time_indices": "t=0..T-2",
+}
+PEER_SYNC_H6_P2_TRANSITION_PREFIX_STEPS = 2
+PEER_SYNC_H6_P2_TRANSITION_RULE = {
+    "contract": "wam4va_world_transition_mask_v1",
+    "expression": (
+        "action_valid_mask[:, t, :2].all(-1) & "
+        "action_valid_mask[:, t + 1, 0]"
+    ),
+    "current_action_prefix_steps": PEER_SYNC_H6_P2_TRANSITION_PREFIX_STEPS,
     "next_action_index": 0,
     "time_indices": "t=0..T-2",
 }
@@ -70,19 +86,36 @@ def canonical_manifest_sha256(manifest: dict) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _payload_protocol(payload: dict) -> tuple[str, tuple[int, int, int]]:
+def _payload_protocol(payload: dict) -> tuple[str, tuple[int, int, int], int]:
     metadata = payload.get("metadata") or {}
     contract = metadata.get("contract")
-    if contract == PEER_SYNC_H6_CONTRACT:
+    if contract in PEER_SYNC_H6_CONTRACTS:
         if int(metadata.get("contract_version", -1)) != 1:
-            raise ValueError(f"{PEER_SYNC_H6_CONTRACT} requires contract_version=1")
+            raise ValueError(f"{contract} requires contract_version=1")
         if metadata.get("logged_action_chunk") != "full_h6":
-            raise ValueError(f"{PEER_SYNC_H6_CONTRACT} requires full logged H6 chunk")
+            raise ValueError(f"{contract} requires full logged H6 chunk")
         for key in ("parent_identity", "source_identities", "output_identity"):
             if not metadata.get(key):
-                raise ValueError(f"{PEER_SYNC_H6_CONTRACT} requires metadata.{key}")
-        return PEER_SYNC_H6_CONTRACT, PEER_SHAPE
-    return MANIFEST_CONTRACT, LEGACY_SHAPE
+                raise ValueError(f"{contract} requires metadata.{key}")
+        if contract == PEER_SYNC_H6_P2_CONTRACT:
+            required = {
+                "fps": 80,
+                "planning_stride": 2,
+                "control_stride": 2,
+                "sequence_length": 4,
+                "decision_offsets": [0, 2, 4, 6],
+                "action_horizon": 6,
+                "action_label_offsets": [0, 1, 2, 3, 4, 5],
+            }
+            for key, expected in required.items():
+                if metadata.get(key) != expected:
+                    raise ValueError(
+                        f"{PEER_SYNC_H6_P2_CONTRACT} requires metadata.{key}="
+                        f"{expected!r}, got {metadata.get(key)!r}"
+                    )
+            return contract, PEER_SHAPE, PEER_SYNC_H6_P2_TRANSITION_PREFIX_STEPS
+        return contract, PEER_SHAPE, TRANSITION_PREFIX_STEPS
+    return MANIFEST_CONTRACT, LEGACY_SHAPE, TRANSITION_PREFIX_STEPS
 
 
 def _validate_payload(payload: dict) -> tuple[Tensor, Tensor, Tensor, Tensor]:
@@ -105,11 +138,11 @@ def _validate_payload(payload: dict) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     if not isinstance(actions, Tensor) or actions.ndim != 4:
         raise ValueError("actions must be a tensor with shape [N,T,H,A]")
     n, sequence, horizon, action_dim = actions.shape
-    protocol, expected_shape = _payload_protocol(payload)
+    protocol, expected_shape, _ = _payload_protocol(payload)
     if n == 0:
         raise ValueError("actions require N>0")
     if (sequence, horizon, action_dim) != expected_shape:
-        label = "peer" if protocol == PEER_SYNC_H6_CONTRACT else "legacy H48"
+        label = "peer" if protocol in PEER_SYNC_H6_CONTRACTS else "legacy H48"
         raise ValueError(
             f"{label} split requires exact T{expected_shape[0]}/H{expected_shape[1]}/"
             f"A{expected_shape[2]}, got T{sequence}/H{horizon}/A{action_dim}"
@@ -223,16 +256,25 @@ def build_split_plan(
     }
 
 
-def transition_mask(action_valid_mask: Tensor) -> Tensor:
-    """Return [N,T-1] World-transition validity using the fixed cycle-6 rule."""
+def transition_mask(
+    action_valid_mask: Tensor,
+    prefix_steps: int = TRANSITION_PREFIX_STEPS,
+) -> Tensor:
+    """Return [N,T-1] validity for the contract's transition action prefix."""
     if (
         action_valid_mask.ndim != 3
         or action_valid_mask.dtype != torch.bool
         or action_valid_mask.shape[1] < 2
-        or action_valid_mask.shape[2] < TRANSITION_PREFIX_STEPS
+        or isinstance(prefix_steps, bool)
+        or not isinstance(prefix_steps, int)
+        or prefix_steps <= 0
+        or action_valid_mask.shape[2] < prefix_steps
     ):
-        raise ValueError("action_valid_mask must be bool [N,T>=2,H>=6]")
-    current = action_valid_mask[:, :-1, :TRANSITION_PREFIX_STEPS].all(dim=-1)
+        raise ValueError(
+            "action_valid_mask must be bool [N,T>=2,H>=prefix_steps] with "
+            "positive integer prefix_steps"
+        )
+    current = action_valid_mask[:, :-1, :prefix_steps].all(dim=-1)
     next_first = action_valid_mask[:, 1:, 0]
     return current & next_first
 
@@ -248,7 +290,8 @@ def mask_stats(payload: dict, indices: Tensor) -> dict:
     _, _, action_valid, recovery = _validate_payload(payload)
     selected_valid = action_valid.index_select(0, indices)
     selected_recovery = recovery.index_select(0, indices)
-    transitions = transition_mask(selected_valid)
+    _, _, transition_prefix_steps = _payload_protocol(payload)
+    transitions = transition_mask(selected_valid, transition_prefix_steps)
     return {
         "action_valid": _binary_stats(selected_valid),
         "recovery": _binary_stats(selected_recovery),
@@ -346,7 +389,7 @@ def _build_manifest(
     seed: int,
 ) -> dict:
     task, episode, _, _ = _validate_payload(payload)
-    data_protocol, expected_shape = _payload_protocol(payload)
+    data_protocol, expected_shape, transition_prefix_steps = _payload_protocol(payload)
     task_names = _task_names(payload, task)
     train = _selection_summary(
         payload, plan["train_indices"], task_names, output_path=train_output
@@ -399,7 +442,21 @@ def _build_manifest(
                 "action_dim": expected_shape[2],
             },
             "logged_action_chunk": (
-                "full_h6" if data_protocol == PEER_SYNC_H6_CONTRACT else "full_h48"
+                "full_h6" if data_protocol in PEER_SYNC_H6_CONTRACTS else "full_h48"
+            ),
+            **(
+                {
+                    key: copy.deepcopy((payload.get("metadata") or {})[key])
+                    for key in (
+                        "fps",
+                        "planning_stride",
+                        "control_stride",
+                        "decision_offsets",
+                        "action_label_offsets",
+                    )
+                }
+                if data_protocol == PEER_SYNC_H6_P2_CONTRACT
+                else {}
             ),
         },
         "source": {
@@ -424,7 +481,11 @@ def _build_manifest(
             "ranking": "sha256(contract,seed,task_id,episode_id)",
             "seed": int(seed),
         },
-        "transition_rule": dict(TRANSITION_RULE),
+        "transition_rule": dict(
+            PEER_SYNC_H6_P2_TRANSITION_RULE
+            if transition_prefix_steps == PEER_SYNC_H6_P2_TRANSITION_PREFIX_STEPS
+            else TRANSITION_RULE
+        ),
         "tasks": tasks,
         "splits": {"train": train, "eval": eval_split},
         "validation": {

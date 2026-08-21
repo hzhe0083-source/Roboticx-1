@@ -217,10 +217,12 @@ DEFAULT_CYCLE_STEPS = 6
 PROPOSAL_FLOW_STEPS = 8
 LEGACY_VA_WORLD_MODE = "legacy"
 PEER_VA_WORLD_MODE = "peer_sync_h6"
-PEER_WORLD_TOPOLOGY_CONTRACT = "pre_stage_snapshot_parallel_va_world_v1"
+PEER_WORLD_TOPOLOGY_CONTRACT = "one_stage_delayed_bidirectional_state_kv_v1"
 PEER_WORLD_ACTION_SOURCE_CONTRACT = (
     "deterministic_readout_main_explicit_env_override_supervision_v1"
 )
+PEER_GRADIENT_BOUNDARY_CONTRACT = "bidirectional_stop_gradient_v1"
+PEER_DATA_ISOLATION_CONTRACT = "separate_invocations_v1"
 DEFAULT_TASK_IDS = (0, 16)
 DEFAULT_TASK_NAMES = {0: "assembly-v3", 16: "door-unlock-v3"}
 CI_LEVEL = 0.95
@@ -715,6 +717,11 @@ def _checkpoint_world_contract(
             == PEER_WORLD_TOPOLOGY_CONTRACT
             and contract.get("peer_world_action_source")
             == PEER_WORLD_ACTION_SOURCE_CONTRACT
+            and contract.get("peer_gradient_boundary")
+            == PEER_GRADIENT_BOUNDARY_CONTRACT
+            and contract.get("peer_data_isolation")
+            == PEER_DATA_ISOLATION_CONTRACT
+            and contract.get("peer_training_mode") in {"world_only", "va_only"}
         )
     )
     base_valid = bool(
@@ -817,7 +824,11 @@ def _checkpoint_world_contract(
             f"va_world_mode={va_world_mode!r}, "
             f"peer_world_topology={contract.get('peer_world_topology')!r}, "
             "peer_world_action_source="
-            f"{contract.get('peer_world_action_source')!r}"
+            f"{contract.get('peer_world_action_source')!r}, "
+            "peer_gradient_boundary="
+            f"{contract.get('peer_gradient_boundary')!r}, "
+            f"peer_data_isolation={contract.get('peer_data_isolation')!r}, "
+            f"peer_training_mode={contract.get('peer_training_mode')!r}"
         )
     return supervision, logged_branch, valid
 
@@ -1278,7 +1289,6 @@ def _load_model_and_metric(
             else 48
         ),
         "wmrm_inject": "all",
-        "wmrm_handshake": True,
         "wmrm_predictor": "st_blocks",
         "wmrm_map_size": 16,
         "wmrm_map_channels": 1024,
@@ -1406,7 +1416,7 @@ def _proposal_pre_step_memory(
     seed: int,
     flow_steps: int = PROPOSAL_FLOW_STEPS,
 ) -> VisualMemory | None:
-    """Replay proposal handshake history and return current pre-step memory."""
+    """Replay World-state history and return current pre-step memory."""
 
     if time_index < 0 or time_index >= vision_tokens.shape[1]:
         raise ValueError("time_index is outside the encoded sequence")
@@ -1466,7 +1476,7 @@ def _proposal_pre_step_memory(
             )
             if proposal_action.shape[1] < DEFAULT_CYCLE_STEPS:
                 raise RuntimeError(
-                    "proposal action horizon is shorter than the cycle-6 handshake"
+                    "proposal action horizon is shorter than the cycle-6 World input"
                 )
             proposal_action = proposal_action[:, :DEFAULT_CYCLE_STEPS].clamp(-1.0, 1.0)
             _, visual_memory = model.encode_condition(

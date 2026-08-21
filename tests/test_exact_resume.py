@@ -18,7 +18,13 @@ from train import (
     WORLD_LOGGED_BRANCH_CONTRACT,
     WORLD_LOSS_COMPONENT_WEIGHTS,
     WORLD_NO_REGRESSION,
+    PEER_DATA_ISOLATION_CONTRACT,
+    PEER_DUAL_STREAM_OPTIMIZER_CONTRACT,
+    PEER_GRADIENT_BOUNDARY_CONTRACT,
+    PEER_HIGH_FREQUENCY_CONTRACT,
+    PEER_WORLD_ACTION_SOURCE_CONTRACT,
     PEER_WORLD_READOUT_CONTRACT,
+    PEER_WORLD_TOPOLOGY_CONTRACT,
     WORLD_STAGE_AUXILIARY_DECAY,
     WORLD_STATIC_COPY_CONSTRAINT,
     WORLD_SUPERVISION_CONTRACT,
@@ -218,6 +224,62 @@ def test_main_checkpoint_contains_exact_training_state(tmp_path) -> None:
     assert set(loaded["rng_state"]) == {"python", "numpy", "torch_cpu", "torch_cuda"}
     assert loaded["rng_state"]["numpy"]["state"].dtype == torch.int64
     assert loaded["exact_run_contract"]["contract_version"] == 1
+
+
+def test_peer_checkpoint_contains_both_sampler_states_and_data_identities(
+    tmp_path,
+) -> None:
+    path = tmp_path / "peer.pt"
+    args = parse_args(
+        [
+            "--single-task",
+            "--save",
+            str(path),
+            "--wam4va",
+            "--va-world-mode",
+            "peer_sync_h6",
+            "--va-data",
+            "va.pt",
+            "--world-data",
+            "world.pt",
+        ]
+    )
+    model, optimizer = _model_and_optimizer()
+    va_sampler = _sampler()
+    world_sampler = _sampler()
+    va_identity = {"full_file_sha256": "va"}
+    world_identity = {"full_file_sha256": "world"}
+    va_sampler.bind_dataset_content_identity(va_identity)
+    world_sampler.bind_dataset_content_identity(world_identity)
+    va_sampler.advance()
+    world_sampler.advance(2)
+    config = SimpleNamespace(va_world_mode="peer_sync_h6")
+    exact_contract = build_exact_run_contract(
+        args,
+        config,
+        optimizer,
+        va_sampler,
+        world_sampler=world_sampler,
+    )
+
+    save_checkpoint(
+        args,
+        config,
+        model,
+        None,
+        optimizer=optimizer,
+        global_step=2,
+        sampler=va_sampler,
+        world_sampler=world_sampler,
+        exact_run_contract=exact_contract,
+    )
+
+    loaded = torch.load(path, map_location="cpu", weights_only=True)
+    assert loaded["sampler_state"] == va_sampler.state_dict()
+    assert loaded["world_sampler_state"] == world_sampler.state_dict()
+    peer = loaded["exact_run_contract"]["peer_world"]
+    assert peer["va_data_identity"] == va_identity
+    assert peer["world_data_identity"] == world_identity
 
 
 def test_final_checkpoint_skips_same_step_periodic_save(tmp_path) -> None:
@@ -478,85 +540,116 @@ def test_exact_contract_rejects_changed_objective_args(
         validate_exact_run_contract(baseline, current)
 
 
-def test_va_world_mode_cli_and_peer_scratch_resume_rules(tmp_path) -> None:
+def test_va_world_mode_cli_requires_joint_dual_data() -> None:
     assert parse_args([]).va_world_mode == "legacy"
-    peer = parse_args(["--wam4va", "--va-world-mode", "peer_sync_h6"])
-    validate_args(peer)
-
-    with pytest.raises(ValueError, match="scratch or use --resume-exact"):
-        validate_args(
-            parse_args(
-                [
-                    "--wam4va",
-                    "--va-world-mode",
-                    "peer_sync_h6",
-                    "--resume",
-                    "legacy.pt",
-                ]
-            )
-        )
-    legacy_path = tmp_path / "legacy.pt"
-    torch.save({"config": {}}, legacy_path)
-    with pytest.raises(ValueError, match="requires a peer_sync_h6 checkpoint"):
-        validate_args(
-            parse_args(
-                [
-                    "--wam4va",
-                    "--va-world-mode",
-                    "peer_sync_h6",
-                    "--resume-exact",
-                    str(legacy_path),
-                    "--data",
-                    str(legacy_path),
-                    "--single-task",
-                    "--task-sampling",
-                    "weighted",
-                    "--dino-main-vision",
-                ]
-            )
-        )
-
-
-def test_peer_rejects_nonzero_adep_weight_but_legacy_preserves_it() -> None:
     peer = parse_args(
-        [
-            "--wam4va",
-            "--va-world-mode",
-            "peer_sync_h6",
-            "--wmrm-adep-weight",
-            "0.1",
-        ]
+        ["--wam4va", "--va-only", "--va-world-mode", "peer_sync_h6"]
     )
-    with pytest.raises(ValueError, match="same-snapshot action-dependence"):
+    with pytest.raises(ValueError, match="both --va-data and --world-data"):
         validate_args(peer)
 
+
+def test_legacy_preserves_nonzero_adep_weight() -> None:
     legacy = parse_args(["--wam4va", "--wmrm-adep-weight", "0.1"])
     validate_args(legacy)
     assert legacy.wmrm_adep_weight == pytest.approx(0.1)
 
 
-def test_peer_exact_contract_binds_readout_mask_and_stage_aggregation() -> None:
+def test_peer_exact_contract_binds_dual_data_and_joint_loss_protocol() -> None:
     _, optimizer = _model_and_optimizer()
-    args = parse_args(["--wam4va", "--va-world-mode", "peer_sync_h6"])
+    args = parse_args(
+        [
+            "--wam4va",
+            "--va-world-mode",
+            "peer_sync_h6",
+            "--va-data",
+            "va.pt",
+            "--world-data",
+            "world.pt",
+        ]
+    )
     config = SimpleNamespace(
         num_layers=8,
         action_horizon=6,
         wmrm=True,
         va_world_mode="peer_sync_h6",
     )
-    contract = build_exact_run_contract(args, config, optimizer, _sampler())
+    va_sampler = _sampler()
+    world_sampler = _sampler()
+    va_sampler.bind_dataset_content_identity({"full_file_sha256": "va"})
+    world_sampler.bind_dataset_content_identity({"full_file_sha256": "world"})
+    contract = build_exact_run_contract(
+        args,
+        config,
+        optimizer,
+        va_sampler,
+        world_sampler=world_sampler,
+    )
 
     assert contract["peer_world"]["readout"] == PEER_WORLD_READOUT_CONTRACT
-    assert contract["peer_world"]["readout"]["validity"].startswith(
-        "world_transition_mask"
+    assert contract["peer_world"]["readout"]["va_stream"] == (
+        "causal_deterministic_h6_readout_v1"
     )
-    assert contract["peer_world"]["readout"]["stage_supervision"] == (
-        "final_peer_stage_only_v1"
+    assert contract["peer_world"]["readout"]["world_stream"] == (
+        "explicit_logged_h6_model_uses_planning_prefix_v1"
+    )
+    assert contract["peer_world"]["optimizer"] == (
+        PEER_DUAL_STREAM_OPTIMIZER_CONTRACT
+    )
+    assert contract["peer_world"]["va_data_identity"]["full_file_sha256"] == "va"
+    assert contract["peer_world"]["world_data_identity"]["full_file_sha256"] == (
+        "world"
     )
 
     changed = copy.deepcopy(contract)
-    changed["peer_world"]["readout"]["stage_supervision"] = "all_stages_v0"
-    with pytest.raises(ValueError, match="peer_world.readout.stage_supervision"):
+    changed["peer_world"]["readout"]["loss"] = "label_writeback_v0"
+    with pytest.raises(ValueError, match="peer_world.readout.loss"):
+        validate_exact_run_contract(contract, changed)
+
+
+def test_peer_p2_exact_contract_binds_planning_frequency() -> None:
+    _, optimizer = _model_and_optimizer()
+    args = parse_args(
+        [
+            "--wam4va",
+            "--va-world-mode",
+            "peer_sync_h6",
+            "--va-data",
+            "va.pt",
+            "--world-data",
+            "world.pt",
+            "--planning-stride",
+            "2",
+            "--control-stride",
+            "2",
+            "--wmrm-cycle-steps",
+            "2",
+            "--flow-prefix-steps",
+            "2",
+        ]
+    )
+    config = SimpleNamespace(
+        num_layers=8,
+        action_horizon=6,
+        planning_stride=2,
+        wmrm=True,
+        wmrm_cycle_steps=2,
+        va_world_mode="peer_sync_h6",
+    )
+    contract = build_exact_run_contract(
+        args, config, optimizer, _sampler(), world_sampler=_sampler()
+    )
+
+    assert contract["model_config"]["planning_stride"] == 2
+    assert contract["peer_world"]["planning_stride"] == 2
+    assert contract["peer_world"]["planning_hz"] == pytest.approx(40.0)
+    assert contract["peer_world"]["high_frequency"] == (
+        PEER_HIGH_FREQUENCY_CONTRACT
+    )
+
+    changed = copy.deepcopy(contract)
+    changed["peer_world"]["planning_stride"] = 6
+    with pytest.raises(ValueError, match="peer_world.planning_stride"):
         validate_exact_run_contract(contract, changed)
 
 
@@ -1048,11 +1141,16 @@ def test_visual_world_exact_resume_binds_fixed_action_donors() -> None:
     peer_contract = {
         **contract,
         "va_world_mode": "peer_sync_h6",
-        "peer_world_topology": "pre_stage_snapshot_parallel_va_world_v1",
-        "peer_world_action_source": (
-            "deterministic_readout_main_explicit_env_override_supervision_v1"
-        ),
+        "peer_world_topology": PEER_WORLD_TOPOLOGY_CONTRACT,
+        "peer_world_action_source": PEER_WORLD_ACTION_SOURCE_CONTRACT,
         "peer_world_readout": PEER_WORLD_READOUT_CONTRACT,
+        "peer_training_mode": "joint_dual_stream",
+        "peer_gradient_boundary": PEER_GRADIENT_BOUNDARY_CONTRACT,
+        "peer_data_isolation": PEER_DATA_ISOLATION_CONTRACT,
+        "peer_dual_stream_optimizer": PEER_DUAL_STREAM_OPTIMIZER_CONTRACT,
+        "planning_stride": 6,
+        "planning_hz": 80.0 / 6,
+        "peer_high_frequency_contract": PEER_HIGH_FREQUENCY_CONTRACT,
     }
     validate_visual_world_resume_contract(
         {"training_contract": peer_contract},

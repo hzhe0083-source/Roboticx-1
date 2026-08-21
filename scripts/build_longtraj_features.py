@@ -45,7 +45,14 @@ REF = ROOT / "data" / "metaworld_fullframe_executed.pt"
 ST_NPY_DIR = Path("/media/ryan/robot-data")
 LEGACY_PERTURB_SETTLE_STEPS = 12
 PEER_SYNC_H6_CONTRACT = "peer_sync_h6_world_windows_v1"
+PEER_SYNC_H6_P2_CONTRACT = "peer_sync_h6_p2_world_windows_v1"
 PEER_SYNC_H6_VERSION = 1
+PEER_SYNC_H6_P2_VERSION = 1
+PEER_SYNC_H6_P2_STRIDE = 2
+PEER_SYNC_H6_CONTRACTS = frozenset({
+    PEER_SYNC_H6_CONTRACT,
+    PEER_SYNC_H6_P2_CONTRACT,
+})
 
 
 def win_out(horizon: int, task: str | None = None) -> Path:
@@ -435,6 +442,7 @@ def phase1(horizon: int, *, task: str | None = None,
            ref_path: Path = REF,
            legacy_policy: str = "warn",
            data_contract: str | None = None,
+           planning_stride: int = CONTROL_STRIDE,
            overwrite: bool = False) -> Path:
     """窗口切片（动作/状态/prev/帧索引），无 GPU。horizon=action chunk 长度。
 
@@ -442,11 +450,30 @@ def phase1(horizon: int, *, task: str | None = None,
     output, so a door-lock repair cannot replace the all-task H48 dataset.
     ``input_paths`` can select a clean collector file explicitly.
     """
-    if data_contract not in {None, PEER_SYNC_H6_CONTRACT}:
+    if data_contract not in {None, *PEER_SYNC_H6_CONTRACTS}:
         raise ValueError(f"unknown data_contract={data_contract!r}")
-    if data_contract == PEER_SYNC_H6_CONTRACT and horizon != 6:
+    if data_contract in PEER_SYNC_H6_CONTRACTS and horizon != 6:
         raise ValueError(
-            f"{PEER_SYNC_H6_CONTRACT} requires exact action horizon H6, got H{horizon}"
+            f"{data_contract} requires exact action horizon H6, got H{horizon}"
+        )
+    if (
+        isinstance(planning_stride, (bool, np.bool_))
+        or not isinstance(planning_stride, (int, np.integer))
+        or planning_stride <= 0
+    ):
+        raise ValueError(f"planning_stride must be a positive integer, got {planning_stride!r}")
+    planning_stride = int(planning_stride)
+    if data_contract == PEER_SYNC_H6_P2_CONTRACT:
+        if planning_stride != PEER_SYNC_H6_P2_STRIDE:
+            raise ValueError(
+                f"{PEER_SYNC_H6_P2_CONTRACT} requires planning_stride="
+                f"{PEER_SYNC_H6_P2_STRIDE}, got {planning_stride}"
+            )
+    elif planning_stride != CONTROL_STRIDE:
+        raise ValueError(
+            f"planning_stride={planning_stride} requires data_contract="
+            f"{PEER_SYNC_H6_P2_CONTRACT}; legacy contracts remain stride="
+            f"{CONTROL_STRIDE}"
         )
 
     ref_path = Path(ref_path).expanduser().resolve(strict=True)
@@ -515,7 +542,7 @@ def phase1(horizon: int, *, task: str | None = None,
             raise ValueError(f"{path}: task text absent from reference: {task_text!r}") from exc
         source_key = (
             data["task"]
-            if data_contract == PEER_SYNC_H6_CONTRACT
+            if data_contract in PEER_SYNC_H6_CONTRACTS
             else _frame_ref_key(path)
         )
         for ei, ep in enumerate(data["episodes"]):
@@ -532,16 +559,18 @@ def phase1(horizon: int, *, task: str | None = None,
                 legacy_perturb_events_inferred += int(
                     semantics["perturb_start"] is not None
                 )
-            last_start = T - 1 - ((SEQUENCE_LENGTH - 1) * CONTROL_STRIDE + (horizon - 1))
+            last_start = T - 1 - (
+                (SEQUENCE_LENGTH - 1) * planning_stride + (horizon - 1)
+            )
             if last_start < 0:
                 continue
-            for s in range(0, last_start + 1, CONTROL_STRIDE):
+            for s in range(0, last_start + 1, planning_stride):
                 target_idx = np.asarray([
-                    [s + t * CONTROL_STRIDE + h for h in range(horizon)]
+                    [s + t * planning_stride + h for h in range(horizon)]
                     for t in range(SEQUENCE_LENGTH)
                 ], dtype=np.int64)
                 action_valid_mask = semantics["valid"][target_idx]
-                decision_idx = s + np.arange(SEQUENCE_LENGTH) * CONTROL_STRIDE
+                decision_idx = s + np.arange(SEQUENCE_LENGTH) * planning_stride
                 # A pre-perturb observation cannot predict which random
                 # perturb/recovery branch will occur later in its H-step target.
                 # Keep recovery supervision once the perturb is observable.
@@ -557,17 +586,17 @@ def phase1(horizon: int, *, task: str | None = None,
                 acts = np.asarray(actions)[target_idx]
                 prev = np.stack([
                     np.zeros(4, dtype=np.float32)
-                    if s + t * CONTROL_STRIDE == 0
-                    else actions[s + t * CONTROL_STRIDE - 1]
+                    if s + t * planning_stride == 0
+                    else actions[s + t * planning_stride - 1]
                     for t in range(SEQUENCE_LENGTH)
                 ])
                 proprio = np.stack([
-                    states[s + t * CONTROL_STRIDE] for t in range(SEQUENCE_LENGTH)
+                    states[s + t * planning_stride] for t in range(SEQUENCE_LENGTH)
                 ])
                 # 帧索引：每个决策点的 4 帧窗口（编码阶段取帧）。
                 # 存纯 list（Codex P0-4：numpy 使 weights_only=True 加载失败）。
                 frame_idx = np.stack([
-                    clip_frame_indices(s + t * CONTROL_STRIDE)
+                    clip_frame_indices(s + t * planning_stride)
                     for t in range(SEQUENCE_LENGTH)
                 ])  # [T, W]
                 W.append({
@@ -635,16 +664,28 @@ def phase1(horizon: int, *, task: str | None = None,
         "metadata": {
             "contract": data_contract or "language_conditioned_mt50_longtraj_v2",
             "contract_version": (
-                PEER_SYNC_H6_VERSION if data_contract == PEER_SYNC_H6_CONTRACT else 2
+                (
+                    PEER_SYNC_H6_P2_VERSION
+                    if data_contract == PEER_SYNC_H6_P2_CONTRACT
+                    else PEER_SYNC_H6_VERSION
+                )
+                if data_contract in PEER_SYNC_H6_CONTRACTS
+                else 2
             ),
             "tasks": ref["metadata"]["tasks"],
-            "fps": FPS, "control_stride": CONTROL_STRIDE,
+            "fps": FPS,
+            "planning_stride": planning_stride,
+            "control_stride": planning_stride,
             "sequence_length": SEQUENCE_LENGTH,
+            "decision_offsets": [
+                t * planning_stride for t in range(SEQUENCE_LENGTH)
+            ],
             "action_horizon": horizon,
+            "action_label_offsets": list(range(horizon)),
             "action_dim": 4,
             "action_contract": "executed-clip-fullframe",
             "logged_action_chunk": (
-                "full_h6" if data_contract == PEER_SYNC_H6_CONTRACT else "full_horizon"
+                "full_h6" if data_contract in PEER_SYNC_H6_CONTRACTS else "full_horizon"
             ),
             "parent_identity": parent_identity,
             "source_identities": source_identities,
@@ -827,8 +868,14 @@ if __name__ == "__main__":
     ap.add_argument("--st-npy", type=Path, help="phase2 特征 memmap 输出")
     ap.add_argument("--st-meta", type=Path, help="phase2 metadata 输出")
     ap.add_argument(
-        "--data-contract", choices=(PEER_SYNC_H6_CONTRACT,),
-        help=(f"emit the explicit {PEER_SYNC_H6_CONTRACT} protocol; requires --horizon 6"),
+        "--data-contract", choices=tuple(sorted(PEER_SYNC_H6_CONTRACTS)),
+        help=("emit an explicit peer H6 protocol; the P2 contract additionally "
+              "requires --planning-stride 2"),
+    )
+    ap.add_argument(
+        "--planning-stride", type=int, default=CONTROL_STRIDE,
+        help=("decision/control cadence in source frames; default 6 preserves old "
+              f"datasets, while {PEER_SYNC_H6_P2_CONTRACT} requires 2"),
     )
     ap.add_argument(
         "--legacy-policy", choices=("warn", "error", "infer"), default="warn",
@@ -847,6 +894,7 @@ if __name__ == "__main__":
             ref_path=args.ref,
             legacy_policy=args.legacy_policy,
             data_contract=args.data_contract,
+            planning_stride=args.planning_stride,
             overwrite=args.overwrite,
         )
     else:

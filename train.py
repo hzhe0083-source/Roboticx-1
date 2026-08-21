@@ -40,14 +40,24 @@ WORLD_LOSS_COMPONENT_WEIGHTS = {
 WORLD_STAGE_AUXILIARY_DECAY = 0.25
 WORLD_LOGGED_BRANCH_CONTRACT = "matched_context_full_forward_v1"
 WORLD_ACTION_DONOR_CONTRACT = "train_split_task_cross_episode_proprio_nearest_v1"
-PEER_WORLD_TOPOLOGY_CONTRACT = "pre_stage_snapshot_parallel_va_world_v1"
+PEER_WORLD_TOPOLOGY_CONTRACT = "one_stage_delayed_bidirectional_state_kv_v1"
 PEER_WORLD_ACTION_SOURCE_CONTRACT = "deterministic_readout_main_explicit_env_override_supervision_v1"
+PEER_GRADIENT_BOUNDARY_CONTRACT = "fully_differentiable_bidirectional_messages_v1"
+PEER_DATA_ISOLATION_CONTRACT = "separate_va_world_episode_datasets_per_step_v1"
+PEER_DUAL_STREAM_OPTIMIZER_CONTRACT = (
+    "va_backward_then_world_backward_one_optimizer_step_v1"
+)
+PEER_PLANNING_STRIDES = frozenset({1, 2, 3, 6})
+PEER_HIGH_FREQUENCY_CONTRACT = {
+    "action_prediction": "full_h6_each_decision_v1",
+    "world_transition": "logged_h6_prefix_planning_stride_v1",
+    "world_target": "adjacent_decision_at_data_stride_v1",
+    "readout_auxiliary": "full_logged_h6_v1",
+}
 PEER_WORLD_READOUT_CONTRACT = {
-    "loss": "smooth_l1_logged_h6_v1",
-    "validity": "world_transition_mask_all_h6_current_and_next_first_v1",
-    "stage_supervision": "final_peer_stage_only_v1",
-    "reduction": "masked_mean_over_valid_transitions_v1",
-    "diagnostic": "rmse_same_mask_and_stage_v1",
+    "va_stream": "causal_deterministic_h6_readout_v1",
+    "world_stream": "explicit_logged_h6_model_uses_planning_prefix_v1",
+    "loss": "logged_h6_auxiliary_without_forward_label_injection_v1",
 }
 FEATURE_AUTOCAST_CONTRACT = "bf16_nograd_decode_cache_isolated_v1"
 WORLD_NO_REGRESSION = {
@@ -114,7 +124,7 @@ def wmrm_next_feature_target(
     if kind == "metric":
         if metric_g is None:
             raise ValueError("wmrm_target=metric requires metric_g")
-        return metric_g[:, nxt]
+        return metric_g[:, nxt].detach()
     if kind == "vjepa":
         if dense_evidence is None or 11 not in dense_evidence:
             raise ValueError("wmrm_target=vjepa requires dense_evidence[11] (H11)")
@@ -1090,14 +1100,12 @@ _EXACT_RUN_OPERATIONAL_ARGS = {
     # weights and content identity are checkpointed, so replaying this flag is
     # neither necessary nor allowed during an exact continuation.
     "replace_mtvj_metric_head_from_external",
+    # Dataset paths are spelling only; full content identities are stored in
+    # data_identity and peer_world.{va_data_identity,world_data_identity}.
     "data",
+    "va_data",
+    "world_data",
 }
-
-# E7 WAM args/config enter the exact-run contract only through the conditional
-# "wam" section (appended when --wam-joint is on). Excluding them
-# unconditionally from argument_semantics/model_config keeps the WAM-off
-# contract key-for-key identical to pre-WAM (main-era) checkpoints.
-_WAM_CONTRACT_ARG_KEYS = {"wam_joint", "wam_alpha", "wam_ckpt"}
 
 
 def _normalize_contract_value(value):
@@ -1136,6 +1144,7 @@ def validate_visual_world_training_split(
     manifest_path: Path,
     *,
     va_world_mode: str = "legacy",
+    planning_stride: int = 6,
 ) -> dict[str, str]:
     """Validate the immutable episode-level train split before model startup."""
 
@@ -1156,7 +1165,7 @@ def validate_visual_world_training_split(
     manifest_sha = canonical_manifest_sha256(manifest)
     if manifest.get("manifest_sha256") != manifest_sha:
         raise ValueError("World split manifest canonical SHA mismatch")
-    if Path(str(manifest.get("manifest_path", ""))).expanduser().resolve() != resolved_manifest:
+    if Path(str(manifest.get("manifest_path", ""))).name != resolved_manifest.name:
         raise ValueError("World split manifest_path does not match the supplied file")
 
     metadata = payload.get("metadata") or {}
@@ -1166,7 +1175,7 @@ def validate_visual_world_training_split(
         raise ValueError("embedded split_contract differs from the external manifest")
     if metadata.get("split_manifest_sha256") != manifest_sha:
         raise ValueError("training payload split_manifest_sha256 mismatch")
-    if Path(str(metadata.get("split_manifest_path", ""))).expanduser().resolve() != resolved_manifest:
+    if Path(str(metadata.get("split_manifest_path", ""))).name != resolved_manifest.name:
         raise ValueError("training payload split_manifest_path mismatch")
 
     actions = payload.get("actions")
@@ -1180,7 +1189,15 @@ def validate_visual_world_training_split(
         raise ValueError("visual World actions must be finite floating-point values")
     peer_mode = va_world_mode == "peer_sync_h6"
     expected_shape = (4, 6, 4) if peer_mode else (4, 48, 4)
-    expected_protocol = PEER_SYNC_H6_CONTRACT if peer_mode else MANIFEST_CONTRACT
+    if peer_mode and planning_stride not in PEER_PLANNING_STRIDES:
+        raise ValueError("peer planning_stride must be one of 1/2/3/6")
+    expected_protocol = (
+        PEER_SYNC_H6_CONTRACT
+        if peer_mode and planning_stride == 6
+        else f"peer_sync_h6_p{planning_stride}_world_windows_v1"
+        if peer_mode
+        else MANIFEST_CONTRACT
+    )
     metadata_contract = metadata.get("contract")
     manifest_protocol = (manifest.get("data_protocol") or {}).get("contract")
     if tuple(actions.shape[1:]) != expected_shape:
@@ -1190,12 +1207,32 @@ def validate_visual_world_training_split(
             f"A={expected_shape[2]}, got {tuple(actions.shape[1:])}"
         )
     if peer_mode:
-        if metadata_contract != PEER_SYNC_H6_CONTRACT:
+        if metadata_contract != expected_protocol:
             raise ValueError(
-                f"peer_sync_h6 requires metadata.contract={PEER_SYNC_H6_CONTRACT!r}"
+                f"peer_sync_h6 requires metadata.contract={expected_protocol!r}"
             )
         if metadata.get("logged_action_chunk") != "full_h6":
             raise ValueError("peer_sync_h6 requires the full logged H6 action chunk")
+        if int(metadata.get("control_stride", -1)) != planning_stride:
+            raise ValueError(
+                "peer_sync_h6 data control_stride must equal planning_stride "
+                f"({planning_stride})"
+            )
+        if planning_stride != 6 and int(
+            metadata.get("planning_stride", -1)
+        ) != planning_stride:
+            raise ValueError(
+                "high-frequency peer data metadata.planning_stride must equal "
+                f"{planning_stride}"
+            )
+        expected_offsets = [
+            index * planning_stride for index in range(expected_shape[0])
+        ]
+        if planning_stride != 6 and metadata.get("decision_offsets") != expected_offsets:
+            raise ValueError(
+                "high-frequency peer data decision_offsets must be adjacent "
+                f"planning decisions: {expected_offsets}"
+            )
         for key in ("parent_identity", "source_identities", "output_identity"):
             if not metadata.get(key):
                 raise ValueError(f"peer_sync_h6 requires metadata.{key}")
@@ -1238,8 +1275,8 @@ def validate_visual_world_training_split(
     splits = manifest.get("splits") or {}
     train_contract = splits.get("train") or {}
     eval_contract = splits.get("eval") or {}
-    if Path(str(train_contract.get("output_path", ""))).expanduser().resolve() != resolved_data:
-        raise ValueError("World split train output_path does not match --data")
+    if Path(str(train_contract.get("output_path", ""))).name != resolved_data.name:
+        raise ValueError("World split train output_path does not match the World dataset")
     if int(train_contract.get("windows", -1)) != int(actions.shape[0]):
         raise ValueError("World split train window count mismatch")
     if metadata.get("output_identity") != train_contract.get("output_identity"):
@@ -1270,7 +1307,15 @@ def validate_visual_world_training_split(
             f"{manifest_tasks}"
         )
 
-    transition = split_transition_mask(action_valid)
+    transition_rule = manifest.get("transition_rule") or {}
+    if int(transition_rule.get("current_action_prefix_steps", -1)) != (
+        planning_stride if peer_mode else 6
+    ):
+        raise ValueError("World split transition prefix does not match planning_stride")
+    transition = split_transition_mask(
+        action_valid,
+        prefix_steps=planning_stride if peer_mode else 6,
+    )
     transition_stats = (train_contract.get("mask_stats") or {}).get("transition") or {}
     if (
         int(transition.sum()) != int(transition_stats.get("true", -1))
@@ -1301,7 +1346,11 @@ def validate_visual_world_training_split(
             raise ValueError(f"World split task {task_id} transition stats mismatch")
 
     source = manifest.get("source") or {}
-    source_path = Path(str(source.get("path", ""))).expanduser().resolve(strict=True)
+    source_candidate = resolved_data.parent / Path(str(source.get("path", ""))).name
+    if source_candidate.exists():
+        source_path = source_candidate.resolve(strict=True)
+    else:
+        source_path = Path(str(source.get("path", ""))).expanduser().resolve(strict=True)
     source_sha = str(source.get("sha256", ""))
     if not source_sha or _sha256_file(source_path) != source_sha:
         raise ValueError("World split source SHA mismatch")
@@ -1317,6 +1366,77 @@ def validate_visual_world_training_split(
     }
 
 
+def validate_peer_data_isolation(
+    va_payload: dict,
+    world_payload: dict,
+    *,
+    planning_stride: int | None = None,
+) -> dict[str, object]:
+    """Prove that peer VA and World supervision use disjoint episode rows."""
+
+    def integer_vector(payload: dict, key: str, stream: str) -> Tensor:
+        value = payload.get(key)
+        if (
+            not isinstance(value, Tensor)
+            or value.ndim != 1
+            or value.dtype == torch.bool
+            or value.is_floating_point()
+        ):
+            raise ValueError(f"{stream} {key} must be an integer [N] tensor")
+        return value.to(torch.int64)
+
+    va_episode = integer_vector(va_payload, "episode_id", "VA")
+    world_episode = integer_vector(world_payload, "episode_id", "World")
+    va_task = integer_vector(va_payload, "instruction_id", "VA")
+    world_task = integer_vector(world_payload, "instruction_id", "World")
+    va_episodes = {int(value) for value in va_episode.tolist()}
+    world_episodes = {int(value) for value in world_episode.tolist()}
+    overlap = sorted(va_episodes & world_episodes)
+    if overlap:
+        raise ValueError(
+            "peer VA/World datasets must be episode-disjoint; overlapping "
+            f"episode_id values: {overlap[:12]}"
+        )
+    va_tasks = sorted(int(value) for value in torch.unique(va_task).tolist())
+    world_tasks = sorted(int(value) for value in torch.unique(world_task).tolist())
+    if va_tasks != world_tasks:
+        raise ValueError(
+            "peer VA/World datasets must cover the same task ids: "
+            f"VA={va_tasks}, World={world_tasks}"
+        )
+    for key in ("actions", "proprio", "language_hidden"):
+        va_value = va_payload.get(key)
+        world_value = world_payload.get(key)
+        if not isinstance(va_value, Tensor) or not isinstance(world_value, Tensor):
+            raise ValueError(f"peer VA/World datasets both require tensor {key}")
+        if tuple(va_value.shape[1:]) != tuple(world_value.shape[1:]):
+            raise ValueError(
+                f"peer VA/World {key} schema mismatch: "
+                f"{tuple(va_value.shape[1:])} vs {tuple(world_value.shape[1:])}"
+            )
+    if planning_stride is not None:
+        for stream, payload in (("VA", va_payload), ("World", world_payload)):
+            metadata = payload.get("metadata") or {}
+            if int(metadata.get("control_stride", -1)) != planning_stride:
+                raise ValueError(
+                    f"{stream} data control_stride must equal planning_stride "
+                    f"({planning_stride})"
+                )
+            if planning_stride != 6 and int(
+                metadata.get("planning_stride", -1)
+            ) != planning_stride:
+                raise ValueError(
+                    f"{stream} data metadata.planning_stride must equal "
+                    f"{planning_stride}"
+                )
+    return {
+        "contract": PEER_DATA_ISOLATION_CONTRACT,
+        "va_episode_count": len(va_episodes),
+        "world_episode_count": len(world_episodes),
+        "task_ids": va_tasks,
+    }
+
+
 def validate_visual_world_resume_contract(
     checkpoint: dict,
     split_identity: dict[str, object],
@@ -1324,13 +1444,18 @@ def validate_visual_world_resume_contract(
     static_constraint_weight: float = 4.0,
     migration_id: str | None = None,
     va_world_mode: str = "legacy",
+    planning_stride: int = 6,
 ) -> None:
     """Reject exact continuation from an old or differently split loss graph."""
 
     contract = checkpoint.get("training_contract") or {}
     expected = {
         "world_supervision": WORLD_SUPERVISION_CONTRACT,
-        "world_transition": WORLD_TRANSITION_CONTRACT,
+        "world_transition": (
+            WORLD_TRANSITION_CONTRACT
+            if planning_stride == 6
+            else f"current_first{planning_stride}_and_next_first_v1"
+        ),
         "world_loss_weights": WORLD_LOSS_COMPONENT_WEIGHTS,
         "world_stage_auxiliary_decay": WORLD_STAGE_AUXILIARY_DECAY,
         "world_no_regression": WORLD_NO_REGRESSION,
@@ -1362,6 +1487,13 @@ def validate_visual_world_resume_contract(
                 "peer_world_topology": PEER_WORLD_TOPOLOGY_CONTRACT,
                 "peer_world_action_source": PEER_WORLD_ACTION_SOURCE_CONTRACT,
                 "peer_world_readout": PEER_WORLD_READOUT_CONTRACT,
+                "peer_training_mode": "joint_dual_stream",
+                "peer_gradient_boundary": PEER_GRADIENT_BOUNDARY_CONTRACT,
+                "peer_data_isolation": PEER_DATA_ISOLATION_CONTRACT,
+                "peer_dual_stream_optimizer": PEER_DUAL_STREAM_OPTIMIZER_CONTRACT,
+                "planning_stride": planning_stride,
+                "planning_hz": 80.0 / planning_stride,
+                "peer_high_frequency_contract": PEER_HIGH_FREQUENCY_CONTRACT,
             }
         )
     mismatches = {
@@ -1566,13 +1698,13 @@ def build_exact_run_contract(
     sampler: TaskLocalityWeightedSampler | TaskWeightedSampler | None,
     metric_head: nn.Module | None = None,
     roi_head: nn.Module | None = None,
+    world_sampler: TaskLocalityWeightedSampler | TaskWeightedSampler | None = None,
 ) -> dict:
     """Freeze every current MT-VJ CLI/data/objective semantic for exact resume."""
     argument_semantics = {
         key: _normalize_contract_value(value)
         for key, value in sorted(vars(args).items())
         if key not in _EXACT_RUN_OPERATIONAL_ARGS
-        and key not in _WAM_CONTRACT_ARG_KEYS
     }
     metric_config = (
         _mtvj_metric_head_constructor_config(metric_head)
@@ -1602,16 +1734,11 @@ def build_exact_run_contract(
             key: roi_identity.get(key)
             for key in ("sha256", "size_bytes", "contract")
         }
-    # wam_joint is recorded in the conditional "wam" section below; stripping it
-    # here keeps the WAM-off model_config byte-compatible with pre-WAM configs.
     model_config = dict(getattr(config, "__dict__", {}))
-    model_config.pop("wam_joint", None)
     if not getattr(config, "wmrm", False):
         model_config.pop("wmrm", None)
-        model_config.pop("wmrm_rank", None)
         model_config.pop("wmrm_world_dim", None)
         model_config.pop("wmrm_inject", None)
-        model_config.pop("wmrm_mixer_dropout", None)
         model_config.pop("wmrm_target", None)
         model_config.pop("wmrm_detach_proposal_stage_state", None)
         model_config.pop("wmrm_predictor", None)
@@ -1644,10 +1771,23 @@ def build_exact_run_contract(
         },
     }
     if getattr(args, "va_world_mode", "legacy") == "peer_sync_h6":
+        planning_stride = int(getattr(args, "planning_stride", 6))
         contract["peer_world"] = {
             "topology": PEER_WORLD_TOPOLOGY_CONTRACT,
             "action_source": PEER_WORLD_ACTION_SOURCE_CONTRACT,
             "readout": PEER_WORLD_READOUT_CONTRACT,
+            "gradient_boundary": PEER_GRADIENT_BOUNDARY_CONTRACT,
+            "data_isolation": PEER_DATA_ISOLATION_CONTRACT,
+            "optimizer": PEER_DUAL_STREAM_OPTIMIZER_CONTRACT,
+            "planning_stride": planning_stride,
+            "planning_hz": 80.0 / planning_stride,
+            "high_frequency": PEER_HIGH_FREQUENCY_CONTRACT,
+            "va_data_identity": getattr(
+                sampler, "dataset_content_identity", None
+            ),
+            "world_data_identity": getattr(
+                world_sampler, "dataset_content_identity", None
+            ),
         }
     if getattr(args, "feature_autocast_bf16", False):
         contract["feature_autocast"] = {
@@ -1655,16 +1795,6 @@ def build_exact_run_contract(
             "dtype": "bfloat16",
             "training_cache_enabled": True,
             "no_grad_decode_cache_enabled": False,
-        }
-    if getattr(args, "wam_joint", False):
-        # WAM-on contract: freeze alpha and the content identity of the base
-        # WAM checkpoint (path spelling is not a model semantic).
-        wam_ckpt_sha256 = "none"
-        if getattr(args, "wam_ckpt", None):
-            wam_ckpt_sha256 = _sha256_file(Path(args.wam_ckpt))
-        contract["wam"] = {
-            "wam_alpha": float(getattr(args, "wam_alpha", 1.0)),
-            "wam_ckpt_sha256": wam_ckpt_sha256,
         }
     return _normalize_contract_value(contract)
 
@@ -2660,7 +2790,7 @@ def _action_vision_online_encode(
 
     The raw window is ``[d-6,d-4,d-2,d]``; the action tower uses ``[d-4,d]``
     (the newest frame from each of V-JEPA's two temporal bins).
-    V-JEPA continues to consume the complete window for the base/metric/WAM
+    V-JEPA continues to consume the complete window for the base/metric/World
     paths.  Chunking bounds the frozen ViT-L workspace on a 16-GiB GPU.
     """
     if encode_batch < 1:
@@ -3562,8 +3692,8 @@ def _mtvj_online_encode(
     - metric_tokens：有 metric_head 时 ``[B, T, 2, d_model] = stack(z_g, z_nu)``，
       g_t = ``out.p * out.visibility`` 展平后的8维可见度门控坐标，
       ν_t = g_t − g_{t−1}（首决策 ν≡0，与 servo g_prev 语义一致）；
-    - metric_g：同一 ``g_t``，``[B, T, 8]``，供 WAM ``geo8`` 与动作残差条件
-      使用；无 metric_head 时为 None（WAM 不得假装有几何）。
+    - metric_g：同一 ``g_t``，``[B, T, 8]``，供 metric 世界监督与 VA metric
+      条件使用；无 metric_head 时为 None。
     V-JEPA 始终 no_grad；metric localization path 与 relation encoder 可选联合微调。
     """
     if frames.ndim != 6 or frames.shape[-1] != 3:
@@ -4116,18 +4246,26 @@ def _nearest_cross_episode_donors(
     return donors
 
 
-def prepare_visual_world_action_ranking(payload: dict) -> dict[str, object]:
+def prepare_visual_world_action_ranking(
+    payload: dict,
+    *,
+    planning_stride: int = 6,
+) -> dict[str, object]:
     """Attach the fixed train-split shuffled-action table to a dataset payload."""
+
+    if planning_stride not in PEER_PLANNING_STRIDES:
+        raise ValueError("planning_stride must be one of 1/2/3/6")
 
     actions = torch.as_tensor(payload["actions"])
     proprio = torch.as_tensor(payload["proprio"])
     task_ids = torch.as_tensor(payload["instruction_id"], dtype=torch.int64)
     episode_ids = torch.as_tensor(payload["episode_id"], dtype=torch.int64)
     valid = world_transition_mask(
-        torch.as_tensor(payload["action_valid_mask"]), cycle_steps=6
+        torch.as_tensor(payload["action_valid_mask"]),
+        cycle_steps=planning_stride,
     )
     rows, times = torch.nonzero(valid, as_tuple=True)
-    flat_actions = actions[rows, times, :6]
+    flat_actions = actions[rows, times, :planning_stride]
     flat_proprio = proprio[rows, times]
     flat_tasks = task_ids[rows]
     flat_episodes = episode_ids[rows]
@@ -4141,7 +4279,14 @@ def prepare_visual_world_action_ranking(payload: dict) -> dict[str, object]:
         raise ValueError("visual World action ranking found a transition without a donor")
     shuffled = flat_actions.index_select(0, donors)
     distinct = shuffled.ne(flat_actions).any(dim=(1, 2))
-    table = actions.new_zeros((actions.shape[0], actions.shape[1] - 1, 6, 4))
+    table = actions.new_zeros(
+        (
+            actions.shape[0],
+            actions.shape[1] - 1,
+            planning_stride,
+            actions.shape[-1],
+        )
+    )
     table[rows, times] = shuffled
     rank_mask = torch.zeros_like(valid)
     rank_mask[rows, times] = distinct
@@ -4251,12 +4396,19 @@ def rollout_policy(
     wmrm_action_rank_per_sample_cap: float | None = None,
     wmrm_static_constraint_weight: float = 4.0,
     feature_autocast_bf16: bool = False,
+    train_world_model: bool = True,
+    compute_action_output: bool = True,
 ) -> tuple[Tensor, Tensor]:
     if world_action_rank_step < 0:
         raise ValueError("world_action_rank_step must be non-negative")
     if world_action_rank_stage not in {"final", "cycle"}:
         raise ValueError("world_action_rank_stage must be 'final' or 'cycle'")
     peer_world_mode = getattr(model.config, "va_world_mode", "legacy") == "peer_sync_h6"
+    logged_peer_world_forward = peer_world_mode and visual_world_supervision
+    if visual_world_supervision and not train_world_model:
+        raise ValueError(
+            "visual World supervision cannot run in the VA-only objective path"
+        )
     if peer_world_mode and wmrm_adep_enabled:
         raise ValueError(
             "peer_sync_h6 rejects nonzero wmrm_adep until action-dependence "
@@ -4315,9 +4467,7 @@ def rollout_policy(
     peer_readout_loss_records: list[tuple[Tensor, Tensor]] = []
     peer_readout_squared_error_records: list[tuple[Tensor, Tensor]] = []
     visual_world_final_records: list[dict[str, Tensor]] = []
-    wmrm_pi_kl_terms: list[Tensor] = []
     wmrm_adep_terms: list[Tensor] = []
-    wmrm_med_terms: list[Tensor] = []
     memories: list[VisualMemory] | None = [] if model.config.future_predict else None
     direct_predictions = [] if model.config.direct_head else None
     c2_references = [] if model.config.c2_controller else None
@@ -4422,42 +4572,31 @@ def rollout_policy(
                     f"but the training chunk has {batch['actions'].shape[2]}"
                 )
             if peer_world_mode:
-                # Peer mode owns its deterministic executable-action readout inside
-                # the single main encode.  A preliminary Flow decode would create a
-                # second, stale snapshot and violate the peer topology contract.
-                if cycle != 6 or model.config.action_horizon != 6:
-                    raise ValueError("peer_sync_h6 rollout requires exact H6")
-                if getattr(model, "world_action_readout", None) is None:
-                    raise ValueError("peer_sync_h6 requires world_action_readout")
-            elif getattr(model.config, "wmrm_handshake", True):
-                proposal_cond, _ = model.encode_condition(
-                    vision_in,
-                    batch["proprio"][:, time_index],
-                    batch["previous_action"][:, time_index],
-                    language_cache=language_cache,
-                    visual_memory=pre_step_visual_memory,
-                    return_visual_memory=True,
-                    skip_wmrm=True,
-                    **mtvj_kwargs,
-                )
-                with feature_no_grad_decode_autocast(
-                    proposal_cond.device, feature_autocast_bf16
+                planning_stride = int(getattr(model.config, "planning_stride", 6))
+                if (
+                    model.config.action_horizon != 6
+                    or planning_stride not in PEER_PLANNING_STRIDES
+                    or cycle != planning_stride
                 ):
-                    with torch.no_grad():
-                        decoded = model.decode_actions(
-                            proposal_cond, steps=flow_steps
-                        )
-                if decoded.shape[1] < cycle:
                     raise ValueError(
-                        f"decoded action horizon {decoded.shape[1]} "
-                        f"is shorter than WAM4VA cycle {cycle}"
+                        "peer_sync_h6 rollout requires H6 prediction with "
+                        "cycle_steps == planning_stride in {1,2,3,6}"
                     )
-                world_action = decoded[:, :cycle].clamp(-1.0, 1.0)
+                if logged_peer_world_forward:
+                    # The World dataset owns logged transition supervision. Feed
+                    # the complete H6 label to the model; peer encode slices H[:P]
+                    # for WAM while preserving full H6 for readout supervision.
+                    world_action = batch["actions"][
+                        :, time_index, : model.config.action_horizon
+                    ].clamp(-1.0, 1.0)
+                elif getattr(model, "world_action_readout", None) is None:
+                    raise ValueError("peer_sync_h6 requires world_action_readout")
             else:
+                # Non-peer World-only runs use the logged executable transition.
                 world_action = batch["actions"][:, time_index, :cycle].clamp(-1.0, 1.0)
         peer_stage_snapshots: list[tuple[tuple, dict]] = []
         original_peer_propose = None
-        if peer_world_mode:
+        if peer_world_mode and not logged_peer_world_forward:
             original_peer_propose = model.wmrm.propose
 
             def record_peer_snapshot(*proposal_args, **proposal_kwargs):
@@ -4486,11 +4625,12 @@ def rollout_policy(
         if not proposal_auxes and getattr(model, "last_wmrm", None) is not None:
             proposal_auxes = [model.last_wmrm]
         proposal_pres = list(getattr(model, "last_wmrm_pre_actions", None) or ())
-        proposal_meds = list(getattr(model, "last_wmrm_meds", None) or ())
-        proposal_kls = list(getattr(model, "last_wmrm_pi_kls", None) or ())
         proposal_last = getattr(model, "last_wmrm", None)
-        proposal_last_kl = getattr(model, "last_wmrm_pi_kl", None)
-        if model.wmrm is not None and time_index + 1 < batch["actions"].shape[1]:
+        if (
+            train_world_model
+            and model.wmrm is not None
+            and time_index + 1 < batch["actions"].shape[1]
+        ):
             target = wmrm_next_feature_target(
                 model,
                 batch,
@@ -4517,22 +4657,24 @@ def rollout_policy(
                 logged_action = batch["actions"][
                     :, time_index, : model.wmrm.cycle_steps
                 ]
+                logged_h6 = batch["actions"][
+                    :, time_index, : model.config.action_horizon
+                ]
                 if peer_world_mode:
                     logged_auxes = list(proposal_auxes)
-                    # The main peer encode already consumed the one authoritative
-                    # pre-stage snapshot per layer.  Supervision changes only the
-                    # executable action supplied to the predictor; it must not
-                    # rerun VA, mutate VisualMemory, or advance WAMState again.
                     logged_pres = proposal_pres
-                    # Readout supervision follows the exact World transition-valid
-                    # mask and has one explicit aggregation contract: supervise only
-                    # the final peer stage, then average all H6 action coordinates.
-                    final_readout = proposal_auxes[-1].env_action
+                    # H[:P] conditions the World transition, while this auxiliary
+                    # always supervises the causal action readout against full H6.
+                    if not proposal_pres:
+                        raise RuntimeError(
+                            "peer World stage did not expose its action snapshot"
+                        )
+                    final_readout = model.world_action_readout(proposal_pres[-1])
                     if final_readout is None:
                         raise RuntimeError(
                             "final peer World stage did not expose deterministic readout"
                         )
-                    logged_readout = logged_action.to(dtype=final_readout.dtype)
+                    logged_readout = logged_h6.to(dtype=final_readout.dtype)
                     readout_error = F.smooth_l1_loss(
                         final_readout,
                         logged_readout,
@@ -4571,13 +4713,10 @@ def rollout_policy(
                         del logged_condition
                     finally:
                         # The independent logged-action branch must not replace the
-                        # proposal branch consumed by Flow/handshake regularizers.
+                        # proposal branch consumed by Flow and World diagnostics.
                         model.last_wmrm = proposal_last
                         model.last_wmrm_auxes = proposal_auxes
                         model.last_wmrm_pre_actions = proposal_pres
-                        model.last_wmrm_meds = proposal_meds
-                        model.last_wmrm_pi_kls = proposal_kls
-                        model.last_wmrm_pi_kl = proposal_last_kl
                     if len(logged_auxes) != len(proposal_auxes):
                         raise RuntimeError(
                             "logged/proposal World stage counts differ: "
@@ -4591,7 +4730,7 @@ def rollout_policy(
                 final_visual = None
                 logged_visuals = []
                 for inject_i, aux in enumerate(logged_auxes):
-                    if peer_world_mode:
+                    if peer_world_mode and not logged_peer_world_forward:
                         if len(peer_stage_snapshots) != len(proposal_auxes):
                             raise RuntimeError(
                                 "peer snapshot/stage counts differ: "
@@ -4692,7 +4831,7 @@ def rollout_policy(
                         and logged_auxes[rank_stage - 1].z_tokens is not None
                         else None
                     )
-                    if peer_world_mode:
+                    if peer_world_mode and not logged_peer_world_forward:
                         snapshot_args, snapshot_kwargs = peer_stage_snapshots[rank_stage]
                         snapshot_kwargs["env_action"] = rank_shuffle_actions[:, time_index]
                         shuffled_map = model.wmrm.propose(
@@ -4828,12 +4967,6 @@ def rollout_policy(
                             margin=wmrm_adep_margin,
                         )
                     )
-        if proposal_meds:
-            wmrm_med_terms.extend(proposal_meds)
-        if proposal_kls:
-            wmrm_pi_kl_terms.extend(proposal_kls)
-        elif proposal_last_kl is not None:
-            wmrm_pi_kl_terms.append(proposal_last_kl)
         if model.config.c2_controller:
             # C²-VA Stage B：c_current = P(当前决策视觉均值)；解码
             # a = clip(ū − K·(c_current − c̄))；reference 序列供 L_f 监督。
@@ -4845,54 +4978,22 @@ def rollout_policy(
             # C²-VA Stage A：Direct Head 一次前向解码完整 chunk（无采样噪声）。
             direct_predictions.append(model.decode_actions(condition))
         else:
-            velocity = model.flow_velocity(
-                condition,
-                noisy_actions[:, time_index],
-                flow_time[:, time_index],
-                semantic_context=semantic_context,
-            )
-            if (
-                getattr(model, "wam", None) is not None
-                and getattr(model, "wam_alpha", 0.0) != 0
-            ):
-                # α=0 时整段 WAM 代码不执行（不是乘零），避免无意义 forward
-                # 与额外噪声来源。
-                from va_compound.wam_cache import wam_last_slice_pool
-                B = condition.shape[0]
-                if dense_evidence is not None and 11 in dense_evidence:
-                    h11_t = dense_evidence[11][:, time_index]          # [B,1152,768]
-                    spatial16 = wam_last_slice_pool(h11_t)             # [B,16,768]
-                else:
-                    spatial16 = condition.new_zeros((B, 16, model.config.vision_dim))
-                if metric_g is not None:
-                    geo8 = metric_g[:, time_index].to(
-                        device=condition.device, dtype=condition.dtype
-                    )
-                    if geo8.shape != (B, 8):
-                        raise ValueError(
-                            "WAM geo8 必须为当前决策的 p*vis 8 维状态 "
-                            f"[B, 8]，got {tuple(geo8.shape)}"
-                        )
-                else:
-                    geo8 = condition.new_zeros((B, 8))
-                wam_layers = visual_memory.layers if visual_memory is not None else ()
-                if len(wam_layers) == 0:
-                    raise ValueError(
-                        "WAM 残差通路需要非空 VA 记忆快照；"
-                        "encode_condition(..., return_visual_memory=True) 未返回 layers"
-                    )
-                wam_dv, _ = model.wam(
-                    action_condition=condition, va_layers=wam_layers,
-                    spatial_tokens=spatial16, geo_tokens=geo8,
-                    noisy_actions=noisy_actions[:, time_index],
-                    noisy_scene_latents=condition.new_zeros(
-                        (B, 3, 16, model.wam.config.vision_dim)
-                    ),
-                    noisy_scene_geo=condition.new_zeros((B, 3, 2, 8)),
-                    flow_time=flow_time[:, time_index],
+            if compute_action_output:
+                velocity = model.flow_velocity(
+                    condition,
+                    noisy_actions[:, time_index],
+                    flow_time[:, time_index],
+                    semantic_context=semantic_context,
                 )
-                velocity = velocity + model.wam_alpha * wam_dv
-            if servo is not None:
+            else:
+                velocity = condition.new_zeros(
+                    (
+                        condition.shape[0],
+                        model.config.action_horizon,
+                        model.config.action_dim,
+                    )
+                )
+            if servo is not None and compute_action_output:
                 # Step 2：双新息伺服（设计 §七 Step 2 / 最小完整算法）——
                 # MultiModeReadout 由角色读出路径提供（与 build_local_vision
                 # 内部重复一次 reader 前向；按 Agent E 文件契约不改 model.py，
@@ -5052,18 +5153,10 @@ def rollout_policy(
         model.last_world_action_readout_loss = None
         model.last_world_action_readout_rmse = None
         model.last_visual_world_metrics = {}
-    if wmrm_pi_kl_terms:
-        model.last_wmrm_pi_kl_loss = torch.stack(wmrm_pi_kl_terms).mean()
-    else:
-        model.last_wmrm_pi_kl_loss = None
     if wmrm_adep_terms:
         model.last_wmrm_adep_loss = torch.stack(wmrm_adep_terms).mean()
     else:
         model.last_wmrm_adep_loss = None
-    if wmrm_med_terms:
-        model.last_wmrm_med_loss = torch.stack(wmrm_med_terms).mean()
-    else:
-        model.last_wmrm_med_loss = None
     if memories is not None:
         return out + (memories,)
     return out
@@ -5147,6 +5240,45 @@ def iter_forever(loader):
     """无限循环迭代 DataLoader（epoch 结束自动重启）。"""
     while True:
         yield from iter(loader)
+
+
+def next_peer_joint_batches(
+    va_iterator,
+    va_loader,
+    world_iterator,
+    world_loader,
+):
+    """Fetch one independent VA batch and one independent World batch."""
+
+    def next_or_restart(iterator, loader):
+        try:
+            return next(iterator), iterator
+        except StopIteration:
+            iterator = iter(loader)
+            return next(iterator), iterator
+
+    va_batch, va_iterator = next_or_restart(va_iterator, va_loader)
+    world_batch, world_iterator = next_or_restart(world_iterator, world_loader)
+    if va_batch is world_batch:
+        raise RuntimeError("peer joint streams returned the same batch object")
+    return va_batch, world_batch, va_iterator, world_iterator
+
+
+def backward_peer_joint_losses(va_loss: Tensor, world_loss_or_forward):
+    """Backprop VA, then build/backprop World, accumulating into one update."""
+    if va_loss.ndim != 0:
+        raise ValueError("peer joint VA loss must be a scalar tensor")
+    va_loss.backward()
+    result = (
+        world_loss_or_forward()
+        if callable(world_loss_or_forward)
+        else world_loss_or_forward
+    )
+    world_loss = result[0] if isinstance(result, tuple) else result
+    if not isinstance(world_loss, Tensor) or world_loss.ndim != 0:
+        raise ValueError("peer joint World loss must be a scalar tensor")
+    world_loss.backward()
+    return result
 
 
 def compute_c2_loss(
@@ -5295,6 +5427,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--data", type=Path, help="optional paired precomputed .pt dataset")
     parser.add_argument(
+        "--va-data",
+        type=Path,
+        help=(
+            "peer_sync_h6 joint training: action/Flow dataset. It is sampled "
+            "independently from --world-data on every optimizer step"
+        ),
+    )
+    parser.add_argument(
+        "--world-data",
+        type=Path,
+        help=(
+            "peer_sync_h6 joint training: logged-transition World dataset. "
+            "Its episodes must not overlap --va-data"
+        ),
+    )
+    parser.add_argument(
         "--live-vjepa",
         action="store_true",
         help="Stage B：--data 路径在线 V-JEPA 编码（帧来自 raw parquet，可对 "
@@ -5315,6 +5463,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=6,
         help="决策点间隔（80 FPS 帧，--live-vjepa 用）：6=13.3Hz（v5 默认），"
         "2=40Hz，1=80Hz。须与数据提取时一致（与 payload 行数对齐）。",
+    )
+    parser.add_argument(
+        "--planning-stride",
+        type=int,
+        default=6,
+        help=(
+            "每次 H6 预测后实际执行的动作数 P；peer_sync_h6 支持 "
+            "1/2/3/6，且必须等于 control-stride、wmrm-cycle-steps 和 "
+            "flow-prefix-steps"
+        ),
     )
     parser.add_argument(
         "--sequences-per-episode",
@@ -5500,50 +5658,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "tokens，需 --compile-task 才有上下文；flow_cond=adaln 时经 cross-attn 注入）",
     )
     parser.add_argument(
-        "--wam-joint",
-        action="store_true",
-        help="E7 WAM v1：联合世界动作流残差通路（独立 WAM 模块只读推理，"
-        "与 --future-predict/--evsm 互斥）",
-    )
-    parser.add_argument(
-        "--wam-alpha",
-        type=float,
-        default=1.0,
-        help="E7 WAM v1：动作残差速度缩放系数（默认 1.0；0 = 关闭 WAM 贡献）",
-    )
-    parser.add_argument(
-        "--wam-ckpt",
-        type=str,
-        default=None,
-        help="E7 WAM v1：WAM 权重来源——独立训练器 checkpoint（含 wam_model 键）"
-        "或裸 state_dict",
-    )
-    parser.add_argument(
         "--wmrm",
         action="store_true",
-        help="WAM4VA（原 --wmrm）：世界预测调制 VA 动作流（与 --wam-joint 互斥）",
+        help="WAM4VA（原 --wmrm）：世界状态通过层间 K/V 与 VA 交换信息",
     )
     parser.add_argument(
         "--wam4va",
         action="store_true",
         dest="wmrm",
-        help="WAM4VA：同 --wmrm。WAM 向 VA 注入未来信息，动作仍由 VA 发出",
+        help="WAM4VA：同 --wmrm。WAM 发布预测世界状态供下一层 VA 注意力读取",
     )
     parser.add_argument(
         "--va-world-mode",
         choices=("legacy", "peer_sync_h6"),
         default="legacy",
         help=(
-            "VA/World topology: legacy preserves sequential writeback; "
-            "peer_sync_h6 uses one shared pre-stage snapshot and a deterministic H6 "
-            "executable-action readout"
+            "VA/World action source: legacy requires the caller-provided executable "
+            "action; peer_sync_h6 adds a deterministic H6 readout. Both use delayed "
+            "bidirectional state exchange through VA attention K/V"
         ),
     )
     parser.add_argument(
         "--wmrm-target",
         choices=("dino", "vjepa", "metric"),
         default="dino",
-        help="WAM 下一步监督：dino=下一决策 DINO 投影均值（与 VA 同周期）；"
+        help="WAM 下一步监督：dino=下一决策完整 DINO latent map（与 VA 同周期）；"
         "vjepa=下一决策 H11 均值（冻塔白得空间）；metric=旧几何",
     )
     parser.add_argument(
@@ -5587,19 +5726,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--wmrm-inject",
         choices=("last", "all", "even"),
         default="all",
-        help="WAM↔VA 握手：all 每层对传；last 只末端；even 奇数层+末层",
-    )
-    parser.add_argument(
-        "--wmrm-pi-kl-weight",
-        type=float,
-        default=0.0,
-        help="可选：π 对 z_hat 不敏感惩罚（默认 0，联合训练只用 world+flow）",
-    )
-    parser.add_argument(
-        "--wmrm-pi-kl-margin",
-        type=float,
-        default=0.1,
-        help="π shuffle-KL 下限（nat）",
+        help="World state 更新层：all 每层；last 只末层；even 奇数层+末层",
     )
     parser.add_argument(
         "--wmrm-lang-align-weight",
@@ -5620,18 +5747,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="动作打乱后 world MSE 至少应增加的幅度",
     )
     parser.add_argument(
-        "--wmrm-med-weight",
-        type=float,
-        default=0.0,
-        help="可选：强迫 ẑ 进入 FM 条件的 hinge（默认 0；握手已写 A'）",
-    )
-    parser.add_argument(
-        "--wmrm-med-margin",
-        type=float,
-        default=0.05,
-        help="shuffle ẑ 后 FM condition 的最小 signed shift",
-    )
-    parser.add_argument(
         "--wmrm-cycle-steps",
         type=int,
         default=6,
@@ -5642,8 +5757,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--wmrm-detach-proposal-stage-state",
         action="store_true",
         help=(
-            "训练 proposal 分支在相邻 WMRM stage map 间 stop-grad；"
-            "前向值不变，默认关闭以保留旧反向语义"
+            "在相邻 World stage 状态间 stop-grad；"
+            "前向值不变，默认关闭以保留跨层梯度"
         ),
     )
     parser.add_argument(
@@ -5694,9 +5809,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--wmrm-only",
+        "--world-only",
+        dest="wmrm_only",
         action="store_true",
-        help="第一阶段 JEPA 式：断开握手、世界头不读 VA 的 A，只训下一 latent。"
-        "第二阶段去掉本开关 --resume 后再接上握手并训 VA+FM。",
+        help="World 数据阶段：VA 只负责产生 detached 层消息，仅优化 WAM/World loss。",
+    )
+    parser.add_argument(
+        "--va-only",
+        action="store_true",
+        help="动作数据阶段：WAM 只负责产生 detached 世界消息，仅优化 VA/Flow loss。",
     )
     parser.add_argument(
         "--training-stage",
@@ -5872,7 +5993,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("none", *ACTION_VISION_SPECS),
         default="none",
         help="Add a frozen DINO action-only tower while retaining the existing "
-        "V-JEPA base/metric/WAM paths. The new per-layer residual is zero-init, "
+        "V-JEPA base/metric/World paths. The new per-layer residual is zero-init, "
         "so ordinary migration from an E7 checkpoint starts exactly unchanged.",
     )
     parser.add_argument(
@@ -5976,7 +6097,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--task35-precision-contract",
         action="store_true",
         help="最终 task35 精插实验 fail-fast：要求 matched clean/recovery H6、"
-        "grid16 四帧 temporal、DINO MT-VJ、直接 8D geometry、ROI v2、WAM off。",
+        "grid16 四帧 temporal、DINO MT-VJ、直接 8D geometry、ROI v2。",
     )
     parser.add_argument(
         "--action-vision-only",
@@ -6452,12 +6573,70 @@ def validate_args(args: argparse.Namespace) -> None:
             "--resume-exact-contract-migration requires --resume-exact"
         )
     peer_world = getattr(args, "va_world_mode", "legacy") == "peer_sync_h6"
+    va_data = getattr(args, "va_data", None)
+    world_data = getattr(args, "world_data", None)
+    if (va_data is None) != (world_data is None):
+        raise ValueError("--va-data and --world-data must be provided together")
+    dual_peer_data = peer_world and va_data is not None and world_data is not None
+    primary_data = va_data if dual_peer_data else args.data
+    if not peer_world and (va_data is not None or world_data is not None):
+        raise ValueError("--va-data/--world-data are only supported by peer_sync_h6")
     if peer_world:
+        planning_stride = int(getattr(args, "planning_stride", 6))
+        if not dual_peer_data:
+            raise ValueError(
+                "peer_sync_h6 joint training requires both --va-data and --world-data"
+            )
+        if args.data is not None:
+            raise ValueError(
+                "peer_sync_h6 dual-stream training uses --va-data/--world-data, "
+                "not --data"
+            )
+        if va_data.expanduser().resolve(strict=False) == world_data.expanduser().resolve(
+            strict=False
+        ):
+            raise ValueError("--va-data and --world-data must be different files")
+        if getattr(args, "wmrm_only", False) or getattr(args, "va_only", False):
+            raise ValueError(
+                "peer_sync_h6 is jointly optimized; do not use --world-only/--va-only"
+            )
         required = {
             "--wam4va": bool(getattr(args, "wmrm", False)),
-            "--wmrm-cycle-steps 6": int(getattr(args, "wmrm_cycle_steps", 0)) == 6,
-            "--flow-prefix-steps 6": int(getattr(args, "flow_prefix_steps", 0)) == 6,
+            "--visual-world-supervision": bool(
+                getattr(args, "visual_world_supervision", False)
+            ),
+            "--planning-stride 1/2/3/6": planning_stride
+            in PEER_PLANNING_STRIDES,
+            "--control-stride == --planning-stride": int(
+                getattr(args, "control_stride", 6)
+            )
+            == planning_stride,
+            "--wmrm-cycle-steps == --planning-stride": int(
+                getattr(args, "wmrm_cycle_steps", 0)
+            )
+            == planning_stride,
+            "--flow-prefix-steps == --planning-stride": int(
+                getattr(args, "flow_prefix_steps", 0)
+            )
+            == planning_stride,
             "--wmrm-inject all": getattr(args, "wmrm_inject", None) == "all",
+            "differentiable World stage recurrence": not bool(
+                getattr(args, "wmrm_detach_proposal_stage_state", False)
+            ),
+            "--sam-rho 0": float(getattr(args, "sam_rho", 0.0)) == 0.0,
+            "no --e2e-data": args.e2e_data is None,
+            "no --live-vjepa": not bool(args.live_vjepa),
+            "no --dino-feature-cache": getattr(args, "dino_feature_cache", None)
+            is None,
+            "no --dense-readout-mtvj": not bool(args.dense_readout_mtvj),
+            "no --action-vision-backbone": getattr(
+                args, "action_vision_backbone", "none"
+            )
+            == "none",
+            "no --perturb-data/--fork-data": args.perturb_data is None
+            and args.fork_data is None,
+            "--task-sampling balanced/weighted": args.task_sampling
+            in {"balanced", "weighted"},
         }
         missing = [name for name, enabled in required.items() if not enabled]
         if missing:
@@ -6465,14 +6644,10 @@ def validate_args(args: argparse.Namespace) -> None:
                 "--va-world-mode peer_sync_h6 missing required settings: "
                 + ", ".join(missing)
             )
-        if args.resume is not None or getattr(args, "resume_weights", None) is not None:
+        if args.resume is not None:
             raise ValueError(
-                "peer_sync_h6 training may only start scratch or use --resume-exact"
-            )
-        if getattr(args, "wmrm_only", False):
-            raise ValueError(
-                "--wmrm-only with peer_sync_h6 has unsupported readout ownership; "
-                "use legacy or train the full peer policy"
+                "peer_sync_h6 rejects legacy --resume; use scratch, "
+                "--resume-weights, or --resume-exact"
             )
         if float(getattr(args, "wmrm_adep_weight", 0.0)) != 0.0:
             raise ValueError(
@@ -6495,15 +6670,21 @@ def validate_args(args: argparse.Namespace) -> None:
     split_manifest = getattr(args, "world_split_manifest", None)
     if visual_world:
         required = {
-            "--data": args.data is not None,
+            "--world-data" if dual_peer_data else "--data": (
+                world_data is not None if dual_peer_data else args.data is not None
+            ),
             "--world-split-manifest": split_manifest is not None,
             "--wam4va": bool(getattr(args, "wmrm", False)),
             "--wmrm-target dino": getattr(args, "wmrm_target", None) == "dino",
-            "--wmrm-cycle-steps 6": int(getattr(args, "wmrm_cycle_steps", 0)) == 6,
-            "--wmrm-inject all": getattr(args, "wmrm_inject", None) == "all",
-            "WAM4VA handshake enabled": bool(
-                getattr(args, "wmrm_handshake", True)
+            "--wmrm-cycle-steps 6 or peer planning stride": (
+                int(getattr(args, "wmrm_cycle_steps", 0))
+                == (
+                    int(getattr(args, "planning_stride", 6))
+                    if peer_world
+                    else 6
+                )
             ),
+            "--wmrm-inject all": getattr(args, "wmrm_inject", None) == "all",
             "--va-layers 8": int(getattr(args, "va_layers", 0)) == 8,
             "--wmrm-predictor st_blocks": getattr(args, "wmrm_predictor", None)
             == "st_blocks",
@@ -6543,9 +6724,10 @@ def validate_args(args: argparse.Namespace) -> None:
                 "--visual-world-supervision missing required settings: "
                 + ", ".join(missing)
             )
-        if args.resume is not None or getattr(args, "resume_weights", None) is not None:
+        if args.resume is not None:
             raise ValueError(
-                "visual World training may only start scratch or use --resume-exact"
+                "visual World training rejects legacy --resume; use scratch, "
+                "--resume-weights, or --resume-exact"
             )
     elif split_manifest is not None:
         raise ValueError(
@@ -6572,7 +6754,7 @@ def validate_args(args: argparse.Namespace) -> None:
         if not args.dense_readout_mtvj:
             raise ValueError(
                 "--action-vision-backbone requires --dense-readout-mtvj "
-                "(V-JEPA remains the metric/WAM anchor)"
+                "(V-JEPA remains the metric/World anchor)"
             )
         if action_vision_checkpoint is None:
             raise ValueError(
@@ -6620,7 +6802,7 @@ def validate_args(args: argparse.Namespace) -> None:
     # 保留在代码中（flag 关闭即禁用，不删除），此处只校验组合合法性。
     dino_main_vision = bool(getattr(args, "dino_main_vision", False))
     if dino_main_vision:
-        if not args.data:
+        if not primary_data:
             raise ValueError("--dino-main-vision requires --data (LongTrajFramesDataset)")
         if args.dense_readout_mtvj:
             raise ValueError(
@@ -6712,7 +6894,7 @@ def validate_args(args: argparse.Namespace) -> None:
             )
     if getattr(args, "task35_precision_contract", False):
         required = {
-            "--data": args.data is not None,
+            "--data": primary_data is not None,
             "--single-task": args.single_task,
             "--dino-main-vision": dino_main_vision,
             "--dino-dense-metric": getattr(args, "dino_dense_metric", False),
@@ -6733,7 +6915,6 @@ def validate_args(args: argparse.Namespace) -> None:
             "--task-sampling weighted": args.task_sampling == "weighted",
             "--num-workers 0": args.num_workers == 0,
             "no ordinary resume": args.resume is None,
-            "WAM off": not getattr(args, "wam_joint", False),
         }
         missing = [name for name, enabled in required.items() if not enabled]
         if missing:
@@ -6797,7 +6978,7 @@ def validate_args(args: argparse.Namespace) -> None:
         if args.num_workers != 0:
             raise ValueError("--resume-exact requires --num-workers 0 (worker RNG is not checkpointed)")
         if not (
-            args.data is not None
+            primary_data is not None
             and args.single_task
             and args.task_sampling in {"weighted", "balanced"}
             and (
@@ -6820,30 +7001,34 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--evsm requires a positive --future-predict-weight")
     if args.evsm and args.evsm_temp <= 0.0:
         raise ValueError("--evsm-temp must be positive")
-    if getattr(args, "wam_alpha", 1.0) == 0.0:
-        # α=0 语义 = WAM 完全关闭：不构造、不恢复、不进契约，保证旧路径
-        # 全局 bit-identical（含 RNG 消费）。必须赶在所有 wam 校验之前。
-        args.wam_joint = False
-    if getattr(args, "wmrm", False) and getattr(args, "wam_joint", False):
-        raise ValueError("--wmrm is mutually exclusive with --wam-joint")
     if getattr(args, "wmrm", False) and args.memory_split:
         raise ValueError("--wmrm is mutually exclusive with --memory-split")
     if getattr(args, "wmrm", False) and (args.direct_head or args.c2_controller):
         raise ValueError("--wmrm/--wam4va is mutually exclusive with --direct-head/--c2-controller")
     if getattr(args, "wmrm_only", False) and not getattr(args, "wmrm", False):
         raise ValueError("--wmrm-only requires --wmrm/--wam4va")
+    if getattr(args, "va_only", False) and not getattr(args, "wmrm", False):
+        raise ValueError("--va-only requires --wmrm/--wam4va")
+    if getattr(args, "wmrm_only", False) and getattr(args, "va_only", False):
+        raise ValueError("--world-only and --va-only are mutually exclusive")
     if getattr(args, "wmrm_only", False) and (
         args.head_only
         or args.servo_only
         or getattr(args, "action_vision_only", False)
     ):
         raise ValueError("--wmrm-only is mutually exclusive with --head-only/--servo-only/--action-vision-only")
+    if getattr(args, "va_only", False) and (
+        args.head_only
+        or args.servo_only
+        or getattr(args, "action_vision_only", False)
+    ):
+        raise ValueError(
+            "--va-only is mutually exclusive with "
+            "--head-only/--servo-only/--action-vision-only"
+        )
     if getattr(args, "wmrm_only", False):
-        # Stage-1 JEPA-style: no handshake, no VA action leak, only L_world.
-        args.wmrm_handshake = False
-        args.wmrm_med_weight = 0.0
+        # Stage-1 JEPA-style: freeze VA/Flow and optimize only World objectives.
         args.wmrm_adep_weight = 0.0
-        args.wmrm_pi_kl_weight = 0.0
         args.mtvj_train_metric_head = False
         args.mtvj_train_relation = False
     if getattr(args, "wmrm", False) and float(getattr(args, "wmrm_world_weight", 1.0)) <= 0.0:
@@ -6872,25 +7057,6 @@ def validate_args(args: argparse.Namespace) -> None:
                 "(dino_main_vision / main_vision_backbone != vjepa); "
                 "do not infer V-JEPA from dense key 11"
             )
-    if getattr(args, "wam_joint", False) and (args.future_predict or args.evsm):
-        raise ValueError("--wam-joint is mutually exclusive with --future-predict/--evsm")
-    if getattr(args, "wam_joint", False) and args.memory_split:
-        raise ValueError(
-            "--wam-joint is mutually exclusive with --memory-split "
-            "（WAM CA 读 VA 层快照 layers，memory_split 会把 layers 置空）"
-        )
-    if getattr(args, "wam_joint", False) and (args.direct_head or args.c2_controller):
-        raise ValueError(
-            "--wam-joint 与 --direct-head/--c2-controller 互斥"
-            "（WAM 残差只作用于 flow Euler 速度路径）"
-        )
-    if getattr(args, "wam_joint", False) and (
-        not args.dense_readout_mtvj or args.metric_visual_checkpoint is None
-    ):
-        raise ValueError(
-            "--wam-joint requires --dense-readout-mtvj and "
-            "--metric-visual-checkpoint（WAM spatial16/geo8 的来源）"
-        )
     if args.compile_task and not args.e2e_data:
         raise ValueError(
             "--compile-task requires --e2e-data (online SemanticCompiler path only)"
@@ -6921,7 +7087,7 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--plan-resampler and --scene-teacher are mutually exclusive")
     if args.plan_resampler and args.e2e_data:
         raise ValueError("--plan-resampler is not supported with --e2e-data")
-    if args.scene_teacher and (args.e2e_data or not args.data):
+    if args.scene_teacher and (args.e2e_data or not primary_data):
         raise ValueError("--scene-teacher requires --data with precomputed features (needs metadata.tasks)")
     if args.direct_head and args.e2e_data:
         raise ValueError("--direct-head is not supported with --e2e-data (e2e rollout is flow-specific)")
@@ -6934,7 +7100,7 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError("--fork-data is not supported with --live-vjepa (预计算特征路径)")
         if not args.single_task:
             raise ValueError("--fork-data requires --single-task (v5 主 loader FM-only)")
-        if not args.data:
+        if not primary_data:
             raise ValueError("--fork-data requires --data (v5 特征数据集)")
         if args.fork_k < 1:
             raise ValueError("--fork-k must be >= 1")
@@ -6944,10 +7110,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--c2-controller requires --direct-head")
     if args.c2_controller and not args.single_task:
         raise ValueError("--c2-controller requires --single-task (v6a/v6b 为按钮任务单任务数据)")
-    if args.c2_controller and not args.data:
+    if args.c2_controller and not primary_data:
         raise ValueError("--c2-controller requires --data (precomputed features)")
     if args.live_vjepa:
-        if not args.data:
+        if not primary_data:
             raise ValueError("--live-vjepa requires --data (v5 paired .pt 与 parquet 行对齐)")
         if not args.single_task:
             # Stage B 限定 single-task：配对帧级契约留待数据侧（flow 在
@@ -7015,7 +7181,7 @@ def validate_args(args: argparse.Namespace) -> None:
                 "--dense-readout-mtvj/--metric-visual-checkpoint 不支持 --e2e-data"
                 "（MT-VJ 在线 dense 编码仅 live/合成冒烟路径）"
             )
-        if args.data is not None and not args.live_vjepa:
+        if primary_data is not None and not args.live_vjepa:
             # 2026-08-10：--dense-readout-mtvj + --data 走 LongTrajFramesDataset
             # （windows_h48.pt + longtraj JPEG 帧在线解码，MT-VJ 主数据路径）。
             print(
@@ -7150,7 +7316,7 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError("--servo-perturb-ratio 须在 (0, 0.5]（每批 perturbed 占比）")
         if args.batch_size < 2:
             raise ValueError("--perturb-data requires --batch-size >= 2（配对混批）")
-        if not args.data:
+        if not primary_data:
             raise ValueError("--perturb-data requires --data（clean 行来源）")
         if args.c2_controller:
             raise ValueError("--perturb-data 与 --c2-controller 互斥（混批破坏 C² 干净/恢复契约）")
@@ -7503,28 +7669,49 @@ def _feature_optimizer_groups(args, model, vision_backbone):
         )
         return [{"params": action_params, "lr": args.lr_action_vision}]
     if getattr(args, "wmrm_only", False):
-        if getattr(model.config, "va_world_mode", "legacy") != "legacy":
-            raise ValueError(
-                "--wmrm-only does not support peer readout ownership; use legacy"
-            )
         if getattr(model, "wmrm", None) is None:
             raise ValueError("--wmrm-only requires a constructed WAM4VA module")
         wmrm_params, frozen_names = [], []
         for name, param in model.named_parameters():
-            if name.startswith("wmrm."):
+            if name.startswith(("wmrm.", "world_action_readout.")):
                 wmrm_params.append(param)
             else:
                 frozen_names.append(name)
                 param.requires_grad_(False)
         if not wmrm_params:
-            raise ValueError("--wmrm-only found no wmrm.* parameters")
+            raise ValueError("--wmrm-only found no World parameters")
         print(
             f"wmrm-only: freeze VA/FM ({len(frozen_names)} tensors); "
-            f"train latent predictor only "
+            f"train World state/predictor only "
             f"({sum(p.numel() for p in wmrm_params):,} params)",
             flush=True,
         )
         return [{"params": wmrm_params, "lr": args.lr}]
+    if getattr(args, "va_only", False):
+        va_params, frozen_names = [], []
+        for name, param in model.named_parameters():
+            if name.startswith(("wmrm.", "world_action_readout.")):
+                frozen_names.append(name)
+                param.requires_grad_(False)
+            else:
+                va_params.append(param)
+        if not va_params:
+            raise ValueError("--va-only found no VA/Flow parameters")
+        groups = [{"params": va_params, "lr": args.lr}]
+        if vision_backbone is not None:
+            vision_params = [
+                parameter
+                for parameter in vision_backbone.parameters()
+                if parameter.requires_grad
+            ]
+            if vision_params:
+                groups.append({"params": vision_params, "lr": args.lr_vision})
+        print(
+            f"va-only: freeze World ({len(frozen_names)} tensors); "
+            f"train VA/Flow only ({sum(p.numel() for p in va_params):,} params)",
+            flush=True,
+        )
+        return groups
     if args.head_only:
         head_params, rest_names = [], []
         for name, param in model.named_parameters():
@@ -7764,6 +7951,7 @@ def save_checkpoint(
     optimizer=None,
     global_step: int = 0,
     sampler: TaskLocalityWeightedSampler | TaskWeightedSampler | None = None,
+    world_sampler: TaskLocalityWeightedSampler | TaskWeightedSampler | None = None,
     exact_run_contract: dict | None = None,
 ) -> None:
     """原子保存 checkpoint（tmp 文件 + rename），供周期/最终保存复用。"""
@@ -7854,6 +8042,82 @@ def save_checkpoint(
                 "min_pair_action_delta": args.min_pair_action_delta,
                 "task_sampling": args.task_sampling,
                 "task_locality_block_batches": args.task_locality_block_batches,
+                "peer_training_mode": (
+                    "joint_dual_stream"
+                    if getattr(config, "va_world_mode", "legacy")
+                    == "peer_sync_h6"
+                    else (
+                        "world_only"
+                        if getattr(args, "wmrm_only", False)
+                        else "va_only"
+                        if getattr(args, "va_only", False)
+                        else None
+                    )
+                ),
+                "va_world_mode": getattr(config, "va_world_mode", "legacy"),
+                "peer_world_topology": (
+                    PEER_WORLD_TOPOLOGY_CONTRACT
+                    if getattr(config, "va_world_mode", "legacy")
+                    == "peer_sync_h6"
+                    else None
+                ),
+                "peer_world_action_source": (
+                    PEER_WORLD_ACTION_SOURCE_CONTRACT
+                    if getattr(config, "va_world_mode", "legacy")
+                    == "peer_sync_h6"
+                    else None
+                ),
+                "peer_world_readout": (
+                    PEER_WORLD_READOUT_CONTRACT
+                    if getattr(config, "va_world_mode", "legacy")
+                    == "peer_sync_h6"
+                    else None
+                ),
+                "peer_gradient_boundary": (
+                    PEER_GRADIENT_BOUNDARY_CONTRACT
+                    if getattr(config, "va_world_mode", "legacy")
+                    == "peer_sync_h6"
+                    else None
+                ),
+                "peer_data_isolation": (
+                    PEER_DATA_ISOLATION_CONTRACT
+                    if getattr(config, "va_world_mode", "legacy")
+                    == "peer_sync_h6"
+                    else None
+                ),
+                "peer_dual_stream_optimizer": (
+                    PEER_DUAL_STREAM_OPTIMIZER_CONTRACT
+                    if getattr(config, "va_world_mode", "legacy")
+                    == "peer_sync_h6"
+                    else None
+                ),
+                "planning_stride": int(getattr(args, "planning_stride", 6)),
+                "planning_hz": 80.0
+                / int(getattr(args, "planning_stride", 6)),
+                "peer_high_frequency_contract": (
+                    PEER_HIGH_FREQUENCY_CONTRACT
+                    if getattr(config, "va_world_mode", "legacy")
+                    == "peer_sync_h6"
+                    else None
+                ),
+                "peer_va_data_identity": (
+                    getattr(sampler, "dataset_content_identity", None)
+                    if getattr(config, "va_world_mode", "legacy")
+                    == "peer_sync_h6"
+                    else None
+                ),
+                "peer_world_data_identity": (
+                    getattr(world_sampler, "dataset_content_identity", None)
+                    if getattr(config, "va_world_mode", "legacy")
+                    == "peer_sync_h6"
+                    else None
+                ),
+                "peer_data_isolation_summary": (
+                    getattr(args, "peer_data_isolation", None)
+                    if getattr(config, "va_world_mode", "legacy")
+                    == "peer_sync_h6"
+                    else None
+                ),
                 # Step 2（C²-IRF v2）：双新息伺服契约（评估侧据此重建 InteractionServo）。
                 "servo": args.servo,
                 "servo_only": args.servo_only,
@@ -8007,7 +8271,6 @@ def save_checkpoint(
                 "task35_dino_feature_sha256": getattr(
                     args, "task35_dino_feature_sha256", None
                 ),
-                "wam_enabled": bool(getattr(args, "wam_joint", False)),
                 "main_vision_checkpoint_sha256": getattr(
                     args, "main_vision_checkpoint_sha256", None
                 ),
@@ -8024,23 +8287,6 @@ def save_checkpoint(
             # Stage B：解冻后的 V-JEPA 权重必须随 checkpoint 保存（评估侧
             # eval_metaworld.py 已支持 vjepa_state_dict 恢复）。
             payload["vjepa_state_dict"] = vision_backbone.model.state_dict()
-        if getattr(model, "wam", None) is not None:
-            # 追加式：WAM 启用时写入完整恢复契约（wam_model + wam_config +
-            # 来源指纹），不改动任何既有键语义（eval_metaworld --wam auto 据此识别）。
-            import dataclasses
-
-            payload["wam_model"] = {
-                key: value.detach().cpu()
-                for key, value in model.wam.state_dict().items()
-            }
-            payload["wam_config"] = dataclasses.asdict(model.wam.config)
-            payload["wam_base_ckpt_sha256"] = (
-                _sha256_file(Path(args.wam_ckpt))
-                if getattr(args, "wam_ckpt", None)
-                else "builtin"
-            )
-            payload["training_contract"]["wam_joint"] = True
-            payload["training_contract"]["wam_contract_version"] = 1
     if getattr(args, "visual_world_supervision", False):
         split_identity = getattr(args, "visual_world_split_identity", None)
         if not isinstance(split_identity, dict):
@@ -8050,7 +8296,13 @@ def save_checkpoint(
         payload["training_contract"].update(
             {
                 "world_supervision": WORLD_SUPERVISION_CONTRACT,
-                "world_transition": WORLD_TRANSITION_CONTRACT,
+                "world_transition": (
+                    WORLD_TRANSITION_CONTRACT
+                    if int(getattr(args, "planning_stride", 6)) == 6
+                    else "current_first"
+                    f"{int(getattr(args, 'planning_stride', 6))}"
+                    "_and_next_first_v1"
+                ),
                 "world_loss_weights": dict(WORLD_LOSS_COMPONENT_WEIGHTS),
                 "world_stage_auxiliary_decay": WORLD_STAGE_AUXILIARY_DECAY,
                 "world_no_regression": dict(WORLD_NO_REGRESSION),
@@ -8074,7 +8326,10 @@ def save_checkpoint(
                 "world_action_rank_transitions": split_identity[
                     "world_action_rank_transitions"
                 ],
-                "world_action_source": "logged_cycle6",
+                "world_action_source": (
+                    "logged_h6_transition_prefix_"
+                    f"{int(getattr(args, 'planning_stride', 6))}"
+                ),
                 "world_target_stop_gradient": True,
                 "world_logged_branch": WORLD_LOGGED_BRANCH_CONTRACT,
                 "va_world_mode": getattr(args, "va_world_mode", "legacy"),
@@ -8090,6 +8345,14 @@ def save_checkpoint(
                 ),
                 "peer_world_readout": (
                     PEER_WORLD_READOUT_CONTRACT
+                    if getattr(args, "va_world_mode", "legacy") == "peer_sync_h6"
+                    else None
+                ),
+                "planning_stride": int(getattr(args, "planning_stride", 6)),
+                "planning_hz": 80.0
+                / int(getattr(args, "planning_stride", 6)),
+                "peer_high_frequency_contract": (
+                    PEER_HIGH_FREQUENCY_CONTRACT
                     if getattr(args, "va_world_mode", "legacy") == "peer_sync_h6"
                     else None
                 ),
@@ -8179,13 +8442,21 @@ def save_checkpoint(
     if optimizer is not None:
         if exact_run_contract is None:
             exact_run_contract = build_exact_run_contract(
-                args, config, optimizer, sampler, metric_head, roi_head
+                args,
+                config,
+                optimizer,
+                sampler,
+                metric_head,
+                roi_head,
+                world_sampler,
             )
         payload.update(
             build_exact_resume_state(
                 optimizer, global_step, sampler, exact_run_contract
             )
         )
+        if world_sampler is not None:
+            payload["world_sampler_state"] = world_sampler.state_dict()
     tmp_path = args.save.with_suffix(args.save.suffix + ".tmp")
     torch.save(payload, tmp_path)
     tmp_path.replace(args.save)
@@ -8332,9 +8603,18 @@ def main() -> None:
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
 
+    dual_peer_data = bool(
+        getattr(args, "va_data", None) is not None
+        and getattr(args, "world_data", None) is not None
+    )
+    primary_data = args.va_data if dual_peer_data else args.data
     loader = None
     iterator = None
     sampler = None
+    world_loader = None
+    world_iterator = None
+    world_sampler = None
+    world_dataset = None
     model = None
     e2e_model = None
     vision_backbone = None
@@ -8356,6 +8636,7 @@ def main() -> None:
             language_dim=2048,
             vision_dim=768,
             action_horizon=int(payload["actions"].shape[-2]),
+            planning_stride=args.planning_stride,
             action_dim=int(payload["actions"].shape[-1]),
             proprio_dim=int(payload["proprio"].shape[-1]),
             mode=args.mode,
@@ -8381,7 +8662,6 @@ def main() -> None:
             role_query_tokens=args.role_query_tokens,
             dual_attention=args.dual_attention,
             flow_semantic=args.flow_semantic,
-            wam_joint=args.wam_joint,
             wmrm=args.wmrm,
             va_world_mode=args.va_world_mode,
             wmrm_inject=args.wmrm_inject,
@@ -8396,8 +8676,6 @@ def main() -> None:
                 )
             ),
             wmrm_cycle_steps=getattr(args, "wmrm_cycle_steps", 6),
-            wmrm_med_margin=getattr(args, "wmrm_med_margin", 0.05),
-            wmrm_handshake=getattr(args, "wmrm_handshake", True),
             wmrm_detach_proposal_stage_state=getattr(
                 args, "wmrm_detach_proposal_stage_state", False
             ),
@@ -8425,7 +8703,7 @@ def main() -> None:
             )
         iterator = iter(loader)
         smoke_batch = None
-    elif args.data:
+    elif primary_data:
         vision_key = (
             "vision_tokens_spatial" if args.vision_pooling == "spatial" else "vision_tokens"
         )
@@ -8472,9 +8750,15 @@ def main() -> None:
             from va_compound.longtraj_frames import LongTrajFramesDataset
 
             dataset = LongTrajFramesDataset(
-                args.data,
+                primary_data,
                 min_sequence_length=args.min_sequence_length,
-                decode_cache_tasks=2 if getattr(args, "dino_main_vision", False) else 1,
+                decode_cache_tasks=(
+                    1
+                    if dual_peer_data
+                    else 2
+                    if getattr(args, "dino_main_vision", False)
+                    else 1
+                ),
                 feature_cache=(
                     args.dino_feature_cache
                     if getattr(args, "dino_main_vision", False)
@@ -8497,7 +8781,7 @@ def main() -> None:
             from va_compound.live_vjepa import LiveVJEPADataset
 
             dataset = LiveVJEPADataset(
-                args.data,
+                primary_data,
                 args.live_root,
                 min_sequence_length=args.min_sequence_length,
                 vision_pooling=args.vision_pooling,
@@ -8513,7 +8797,7 @@ def main() -> None:
             )
         else:
             dataset = FeatureDataset(
-                args.data,
+                primary_data,
                 require_pairs=not args.single_task,
                 min_sequence_length=args.min_sequence_length,
                 pair_start_atol=args.pair_start_atol,
@@ -8526,14 +8810,18 @@ def main() -> None:
                 coords=(local_payload["coords"] if local_payload is not None else None),
             )
         _enable_optional_action_masks(dataset)
-        if getattr(args, "visual_world_supervision", False):
+        if getattr(args, "visual_world_supervision", False) and not dual_peer_data:
             args.visual_world_split_identity = validate_visual_world_training_split(
                 dataset.payload,
-                args.data,
+                primary_data,
                 args.world_split_manifest,
                 va_world_mode=getattr(args, "va_world_mode", "legacy"),
+                planning_stride=int(getattr(args, "planning_stride", 6)),
             )
-            donor_identity = prepare_visual_world_action_ranking(dataset.payload)
+            donor_identity = prepare_visual_world_action_ranking(
+                dataset.payload,
+                planning_stride=int(getattr(args, "planning_stride", 6)),
+            )
             args.visual_world_split_identity.update(donor_identity)
             print(
                 "visual World split: PASS "
@@ -8626,7 +8914,7 @@ def main() -> None:
                 (args.dino_feature_cache / "meta.json").read_text()
             )
             data_digest = hashlib.sha256()
-            with args.data.expanduser().open("rb") as stream:
+            with primary_data.expanduser().open("rb") as stream:
                 for block in iter(lambda: stream.read(16 << 20), b""):
                     data_digest.update(block)
             args.task35_data_sha256 = data_digest.hexdigest()
@@ -8663,6 +8951,7 @@ def main() -> None:
                 else int(dataset.payload[vision_key].shape[-1])
             ),
             action_horizon=int(dataset.payload["actions"].shape[-2]),
+            planning_stride=args.planning_stride,
             action_dim=int(dataset.payload["actions"].shape[-1]),
             proprio_dim=int(dataset.payload["proprio"].shape[-1]),
             mode=args.mode,
@@ -8689,7 +8978,6 @@ def main() -> None:
             role_query_tokens=args.role_query_tokens,
             dual_attention=args.dual_attention,
             flow_semantic=args.flow_semantic,
-            wam_joint=args.wam_joint,
             wmrm=args.wmrm,
             va_world_mode=args.va_world_mode,
             wmrm_inject=args.wmrm_inject,
@@ -8704,8 +8992,6 @@ def main() -> None:
                 )
             ),
             wmrm_cycle_steps=getattr(args, "wmrm_cycle_steps", 6),
-            wmrm_med_margin=getattr(args, "wmrm_med_margin", 0.05),
-            wmrm_handshake=getattr(args, "wmrm_handshake", True),
             wmrm_detach_proposal_stage_state=getattr(
                 args, "wmrm_detach_proposal_stage_state", False
             ),
@@ -8867,7 +9153,7 @@ def main() -> None:
                         # checkpoints reuse the sampler-cached identity.
                         sampler.bind_dataset_content_identity(
                             build_dataset_content_identity(
-                                args.data,
+                                primary_data,
                                 dataset.payload,
                                 longtraj_dir=getattr(dataset, "longtraj_dir", None),
                             )
@@ -8955,6 +9241,93 @@ def main() -> None:
                 f"交替比 1:{args.fork_k}，pair_loss_weight={args.pair_loss_weight}）",
                 flush=True,
             )
+        if dual_peer_data:
+            from va_compound.longtraj_frames import LongTrajFramesDataset, mtvj_collate
+
+            world_dataset = LongTrajFramesDataset(
+                args.world_data,
+                min_sequence_length=args.min_sequence_length,
+                decode_cache_tasks=1,
+                feature_cache=None,
+                include_frames=True,
+            )
+            _enable_optional_action_masks(world_dataset)
+            args.visual_world_split_identity = validate_visual_world_training_split(
+                world_dataset.payload,
+                args.world_data,
+                args.world_split_manifest,
+                va_world_mode=getattr(args, "va_world_mode", "legacy"),
+                planning_stride=int(getattr(args, "planning_stride", 6)),
+            )
+            donor_identity = prepare_visual_world_action_ranking(
+                world_dataset.payload,
+                planning_stride=int(getattr(args, "planning_stride", 6)),
+            )
+            args.visual_world_split_identity.update(donor_identity)
+            args.peer_data_isolation = validate_peer_data_isolation(
+                dataset.payload,
+                world_dataset.payload,
+                planning_stride=int(getattr(args, "planning_stride", 6)),
+            )
+            world_tasks = list(
+                world_dataset.payload.get("metadata", {}).get("tasks", [])
+            )
+            if not world_tasks:
+                raise ValueError("--world-data requires metadata.tasks")
+            world_raw_task_w = (
+                torch.ones(len(world_tasks), dtype=torch.float64)
+                if args.task_sampling == "balanced"
+                else torch.tensor(
+                    task_weights_for(world_tasks), dtype=torch.float64
+                )
+            )
+            if args.task_sampling in {"weighted", "balanced"}:
+                world_sampler = TaskLocalityWeightedSampler(
+                    world_dataset.payload["instruction_id"],
+                    world_dataset.payload["episode_id"],
+                    world_raw_task_w,
+                    args.batch_size,
+                    args.seed + 1,
+                    args.task_locality_block_batches,
+                    args.task_sampling,
+                )
+                if args.save is not None or args.resume_exact is not None:
+                    world_sampler.bind_dataset_content_identity(
+                        build_dataset_content_identity(
+                            args.world_data,
+                            world_dataset.payload,
+                            longtraj_dir=getattr(
+                                world_dataset, "longtraj_dir", None
+                            ),
+                        )
+                    )
+                world_loader = DataLoader(
+                    world_dataset,
+                    batch_sampler=world_sampler,
+                    collate_fn=mtvj_collate,
+                    num_workers=args.num_workers,
+                    persistent_workers=args.num_workers > 0,
+                    generator=torch.Generator().manual_seed(args.seed + 1),
+                )
+            else:
+                world_loader = DataLoader(
+                    world_dataset,
+                    batch_size=args.batch_size,
+                    shuffle=True,
+                    collate_fn=mtvj_collate,
+                    num_workers=args.num_workers,
+                    persistent_workers=args.num_workers > 0,
+                    generator=torch.Generator().manual_seed(args.seed + 1),
+                )
+            world_iterator = iter(world_loader)
+            print(
+                "peer joint data: PASS "
+                f"VA={args.va_data} ({len(dataset)} rows), "
+                f"World={args.world_data} ({len(world_dataset)} rows), "
+                f"episodes={args.peer_data_isolation['va_episode_count']}+"
+                f"{args.peer_data_isolation['world_episode_count']}",
+                flush=True,
+            )
         iterator = iter(loader)
         smoke_batch = None
         if args.c2_controller:
@@ -8967,6 +9340,7 @@ def main() -> None:
     else:
         config = VACompoundConfig(
             mode=args.mode, num_layers=args.va_layers, qk_norm=args.qk_norm,
+            planning_stride=args.planning_stride,
             attention_variant=args.attention_variant,
             va_attention_backend=args.va_attention_backend,
             action_query_cond=args.action_query_cond,
@@ -8987,7 +9361,6 @@ def main() -> None:
             role_query_tokens=args.role_query_tokens,
             dual_attention=args.dual_attention,
             flow_semantic=args.flow_semantic,
-            wam_joint=args.wam_joint,
             wmrm=args.wmrm,
             va_world_mode=args.va_world_mode,
             wmrm_inject=args.wmrm_inject,
@@ -9002,8 +9375,6 @@ def main() -> None:
                 )
             ),
             wmrm_cycle_steps=getattr(args, "wmrm_cycle_steps", 6),
-            wmrm_med_margin=getattr(args, "wmrm_med_margin", 0.05),
-            wmrm_handshake=getattr(args, "wmrm_handshake", True),
             wmrm_detach_proposal_stage_state=getattr(
                 args, "wmrm_detach_proposal_stage_state", False
             ),
@@ -9412,36 +9783,16 @@ def main() -> None:
         print(f"SAM enabled: rho={args.sam_rho} (2x forward per step)")
     validate_optimizer_update_state(optimizer)
 
-    # E7 WAM v1（M0）：--wam-joint 时 attach 独立 WAM 模块（只读残差通路，
-    # 由 scripts/train_wam_e7.py 独立训练）。object.__setattr__ 绕过
-    # nn.Module 注册——WAM 参数不进 model.state_dict()/optimizer，
-    # 保证 checkpoint 与优化器契约完全追加式。
-    if args.wam_joint and model is not None:
-        from va_compound.wam import WAMConfig, JointWorldActionFlow
-
-        wam = JointWorldActionFlow(
-            WAMConfig(
-                action_horizon=config.action_horizon,
-                action_dim=config.action_dim,
-            )
-        ).to(device)
-        if args.wam_ckpt:
-            wam_state = torch.load(args.wam_ckpt, map_location="cpu", weights_only=True)
-            if isinstance(wam_state, dict) and "wam_model" in wam_state:
-                wam_state = wam_state["wam_model"]
-            wam.load_state_dict(wam_state)
-            print(f"wam: 权重加载自 {args.wam_ckpt}")
-        object.__setattr__(model, "wam", wam)
-        object.__setattr__(model, "wam_alpha", args.wam_alpha)
-        print(
-            f"wam: JointWorldActionFlow attached "
-            f"({wam.num_params():,} params, alpha={args.wam_alpha})"
-        )
-
     # Cheap after startup: the expensive data digest is already cached on the
     # locality sampler. This immutable value is reused by every checkpoint.
     runtime_exact_run_contract = build_exact_run_contract(
-        args, config, optimizer, sampler, metric_head, roi_head
+        args,
+        config,
+        optimizer,
+        sampler,
+        metric_head,
+        roi_head,
+        world_sampler,
     )
 
     if e2e_model is not None:
@@ -9469,6 +9820,7 @@ def main() -> None:
                     float(getattr(args, "wmrm_static_constraint_weight", 4.0)),
                     args.resume_exact_contract_migration,
                     getattr(args, "va_world_mode", "legacy"),
+                    int(getattr(args, "planning_stride", 6)),
                 )
             # Fail before restoring model/optimizer/sampler/RNG if any data,
             # objective, sampler, architecture or optimizer semantic changed.
@@ -9477,6 +9829,42 @@ def main() -> None:
                 runtime_exact_run_contract,
                 migration_id=args.resume_exact_contract_migration,
             )
+            if world_sampler is not None:
+                saved_world_sampler = resume_ckpt.get("world_sampler_state")
+                if saved_world_sampler is None:
+                    raise ValueError(
+                        "peer joint --resume-exact requires world_sampler_state"
+                    )
+                # Validate the second stream before restoring model/optimizer or
+                # primary sampler state. The sampler checks immutable fields
+                # before assigning its epoch/cursor.
+                world_sampler.load_state_dict(saved_world_sampler)
+        elif (
+            getattr(args, "resume_weights", None) is not None
+            and getattr(config, "va_world_mode", "legacy") == "peer_sync_h6"
+        ):
+            contract = resume_ckpt.get("training_contract") or {}
+            expected = {
+                "peer_training_mode": "joint_dual_stream",
+                "peer_world_topology": PEER_WORLD_TOPOLOGY_CONTRACT,
+                "peer_gradient_boundary": PEER_GRADIENT_BOUNDARY_CONTRACT,
+                "peer_data_isolation": PEER_DATA_ISOLATION_CONTRACT,
+                "peer_dual_stream_optimizer": PEER_DUAL_STREAM_OPTIMIZER_CONTRACT,
+                "planning_stride": int(getattr(args, "planning_stride", 6)),
+                "planning_hz": 80.0
+                / int(getattr(args, "planning_stride", 6)),
+                "peer_high_frequency_contract": PEER_HIGH_FREQUENCY_CONTRACT,
+            }
+            mismatches = {
+                key: (contract.get(key), value)
+                for key, value in expected.items()
+                if contract.get(key) != value
+            }
+            if mismatches:
+                raise ValueError(
+                    "peer --resume-weights requires a joint dual-stream "
+                    f"checkpoint with the same message contract: {mismatches}"
+                )
         resume_config = resume_ckpt["config"]
         for key in (
             "num_layers",
@@ -9485,6 +9873,8 @@ def main() -> None:
             "proprio_dim",
             "mode",
             "va_world_mode",
+            "planning_stride",
+            "wmrm_cycle_steps",
             "wmrm_predictor",
             "wmrm_predictor_depth",
             "wmrm_predictor_width",
@@ -9495,9 +9885,12 @@ def main() -> None:
             left = resume_config.get(key)
             if key == "va_world_mode" and left is None:
                 left = "legacy"
+            if key == "planning_stride" and left is None:
+                left = 6
             right = getattr(config, key, None)
             if key.startswith("wmrm_") and left is None:
                 left = {
+                    "wmrm_cycle_steps": 6,
                     "wmrm_predictor": "legacy",
                     "wmrm_predictor_depth": 6,
                     "wmrm_predictor_width": 384,
@@ -9535,6 +9928,11 @@ def main() -> None:
             print(f"e2e resumed from {resume_path}")
         else:
             if exact_resume:
+                model.load_state_dict(resume_ckpt["model"], strict=True)
+            elif (
+                getattr(args, "resume_weights", None) is not None
+                and getattr(config, "va_world_mode", "legacy") == "peer_sync_h6"
+            ):
                 model.load_state_dict(resume_ckpt["model"], strict=True)
             elif args.c2_controller:
                 # Stage A → C² 迁移：仅允许新 C² keys（c2_head/control_projector）缺失；
@@ -9664,29 +10062,6 @@ def main() -> None:
                     getattr(config, "dino_dense_metric", False)
                 ),
             )
-            if getattr(model, "wam", None) is not None:
-                # 确定性续训：WAM 权重与构造配置必须成对出现，不允许随机
-                # 初始化 WAM 继续训练（--wam-ckpt 外部文件不受 resume 兜底）。
-                if resume_ckpt.get("wam_model") is None:
-                    raise ValueError(
-                        "--wam-joint resume 需要含 wam_model 的 checkpoint"
-                    )
-                saved_wam_config = resume_ckpt.get("wam_config")
-                if saved_wam_config is None:
-                    raise ValueError(
-                        "resume checkpoint 含 wam_model 但缺少 wam_config"
-                        "（不允许随机初始化 WAM 续训）"
-                    )
-                import dataclasses
-
-                runtime_wam_config = dataclasses.asdict(model.wam.config)
-                if saved_wam_config != runtime_wam_config:
-                    raise ValueError(
-                        "resume checkpoint wam_config 与运行时 WAMConfig 不一致："
-                        f"checkpoint={saved_wam_config}, runtime={runtime_wam_config}"
-                    )
-                model.wam.load_state_dict(resume_ckpt["wam_model"])
-                print("wam: WAM 权重从 resume checkpoint 恢复")
             print(f"resumed from {resume_path}")
         if exact_resume:
             global_step = restore_exact_resume_state(
@@ -9739,11 +10114,73 @@ def main() -> None:
         lang_fixed_vec = dataset.payload["language_hidden"].mean(dim=(0, 1), keepdim=True)
         print(f"lang-fixed-vector: 语言通道替换为全局均值（shape={tuple(lang_fixed_vec.shape)}）")
 
+    def prepare_peer_world_batch(raw_batch):
+        """Encode one physically separate World batch without VA-label reuse."""
+        if not dual_peer_data:
+            raise RuntimeError("peer World batch preparation requires dual streams")
+        if main_vision_backbone is None or not config.dino_dense_metric:
+            raise ValueError(
+                "peer joint World stream requires DINO-main dense metric encoding"
+            )
+        frames = raw_batch.get("frames")
+        if frames is None:
+            raise ValueError("--world-data batch has no raw frames")
+        if isinstance(frames, torch.Tensor):
+            frames = frames.cpu().numpy()
+        vision_tokens, dense_evidence = _dino_main_online_encode(
+            frames,
+            main_vision_backbone,
+            device,
+            encode_batch=args.main_vision_encode_batch,
+            grid=config.main_vision_grid,
+            window=config.main_vision_frames,
+            return_dense=True,
+        )
+        raw_batch["vision_tokens"] = vision_tokens
+        metric_tokens, metric_g = _dino_metric_tokens(
+            metric_head,
+            relation_encoder,
+            dense_evidence,
+            raw_batch,
+            device,
+            train_metric_head=args.mtvj_train_metric_head,
+            roi_head=roi_head,
+            roi_backbone=main_vision_backbone,
+            roi_frames=raw_batch.get("frames"),
+            roi_alpha=(
+                float(args.dino_roi_alpha) if roi_head is not None else 0.0
+            ),
+        )
+        raw_batch.pop("frames", None)
+        prepared = move_batch(raw_batch, device)
+        prepared = ensure_sequence(prepared, args.min_sequence_length)
+        if args.prev_dropout > 0.0:
+            prev_mask = (
+                torch.rand(
+                    prepared["previous_action"].shape[0], device=device
+                )
+                < args.prev_dropout
+            )
+            prepared["previous_action"] = prepared["previous_action"] * (
+                ~prev_mask
+            ).view(-1, 1, 1).float()
+        if args.lang_fixed_vector:
+            prepared["language_hidden"] = lang_fixed_vec.expand(
+                prepared["language_hidden"].shape
+            ).to(device)
+            if "language_mask" in prepared:
+                prepared["language_mask"] = torch.ones_like(
+                    prepared["language_mask"]
+                )
+        return prepared, dense_evidence, metric_tokens, metric_g
+
     if resume_rng_state is not None:
         # DataLoader iterator construction consumes a torch base-seed. Rebuild it
         # from the restored sampler first, then restore global RNG immediately
         # before fetching the next batch/noise.
         iterator = iter(loader)
+        if world_loader is not None:
+            world_iterator = iter(world_loader)
         restore_rng_state(resume_rng_state)
 
     last_saved_global_step: int | None = None
@@ -9753,6 +10190,8 @@ def main() -> None:
         nonlocal global_step, last_saved_global_step
         if consumed_locality_batch:
             sampler.advance()
+        if world_sampler is not None:
+            world_sampler.advance()
         global_step += 1
         if (
             args.save is not None
@@ -9773,6 +10212,7 @@ def main() -> None:
                 optimizer=optimizer,
                 global_step=global_step,
                 sampler=sampler,
+                world_sampler=world_sampler,
                 exact_run_contract=runtime_exact_run_contract,
             )
             last_saved_global_step = global_step
@@ -9784,12 +10224,28 @@ def main() -> None:
 
     for step in range(1, args.steps + 1):
         rec_batch = None
+        world_raw_batch = None
         consumed_locality_batch = False
         is_fork_batch = fork_iter is not None and step % (args.fork_k + 1) == 0
         if args.c2_controller:
             # C² 3:1 混合：clean 部分（v5 + v6a 目标）+ recovery 部分（v6b）。
             batch = move_batch(next(clean_iter), device)
             rec_batch = move_batch(next(rec_iter), device)
+            consumed_locality_batch = isinstance(
+                sampler, (TaskLocalityWeightedSampler, TaskWeightedSampler)
+            )
+        elif dual_peer_data:
+            (
+                batch,
+                world_raw_batch,
+                iterator,
+                world_iterator,
+            ) = next_peer_joint_batches(
+                iterator,
+                loader,
+                world_iterator,
+                world_loader,
+            )
             consumed_locality_batch = isinstance(
                 sampler, (TaskLocalityWeightedSampler, TaskWeightedSampler)
             )
@@ -10058,13 +10514,30 @@ def main() -> None:
             env_by_description,
             seed=args.seed,
             global_step=next_global_step,
-            every=args.mtvj_visual_aux_every,
+            every=(
+                0
+                if getattr(args, "wmrm_only", False)
+                else args.mtvj_visual_aux_every
+            ),
             aux_batch=args.mtvj_visual_aux_batch,
             include_raw_frames=bool(getattr(args, "dino_main_vision", False)),
         )
 
-        def compute_loss(batch, noisy_actions, flow_time):
+        def compute_loss(
+            batch,
+            noisy_actions,
+            flow_time,
+            target_velocity,
+            *,
+            objective: str = "joint",
+            dense_evidence=None,
+            metric_tokens=None,
+            action_evidence=None,
+            metric_g=None,
+        ):
             """Forward + flow/pair loss（SAM 二次前向复用同一噪声/配对）。"""
+            if objective not in {"joint", "va", "world"}:
+                raise ValueError(f"unknown training objective: {objective!r}")
             evsm_gates = []
             if e2e_model is not None:
                 mb = move_batch(batch, device)
@@ -10134,14 +10607,15 @@ def main() -> None:
                     tasks=tasks,
                     servo=servo,
                     servo_stats=servo_stats,
-                    dense_evidence=mtvj_dense_evidence,
-                    metric_tokens=mtvj_metric_tokens,
-                    action_dense_evidence=action_dense_evidence,
-                    metric_g=mtvj_metric_g,
+                    dense_evidence=dense_evidence,
+                    metric_tokens=metric_tokens,
+                    action_dense_evidence=action_evidence,
+                    metric_g=metric_g,
                     wmrm_adep_margin=float(getattr(args, "wmrm_adep_margin", 0.05)),
                     visual_world_supervision=bool(
                         getattr(args, "visual_world_supervision", False)
-                    ),
+                    )
+                    and objective != "va",
                     wmrm_adep_enabled=float(
                         getattr(args, "wmrm_adep_weight", 0.0)
                     )
@@ -10158,12 +10632,24 @@ def main() -> None:
                         getattr(args, "wmrm_static_constraint_weight", 4.0)
                     ),
                     feature_autocast_bf16=bool(args.feature_autocast_bf16),
+                    train_world_model=(
+                        objective != "va"
+                        and not bool(getattr(args, "va_only", False))
+                    ),
+                    compute_action_output=objective != "world",
                 )
                 if model.config.future_predict:
                     predicted_velocity, action_conditions, memories = rollout
                 else:
                     predicted_velocity, action_conditions = rollout
-                if model.config.direct_head:
+                if objective == "world":
+                    flow_loss = predicted_velocity.new_zeros(())
+                    flow_prefix_loss = predicted_velocity.new_zeros(())
+                    flow_tail_loss = predicted_velocity.new_zeros(())
+                    pair_loss = predicted_velocity.new_zeros(())
+                    pred_delta = predicted_velocity.new_zeros(())
+                    tgt_delta = predicted_velocity.new_zeros(())
+                elif model.config.direct_head:
                     # Deterministic H6 baseline uses the exact same validity masks as FM.
                     # Reusing the masked reducer prevents settle/post-success targets from
                     # entering the direct loss merely because its decoder is deterministic.
@@ -10270,7 +10756,9 @@ def main() -> None:
                             pair_loss, pred_delta, tgt_delta = semantic_pair_loss(
                                 pair_predicted_velocity, pair_target_velocity, partner
                             )
-                if model.config.future_predict:
+                if objective == "world":
+                    future_loss = flow_loss.new_zeros(())
+                elif model.config.future_predict:
                     # 未来 latent 预测（审阅落地③）：从 (E_t, T_t, C_t) 预测
                     # t+1 决策点的冻结 V-JEPA 特征均值；target 来自预计算特征
                     # bank（冻结特征即 stop-grad，此处再显式 detach 保险）。
@@ -10387,12 +10875,6 @@ def main() -> None:
             wmrm_loss = getattr(model, "last_wmrm_loss", None)
             if wmrm_loss is None:
                 wmrm_loss = flow_loss.new_zeros(())
-            pi_kl = getattr(model, "last_wmrm_pi_kl_loss", None)
-            if pi_kl is None:
-                pi_kl_hinge = flow_loss.new_zeros(())
-            else:
-                margin = float(getattr(args, "wmrm_pi_kl_margin", 0.1))
-                pi_kl_hinge = torch.relu(margin - pi_kl)
             lang_align = flow_loss.new_zeros(())
             last_aux = getattr(model, "last_wmrm", None)
             if last_aux is not None and getattr(last_aux, "task_summary", None) is not None:
@@ -10404,15 +10886,17 @@ def main() -> None:
             adep = getattr(model, "last_wmrm_adep_loss", None)
             if adep is None:
                 adep = flow_loss.new_zeros(())
-            med = getattr(model, "last_wmrm_med_loss", None)
-            if med is None:
-                med = flow_loss.new_zeros(())
-            if getattr(args, "wmrm_only", False):
+            if objective == "world" or getattr(args, "wmrm_only", False):
                 action_total = (
                     float(getattr(args, "wmrm_world_weight", 1.0)) * wmrm_loss
-                    + float(getattr(args, "wmrm_pi_kl_weight", 0.0)) * pi_kl_hinge
                     + float(getattr(args, "wmrm_lang_align_weight", 0.0)) * lang_align
                     + float(getattr(args, "wmrm_adep_weight", 0.0)) * adep
+                )
+            elif objective == "va" or getattr(args, "va_only", False):
+                action_total = (
+                    flow_loss
+                    + args.pair_loss_weight * pair_loss
+                    + args.future_predict_weight * future_loss
                 )
             else:
                 action_total = (
@@ -10420,13 +10904,13 @@ def main() -> None:
                     + args.pair_loss_weight * pair_loss
                     + args.future_predict_weight * future_loss
                     + float(getattr(args, "wmrm_world_weight", 1.0)) * wmrm_loss
-                    + float(getattr(args, "wmrm_pi_kl_weight", 0.0)) * pi_kl_hinge
                     + float(getattr(args, "wmrm_lang_align_weight", 0.0)) * lang_align
                     + float(getattr(args, "wmrm_adep_weight", 0.0)) * adep
-                    + float(getattr(args, "wmrm_med_weight", 0.0)) * med
                 )
             semantic_total = (
-                args.semantic_anchor_weight * semantic_anchor_loss
+                flow_loss.new_zeros(())
+                if objective == "world" or getattr(args, "wmrm_only", False)
+                else args.semantic_anchor_weight * semantic_anchor_loss
                 + args.semantic_geometry_weight * semantic_geom_loss
             )
             return (
@@ -10444,9 +10928,8 @@ def main() -> None:
                 semantic_geom_loss,
             )
 
-        # No accumulation is used on this path.  Release the previous update's
-        # gradients before constructing the next 8-stage World graph; keeping
-        # them through the forward needlessly raises the transient CUDA peak.
+        # Clear the previous update once. Peer joint mode then accumulates one
+        # VA backward and one physically separate World backward before stepping.
         optimizer.zero_grad(set_to_none=True)
         with feature_policy_autocast(
             device, bool(args.feature_autocast_bf16)
@@ -10464,7 +10947,17 @@ def main() -> None:
                 evsm_gate_mean,
                 semantic_anchor_loss,
                 semantic_geom_loss,
-            ) = compute_loss(batch, noisy_actions, flow_time)
+            ) = compute_loss(
+                batch,
+                noisy_actions,
+                flow_time,
+                target_velocity,
+                objective="va" if dual_peer_data else "joint",
+                dense_evidence=mtvj_dense_evidence,
+                metric_tokens=mtvj_metric_tokens,
+                action_evidence=action_dense_evidence,
+                metric_g=mtvj_metric_g,
+            )
 
         validate_finite_update_scalars(
             [
@@ -10479,9 +10972,54 @@ def main() -> None:
                 ("semantic_geometry", semantic_geom_loss),
             ]
         )
-        # P0-5：动作损失与语义损失分开 backward——LoRA 参数只缩放动作侧梯度
-        # （η_act），anchor/geometry 梯度完整（旧实现统一缩放两者）。
-        action_total.backward()
+        world_action_total = action_total.new_zeros(())
+        if dual_peer_data:
+            if world_raw_batch is None:
+                raise RuntimeError("peer joint step did not fetch a World batch")
+
+            def world_forward():
+                nonlocal world_raw_batch
+                (
+                    world_batch,
+                    world_dense_evidence,
+                    world_metric_tokens,
+                    world_metric_g,
+                ) = prepare_peer_world_batch(world_raw_batch)
+                world_noisy_actions, world_flow_time, world_target_velocity = (
+                    sample_flow_matching_inputs(world_batch["actions"])
+                )
+                with feature_policy_autocast(
+                    device, bool(args.feature_autocast_bf16)
+                ):
+                    losses = compute_loss(
+                        world_batch,
+                        world_noisy_actions,
+                        world_flow_time,
+                        world_target_velocity,
+                        objective="world",
+                        dense_evidence=world_dense_evidence,
+                        metric_tokens=world_metric_tokens,
+                        action_evidence=None,
+                        metric_g=world_metric_g,
+                    )
+                validate_finite_update_scalars(
+                    [
+                        ("world.total", losses[1]),
+                        ("world.objective", losses[0]),
+                        ("world.flow_excluded", losses[2]),
+                    ]
+                )
+                return losses
+
+            world_losses = backward_peer_joint_losses(
+                action_total, world_forward
+            )
+            world_action_total = world_losses[0]
+            total_loss = total_loss.detach() + world_losses[1].detach()
+        else:
+            # P0-5：动作损失与语义损失分开 backward——LoRA 参数只缩放
+            # 动作侧梯度，anchor/geometry 梯度完整。
+            action_total.backward()
         # 双数据流视觉辅助批次（阶段 C）：每 N 步一个在线仿真批次，辅助 loss
         # 累积到同一优化器 step；辅助分支只反传 metric head，且视觉头与
         # VA/relation 分别 clip，避免大辅助梯度压小动作学习信号。
@@ -10522,7 +11060,7 @@ def main() -> None:
             scale_semantic_lora_grads(
                 e2e_model.text_backbone, args.semantic_act_grad_scale
             )
-        if args.semantic_adapter and (
+        if not getattr(args, "wmrm_only", False) and args.semantic_adapter and (
             args.semantic_anchor_weight > 0.0 or args.semantic_geometry_weight > 0.0
         ):
             semantic_total.backward()
@@ -10575,9 +11113,26 @@ def main() -> None:
             )
         )
         validate_optimizer_update_state(optimizer, validate_values=False)
-        validate_update_gradients(
+        raw_gradient_norm = validate_update_gradients(
             update_named_parameters, max_norm=args.max_gradient_norm
         )
+        if raw_gradient_norm > 100.0:
+            largest_gradients = sorted(
+                (
+                    (float(parameter.grad.detach().double().norm().item()), name)
+                    for name, parameter in update_named_parameters
+                    if parameter.grad is not None
+                ),
+                reverse=True,
+            )[:12]
+            print(
+                "gradient_spike "
+                f"global_step={next_global_step} raw_norm={raw_gradient_norm:.6g} "
+                + " ".join(
+                    f"{name}={norm:.6g}" for norm, name in largest_gradients
+                ),
+                flush=True,
+            )
         main_parameter_ids = {id(parameter) for parameter in clip_params}
         main_named_parameters = [
             (name, parameter)
@@ -10605,7 +11160,16 @@ def main() -> None:
                 with feature_policy_autocast(
                     device, bool(args.feature_autocast_bf16)
                 ):
-                    second_losses = compute_loss(batch, noisy_actions, flow_time)
+                    second_losses = compute_loss(
+                        batch,
+                        noisy_actions,
+                        flow_time,
+                        target_velocity,
+                        dense_evidence=mtvj_dense_evidence,
+                        metric_tokens=mtvj_metric_tokens,
+                        action_evidence=action_dense_evidence,
+                        metric_g=mtvj_metric_g,
+                    )
                 action_total2, semantic_total2 = second_losses[:2]
                 validate_finite_update_scalars(
                     [("sam.total", second_losses[1]), ("sam.action", action_total2)]
@@ -10751,6 +11315,7 @@ def main() -> None:
             f"flow_tail{max(noisy_actions.shape[-2] - args.flow_prefix_steps, 0)}="
             f"{flow_tail_loss.item():.6f} "
             f"pair={pair_loss.item():.6f} future={future_loss.item():.6f} "
+            f"world_objective={world_action_total.item():.6f} "
             f"world={float((getattr(model, 'last_wmrm_loss', None) if model is not None else None) or 0.0):.6f} "
             f"goal_delta={predicted_delta.item():.6f}/"
             f"{target_delta.item():.6f} grad={float(gradient_norm):.6f}"
@@ -10776,6 +11341,7 @@ def main() -> None:
             optimizer=optimizer,
             global_step=global_step,
             sampler=sampler,
+            world_sampler=world_sampler,
             exact_run_contract=runtime_exact_run_contract,
         )
 

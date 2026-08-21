@@ -7,6 +7,8 @@ import pytest
 import torch
 
 from scripts.split_wam4va_episode_holdout import (
+    PEER_SYNC_H6_P2_CONTRACT,
+    PEER_SYNC_H6_P2_TRANSITION_RULE,
     TRANSITION_RULE,
     build_split_artifacts,
     build_split_plan,
@@ -69,6 +71,23 @@ def _peer_payload() -> dict:
             "parent_identity": {"path": "/parent", "sha256": "p"},
             "source_identities": [{"path": "/source", "sha256": "s"}],
             "output_identity": {"path": "/windows", "shape": {"action_horizon": 6}},
+        }
+    )
+    return payload
+
+
+def _peer_p2_payload() -> dict:
+    payload = _peer_payload()
+    payload["metadata"].update(
+        {
+            "contract": PEER_SYNC_H6_P2_CONTRACT,
+            "fps": 80,
+            "planning_stride": 2,
+            "control_stride": 2,
+            "sequence_length": 4,
+            "decision_offsets": [0, 2, 4, 6],
+            "action_horizon": 6,
+            "action_label_offsets": [0, 1, 2, 3, 4, 5],
         }
     )
     return payload
@@ -238,6 +257,52 @@ def test_peer_h6_manifest_preserves_protocol_identities_and_episode_disjointness
     assert train["metadata"]["output_identity"] == manifest["splits"]["train"]["output_identity"]
     assert eval_payload["metadata"]["output_identity"] == manifest["splits"]["eval"]["output_identity"]
     assert set(train["episode_id"].tolist()).isdisjoint(eval_payload["episode_id"].tolist())
+
+
+def test_peer_h6_p2_split_preserves_cadence_and_uses_two_action_transition(tmp_path) -> None:
+    source = tmp_path / "peer_p2_source.pt"
+    train_path = tmp_path / "peer_p2_train.pt"
+    eval_path = tmp_path / "peer_p2_eval.pt"
+    manifest_path = tmp_path / "peer_p2_split.json"
+    payload = _peer_p2_payload()
+    # This action is outside the d -> d+2 transition prefix. It must not mask
+    # the transition even though every decision retains a full H6 action label.
+    payload["action_valid_mask"][0, 0, 4] = False
+    torch.save(payload, source)
+
+    manifest = build_split_artifacts(source, train_path, eval_path, manifest_path)
+    train = torch.load(train_path, map_location="cpu", weights_only=True)
+    eval_payload = torch.load(eval_path, map_location="cpu", weights_only=True)
+
+    assert manifest["data_protocol"] == {
+        "contract": PEER_SYNC_H6_P2_CONTRACT,
+        "shape": {"sequence_length": 4, "action_horizon": 6, "action_dim": 4},
+        "logged_action_chunk": "full_h6",
+        "fps": 80,
+        "planning_stride": 2,
+        "control_stride": 2,
+        "decision_offsets": [0, 2, 4, 6],
+        "action_label_offsets": [0, 1, 2, 3, 4, 5],
+    }
+    assert manifest["transition_rule"] == PEER_SYNC_H6_P2_TRANSITION_RULE
+    assert manifest["source"]["mask_stats"]["transition"]["true"] == (
+        len(payload["actions"]) * 3
+    )
+    assert manifest["source"]["payload_parent_identity"]["path"] == "/parent"
+    for split_payload in (train, eval_payload):
+        metadata = split_payload["metadata"]
+        assert metadata["contract"] == PEER_SYNC_H6_P2_CONTRACT
+        assert metadata["planning_stride"] == 2
+        assert metadata["control_stride"] == 2
+        assert metadata["decision_offsets"] == [0, 2, 4, 6]
+        assert metadata["source_identities"] == [{"path": "/source", "sha256": "s"}]
+
+
+def test_peer_h6_p2_split_rejects_incomplete_cadence_metadata() -> None:
+    payload = _peer_p2_payload()
+    payload["metadata"]["planning_stride"] = 6
+    with pytest.raises(ValueError, match="requires metadata.planning_stride=2"):
+        build_split_plan(payload)
 
 
 def test_legacy_split_rejects_non_h48_and_peer_requires_complete_identity() -> None:

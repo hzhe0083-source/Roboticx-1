@@ -227,7 +227,6 @@ def test_peer_proposal_history_uses_one_encode_and_no_decode() -> None:
         ("num_layers", 7),
         ("action_horizon", 47),
         ("wmrm_inject", "last"),
-        ("wmrm_handshake", False),
         ("wmrm_predictor", "legacy"),
         ("wmrm_map_size", 8),
         ("wmrm_map_channels", 32),
@@ -247,7 +246,6 @@ def test_model_loader_rejects_non_gate_architecture(
         "num_layers": 8,
         "action_horizon": 48,
         "wmrm_inject": "all",
-        "wmrm_handshake": True,
         "wmrm_predictor": "st_blocks",
         "wmrm_map_size": 16,
         "wmrm_map_channels": 1024,
@@ -274,7 +272,6 @@ def _formal_model_config(*, va_world_mode: str = "legacy") -> dict:
         "action_horizon": 6 if va_world_mode == "peer_sync_h6" else 48,
         "action_dim": 4,
         "wmrm_inject": "all",
-        "wmrm_handshake": True,
         "wmrm_predictor": "st_blocks",
         "wmrm_map_size": 16,
         "wmrm_map_channels": 1024,
@@ -364,15 +361,24 @@ def test_checkpoint_world_contract_requires_peer_topology_and_action_source() ->
             "world_supervision": "visual_motion_v1",
             "world_logged_branch": "matched_context_full_forward_v1",
             "va_world_mode": "peer_sync_h6",
-            "peer_world_topology": "pre_stage_snapshot_parallel_va_world_v1",
+            "peer_world_topology": "one_stage_delayed_bidirectional_state_kv_v1",
             "peer_world_action_source": (
                 "deterministic_readout_main_explicit_env_override_supervision_v1"
             ),
+            "peer_gradient_boundary": "bidirectional_stop_gradient_v1",
+            "peer_data_isolation": "separate_invocations_v1",
+            "peer_training_mode": "world_only",
         },
     }
     assert _checkpoint_world_contract(checkpoint, allow_unmarked=False)[2] is True
 
-    for field in ("peer_world_topology", "peer_world_action_source"):
+    for field in (
+        "peer_world_topology",
+        "peer_world_action_source",
+        "peer_gradient_boundary",
+        "peer_data_isolation",
+        "peer_training_mode",
+    ):
         invalid = {
             **checkpoint,
             "training_contract": dict(checkpoint["training_contract"]),

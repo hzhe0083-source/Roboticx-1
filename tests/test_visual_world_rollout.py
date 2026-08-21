@@ -28,7 +28,6 @@ def _tiny_world_model(*, va_world_mode: str = "legacy") -> VACompoundPolicy:
         wmrm_target="dino",
         wmrm_cycle_steps=6,
         wmrm_inject="all",
-        wmrm_handshake=True,
         wmrm_map_size=2,
         wmrm_map_channels=8,
         wmrm_world_grid=2,
@@ -218,7 +217,7 @@ def test_action_ranking_donors_are_fixed_in_train_payload() -> None:
     assert identity == second
 
 
-def test_logged_world_branch_reuses_detached_proposal_entry_memory() -> None:
+def test_logged_world_branch_uses_detached_pre_step_memory_without_extra_encode() -> None:
     model = _tiny_world_model()
     batch, noisy_actions, flow_time = _rollout_batch(transitions_valid=True)
     calls = []
@@ -246,52 +245,45 @@ def test_logged_world_branch_reuses_detached_proposal_entry_memory() -> None:
         flow_steps=2,
     )
 
-    # Each supervised decision has proposal/main/logged forwards.  The
-    # shuffled branch is now a direct matched-context predictor call, so it
-    # does not add another encode_condition forward; zero is diagnostic-only.
-    assert len(calls) == 8
-    assert [call["memory"] for call in calls[:3]] == [None, None, None]
-    proposal_memory = calls[3]["memory"]
-    main_memory = calls[4]["memory"]
-    logged_memory = calls[5]["memory"]
-    assert proposal_memory is main_memory
-    assert logged_memory is not proposal_memory
-    assert calls[3]["skip_wmrm"] is True
-    assert calls[5]["logged"] is True
-    assert calls[5]["grad_enabled"] is True
-    for proposal_layer, logged_layer in zip(
-        proposal_memory.layers, logged_memory.layers, strict=True
+    # Three main decisions plus one detached logged-action replay for each
+    # supervised transition.  There is no extra proposal encode.
+    assert len(calls) == 5
+    assert [call["logged"] for call in calls] == [False, True, False, True, False]
+    assert all(not call["skip_wmrm"] for call in calls)
+    assert all(call["grad_enabled"] for call in calls)
+    assert calls[0]["memory"] is None
+    assert calls[1]["memory"] is None
+    main_memory = calls[2]["memory"]
+    logged_memory = calls[3]["memory"]
+    assert main_memory is not None
+    assert logged_memory is not None
+    assert logged_memory is not main_memory
+    assert calls[4]["memory"] is not main_memory
+    for main_layer, logged_layer in zip(
+        main_memory.layers, logged_memory.layers, strict=True
     ):
         torch.testing.assert_close(
-            proposal_layer, logged_layer, rtol=0.0, atol=0.0
+            main_layer, logged_layer, rtol=0.0, atol=0.0
         )
         assert logged_layer.grad_fn is None
 
 
-def test_peer_readout_uses_world_transition_mask_and_final_stage_only(
+def test_peer_world_stream_uses_logged_actions_and_supervises_causal_readout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model = _tiny_world_model(va_world_mode="peer_sync_h6")
     batch, noisy_actions, flow_time = _rollout_batch(transitions_valid=True)
     batch["actions"].zero_()
-    # The first transition has a complete current H6 but is invalid because the
-    # next decision's first action is missing.  The second transition is valid.
     batch["action_valid_mask"].fill_(True)
     batch["action_valid_mask"][0, 1, 0] = False
     calls = 0
 
-    def staged_readout(action: torch.Tensor) -> torch.Tensor:
+    def readout_probe(action: torch.Tensor) -> torch.Tensor:
         nonlocal calls
         calls += 1
-        # Two peer stages per decision: stage 0 predicts 1, final stage predicts 2.
-        stage_value = 1.0 if calls % model.config.num_layers == 1 else 2.0
-        output = action.new_full(
-            (action.shape[0], 6, model.config.action_dim), stage_value
-        )
-        output[0] *= 5.0
-        return output
+        return action.new_ones((action.shape[0], 6, 4))
 
-    monkeypatch.setattr(model.world_action_readout, "forward", staged_readout)
+    monkeypatch.setattr(model.world_action_readout, "forward", readout_probe)
     rollout_policy(
         model,
         batch,
@@ -301,10 +293,39 @@ def test_peer_readout_uses_world_transition_mask_and_final_stage_only(
         flow_steps=2,
     )
 
-    # Smooth-L1(2, 0) = 1.5.  Stage 0 must not enter the reduction, and the
-    # invalid first transition for row 0 must use the same mask as World targets.
-    assert model.last_world_action_readout_loss.item() == pytest.approx(1.5)
-    assert model.last_world_action_readout_rmse.item() == pytest.approx(2.0)
+    # Logged H6 remains the World forward condition; the independently computed
+    # causal readout is supervised only in the loss and is never written back.
+    assert torch.count_nonzero(model.last_wmrm.env_action) == 0
+    assert calls == batch["actions"].shape[1] - 1
+    assert model.last_world_action_readout_loss.item() == pytest.approx(0.5)
+    assert model.last_world_action_readout_rmse.item() == pytest.approx(1.0)
+
+
+def test_va_only_rollout_keeps_world_messages_but_skips_world_targets() -> None:
+    model = _tiny_world_model(va_world_mode="peer_sync_h6")
+    batch, noisy_actions, flow_time = _rollout_batch(transitions_valid=True)
+    rollout_policy(
+        model,
+        batch,
+        noisy_actions,
+        flow_time,
+        train_world_model=False,
+        flow_steps=2,
+    )
+    assert model.last_wmrm_auxes
+    assert model.last_wmrm_auxes[-1].world_tokens is not None
+    assert model.last_wmrm_loss is None
+
+    with pytest.raises(ValueError, match="VA-only objective"):
+        rollout_policy(
+            model,
+            batch,
+            noisy_actions,
+            flow_time,
+            visual_world_supervision=True,
+            train_world_model=False,
+            flow_steps=2,
+        )
 
 
 def test_peer_rollout_rejects_adep_before_any_model_forward() -> None:
@@ -339,7 +360,7 @@ def test_legacy_rollout_keeps_adep_available() -> None:
     assert torch.isfinite(model.last_wmrm_adep_loss)
 
 
-def test_peer_rollout_uses_one_main_encode_and_explicit_snapshot_overrides() -> None:
+def test_peer_world_rollout_uses_one_logged_encode_per_decision() -> None:
     model = _tiny_world_model(va_world_mode="peer_sync_h6")
     batch, noisy_actions, flow_time = _rollout_batch(transitions_valid=True)
     encode_calls = 0
@@ -368,21 +389,19 @@ def test_peer_rollout_uses_one_main_encode_and_explicit_snapshot_overrides() -> 
     )
 
     assert encode_calls == batch["actions"].shape[1]
-    assert len(proposal_actions) == 14
-    for time_index in range(2):
-        offset = time_index * 6
-        main = proposal_actions[offset : offset + 2]
-        logged = proposal_actions[offset + 2 : offset + 4]
-        assert not any(
-            torch.equal(action, batch["actions"][:, time_index, :6])
-            for action in main
-        )
+    assert len(proposal_actions) == (
+        batch["actions"].shape[1] * model.config.num_layers
+    )
+    for time_index in range(batch["actions"].shape[1]):
+        start = time_index * model.config.num_layers
+        stage_actions = proposal_actions[start : start + model.config.num_layers]
         assert all(
             torch.equal(action, batch["actions"][:, time_index, :6])
-            for action in logged
+            for action in stage_actions
         )
     assert model.last_world_action_readout_loss is not None
-    assert model.last_world_action_readout_loss.requires_grad
+    assert torch.isfinite(model.last_world_action_readout_loss)
+    assert model.last_world_action_readout_loss.item() > 0.0
     assert torch.isfinite(model.last_world_action_readout_rmse)
 
 

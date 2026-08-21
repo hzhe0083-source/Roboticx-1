@@ -1,0 +1,139 @@
+{
+  "file": "artifacts/figures/va_wam_main_v3/va_wam_main_v3.drawio",
+  "summary": {
+    "total_findings": 6,
+    "fail": 0,
+    "warn": 6,
+    "passed": true,
+    "clean": false
+  },
+  "fails": [],
+  "warns": [
+    {
+      "rule": "spacing-inconsistent-h",
+      "element_id": "va_add2",
+      "message": "Row at y≈690: horizontal gaps vary (gaps=['245', '25'], mean=135, cv=0.81). Use uniform spacing.",
+      "detail": {
+        "row_y": 690,
+        "gaps": [
+          245.0,
+          25.0
+        ],
+        "mean": 135.0,
+        "cv": 0.81,
+        "element_ids": [
+          "va_add2",
+          "predicted_map_stage",
+          "world_state_update"
+        ]
+      }
+    },
+    {
+      "rule": "spacing-inconsistent-v",
+      "element_id": "euler",
+      "message": "Column at x≈420: vertical gaps vary (gaps=['15', '15', '70'], mean=33, cv=0.78). Use uniform spacing.",
+      "detail": {
+        "col_x": 420,
+        "gaps": [
+          15.0,
+          15.0,
+          70.0
+        ],
+        "mean": 33.3,
+        "cv": 0.78,
+        "element_ids": [
+          "euler",
+          "flow_transformer",
+          "final_norm",
+          "stage_commit"
+        ]
+      }
+    },
+    {
+      "rule": "spacing-inconsistent-v",
+      "element_id": "gated_world_mixer",
+      "message": "Column at x≈650: vertical gaps vary (gaps=['15', '15', '105', '120', '120'], mean=75, cv=0.66). Use uniform spacing.",
+      "detail": {
+        "col_x": 650,
+        "gaps": [
+          15.0,
+          15.0,
+          105.0,
+          120.0,
+          120.0
+        ],
+        "mean": 75.0,
+        "cv": 0.66,
+        "element_ids": [
+          "gated_world_mixer",
+          "world_tokens",
+          "predicted_map_stage",
+          "st_ffn",
+          "st_cond_ca",
+          "st_causal_sa"
+        ]
+      }
+    },
+    {
+      "rule": "spacing-inconsistent-v",
+      "element_id": "st_add3",
+      "message": "Column at x≈675: vertical gaps vary (gaps=['76', '23', '86', '23', '86'], mean=59, cv=0.50). Use uniform spacing.",
+      "detail": {
+        "col_x": 675,
+        "gaps": [
+          76.0,
+          23.0,
+          86.0,
+          23.0,
+          86.0
+        ],
+        "mean": 58.8,
+        "cv": 0.5,
+        "element_ids": [
+          "st_add3",
+          "st_pre3",
+          "st_add2",
+          "st_pre2",
+          "st_add1",
+          "st_pre1"
+        ]
+      }
+    },
+    {
+      "rule": "spacing-inconsistent-v",
+      "element_id": "world_state",
+      "message": "Column at x≈855: vertical gaps vary (gaps=['800', '13', '135', '55'], mean=251, cv=1.28). Use uniform spacing.",
+      "detail": {
+        "col_x": 855,
+        "gaps": [
+          800.0,
+          13.0,
+          135.0,
+          55.0
+        ],
+        "mean": 250.8,
+        "cv": 1.28,
+        "element_ids": [
+          "world_state",
+          "belief_update",
+          "evidence_ca",
+          "state_embedding",
+          "robot_state"
+        ]
+      }
+    },
+    {
+      "rule": "edge-density-hotspot",
+      "element_id": "*",
+      "message": "Cell (800,1000) has 7 edge segments — potential arrow spaghetti. Reroute connectors or add explicit waypoints.",
+      "detail": {
+        "cell_x": 800,
+        "cell_y": 1000,
+        "edge_count": 7
+      }
+    }
+  ],
+  "vertex_count": 46,
+  "edge_count": 50,
+  "canvas": "1200x1780"
+}

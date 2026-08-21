@@ -7,7 +7,6 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "scripts" / "run_mw_hard2_wam4va_visualmotion_peer_sync_h6_v1.sh"
-HISTORICAL_H48 = ROOT / "scripts" / "run_mw_hard2_wam4va_visualmotion_joint_v1.sh"
 
 
 def _text() -> str:
@@ -18,7 +17,7 @@ def _block(text: str, start: str, end: str) -> str:
     return text.split(start, 1)[1].split(end, 1)[0]
 
 
-def test_runner_syntax_and_invalid_mode_fail_before_any_training() -> None:
+def test_runner_syntax_and_invalid_mode_fail_before_training() -> None:
     syntax = subprocess.run(
         ["bash", "-n", str(RUNNER)], cwd=ROOT, capture_output=True, text=True
     )
@@ -31,172 +30,85 @@ def test_runner_syntax_and_invalid_mode_fail_before_any_training() -> None:
         env={**os.environ, "PY": "/definitely/missing/python"},
     )
     assert invalid.returncode == 2
-    assert "{prepare|preflight|smoke10|pilot300|20k|continue20k|resume20k}" in invalid.stderr
-    assert "scratch-only formal lineage" not in invalid.stdout
+    assert "{prepare|preflight|joint}" in invalid.stderr
 
 
-def test_runner_has_approved_h6_data_and_unique_output_namespaces() -> None:
+def test_prepare_builds_three_episode_disjoint_p2_data_sides() -> None:
     text = _text()
-    assert "SOURCE=data/hard2_peer_h6_source_v1.pt" in text
-    assert "TRAIN_DATA=data/hard2_peer_h6_train_v1.pt" in text
-    assert "EVAL_DATA=data/hard2_peer_h6_eval_v1.pt" in text
-    assert "SPLIT_MANIFEST=data/hard2_peer_h6_split_v1.json" in text
-    assert "DATA_FAMILY=" not in text
-    assert "FAMILY=mw_hard2_wam4va_visualmotion_peer_sync_h6_v1" in text
-    assert "checkpoints/${run_id}" in text
-    assert "logs/${run_id}" in text
-    assert "diagnostics/${run_id}" in text
-    assert RUNNER != HISTORICAL_H48
-    assert "run_mw_hard2_wam4va_visualmotion_joint_v1.sh" not in text
+    prepare = _block(text, "prepare_data(){", "preflight(){")
+    assert "SOURCE=data/hard2_peer_h6_p2_source_v1.pt" in text
+    assert "VA_TRAIN_DATA=data/hard2_peer_h6_p2_va_train_v1.pt" in text
+    assert "WORLD_TRAIN_DATA=data/hard2_peer_h6_p2_world_train_v1.pt" in text
+    assert "EVAL_DATA=data/hard2_peer_h6_p2_eval_v1.pt" in text
+    assert "WORLD_POOL=data/hard2_peer_h6_p2_world_pool_v1.pt" in text
+    assert "FAMILY=mw_hard2_va_world_state_exchange_joint_h6_p2_v1" in text
+    assert "--planning-stride 2" in prepare
+    assert "--data-contract peer_sync_h6_p2_world_windows_v1" in prepare
+    assert "--control-stride" not in prepare
+    assert "--heldout-fraction 0.50 --seed 101" in prepare
+    assert "--heldout-fraction 0.20 --seed 202" in prepare
+    assert '--eval-output "$VA_TRAIN_DATA"' in prepare
+    assert '--train-output "$WORLD_TRAIN_DATA"' in prepare
+    preflight = _block(text, "preflight(){", "checkpoint_contract(){")
+    assert '"$WORLD_POOL"' in preflight
+    assert 'episodes[left] & episodes[right]' in preflight
+    assert '(("va", "world"), ("va", "eval"), ("world", "eval"))' in preflight
+    assert 'get("current_action_prefix_steps") != 2' in preflight
 
 
-def test_h6_preparation_rewindows_raw_trajectories_with_exact_identities() -> None:
+def test_peer_cli_requires_joint_dual_data_streams() -> None:
+    preflight = _block(_text(), "preflight(){", "checkpoint_contract(){")
+    assert '"--va-data", "va-unused.pt"' in preflight
+    assert '"--world-data", "world-unused.pt"' in preflight
+    assert '"--visual-world-supervision", "--world-split-manifest"' in preflight
+    assert "validate_args(parse_args" in preflight
+    assert "--va-world-mode\", \"peer_sync_h6" in preflight
+    assert '"--planning-stride", "2", "--control-stride", "2"' in preflight
+    assert '"--wmrm-cycle-steps", "2"' in preflight
+    assert '"--flow-prefix-steps", "2"' in preflight
+    assert '"--data"' not in preflight
+    assert "--world-only" not in preflight
+    assert "--va-only" not in preflight
+
+
+def test_joint_run_uses_both_data_streams_without_phase_handoff() -> None:
     text = _text()
-    prepare = _block(text, "prepare_h6_data(){", "preflight_h6(){")
-    assert "ASSEMBLY_RAW=data/metaworld_longtraj_assembly-v3.pt" in text
-    assert "DOOR_RAW=data/metaworld_longtraj_door-unlock-v3.pt" in text
-    assert "ALLTASK_H48_REF=data/metaworld_longtraj_windows_h48.pt" in text
-    assert "EXPECTED_ASSEMBLY_SHA256=c61f3b2102dea781c9db2a73109472e6e181f46e33536879a5eab181ee190ea0" in text
-    assert "EXPECTED_DOOR_SHA256=309726cd679753633bf9bb658635b890affcc666523cb530bab62db4d9699bf1" in text
-    assert "EXPECTED_ALLTASK_H48_REF_SHA256=5adc69fce88cdfc5a62b0fa4e9da536d2368a81e6ebb5c23543bca2810ab19a4" in text
-    assert "raw assembly SHA-256 mismatch" in text
-    assert "raw door-unlock SHA-256 mismatch" in text
-    assert "normalization/language reference SHA-256 mismatch" in text
-    assert "refusing to overwrite immutable H6 data family" in prepare
-    for token in (
-        "scripts/build_longtraj_features.py",
-        "--phase 1",
-        "--horizon 6",
-        "--data-contract peer_sync_h6_world_windows_v1",
-        "--legacy-policy infer",
-        '--input "$ASSEMBLY_RAW"',
-        '--input "$DOOR_RAW"',
-        '--ref "$ALLTASK_H48_REF"',
-        '--output "$SOURCE"',
-    ):
-        assert token in prepare
-    assert "[:, :, :6]" not in text
-    assert "torch.load" not in prepare
-    assert "PARENT_SOURCE" not in text
-    assert "prepare) prepare_h6_data; preflight_h6" in text
-    for mode in ("preflight", "smoke10", "pilot300", "20k", "continue20k", "resume20k"):
-        case = text.split(f"  {mode})", 1)[1].split(";;", 1)[0]
-        assert "prepare_h6_data" not in case
+    joint = _block(text, "run_joint(){", "command -v flock")
+    assert '--va-data "$VA_TRAIN_DATA" --world-data "$WORLD_TRAIN_DATA"' in joint
+    assert '--visual-world-supervision --world-split-manifest "$WORLD_SPLIT_MANIFEST"' in joint
+    assert "--va-world-mode peer_sync_h6 --planning-stride 2 --control-stride 2" in joint
+    assert "--wmrm-cycle-steps 2" in joint
+    assert "--flow-prefix-steps 2" in joint
+    assert "--task-sampling balanced" in joint
+    assert " train.py --data " not in joint
+    assert "--world-only" not in joint
+    assert "--va-only" not in joint
+    assert "--resume-weights" not in joint
+    assert 'resume_args=(--resume-exact "$RESUME_EXACT")' in joint
+    assert "SOURCE_CHECKPOINT" not in text
+    assert "run_phase" not in text
+    assert "joint) preflight; run_joint" in text
+    for legacy in ("--wam-joint", "wam_residual_fn", "JointWorldActionFlow"):
+        assert legacy not in text
 
 
-def test_preflight_requires_exact_h6_counts_identities_split_and_peer_cli() -> None:
-    preflight = _block(_text(), "preflight_h6(){", "refuse_output_family(){")
-    for token in (
-        "peer_sync_h6_world_windows_v1",
-        "'source': 891, 'train': 793, 'eval': 98",
-        "tuple(actions.shape) != (expected_counts[name], 4, 6, 4)",
-        "metadata.get('contract_version') != 1",
-        "metadata.get('action_horizon') != 6",
-        "metadata.get('logged_action_chunk') != 'full_h6'",
-        "normalization/language reference identity mismatch",
-        "raw source identities mismatch",
-        "expected_assembly_sha",
-        "expected_door_sha",
-        "expected_ref_sha",
-        "transition_mask(valid).any()",
-        "[0, 16]",
-        "manifest canonical SHA mismatch",
-        "manifest source SHA mismatch",
-        "split_manifest_sha256",
-        "from train import parse_args, validate_args",
-        "validate_args(args)",
-        "--va-world-mode', 'peer_sync_h6",
-        "--wmrm-adep-weight', '0",
-        "args.resume_weights is not None",
-        "args.resume_exact_contract_migration is not None",
-    ):
-        assert token in preflight
-
-
-def test_training_is_scratch_first_then_exact_resume_only_with_no_migrations() -> None:
-    text = _text()
-    segment = _block(text, "run_segment(){", "run_lineage(){")
-    lineage = _block(text, "run_lineage(){", "command -v flock")
-    assert "local start=0 source_checkpoint=scratch" in lineage
-    assert "first segment must start from scratch" in segment
-    assert 'resume_args=(--resume-exact "$source_checkpoint")' in segment
-    assert "continuation requires a distinct exact-resume source" in segment
-    assert "exact-resume source checkpoint was modified" in segment
-    assert "--resume-weights" not in text
-    assert "--resume-exact-contract-migration" not in segment
-    assert "--resume-exact-contract-migration" not in text[text.index('"$PY" -u -B train.py'):]
-    assert "migrations are forbidden" in text
-
-
-def test_peer_h6_training_contract_is_explicit_and_single_worker() -> None:
-    text = _text()
-    segment = _block(text, "run_segment(){", "run_lineage(){")
-    launch = text[text.index('"$PY" -u -B train.py'):]
-    assert '[[ -f "$DINO" ]] || fail "missing optional training-only DINO checkpoint' in segment
-    assert '"$DINO"' not in text.split("prepare_h6_data(){", 1)[0].split("for path in", 1)[1].split("done", 1)[0]
-    assert "--phase 2" not in text
-    assert "--st-npy" not in text
-    assert "--st-meta" not in text
-    for token in (
-        "--va-world-mode peer_sync_h6",
-        "--wmrm-adep-weight 0",
-        "--wmrm-cycle-steps 6",
-        "--flow-prefix-steps 6",
-        "--wmrm-inject all",
-        "--num-workers 0",
-        "--visual-world-supervision",
-        "--world-split-manifest \"$SPLIT_MANIFEST\"",
-    ):
-        assert token in launch
-    verify = _block(text, "verify_checkpoint(){", "milestone(){")
-    assert "config.get('va_world_mode') != 'peer_sync_h6'" in verify
-    assert "config.get('action_horizon') != 6" in verify
-    assert "arguments.get('num_workers') != 0" in verify
-    assert "arguments.get('wmrm_adep_weight') != 0.0" in verify
-
-
-def test_milestones_are_immutable_and_short_modes_stop_short() -> None:
-    text = _text()
-    assert "refusing to overwrite immutable output family" in text
-    assert "refusing to overwrite immutable milestone" in text
-    smoke = text.split("  smoke10)", 1)[1].split(";;", 1)[0]
-    pilot = text.split("  pilot300)", 1)[1].split(";;", 1)[0]
-    formal = text.split("  20k)", 1)[1].split(";;", 1)[0]
-    assert 'run_lineage "$run_id" 10' in smoke
-    assert "20000" not in smoke
-    assert 'run_lineage "$run_id" 50 300' in pilot
-    assert "20000" not in pilot
-    assert 'run_lineage "$run_id" "${GATE_STEPS[@]}" 20000' in formal
-    assert "no automatic long continuation" in smoke
-    assert "STOP at 300" in pilot
-
-
-def test_continue20k_resumes_pilot300_with_immutable_milestones() -> None:
-    text = _text()
-    continuation = text.split("  continue20k)", 1)[1].split(";;", 1)[0]
-    assert '[[ "$BATCH" == 3 ]]' in continuation
-    assert "pilot300 exact continuation requires batch-size 3" in continuation
-    assert "run_id=${FAMILY}.pilot300_continue20k" in continuation
-    assert 'source_checkpoint=$(milestone "${FAMILY}.pilot300" 300)' in continuation
-    assert 'verify_checkpoint "$source_checkpoint" 300' in continuation
-    assert "CONTINUE_STEPS=(1000 3000 6000 9000 12000 15000 18000 20000)" in text
-    assert 'for target in "${CONTINUE_STEPS[@]}"' in continuation
-    assert 'run_segment "$run_id" "$start" "$target" "$source_checkpoint"' in continuation
-    assert "scratch" not in continuation
-    assert "prepare_h6_data" not in continuation
-
-
-def test_checkpoint_verifier_is_cpu_isolated_and_resume20k_starts_at_1000() -> None:
-    text = _text()
-    assert "VERIFY_PY=${VERIFY_PY:-/home/ryan/.venvs/pytorch-gpu/bin/python}" in text
-    verify = _block(text, "verify_checkpoint(){", "milestone(){")
-    assert '"$VERIFY_PY" -B - "$checkpoint"' in verify
-    resume = text.split("  resume20k)", 1)[1].split(";;", 1)[0]
-    assert 'run_id=${FAMILY}.pilot300_continue20k' in resume
-    assert 'source_checkpoint=$(milestone "$run_id" 1000)' in resume
-    assert 'verify_checkpoint "$source_checkpoint" 1000' in resume
-    assert "start=1000" in resume
-    assert "for target in 3000 6000 9000 12000 15000 18000 20000" in resume
-    assert 'run_segment "$run_id" "$start" "$target" "$source_checkpoint"' in resume
-    assert "refuse_output_family" not in resume
-    assert "scratch" not in resume
+def test_checkpoint_contract_records_joint_gradient_and_data_protocol() -> None:
+    block = _block(_text(), "checkpoint_contract(){", "require_no_active_train(){")
+    assert '"peer_world_topology": "one_stage_delayed_bidirectional_state_kv_v1"' in block
+    assert '"peer_training_mode": "joint_dual_stream"' in block
+    assert '"peer_gradient_boundary": "fully_differentiable_bidirectional_messages_v1"' in block
+    assert '"peer_data_isolation": "separate_va_world_episode_datasets_per_step_v1"' in block
+    assert '"peer_dual_stream_optimizer": "va_backward_then_world_backward_one_optimizer_step_v1"' in block
+    assert '"peer_va_data_identity"' in block
+    assert '"peer_world_data_identity"' in block
+    assert '"peer_data_isolation_summary"' in block
+    assert 'identity.get("full_file_sha256")' in block
+    assert 'summary.get("task_ids") != [0, 16]' in block
+    assert '"planning_stride": (config.get("planning_stride"), 2)' in block
+    assert '"wmrm_cycle_steps": (config.get("wmrm_cycle_steps"), 2)' in block
+    assert '"contract": "peer_sync_h6_p2_world_windows_v1"' in block
+    assert '"fps": 80' in block
+    assert '"control_stride": 2' in block
+    assert '"planning_stride": 2' in block
+    assert '"decision_offsets": [0, 2, 4, 6]' in block
+    assert '"flow_prefix_steps": 2' in block
