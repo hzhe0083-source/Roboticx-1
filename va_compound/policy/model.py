@@ -91,6 +91,8 @@ class VACompoundConfig:
     wmrm: bool = False
     wmrm_world_dim: int = 8
     # all = 每层更新 World state；last = 仅末层；even = 奇数层+末层。
+    # peer_sync_h6 still requires this flag to be "all", but World is one
+    # layer shorter: propose on VA layers 0..N-2, last VA layer consumes only.
     wmrm_inject: str = "all"
     # dino: 预测下一决策 DINO/投影 feature；vjepa: 下一决策 H11 池化；metric: 旧几何。
     wmrm_target: str = "dino"
@@ -107,6 +109,7 @@ class VACompoundConfig:
     wmrm_predictor_heads: int = 12
     # VA↔World execution topology. ``peer_sync_h6`` uses one pre-stage
     # snapshot for both state transitions and a deterministic H6 executable readout.
+    # World has N-1 stages so the last VA layer reads the final DINO map.
     va_world_mode: str = "legacy"  # "legacy" | "peer_sync_h6"
     # 顺序式 A→V→A 耦合（2026-08-07 审阅落地④）：每 N 层使用
     # proposal→reorganize→correction 三遍注意力；0 = 全层同步联合（旧行为）。
@@ -365,8 +368,21 @@ class VACompoundConfig:
                 )
             if self.action_dim != 4:
                 raise ValueError("peer_sync_h6 requires action_dim=4")
+            if self.num_layers < 2:
+                raise ValueError(
+                    "peer_sync_h6 requires num_layers >= 2 so World can be one "
+                    "layer shorter than VA"
+                )
             if self.wmrm_inject != "all":
                 raise ValueError("peer_sync_h6 requires wmrm_inject=all")
+
+    def wmrm_stage_count(self) -> int:
+        """World ``propose()`` steps per encode. Peer is one shorter than VA."""
+        if not self.wmrm:
+            return 0
+        if self.va_world_mode == "peer_sync_h6":
+            return self.num_layers - 1
+        return self.num_layers
 
 
 @dataclass(frozen=True)
@@ -2000,7 +2016,7 @@ class VACompoundPolicy(nn.Module):
                     predictor_depth=config.wmrm_predictor_depth,
                     predictor_width=config.wmrm_predictor_width,
                     predictor_heads=config.wmrm_predictor_heads,
-                    max_stages=config.num_layers,
+                    max_stages=config.wmrm_stage_count(),
                 )
         else:
             self.wmrm = None
@@ -2330,6 +2346,8 @@ class VACompoundPolicy(nn.Module):
 
     def _wmrm_inject_layers(self) -> set[int]:
         n_layers = len(self.layers)
+        if self.config.va_world_mode == "peer_sync_h6":
+            return set(range(n_layers - 1))
         mode = self.config.wmrm_inject
         if mode == "last":
             return {n_layers - 1}
@@ -2699,6 +2717,9 @@ class VACompoundPolicy(nn.Module):
                 # Peer inputs always expose one complete causal/logged H6 action
                 # belief.  World advances only through the actually executable
                 # H[:P] prefix, so its target is the state P steps later.
+                # Propose uses this VA layer's snapshot; the next VA layer reads
+                # the new map. The last VA layer is not in inject_layers, so it
+                # consumes the final world map and does not open another stage.
                 if peer_mode:
                     full_env_action = (
                         self.world_action_readout(snapshot_action)

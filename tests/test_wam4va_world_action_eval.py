@@ -361,7 +361,7 @@ def test_checkpoint_world_contract_requires_peer_topology_and_action_source() ->
             "world_supervision": "visual_motion_v1",
             "world_logged_branch": "matched_context_full_forward_v1",
             "va_world_mode": "peer_sync_h6",
-            "peer_world_topology": "one_stage_delayed_bidirectional_state_kv_v1",
+            "peer_world_topology": "one_stage_delayed_world_minus_one_last_va_consume_v1",
             "peer_world_action_source": (
                 "deterministic_readout_main_explicit_env_override_supervision_v1"
             ),

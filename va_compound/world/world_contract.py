@@ -34,9 +34,38 @@ WORLD_LOSS_COMPONENT_WEIGHTS = {
 }
 WORLD_STAGE_AUXILIARY_DECAY = 0.25
 WORLD_STAGE_AUXILIARY_FLOOR = 0.1
+WORLD_LATE_STAGE_ANCHOR_SOURCE = "visual_plus_no_regression_objective"
+WORLD_LATE_STAGE_ANCHOR_STAGE_WEIGHTS = {
+    5: 0.5,
+    6: 1.0,
+}
+
+
+def world_late_stage_anchor_contract(weight: float = 0.0) -> dict[str, object]:
+    """Extra S5/S6 objective that is added after the normalized stage mean.
+
+    The default weight is 0 so existing exact-resume checkpoints keep the old
+    loss graph. A positive weight does not renormalize S7's share of
+    ``objective_world_loss``.
+    """
+
+    return {
+        "weight": float(weight),
+        "stage_weights": dict(WORLD_LATE_STAGE_ANCHOR_STAGE_WEIGHTS),
+        "source": WORLD_LATE_STAGE_ANCHOR_SOURCE,
+    }
+
+
+WORLD_LATE_STAGE_ANCHOR = world_late_stage_anchor_contract(0.0)
 WORLD_LOGGED_BRANCH_CONTRACT = "matched_context_full_forward_v1"
 WORLD_ACTION_DONOR_CONTRACT = "train_split_task_cross_episode_proprio_nearest_v1"
-PEER_WORLD_TOPOLOGY_CONTRACT = "one_stage_delayed_bidirectional_state_kv_v1"
+# VA has N layers; World proposes on layers 0..N-2. The last VA layer only
+# consumes the final world map (DINO MSE + next-decision handoff). The old
+# equal-depth contract left the last VA layer reading S_{N-2} while World
+# still produced an unseen S_{N-1} after action_condition.
+PEER_WORLD_TOPOLOGY_CONTRACT = (
+    "one_stage_delayed_world_minus_one_last_va_consume_v1"
+)
 PEER_WORLD_ACTION_SOURCE_CONTRACT = "deterministic_readout_main_explicit_env_override_supervision_v1"
 PEER_GRADIENT_BOUNDARY_CONTRACT = "fully_differentiable_bidirectional_messages_v1"
 PEER_DATA_ISOLATION_CONTRACT = "separate_va_world_episode_datasets_per_step_v1"
@@ -413,10 +442,22 @@ def validate_visual_world_resume_contract(
     migration_id: str | None = None,
     va_world_mode: str = "legacy",
     planning_stride: int = 6,
+    late_stage_anchor_weight: float = 0.0,
+    stage_weight_overrides: dict[int, float] | None = None,
 ) -> None:
     """Reject exact continuation from an old or differently split loss graph."""
 
-    contract = checkpoint.get("training_contract") or {}
+    from va_compound.world_supervision import canonical_stage_weight_overrides
+
+    contract = dict(checkpoint.get("training_contract") or {})
+    if "world_late_stage_anchor" not in contract:
+        contract["world_late_stage_anchor"] = world_late_stage_anchor_contract(0.0)
+    if "world_stage_weight_overrides" not in contract:
+        contract["world_stage_weight_overrides"] = {}
+    else:
+        contract["world_stage_weight_overrides"] = canonical_stage_weight_overrides(
+            contract.get("world_stage_weight_overrides")
+        )
     expected = {
         "world_supervision": WORLD_SUPERVISION_CONTRACT,
         "world_transition": (
@@ -427,6 +468,12 @@ def validate_visual_world_resume_contract(
         "world_loss_weights": WORLD_LOSS_COMPONENT_WEIGHTS,
         "world_stage_auxiliary_decay": WORLD_STAGE_AUXILIARY_DECAY,
         "world_stage_auxiliary_floor": WORLD_STAGE_AUXILIARY_FLOOR,
+        "world_stage_weight_overrides": canonical_stage_weight_overrides(
+            stage_weight_overrides
+        ),
+        "world_late_stage_anchor": world_late_stage_anchor_contract(
+            late_stage_anchor_weight
+        ),
         "world_no_regression": WORLD_NO_REGRESSION,
         "world_static_copy_constraint": {
             **WORLD_STATIC_COPY_CONSTRAINT,

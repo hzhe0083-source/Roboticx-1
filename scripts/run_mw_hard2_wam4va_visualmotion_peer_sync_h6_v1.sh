@@ -22,7 +22,8 @@ DATA_TAG=${DATA_TAG:-v1}
 # Resident decoded-task budget; empty keeps train.py's own default.
 DECODE_CACHE_TASKS=${DECODE_CACHE_TASKS:-}
 # 1 = single process; >1 launches torchrun over that many local GPUs.  Global
-# --batch-size is split across ranks (48 on 2 GPUs is 24 per card).
+# --batch-size is split across ranks. Dual L20 (~48GB) held 24/card (global 48).
+# Dual RTX 4090 (24GB) cannot; start at global 16 (8/card) and raise if VRAM allows.
 NGPUS=${NGPUS:-1}
 SOURCE=data/hard2_peer_h6_p2_source_${DATA_TAG}.pt
 WORLD_POOL=data/hard2_peer_h6_p2_world_pool_${DATA_TAG}.pt
@@ -38,6 +39,15 @@ MODE=${1:-}
 STEPS=${2:-}
 BATCH=${3:-3}
 RESUME_EXACT=${RESUME_EXACT:-}
+RESUME_WEIGHTS=${RESUME_WEIGHTS:-}
+# Empty keeps the default floor/decay schedule for the live World depth
+# (peer: 7 stages → [0.1×5, 0.25, 1.0]). Optional S5/S6 overrides still
+# index by stage number; last stage is 6 after the N-1 cut.
+WMRM_STAGE_S5_WEIGHT=${WMRM_STAGE_S5_WEIGHT:-}
+WMRM_STAGE_S6_WEIGHT=${WMRM_STAGE_S6_WEIGHT:-}
+WMRM_LATE_STAGE_ANCHOR_WEIGHT=${WMRM_LATE_STAGE_ANCHOR_WEIGHT:-}
+LR_WMRM_PREDICTOR=${LR_WMRM_PREDICTOR:-}
+WMRM_PREDICTOR_GRAD_CLIP=${WMRM_PREDICTOR_GRAD_CLIP:-}
 RUN_ID=${RUN_ID:-}
 SAVE_EVERY=${SAVE_EVERY:-1500}
 CHECKPOINT_DIR=${CHECKPOINT_DIR:-checkpoints}
@@ -182,7 +192,7 @@ payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
 contract = payload.get("training_contract") or {}
 required = {
     "peer_training_mode": "joint_dual_stream",
-    "peer_world_topology": "one_stage_delayed_bidirectional_state_kv_v1",
+    "peer_world_topology": "one_stage_delayed_world_minus_one_last_va_consume_v1",
     "peer_gradient_boundary": "fully_differentiable_bidirectional_messages_v1",
     "peer_data_isolation": "separate_va_world_episode_datasets_per_step_v1",
     "peer_dual_stream_optimizer": "va_backward_then_world_backward_one_optimizer_step_v1",
@@ -288,10 +298,31 @@ PY
 run_joint(){
   local run_id=${RUN_ID:-${FAMILY}.scratch.s${STEPS}}
   local save=${CHECKPOINT_DIR}/${run_id}.pt log=logs/${run_id}.log
-  local resume_args=()
+  local resume_args=() extra_args=()
+  if [[ -n "$RESUME_EXACT" && -n "$RESUME_WEIGHTS" ]]; then
+    fail 'RESUME_EXACT and RESUME_WEIGHTS are mutually exclusive'
+  fi
   if [[ -n "$RESUME_EXACT" ]]; then
     [[ -f "$RESUME_EXACT" ]] || fail "missing exact-resume checkpoint: $RESUME_EXACT"
     resume_args=(--resume-exact "$RESUME_EXACT")
+  elif [[ -n "$RESUME_WEIGHTS" ]]; then
+    [[ -f "$RESUME_WEIGHTS" ]] || fail "missing weights-only checkpoint: $RESUME_WEIGHTS"
+    resume_args=(--resume-weights "$RESUME_WEIGHTS")
+  fi
+  if [[ -n "$WMRM_STAGE_S5_WEIGHT" ]]; then
+    extra_args+=(--wmrm-stage-s5-weight "$WMRM_STAGE_S5_WEIGHT")
+  fi
+  if [[ -n "$WMRM_STAGE_S6_WEIGHT" ]]; then
+    extra_args+=(--wmrm-stage-s6-weight "$WMRM_STAGE_S6_WEIGHT")
+  fi
+  if [[ -n "$WMRM_LATE_STAGE_ANCHOR_WEIGHT" ]]; then
+    extra_args+=(--wmrm-late-stage-anchor-weight "$WMRM_LATE_STAGE_ANCHOR_WEIGHT")
+  fi
+  if [[ -n "$LR_WMRM_PREDICTOR" ]]; then
+    extra_args+=(--lr-wmrm-predictor "$LR_WMRM_PREDICTOR")
+  fi
+  if [[ -n "$WMRM_PREDICTOR_GRAD_CLIP" ]]; then
+    extra_args+=(--wmrm-predictor-grad-clip "$WMRM_PREDICTOR_GRAD_CLIP")
   fi
   local frame_args=(--longtraj-dir "$FRAMES_DIR")
   if [[ -n "$DECODE_CACHE_TASKS" ]]; then
@@ -333,7 +364,7 @@ run_joint(){
     --mtvj-train-relation --lr-mtvj-relation 0.00002 \
     --mtvj-visual-aux-every 10 --mtvj-visual-aux-batch 8 \
     --steps "$STEPS" --save-every "$SAVE_EVERY" --save-step-copies --save "$save" \
-    "${frame_args[@]}" "${resume_args[@]}" 2>&1 | tee "$log"
+    "${frame_args[@]}" "${resume_args[@]}" "${extra_args[@]}" 2>&1 | tee "$log"
   checkpoint_contract "$save"
 }
 

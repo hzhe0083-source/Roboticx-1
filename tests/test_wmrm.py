@@ -841,6 +841,112 @@ def test_cli_wam4va_uses_state_exchange_without_writeback_flags() -> None:
     assert not hasattr(args, "wmrm_pi_kl_weight")
 
 
+def test_cli_late_stage_anchor_defaults_off_and_requires_visual_world() -> None:
+    from train import parse_args, validate_args
+
+    assert parse_args([]).wmrm_late_stage_anchor_weight == 0.0
+    assert parse_args([]).wmrm_stage_s5_weight is None
+    assert parse_args([]).wmrm_stage_s6_weight is None
+    assert parse_args([]).lr_wmrm_predictor is None
+    assert parse_args([]).wmrm_predictor_grad_clip is None
+    args = parse_args(
+        ["--wam4va", "--wmrm-late-stage-anchor-weight", "0.25"]
+    )
+    with pytest.raises(ValueError, match="visual-world-supervision"):
+        validate_args(args)
+    ok = parse_args(
+        [
+            "--wam4va",
+            "--visual-world-supervision",
+            "--wmrm-late-stage-anchor-weight",
+            "0.25",
+            "--lr-wmrm-predictor",
+            "3e-5",
+            "--wmrm-predictor-grad-clip",
+            "0.5",
+        ]
+    )
+    assert ok.wmrm_late_stage_anchor_weight == 0.25
+    assert ok.lr_wmrm_predictor == pytest.approx(3e-5)
+    assert ok.wmrm_predictor_grad_clip == pytest.approx(0.5)
+    weights = parse_args(
+        [
+            "--wam4va",
+            "--visual-world-supervision",
+            "--wmrm-stage-s5-weight",
+            "0.5",
+            "--wmrm-stage-s6-weight",
+            "1.0",
+        ]
+    )
+    from train import visual_world_stage_weight_overrides
+    from va_compound.world_supervision import stage_supervision_weights
+
+    assert visual_world_stage_weight_overrides(weights) == {5: 0.5, 6: 1.0}
+    assert stage_supervision_weights(
+        8, overrides=visual_world_stage_weight_overrides(weights)
+    ) == (0.1, 0.1, 0.1, 0.1, 0.1, 0.5, 1.0, 1.0)
+
+
+def test_feature_optimizer_groups_can_give_st_predictor_its_own_lr() -> None:
+    from argparse import Namespace
+
+    from train import _feature_optimizer_groups
+
+    model = VACompoundPolicy(_tiny_spatial_config())
+    groups = _feature_optimizer_groups(
+        Namespace(
+            wmrm_only=False,
+            va_only=False,
+            lr=1e-4,
+            lr_wmrm_predictor=3e-5,
+            action_vision_only=False,
+            head_only=False,
+            servo_only=False,
+        ),
+        model,
+        None,
+    )
+    predictor_ids = {
+        id(parameter)
+        for name, parameter in model.named_parameters()
+        if name.startswith("wmrm.st_predictor.")
+    }
+    assert predictor_ids
+    grouped_ids = [id(parameter) for group in groups for parameter in group["params"]]
+    assert len(grouped_ids) == len(set(grouped_ids))
+    predictor_group = next(group for group in groups if group["lr"] == pytest.approx(3e-5))
+    assert {id(parameter) for parameter in predictor_group["params"]} == predictor_ids
+    other_ids = {
+        id(parameter)
+        for group in groups
+        if group is not predictor_group
+        for parameter in group["params"]
+    }
+    assert predictor_ids.isdisjoint(other_ids)
+
+
+def test_predictor_gradient_clip_does_not_overlap_main_clip() -> None:
+    from train import (
+        clip_main_and_optional_predictor_gradients,
+        named_trainable_parameters,
+    )
+
+    model = VACompoundPolicy(_tiny_spatial_config())
+    named = list(named_trainable_parameters(("model", model)))
+    for _, parameter in named:
+        parameter.grad = torch.ones_like(parameter)
+    main_norm, predictor_norm = clip_main_and_optional_predictor_gradients(
+        named, predictor_max_norm=0.5, main_max_norm=1.0
+    )
+    assert predictor_norm is not None
+    assert main_norm >= 0.0
+    predictor_names = [
+        name for name, _ in named if ".wmrm.st_predictor." in name
+    ]
+    assert predictor_names
+
+
 def test_peer_joint_optimizer_keeps_va_world_and_flow_trainable() -> None:
     from argparse import Namespace
 

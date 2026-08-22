@@ -2358,7 +2358,7 @@ def main() -> None:
     ):
         required_p2_contract = {
             "peer_training_mode": "joint_dual_stream",
-            "peer_world_topology": "one_stage_delayed_bidirectional_state_kv_v1",
+            "peer_world_topology": "one_stage_delayed_world_minus_one_last_va_consume_v1",
             "peer_gradient_boundary": "fully_differentiable_bidirectional_messages_v1",
             "peer_data_isolation": "separate_va_world_episode_datasets_per_step_v1",
             "peer_dual_stream_optimizer": (

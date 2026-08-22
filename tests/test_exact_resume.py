@@ -1139,6 +1139,17 @@ def test_visual_world_exact_resume_binds_fixed_action_donors() -> None:
     }
     checkpoint = {"training_contract": contract}
     validate_visual_world_resume_contract(checkpoint, identity)
+    validate_visual_world_resume_contract(
+        checkpoint, identity, late_stage_anchor_weight=0.0
+    )
+    with pytest.raises(ValueError, match="world_late_stage_anchor"):
+        validate_visual_world_resume_contract(
+            checkpoint, identity, late_stage_anchor_weight=0.25
+        )
+    with pytest.raises(ValueError, match="world_stage_weight_overrides"):
+        validate_visual_world_resume_contract(
+            checkpoint, identity, stage_weight_overrides={5: 0.5, 6: 1.0}
+        )
 
     peer_contract = {
         **contract,

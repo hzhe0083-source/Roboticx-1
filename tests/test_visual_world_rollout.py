@@ -389,12 +389,11 @@ def test_peer_world_rollout_uses_one_logged_encode_per_decision() -> None:
     )
 
     assert encode_calls == batch["actions"].shape[1]
-    assert len(proposal_actions) == (
-        batch["actions"].shape[1] * model.config.num_layers
-    )
+    stages = model.config.wmrm_stage_count()
+    assert len(proposal_actions) == batch["actions"].shape[1] * stages
     for time_index in range(batch["actions"].shape[1]):
-        start = time_index * model.config.num_layers
-        stage_actions = proposal_actions[start : start + model.config.num_layers]
+        start = time_index * stages
+        stage_actions = proposal_actions[start : start + stages]
         assert all(
             torch.equal(action, batch["actions"][:, time_index, :6])
             for action in stage_actions

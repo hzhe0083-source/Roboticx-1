@@ -1,53 +1,84 @@
-# ORA0 — VA-World 视觉动作模型
+# ORA0
 
-MetaWorld 视觉-动作策略：**VA（Vision-Action）流 + World 流（WAM4VA）** 通过 peer-sync 双向交换，动作由 Flow Matching 解码。主视觉为冻结 DINOv2。
+ORA0 is a vision–action policy for MetaWorld manipulation. A bidirectional
+Vision–Action (VA) stack is coupled, layer by layer, to a World Action Model
+(WAM4VA). The two peers exchange delayed state; only the VA flow-matching head
+emits physical actions. The main visual encoder is a frozen DINOv2 ViT-L.
 
-当前主线是 **hard2**（`assembly-v3` + `door-unlock-v3`），不是 50 任务全量 MetaWorld。语言表来自 49 任务参考构建，另外 47 个任务没有训练信号。
+The current experimental line is **hard2**: `assembly-v3` and
+`door-unlock-v3`. Language tables are built from a 49-task MetaWorld
+reference; the remaining 47 tasks contribute no training signal.
 
-## 架构
+## Architecture
 
-- **VA 流**：双向 Transformer（`bidir_va`），语言条件 + 视觉记忆，8 层。
-- **World 流（WAM4VA）**：`peer_sync_h6`，在 VA 的 8 层之间逐层交换。World 用 `belief` / `world_map` 两个循环状态预测未来 DINO 特征图，把 `world_message` 作为 K/V 注入下一层 VA。
-- **动作解码**：条件 Flow Matching（8 步 Euler），前 2 步 weight 1.0、后 4 步 weight 0.036。
-- **World 监督**：DINO map 回归 + 静态区约束 + 动作排序（`--world-action-rank-stage final`）。早期 stage 监督有下限 `floor=0.1`。
+Control runs at 80 Hz. Planning stride 2 yields a 40 Hz decision rate. Each
+decision predicts a full H6 action chunk (`action_dim=4`); only the first two
+steps are executed and consumed by the world transition (`d → d+2`).
 
-## 世界状态
+**Vision–Action.** An eight-layer bidirectional transformer
+(`bidir_va`) conditions on language keys, visual tokens, proprioception, and a
+recurrent visual memory. The action decoder is an AdaLN flow-matching head
+(six residual blocks, eight Euler steps). Prefix steps 0–1 have weight 1.0;
+the four tail steps have weight 0.036.
 
-两条流行为不同：
+**World (WAM4VA).** Under `peer_sync_h6`, the world model occupies the same
+eight stages. At stage \(i\) both peers read the committed snapshot from stage
+\(i-1\) (one-stage delay). The world predictor publishes `world_message`
+tokens that the next VA layer consumes as attention K/V. It does not write a
+correction onto VA visual or action outputs.
 
-- **感知流 `world_map`**：每个决策点的 stage 0 重锚到**当前真实 DINO 最后一帧**，只在该决策点内部的 8 个 stage 上做残差细化。评测再加 `--world-reset-every 4`，与训练窗口对齐。
-- **认知流 `belief`**：跨决策点持续。写入是门控凸组合（`_gate_fuse`）再加 RMSNorm，梯度打通，让「该记什么」可学。固定常数收缩（`retention=0.9`）实测有害，已回退。
+**Coupling contract.** Messages are fully differentiable in both directions.
+Each optimizer step uses one VA batch and one World batch from disjoint
+episodes, runs VA backward then World backward, and takes a single AdamW
+update.
 
-## 目录结构
+## Recurrent world state
 
-`va_compound/` 按功能域分子包，顶层保留向后兼容 shim（旧 `from va_compound.X import` 仍可用）：
+WAM maintains two recurrent tensors with distinct lifetimes.
+
+| Stream | Tensor | Persistence |
+| --- | --- | --- |
+| Perceptual | `world_map` | Re-anchored at stage 0 of every decision onto the last frame of the current DINO clip. Stages 1–7 refine the residual inside that decision only. |
+| Cognitive | `belief` | Persists across decisions. Writes are a per-channel gated convex combination followed by RMSNorm. Stage embeddings are added at read time and are not stored in the bank. |
+
+Auxiliary stage losses decay as \(0.25^{7-i}\) with a floor of 0.1, so early
+maps published into VA layers 0–4 remain supervised. Closed-loop evaluation
+resets world state every four decisions (`--world-reset-every 4`) to match the
+training unroll of `sequence_length=4`.
+
+## Data
+
+Windows follow the `peer_sync_h6_p2_world_windows_v1` contract: T4 / H6 / A4.
+VA and World episodes are disjoint. Frame pointers are addressed by
+`(environment name, in-file episode index)`. Expansion shards must be merged
+into one long-trajectory file per task (`scripts/merge_longtraj_expansion.py`)
+before phase-1 feature construction; passing extra shard files as additional
+`--input` arguments collides with base-set indices.
+
+| Family | Contents |
+| --- | --- |
+| `DATA_TAG=v1` | Original hard2 split (approximately 15 VA episodes per task) |
+| `DATA_TAG=v2` | Expanded split (270 VA episodes, 216 World episodes) |
+| `FRAMES_DIR` | One `metaworld_longtraj_<env>.pt` per task; v2 uses `data/frames_v2` |
+
+## Layout
+
+`va_compound/` is partitioned by domain. Top-level shims preserve
+`from va_compound.X import …`.
 
 ```
 va_compound/
-├── policy/    model.py（VACompoundPolicy）, end_to_end.py
-├── world/     wmrm.py（WAM4VA）, world_supervision.py, world_contract.py
-├── vision/    backbones.py, live_vjepa.py, metric_roi.py,
-│              metric_visual_head.py, fovea.py, longtraj_frames.py
-├── control/   servo.py, local_control_slots.py
-├── utils/     exact_resume.py, flow.py, statistics.py
-└── data_parallel.py   双卡：两次 backward 之后手动 allreduce 梯度
+├── policy/     VACompoundPolicy, end-to-end assembly
+├── world/      WAM4VA, supervision, peer contracts
+├── vision/     DINOv2 / V-JEPA backbones, metric ROI, frame cache
+├── control/    residual servo, local control slots
+├── utils/      exact resume, flow matching, statistics
+└── data_parallel.py   post-backward gradient allreduce (do not wrap DDP)
 ```
 
-## 数据
+## Setup
 
-peer_sync_h6 窗口是 T4/H6/A4（`sequence_length=4`、`action_horizon=6`、`action_dim=4`）。VA 与 World 使用**不相交的 episode**。
-
-帧指针按 `(任务名, 文件内 episode 下标)` 寻址。扩产分片必须先合成**每任务一个** longtraj 文件（`scripts/merge_longtraj_expansion.py`），不能把多个 shard 当作额外 `--input` 喂给 phase 1，否则下标会撞到基础集的同一条轨迹。
-
-| 家族 | 含义 |
-|------|------|
-| `DATA_TAG=v1` | 原始 hard2 切分（每任务约 15 条 VA episode） |
-| `DATA_TAG=v2` | 扩产合并后的切分（VA 270 / World 216 条 episode） |
-| `FRAMES_DIR` | 每任务一个 `metaworld_longtraj_<env>.pt` 的目录；v2 用 `data/frames_v2` |
-
-## 运行
-
-用环境变量覆盖解释器和权重路径；不要写死本机 venv。
+Do not hard-code a local virtualenv. Override interpreter and weight paths:
 
 ```bash
 export PY=/opt/conda/bin/python
@@ -55,46 +86,67 @@ export VERIFY_PY=$PY
 export DINO=/path/to/dinov2_vitl14_reg4.safetensors
 ```
 
-### 单卡
+Python dependencies are listed in `requirements.txt` (`torch>=2.4`). Closed-loop
+evaluation additionally requires MetaWorld, MuJoCo, and OSMesa when `/dev/dri`
+is unavailable. `libOSMesa` must match host glibc (an Ubuntu 22.04 container
+cannot load a 24.04-built shared object).
 
-L20（45 GiB）能稳住的是 **batch 24**。36 会 OOM。
+## Training
+
+```bash
+bash scripts/run_mw_hard2_wam4va_visualmotion_peer_sync_h6_v1.sh {prepare|preflight|joint} [steps] [batch-size]
+```
+
+| Mode | Role |
+| --- | --- |
+| `prepare` | Build the immutable split, then run contract checks |
+| `preflight` | Validate data identities, peer topology, and resume contracts |
+| `joint` | Preflight, then train |
+
+`num_workers` is 0: decoded frames reside in host memory, and forking would
+duplicate that cache. On an NVIDIA L20 (45 GiB), the stable per-GPU batch is
+24; 36 out-of-memorys.
+
+**Single GPU**
 
 ```bash
 DATA_TAG=v2 FRAMES_DIR=data/frames_v2 DECODE_CACHE_TASKS=2 \
   bash scripts/run_mw_hard2_wam4va_visualmotion_peer_sync_h6_v1.sh joint 30000 24
 ```
 
-### 双卡（全局 batch 48 = 每卡 24）
+**Two GPUs (global batch 48 = 24 per card)**
 
-不要包 `DistributedDataParallel`：peer 一步是 VA backward 再 World backward，DDP 会在第一次 backward 结束时做 allreduce，VA 独有梯度永远不同步。`va_compound/data_parallel.py` 在两次 backward 都结束后手动平均梯度。
+Do not wrap the model in `DistributedDataParallel`. A peer step performs two
+sequential backwards; DDP would allreduce after the first, leaving VA-only
+gradients rank-local. `va_compound/data_parallel.py` averages optimizer-visible
+gradients once, after both backwards. `--batch-size` is the global batch and
+must be divisible by the number of GPUs.
 
 ```bash
-# 25 epoch ≈ 5450 步（VA 10471 窗口 / 48）
+# 25 epochs ≈ 5450 steps (10471 VA windows / 48)
 DATA_TAG=v2 FRAMES_DIR=data/frames_v2 DECODE_CACHE_TASKS=1 NGPUS=2 \
   SAVE_EVERY=436 CHECKPOINT_DIR=/path/to/local/ckpts \
   bash scripts/run_mw_hard2_wam4va_visualmotion_peer_sync_h6_v1.sh joint 5450 48
 ```
 
-`MODE`：`prepare`（数据准备）、`preflight`（契约校验）、`joint`（训练）。双卡时 `--batch-size` 是**全局** batch，必须能被 GPU 数整除。`num_workers` 必须为 0（解码帧常驻内存，fork 会翻倍拷贝）。
+## Evaluation
 
-### 评测（闭环，10 trials/task）
+Closed loop, 10 trials per task, 40 Hz execution (`planning_stride` =
+`execution_horizon` = `wmrm_cycle_steps` = 2). Checkpoints that are not
+joint dual-stream P2/H6 are rejected.
 
 ```bash
 MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
   bash scripts/eval_mw_hard2_wam4va.sh <checkpoint.pt> data/hard2_peer_h6_p2_eval_v2.pt
 ```
 
-`eval_metaworld.py` 默认 `--world-reset-every 4`。无 `/dev/dri` 的容器用 OSMesa；`libOSMesa` 必须与主机 glibc 匹配（Ubuntu 22.04 不能加载 24.04 编出来的 `.so`）。
+`eval_metaworld.py` defaults `--world-reset-every` to 4. That alignment is a
+distribution match to the training unroll, not evidence that unbounded
+world memory has been learned.
 
-### 测试
+## Tests
 
 ```bash
 MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
   "$PY" -m pytest tests/ -q --ignore=tests/test_recovery_param.py
 ```
-
-## 当前主线
-
-- 训练：`scripts/run_mw_hard2_wam4va_visualmotion_peer_sync_h6_v1.sh`（v2 数据，双卡 batch 48）
-- 评测：`eval_metaworld.py`（闭环，`--world-reset-every 4`）
-- 数据：`data/hard2_peer_h6_p2_*_v2.pt` + `data/frames_v2/`

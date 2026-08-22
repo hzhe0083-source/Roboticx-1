@@ -180,11 +180,42 @@ def masked_reduction(
     return numerator / denominator.clamp_min(torch.finfo(numerator.dtype).eps)
 
 
+def canonical_stage_weight_overrides(
+    overrides: dict[int, float] | None,
+) -> dict[int, float]:
+    """Normalize override keys to ints so contracts compare cleanly."""
+    if not overrides:
+        return {}
+    return {int(index): float(value) for index, value in overrides.items()}
+
+
+def apply_stage_weight_overrides(
+    weights: tuple[float, ...],
+    overrides: dict[int, float] | None,
+) -> tuple[float, ...]:
+    """Replace selected stage weights after the decay/floor schedule."""
+    resolved_overrides = canonical_stage_weight_overrides(overrides)
+    if not resolved_overrides:
+        return weights
+    resolved = list(weights)
+    for index, value in resolved_overrides.items():
+        if index < 0 or index >= len(resolved):
+            raise ValueError(
+                f"stage weight override index {index} is outside "
+                f"0..{max(len(resolved) - 1, 0)}"
+            )
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError("stage weight overrides must be finite and non-negative")
+        resolved[index] = value
+    return tuple(resolved)
+
+
 def stage_supervision_weights(
     num_stages: int,
     *,
     auxiliary_decay: float = 0.25,
     floor: float = 0.1,
+    overrides: dict[int, float] | None = None,
 ) -> tuple[float, ...]:
     """Final refinement has weight 1; earlier auxiliary stages decay to ``floor``.
 
@@ -192,6 +223,10 @@ def stage_supervision_weights(
     were effectively unsupervised.  Measured log-weight vs log-error Pearson
     r = -0.868: unweighted stages diverged to 3000x copy error and those
     maps were still published into VA layers 0-4.
+
+    ``overrides`` replaces individual slots after that schedule. The hard2
+    S5/S6 experiment uses ``{5: 0.5, 6: 1.0}`` so the eight-stage vector
+    becomes ``(0.1, 0.1, 0.1, 0.1, 0.1, 0.5, 1.0, 1.0)``.
     """
 
     if num_stages < 1:
@@ -200,10 +235,51 @@ def stage_supervision_weights(
         raise ValueError("auxiliary_decay must be in (0,1)")
     if not 0.0 <= floor <= 1.0:
         raise ValueError("floor must be in [0,1]")
-    return tuple(
-        max(floor, auxiliary_decay ** (num_stages - 1 - index))
-        for index in range(num_stages)
+    return apply_stage_weight_overrides(
+        tuple(
+            max(floor, auxiliary_decay ** (num_stages - 1 - index))
+            for index in range(num_stages)
+        ),
+        overrides,
     )
+
+
+def late_stage_anchor_loss(
+    stage_objectives: list[Tensor] | tuple[Tensor, ...],
+    *,
+    weight: float,
+    stage_weights: dict[int, float] | None = None,
+) -> Tensor:
+    """Add an extra S5/S6 term that is not folded into the stage-mean denominator.
+
+    ``stage_objectives[i]`` must already be a reduced scalar for stage ``i``.
+    A zero weight returns a zero tensor on the same device/dtype as stage 0.
+    """
+
+    if not stage_objectives:
+        raise ValueError("late_stage_anchor_loss requires at least one stage")
+    reference = stage_objectives[0]
+    if weight == 0.0:
+        return reference * 0.0
+    if not 0.0 < float(weight):
+        raise ValueError("late-stage anchor weight must be non-negative")
+    if stage_weights is None:
+        from va_compound.world_contract import WORLD_LATE_STAGE_ANCHOR_STAGE_WEIGHTS
+
+        resolved = dict(WORLD_LATE_STAGE_ANCHOR_STAGE_WEIGHTS)
+    else:
+        resolved = dict(stage_weights)
+    missing = [index for index in resolved if int(index) >= len(stage_objectives)]
+    if missing:
+        raise ValueError(
+            "late-stage anchor needs stages "
+            f"{sorted(int(index) for index in resolved)}; "
+            f"got {len(stage_objectives)} stages"
+        )
+    total = reference * 0.0
+    for index, stage_weight in resolved.items():
+        total = total + float(stage_weight) * stage_objectives[int(index)]
+    return float(weight) * total
 
 
 def _top_mask(flat_energy: Tensor, fraction: float) -> Tensor:
@@ -898,7 +974,10 @@ __all__ = [
     "action_top10_oracle_straight_through_gap_loss",
     "action_top10_pairwise_loss",
     "action_top10_ranking_loss",
+    "apply_stage_weight_overrides",
+    "canonical_stage_weight_overrides",
     "gated_static_copy_anchor_loss",
+    "late_stage_anchor_loss",
     "masked_numerator_denominator",
     "masked_reduction",
     "stage_supervision_weights",

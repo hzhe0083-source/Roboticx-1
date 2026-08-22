@@ -287,6 +287,11 @@ def _normalize_legacy_exact_run_contract(contract: dict) -> dict:
         arguments.setdefault("wmrm_detach_proposal_stage_state", False)
         arguments.setdefault("wmrm_static_constraint_weight", 4.0)
         arguments.setdefault("wmrm_action_rank_per_sample_cap", None)
+        arguments.setdefault("wmrm_late_stage_anchor_weight", 0.0)
+        arguments.setdefault("wmrm_stage_s5_weight", None)
+        arguments.setdefault("wmrm_stage_s6_weight", None)
+        arguments.setdefault("lr_wmrm_predictor", None)
+        arguments.setdefault("wmrm_predictor_grad_clip", None)
         arguments.setdefault("max_gradient_norm", None)
     model_config = normalized.get("model_config")
     if isinstance(model_config, dict):

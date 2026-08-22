@@ -178,6 +178,51 @@ def test_peer_rejects_world_cycle_different_from_planning_stride() -> None:
         _peer_config(planning_stride=2, wmrm_cycle_steps=6)
 
 
+def test_peer_rejects_single_va_layer() -> None:
+    with pytest.raises(ValueError, match="num_layers >= 2"):
+        _peer_config(num_layers=1)
+
+
+def test_peer_world_is_one_stage_shorter_and_last_va_consumes_final_map() -> None:
+    model = VACompoundPolicy(_peer_config(num_layers=3)).eval()
+    vision, proprio, previous, language, mask = _policy_inputs(model.config)
+    proposes: list[int] = []
+    messages: list[torch.Tensor] = []
+    last_state: list[torch.Tensor | None] = []
+    original_propose = model.wmrm.propose
+    original_last = model.layers[-1].forward
+
+    def record_world(*args, **kwargs):
+        transition = original_propose(*args, **kwargs)
+        proposes.append(int(kwargs["stage_index"]))
+        messages.append(transition.world_message.detach().clone())
+        return transition
+
+    def record_last(*args, **kwargs):
+        last_state.append(kwargs.get("state"))
+        return original_last(*args, **kwargs)
+
+    with (
+        mock.patch.object(model.wmrm, "propose", side_effect=record_world),
+        mock.patch.object(model.layers[-1], "forward", side_effect=record_last),
+        torch.no_grad(),
+    ):
+        model.encode_condition(
+            vision,
+            proprio,
+            previous,
+            language_hidden=language,
+            language_mask=mask,
+        )
+
+    assert model.config.wmrm_stage_count() == 2
+    assert model.wmrm.max_stages == 2
+    assert len(model.last_wmrm_auxes) == 2
+    assert proposes == [0, 1]
+    assert last_state[0] is not None
+    torch.testing.assert_close(last_state[0], messages[-1], rtol=0.0, atol=0.0)
+
+
 def test_causal_h6_readout_sends_only_executed_prefix_to_world() -> None:
     model = VACompoundPolicy(
         _peer_config(planning_stride=2, wmrm_cycle_steps=2)
@@ -210,7 +255,7 @@ def test_causal_h6_readout_sends_only_executed_prefix_to_world() -> None:
             language_mask=mask,
         )
 
-    assert len(full_readouts) == len(world_actions) == model.config.num_layers
+    assert len(full_readouts) == len(world_actions) == model.config.wmrm_stage_count()
     assert all(readout.shape == (2, 6, 4) for readout in full_readouts)
     for readout, world_action in zip(full_readouts, world_actions, strict=True):
         assert world_action.shape == (2, 2, 4)
@@ -250,8 +295,9 @@ def test_va_and_wam_read_the_same_pre_stage_snapshot() -> None:
             language_mask=mask,
         )
 
-    assert len(va_inputs) == len(wam_inputs) == 2
-    for va_in, wam_in in zip(va_inputs, wam_inputs, strict=True):
+    assert len(va_inputs) == model.config.num_layers
+    assert len(wam_inputs) == model.config.wmrm_stage_count()
+    for va_in, wam_in in zip(va_inputs[: len(wam_inputs)], wam_inputs, strict=True):
         torch.testing.assert_close(va_in[0], wam_in[0], rtol=0.0, atol=0.0)
         torch.testing.assert_close(va_in[1], wam_in[1], rtol=0.0, atol=0.0)
     torch.testing.assert_close(va_inputs[1][0], va_outputs[0][0], rtol=0.0, atol=0.0)
@@ -288,7 +334,7 @@ def test_world_message_is_next_va_layers_attention_kv() -> None:
             language_mask=mask,
         )
 
-    assert len(transitions) == 2 and len(layer_states) == 1
+    assert len(transitions) == model.config.wmrm_stage_count() and len(layer_states) == 1
     torch.testing.assert_close(
         layer_states[0], transitions[0].world_message, rtol=0.0, atol=0.0
     )
@@ -324,6 +370,7 @@ def test_flow_loss_reaches_va_reader_and_world_publisher() -> None:
 def test_world_side_loss_reaches_wam_and_va_publishers_but_not_future_target() -> None:
     model = VACompoundPolicy(
         _peer_config(
+            num_layers=3,
             wmrm_predictor="st_blocks",
             wmrm_predictor_depth=1,
             wmrm_predictor_width=16,

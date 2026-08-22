@@ -90,8 +90,14 @@ def test_joint_run_uses_both_data_streams_without_phase_handoff() -> None:
     assert "torch.distributed.run" in joint
     assert "--world-only" not in joint
     assert "--va-only" not in joint
-    assert "--resume-weights" not in joint
     assert 'resume_args=(--resume-exact "$RESUME_EXACT")' in joint
+    assert 'resume_args=(--resume-weights "$RESUME_WEIGHTS")' in joint
+    assert "RESUME_EXACT and RESUME_WEIGHTS are mutually exclusive" in joint
+    assert "--wmrm-stage-s5-weight" in joint
+    assert "--wmrm-stage-s6-weight" in joint
+    assert "--wmrm-late-stage-anchor-weight" in joint
+    assert "--lr-wmrm-predictor" in joint
+    assert "--wmrm-predictor-grad-clip" in joint
     assert "SOURCE_CHECKPOINT" not in text
     assert "run_phase" not in text
     assert "joint) preflight; run_joint" in text
@@ -101,7 +107,7 @@ def test_joint_run_uses_both_data_streams_without_phase_handoff() -> None:
 
 def test_checkpoint_contract_records_joint_gradient_and_data_protocol() -> None:
     block = _block(_text(), "checkpoint_contract(){", "require_no_active_train(){")
-    assert '"peer_world_topology": "one_stage_delayed_bidirectional_state_kv_v1"' in block
+    assert '"peer_world_topology": "one_stage_delayed_world_minus_one_last_va_consume_v1"' in block
     assert '"peer_training_mode": "joint_dual_stream"' in block
     assert '"peer_gradient_boundary": "fully_differentiable_bidirectional_messages_v1"' in block
     assert '"peer_data_isolation": "separate_va_world_episode_datasets_per_step_v1"' in block

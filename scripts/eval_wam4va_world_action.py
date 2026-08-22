@@ -217,7 +217,7 @@ DEFAULT_CYCLE_STEPS = 6
 PROPOSAL_FLOW_STEPS = 8
 LEGACY_VA_WORLD_MODE = "legacy"
 PEER_VA_WORLD_MODE = "peer_sync_h6"
-PEER_WORLD_TOPOLOGY_CONTRACT = "one_stage_delayed_bidirectional_state_kv_v1"
+PEER_WORLD_TOPOLOGY_CONTRACT = "one_stage_delayed_world_minus_one_last_va_consume_v1"
 PEER_WORLD_ACTION_SOURCE_CONTRACT = (
     "deterministic_readout_main_explicit_env_override_supervision_v1"
 )

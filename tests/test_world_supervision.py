@@ -13,6 +13,7 @@ from va_compound.world_supervision import (
     action_top10_pairwise_loss,
     action_top10_ranking_loss,
     gated_static_copy_anchor_loss,
+    late_stage_anchor_loss,
     masked_numerator_denominator,
     masked_reduction,
     stage_supervision_weights,
@@ -1036,11 +1037,44 @@ def test_v9_penalties_keep_empty_transition_reduction_connected() -> None:
     torch.testing.assert_close(zero_prediction.grad, torch.zeros_like(zero_prediction))
 
 
+def test_late_stage_anchor_is_additive_and_does_not_renormalize() -> None:
+    stages = [torch.tensor(float(index), requires_grad=True) for index in range(8)]
+    zero = late_stage_anchor_loss(stages, weight=0.0)
+    extra = late_stage_anchor_loss(stages, weight=0.25)
+
+    assert zero.item() == pytest.approx(0.0)
+    assert extra.item() == pytest.approx(0.25 * (0.5 * 5.0 + 1.0 * 6.0))
+    extra.backward()
+    assert stages[5].grad.item() == pytest.approx(0.25 * 0.5)
+    assert stages[6].grad.item() == pytest.approx(0.25 * 1.0)
+
+
+def test_scaling_all_stage_weights_does_not_change_the_normalized_mean() -> None:
+    values = [torch.tensor([2.0]), torch.tensor([8.0])]
+    masks = [torch.tensor([True]), torch.tensor([True])]
+    base = (0.25, 1.0)
+    scaled = (0.5, 2.0)
+    assert masked_reduction(values, masks, base).item() == pytest.approx(
+        masked_reduction(values, masks, scaled).item()
+    )
+
+
 def test_stage_weights_decay_toward_the_final_refinement() -> None:
     assert stage_supervision_weights(4, floor=0.0) == (0.25**3, 0.25**2, 0.25, 1.0)
     assert stage_supervision_weights(4) == (0.1, 0.1, 0.25, 1.0)
     assert stage_supervision_weights(8)[0] == 0.1
     assert stage_supervision_weights(8)[-1] == 1.0
+    assert stage_supervision_weights(8) == (0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.25, 1.0)
+    assert stage_supervision_weights(8, overrides={5: 0.5, 6: 1.0}) == (
+        0.1,
+        0.1,
+        0.1,
+        0.1,
+        0.1,
+        0.5,
+        1.0,
+        1.0,
+    )
     assert stage_supervision_weights(1) == (1.0,)
     assert stage_supervision_weights(0) == ()
 

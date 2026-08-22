@@ -77,6 +77,7 @@ from va_compound.world_contract import (
     PEER_WORLD_TOPOLOGY_CONTRACT,
     WORLD_ACTION_DONOR_CONTRACT,
     WORLD_ACTION_RANKING,
+    WORLD_LATE_STAGE_ANCHOR,
     WORLD_LOGGED_BRANCH_CONTRACT,
     WORLD_LOSS_COMPONENT_WEIGHTS,
     WORLD_NO_REGRESSION,
@@ -89,10 +90,13 @@ from va_compound.world_contract import (
     validate_visual_world_resume_contract,
     validate_visual_world_training_split,
     world_action_ranking_contract,
+    world_late_stage_anchor_contract,
 )
 from va_compound.wmrm import matched_no_fixed_point_perm, wmrm_world_loss
 from va_compound.world_supervision import (
     action_top10_oracle_straight_through_gap_loss,
+    canonical_stage_weight_overrides,
+    late_stage_anchor_loss,
     masked_reduction as masked_world_reduction,
     prepare_visual_world_action_ranking,
     stage_supervision_weights,
@@ -104,6 +108,19 @@ from va_compound.world_supervision import (
     _summarize_visual_world_metrics,
     _world_task_ids,
 )
+
+
+def visual_world_stage_weight_overrides(args: argparse.Namespace) -> dict[int, float]:
+    """S5/S6 overrides for the next-run weight experiment; empty keeps the old schedule."""
+    overrides: dict[int, float] = {}
+    s5 = getattr(args, "wmrm_stage_s5_weight", None)
+    s6 = getattr(args, "wmrm_stage_s6_weight", None)
+    if s5 is not None:
+        overrides[5] = float(s5)
+    if s6 is not None:
+        overrides[6] = float(s6)
+    return canonical_stage_weight_overrides(overrides)
+
 
 def wmrm_next_feature_target(
     model: VACompoundPolicy,
@@ -2983,6 +3000,8 @@ def rollout_policy(
     world_action_rank_stage: str = "cycle",
     wmrm_action_rank_per_sample_cap: float | None = None,
     wmrm_static_constraint_weight: float = 4.0,
+    wmrm_late_stage_anchor_weight: float = 0.0,
+    wmrm_stage_weight_overrides: dict[int, float] | None = None,
     feature_autocast_bf16: bool = False,
     train_world_model: bool = True,
     compute_action_output: bool = True,
@@ -3640,6 +3659,7 @@ def rollout_policy(
             len(visual_world_stage_records),
             auxiliary_decay=WORLD_STAGE_AUXILIARY_DECAY,
             floor=WORLD_STAGE_AUXILIARY_FLOOR,
+            overrides=wmrm_stage_weight_overrides,
         )
 
         def reduce_stage_records(
@@ -3707,12 +3727,34 @@ def rollout_policy(
         model.last_world_action_strong_loss = action_strong_loss
         model.last_world_action_readout_loss = readout_loss
         model.last_world_action_readout_rmse = readout_rmse
+        if float(wmrm_late_stage_anchor_weight) > 0.0:
+            def reduce_single_stage(
+                records: list[tuple[Tensor, Tensor, Tensor]],
+            ) -> Tensor:
+                if not records:
+                    return objective_world_loss * 0.0
+                return masked_world_reduction(
+                    [value for _, _, value in records],
+                    [valid for _, valid, _ in records],
+                )
+
+            late_stage_anchor = late_stage_anchor_loss(
+                [
+                    reduce_single_stage(records)
+                    for records in visual_world_objective_stage_records
+                ],
+                weight=float(wmrm_late_stage_anchor_weight),
+            )
+        else:
+            late_stage_anchor = objective_world_loss * 0.0
+        model.last_world_late_stage_anchor_loss = late_stage_anchor
         model.last_wmrm_loss = (
             objective_world_loss
             + float(wmrm_static_constraint_weight)
             * static_constraint_loss
             + float(WORLD_ACTION_RANKING["weight"]) * action_rank_loss
             + readout_loss
+            + late_stage_anchor
         )
         model.last_visual_world_metrics = _summarize_visual_world_metrics(
             visual_world_final_records,
@@ -3729,6 +3771,7 @@ def rollout_policy(
         model.last_world_action_strong_loss = model.last_wmrm_loss * 0.0
         model.last_world_action_readout_loss = model.last_wmrm_loss * 0.0
         model.last_world_action_readout_rmse = model.last_wmrm_loss.detach() * 0.0
+        model.last_world_late_stage_anchor_loss = model.last_wmrm_loss * 0.0
         model.last_visual_world_metrics = {}
     else:
         model.last_wmrm_loss = None
@@ -3741,6 +3784,7 @@ def rollout_policy(
         model.last_world_action_strong_loss = None
         model.last_world_action_readout_loss = None
         model.last_world_action_readout_rmse = None
+        model.last_world_late_stage_anchor_loss = None
         model.last_visual_world_metrics = {}
     if wmrm_adep_terms:
         model.last_wmrm_adep_loss = torch.stack(wmrm_adep_terms).mean()
@@ -4214,6 +4258,35 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=4.0,
         help="visual World static-copy constraint loss weight (default: 4.0)",
+    )
+    parser.add_argument(
+        "--wmrm-stage-s5-weight",
+        type=float,
+        default=None,
+        help=(
+            "replace stage-5 weight after decay/floor "
+            "(default: 0.1; next-run S5/S6 experiment uses 0.5)"
+        ),
+    )
+    parser.add_argument(
+        "--wmrm-stage-s6-weight",
+        type=float,
+        default=None,
+        help=(
+            "replace stage-6 weight after decay/floor "
+            "(default: 0.25; next-run S5/S6 experiment uses 1.0)"
+        ),
+    )
+    parser.add_argument(
+        "--wmrm-late-stage-anchor-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "extra unnormalized S5/S6 World objective: "
+            "weight * (0.5 * L_S5 + 1.0 * L_S6). "
+            "Does not change the existing stage-mean weights. "
+            "0 keeps the current loss graph"
+        ),
     )
     parser.add_argument(
         "--wmrm-action-rank-per-sample-cap",
@@ -4978,6 +5051,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument(
+        "--lr-wmrm-predictor",
+        type=float,
+        default=None,
+        help=(
+            "AdamW learning rate for wmrm.st_predictor only "
+            "(default: share --lr). Use 3e-5 to slow the shared 6-block residual"
+        ),
+    )
+    parser.add_argument(
+        "--wmrm-predictor-grad-clip",
+        type=float,
+        default=None,
+        help=(
+            "clip wmrm.st_predictor independently of the rest of the main model "
+            "(default: share the global 1.0 clip)"
+        ),
+    )
+    parser.add_argument(
         "--lr-slot",
         type=float,
         default=None,
@@ -5580,6 +5671,63 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "--wmrm-static-constraint-weight only applies with --visual-world-supervision"
         )
+    late_stage_anchor_weight = float(
+        getattr(args, "wmrm_late_stage_anchor_weight", 0.0)
+    )
+    if not math.isfinite(late_stage_anchor_weight) or late_stage_anchor_weight < 0.0:
+        raise ValueError(
+            "--wmrm-late-stage-anchor-weight must be finite and non-negative"
+        )
+    if late_stage_anchor_weight != 0.0 and not getattr(
+        args, "visual_world_supervision", False
+    ):
+        raise ValueError(
+            "--wmrm-late-stage-anchor-weight only applies with "
+            "--visual-world-supervision"
+        )
+    stage_overrides = visual_world_stage_weight_overrides(args)
+    for index, flag in ((5, "--wmrm-stage-s5-weight"), (6, "--wmrm-stage-s6-weight")):
+        if index not in stage_overrides:
+            continue
+        value = stage_overrides[index]
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"{flag} must be finite and non-negative")
+    if stage_overrides and not getattr(args, "visual_world_supervision", False):
+        raise ValueError(
+            "--wmrm-stage-s5-weight/--wmrm-stage-s6-weight only apply with "
+            "--visual-world-supervision"
+        )
+    lr_wmrm_predictor = getattr(args, "lr_wmrm_predictor", None)
+    if lr_wmrm_predictor is not None and (
+        not math.isfinite(lr_wmrm_predictor) or lr_wmrm_predictor <= 0.0
+    ):
+        raise ValueError("--lr-wmrm-predictor must be a positive finite value")
+    if lr_wmrm_predictor is not None and not getattr(args, "wmrm", False):
+        raise ValueError("--lr-wmrm-predictor requires --wmrm/--wam4va")
+    predictor_grad_clip = getattr(args, "wmrm_predictor_grad_clip", None)
+    if predictor_grad_clip is not None and (
+        not math.isfinite(predictor_grad_clip) or predictor_grad_clip <= 0.0
+    ):
+        raise ValueError("--wmrm-predictor-grad-clip must be a positive finite value")
+    if predictor_grad_clip is not None and not getattr(args, "wmrm", False):
+        raise ValueError("--wmrm-predictor-grad-clip requires --wmrm/--wam4va")
+    if (
+        lr_wmrm_predictor is not None or predictor_grad_clip is not None
+    ) and getattr(args, "va_only", False):
+        raise ValueError(
+            "--lr-wmrm-predictor/--wmrm-predictor-grad-clip cannot be used with --va-only"
+        )
+    if (
+        lr_wmrm_predictor is not None or predictor_grad_clip is not None
+    ) and (
+        args.head_only
+        or args.servo_only
+        or getattr(args, "action_vision_only", False)
+    ):
+        raise ValueError(
+            "--lr-wmrm-predictor/--wmrm-predictor-grad-clip cannot be used with "
+            "--head-only/--servo-only/--action-vision-only"
+        )
     if int(getattr(args, "wmrm_cycle_steps", 6)) < 1:
         raise ValueError("--wmrm-cycle-steps must be >= 1")
     if getattr(args, "wmrm", False) and getattr(args, "wmrm_target", "dino") == "vjepa":
@@ -6114,6 +6262,52 @@ def named_optimizer_parameters(optimizer, *modules):
             )
 
 
+def is_wmrm_predictor_parameter_name(name: str) -> bool:
+    """True for the shared 6-block STPredictor, under any module prefix."""
+    return (
+        name.startswith("wmrm.st_predictor.")
+        or ".wmrm.st_predictor." in name
+    )
+
+
+def partition_wmrm_predictor_named_parameters(
+    named_parameters,
+) -> tuple[list[tuple[str, Tensor]], list[tuple[str, Tensor]]]:
+    """Split update parameters so predictor clip cannot overlap the main clip."""
+    predictor: list[tuple[str, Tensor]] = []
+    other: list[tuple[str, Tensor]] = []
+    for name, parameter in named_parameters:
+        if is_wmrm_predictor_parameter_name(name):
+            predictor.append((name, parameter))
+        else:
+            other.append((name, parameter))
+    return predictor, other
+
+
+def clip_main_and_optional_predictor_gradients(
+    named_parameters,
+    *,
+    predictor_max_norm: float | None,
+    main_max_norm: float = 1.0,
+) -> tuple[float, float | None]:
+    """Clip the shared predictor separately when a dedicated max-norm is set."""
+    if predictor_max_norm is None:
+        return clip_update_gradients(named_parameters, max_norm=main_max_norm), None
+    predictor_named, other_named = partition_wmrm_predictor_named_parameters(
+        named_parameters
+    )
+    if not predictor_named:
+        raise RuntimeError(
+            "--wmrm-predictor-grad-clip is set but no wmrm.st_predictor "
+            "parameters are in the update set"
+        )
+    predictor_norm = clip_update_gradients(
+        predictor_named, max_norm=predictor_max_norm
+    )
+    main_norm = clip_update_gradients(other_named, max_norm=main_max_norm)
+    return main_norm, predictor_norm
+
+
 def clip_update_gradients(named_parameters, *, max_norm: float) -> float:
     """Clip already-validated gradients, with PyTorch's finite-error guard."""
     unique_parameters = []
@@ -6174,6 +6368,42 @@ def _maybe_build_live_vision(args, device):
     return vision_backbone
 
 
+def _split_wmrm_predictor_optimizer_groups(groups, model, args):
+    """Peel ``wmrm.st_predictor`` out of existing groups when it has its own LR."""
+    lr_predictor = getattr(args, "lr_wmrm_predictor", None)
+    if lr_predictor is None:
+        return groups
+    predictor_params = []
+    predictor_ids: set[int] = set()
+    for name, parameter in model.named_parameters():
+        if is_wmrm_predictor_parameter_name(name) and parameter.requires_grad:
+            predictor_params.append(parameter)
+            predictor_ids.add(id(parameter))
+    if not predictor_params:
+        raise ValueError(
+            "--lr-wmrm-predictor requires trainable wmrm.st_predictor parameters"
+        )
+    rewritten = []
+    for group in groups:
+        remaining = [
+            parameter
+            for parameter in group["params"]
+            if id(parameter) not in predictor_ids
+        ]
+        if remaining:
+            rewritten.append({**group, "params": remaining})
+    rewritten.append({"params": predictor_params, "lr": float(lr_predictor)})
+    grouped_ids = [id(parameter) for group in rewritten for parameter in group["params"]]
+    if len(grouped_ids) != len(set(grouped_ids)):
+        raise RuntimeError("wmrm.st_predictor optimizer groups overlap")
+    print(
+        f"wmrm-predictor: {sum(parameter.numel() for parameter in predictor_params):,} "
+        f"params @ lr={float(lr_predictor)}",
+        flush=True,
+    )
+    return rewritten
+
+
 def _feature_optimizer_groups(args, model, vision_backbone):
     """Stage A/B 参数分组：槽模块高 LR / VA 低 LR / V-JEPA 最低 LR。
 
@@ -6220,7 +6450,9 @@ def _feature_optimizer_groups(args, model, vision_backbone):
             f"({sum(p.numel() for p in wmrm_params):,} params)",
             flush=True,
         )
-        return [{"params": wmrm_params, "lr": args.lr}]
+        return _split_wmrm_predictor_optimizer_groups(
+            [{"params": wmrm_params, "lr": args.lr}], model, args
+        )
     if getattr(args, "va_only", False):
         va_params, frozen_names = [], []
         for name, param in model.named_parameters():
@@ -6323,7 +6555,7 @@ def _feature_optimizer_groups(args, model, vision_backbone):
                 f"live-vjepa: V-JEPA 可训练参数 {sum(p.numel() for p in vision_params):,} "
                 f"@ lr={args.lr_vision}"
             )
-    return groups
+    return _split_wmrm_predictor_optimizer_groups(groups, model, args)
 
 
 def _mtvj_relation_optimizer_group(
@@ -6832,6 +7064,12 @@ def save_checkpoint(
                 "world_loss_weights": dict(WORLD_LOSS_COMPONENT_WEIGHTS),
                 "world_stage_auxiliary_decay": WORLD_STAGE_AUXILIARY_DECAY,
                 "world_stage_auxiliary_floor": WORLD_STAGE_AUXILIARY_FLOOR,
+                "world_stage_weight_overrides": visual_world_stage_weight_overrides(
+                    args
+                ),
+                "world_late_stage_anchor": world_late_stage_anchor_contract(
+                    float(getattr(args, "wmrm_late_stage_anchor_weight", 0.0))
+                ),
                 "world_no_regression": dict(WORLD_NO_REGRESSION),
                 "world_static_copy_constraint": {
                     **WORLD_STATIC_COPY_CONSTRAINT,
@@ -8400,6 +8638,8 @@ def main() -> None:
                     args.resume_exact_contract_migration,
                     getattr(args, "va_world_mode", "legacy"),
                     int(getattr(args, "planning_stride", 6)),
+                    float(getattr(args, "wmrm_late_stage_anchor_weight", 0.0)),
+                    visual_world_stage_weight_overrides(args),
                 )
             # Fail before restoring model/optimizer/sampler/RNG if any data,
             # objective, sampler, architecture or optimizer semantic changed.
@@ -9212,6 +9452,12 @@ def main() -> None:
                     wmrm_static_constraint_weight=float(
                         getattr(args, "wmrm_static_constraint_weight", 4.0)
                     ),
+                    wmrm_late_stage_anchor_weight=float(
+                        getattr(args, "wmrm_late_stage_anchor_weight", 0.0)
+                    ),
+                    wmrm_stage_weight_overrides=visual_world_stage_weight_overrides(
+                        args
+                    ),
                     feature_autocast_bf16=bool(args.feature_autocast_bf16),
                     train_world_model=(
                         objective != "va"
@@ -9721,7 +9967,11 @@ def main() -> None:
             for name, parameter in update_named_parameters
             if id(parameter) in main_parameter_ids
         ]
-        gradient_norm = clip_update_gradients(main_named_parameters, max_norm=1.0)
+        gradient_norm, predictor_clip_norm = clip_main_and_optional_predictor_gradients(
+            main_named_parameters,
+            predictor_max_norm=getattr(args, "wmrm_predictor_grad_clip", None),
+            main_max_norm=1.0,
+        )
         metric_named_parameters = [
             (name, parameter)
             for name, parameter in update_named_parameters
@@ -9771,7 +10021,11 @@ def main() -> None:
                     update_named_parameters,
                     max_norm=args.max_gradient_norm,
                 )
-                clip_update_gradients(main_named_parameters, max_norm=1.0)
+                clip_main_and_optional_predictor_gradients(
+                    main_named_parameters,
+                    predictor_max_norm=getattr(args, "wmrm_predictor_grad_clip", None),
+                    main_max_norm=1.0,
+                )
                 if metric_named_parameters:
                     clip_update_gradients(metric_named_parameters, max_norm=1.0)
             except Exception:
@@ -9818,6 +10072,8 @@ def main() -> None:
             )
         if metric_clip_norm is not None:
             metric_head_log += f" metric_clip={float(metric_clip_norm):.6f}"
+        if predictor_clip_norm is not None:
+            metric_head_log += f" predictor_clip={float(predictor_clip_norm):.6f}"
         servo_log = ""
         if servo_stats is not None:
             # Step 2 伺服运行日志：信任缩放 β / 重读触发率 / 假设熵 / 修正幅度 / 阶段分布。
@@ -9872,12 +10128,15 @@ def main() -> None:
             world_task_log = " world_task[" + " | ".join(task_parts) + "]"
         world_constraint_log = ""
         if getattr(model, "last_world_no_regression_loss", None) is not None:
+            late_anchor = getattr(model, "last_world_late_stage_anchor_loss", None)
             world_constraint_log = (
                 f" world_base={float(model.last_wmrm_base_loss):.6f}"
                 f" world_guard={float(model.last_world_no_regression_loss):.6f}"
                 " world_static_constraint="
                 f"{float(model.last_world_static_constraint_loss):.6f}"
                 f" world_action_rank={float(model.last_world_action_rank_loss):.6f}"
+                " world_late_anchor="
+                f"{0.0 if late_anchor is None else float(late_anchor):.6f}"
             )
         resources = runtime_resource_stats(device)
         resource_log = (
