@@ -2,7 +2,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-LOG=${1:-logs/mw_hard2_l20_h15_uniformflow_fixed_anchor_v4_from_s3052.e23s5037.log}
+LOG=${1:-logs/mw_hard2_l20_h15_p15_prefix_tail_from_s1752.to_equiv_s5037.log}
 [[ -f "$LOG" ]] || { echo "missing training log: $LOG" >&2; exit 1; }
 
 # Print recent steps, then follow forever. awk's fflush keeps one compact line
