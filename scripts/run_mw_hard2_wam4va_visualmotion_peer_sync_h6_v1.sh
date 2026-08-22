@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# P2/H6-or-H15 joint VA↔World state exchange over disjoint data streams.
+# P2-sampled peer training; H15 deploys the complete action chunk before replanning.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -24,10 +24,12 @@ if [[ "$ACTION_HORIZON" == 15 ]]; then
   DATA_CONTRACT=peer_sync_h15_p2_world_windows_v1
   WORLD_HORIZON=${WORLD_HORIZON:-15}
   FLOW_TAIL_WEIGHT=1.0
+  DEPLOYMENT_EXECUTION_HORIZON=15
 elif [[ "$ACTION_HORIZON" == 6 ]]; then
   DATA_CONTRACT=peer_sync_h6_p2_world_windows_v1
   WORLD_HORIZON=${WORLD_HORIZON:-2}
   FLOW_TAIL_WEIGHT=0.036
+  DEPLOYMENT_EXECUTION_HORIZON=2
 else
   echo "ERROR: ACTION_HORIZON must be 6 or 15" >&2
   exit 2
@@ -182,7 +184,8 @@ if Path(world_manifest["splits"]["eval"]["output_path"]).name != eval_path.name:
 print("disjoint VA/World/eval data preflight: PASS")
 PY
 
-  "$PY" -B - "$WORLD_SPLIT_MANIFEST" "$DINO" "$WORLD_HORIZON" <<'PY'
+  "$PY" -B - "$WORLD_SPLIT_MANIFEST" "$DINO" "$WORLD_HORIZON" \
+    "$DEPLOYMENT_EXECUTION_HORIZON" <<'PY'
 import sys
 from train import parse_args, validate_args
 
@@ -191,6 +194,7 @@ common = [
     "--visual-world-supervision", "--world-split-manifest", sys.argv[1],
     "--wam4va", "--va-world-mode", "peer_sync_h6",
     "--planning-stride", "2", "--control-stride", "2",
+    "--deployment-execution-horizon", sys.argv[4],
     "--wmrm-inject", "all", "--wmrm-target", "dino", "--wmrm-cycle-steps", sys.argv[3],
     "--wmrm-adep-weight", "0", "--va-layers", "8", "--wmrm-predictor", "st_blocks",
     "--wmrm-predictor-depth", "6", "--wmrm-predictor-width", "384",
@@ -224,6 +228,8 @@ required = {
     "peer_data_isolation": "separate_va_world_episode_datasets_per_step_v1",
     "peer_dual_stream_optimizer": "va_backward_then_world_backward_one_optimizer_step_v1",
 }
+if action_horizon == 15:
+    required["peer_flow_topology"] = "h6_prefix_h9_tail_one_way_detached_flow_v1"
 bad = {key: (contract.get(key), value) for key, value in required.items() if contract.get(key) != value}
 if bad: raise SystemExit(f"checkpoint contract mismatch: {bad}")
 identities = {}
@@ -251,6 +257,10 @@ config_cadence = {
     "action_horizon": (config.get("action_horizon"), action_horizon),
     "planning_stride": (config.get("planning_stride"), 2),
     "wmrm_cycle_steps": (config.get("wmrm_cycle_steps"), world_horizon),
+    "deployment_execution_horizon": (
+        config.get("deployment_execution_horizon"),
+        action_horizon if action_horizon == 15 else 2,
+    ),
 }
 bad_config_cadence = {
     key: values for key, values in config_cadence.items()
@@ -292,6 +302,7 @@ expected_arguments = {
     "control_stride": 2,
     "planning_stride": 2,
     "wmrm_cycle_steps": world_horizon,
+    "deployment_execution_horizon": action_horizon if action_horizon == 15 else 2,
     "flow_prefix_steps": 2,
     "task_sampling": "balanced",
 }
@@ -382,6 +393,7 @@ run_joint(){
     "${launcher[@]}" train.py --va-data "$VA_TRAIN_DATA" --world-data "$WORLD_TRAIN_DATA" \
     --visual-world-supervision --world-split-manifest "$WORLD_SPLIT_MANIFEST" \
     --va-world-mode peer_sync_h6 --planning-stride 2 --control-stride 2 \
+    --deployment-execution-horizon "$DEPLOYMENT_EXECUTION_HORIZON" \
     --wam4va --wmrm-inject all --wmrm-target dino \
     --wmrm-adep-weight 0 --wmrm-cycle-steps "$WORLD_HORIZON" --wmrm-world-weight 1.0 \
     --world-action-rank-stage final \

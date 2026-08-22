@@ -79,6 +79,12 @@ PEER_LEGACY_GRADIENT_BOUNDARY_CONTRACT = (
 PEER_WORLD8_TO_WORLD7_REPAIR_MIGRATION = (
     "peer_world8_h6_to_world7_h15_fixed_anchor_fresh_world_v3"
 )
+PEER_H15_PREFIX_TAIL_FLOW_CONTRACT = (
+    "h6_prefix_h9_tail_one_way_detached_flow_v1"
+)
+PEER_H15_PREFIX_TAIL_FLOW_MIGRATION = (
+    "peer_h15_uniform_to_prefix_tail_flow_from_s1752_v1"
+)
 PEER_DATA_ISOLATION_CONTRACT = "separate_va_world_episode_datasets_per_step_v1"
 PEER_DUAL_STREAM_OPTIMIZER_CONTRACT = (
     "va_backward_then_world_backward_one_optimizer_step_v1"

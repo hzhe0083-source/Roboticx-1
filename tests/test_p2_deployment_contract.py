@@ -31,8 +31,20 @@ def test_peer_defaults_execution_horizon_to_checkpoint_planning_stride() -> None
 
 def test_peer_rejects_execution_horizon_different_from_planning_stride() -> None:
     config = SimpleNamespace(va_world_mode="peer_sync_h6", planning_stride=2)
-    with pytest.raises(ValueError, match="execution_horizon.*planning_stride"):
+    with pytest.raises(ValueError, match="deployment horizon"):
         resolve_execution_horizon(_args(execution_horizon=6), config)
+
+
+def test_h15_peer_defaults_to_full_chunk_deployment() -> None:
+    config = SimpleNamespace(
+        va_world_mode="peer_sync_h6",
+        planning_stride=2,
+        deployment_execution_horizon=15,
+    )
+    assert resolve_execution_horizon(_args(), config) == 15
+    assert resolve_execution_horizon(_args(execution_horizon=15), config) == 15
+    with pytest.raises(ValueError, match="deployment horizon"):
+        resolve_execution_horizon(_args(execution_horizon=2), config)
 
 
 def test_legacy_deployment_keeps_six_step_default() -> None:
@@ -40,7 +52,7 @@ def test_legacy_deployment_keeps_six_step_default() -> None:
     assert resolve_execution_horizon(_args(), config) == 6
 
 
-def test_hard2_eval_launcher_is_fixed_to_peer_p2_for_h6_or_h15() -> None:
+def test_hard2_eval_launcher_is_fixed_to_h15_p15() -> None:
     syntax = subprocess.run(
         ["bash", "-n", str(EVAL_RUNNER)],
         cwd=ROOT,
@@ -50,17 +62,19 @@ def test_hard2_eval_launcher_is_fixed_to_peer_p2_for_h6_or_h15() -> None:
     assert syntax.returncode == 0, syntax.stderr
     text = EVAL_RUNNER.read_text(encoding="utf-8")
     for token in (
-        "hard2_peer_h6_p2_eval_v1.pt",
-        "EXECUTION_HORIZON=2",
+        "hard2_peer_h15_p2_eval_v2.pt",
+        "EXECUTION_HORIZON=${EXECUTION_HORIZON:-15}",
         'data_contract = f"peer_sync_h{action_horizon}_p2_world_windows_v1"',
         "action_horizon not in {6, 15}",
         '"fps": 80',
         '"control_stride": 2',
         '"planning_stride": 2',
+        "deployment_horizon != execution_horizon",
         '"action_horizon": action_horizon',
         '"wmrm_cycle_steps": world_horizon',
         '"flow_prefix_steps": 2',
         '"peer_training_mode": "joint_dual_stream"',
+        '"peer_flow_topology"',
         '"peer_va_data_identity"',
         '"peer_world_data_identity"',
         '--execution-horizon "$EXECUTION_HORIZON"',

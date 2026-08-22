@@ -418,6 +418,128 @@ def test_flow_loss_trains_world_reader_but_not_visual_predictor() -> None:
     assert model.world_action_readout.proj.weight.grad is None
 
 
+def test_h15_tail_flow_cannot_backpropagate_into_prefix_or_va_condition() -> None:
+    model = VACompoundPolicy(
+        _peer_config(
+            action_horizon=15,
+            planning_stride=2,
+            deployment_execution_horizon=15,
+            wmrm_cycle_steps=15,
+            wmrm_predictor="st_blocks",
+            wmrm_predictor_depth=1,
+            wmrm_predictor_width=16,
+            wmrm_predictor_heads=4,
+        )
+    ).train()
+    condition = torch.randn(2, 15, model.config.hidden_dim, requires_grad=True)
+    noisy = torch.randn(2, 15, model.config.action_dim)
+    velocity = model.flow_velocity(condition, noisy, torch.rand(2))
+    velocity[:, 6:].square().mean().backward()
+
+    assert condition.grad is not None
+    assert int(torch.count_nonzero(condition.grad)) == 0
+    prefix_grads = [parameter.grad for parameter in model.flow_head.parameters()]
+    assert all(grad is None or int(torch.count_nonzero(grad)) == 0 for grad in prefix_grads)
+    tail_grads = [parameter.grad for parameter in model.tail_flow_head.parameters()]
+    assert any(grad is not None and float(grad.abs().sum()) > 0.0 for grad in tail_grads)
+
+
+def test_h15_prefix_queries_and_visual_stream_cannot_read_tail_tokens() -> None:
+    model = VACompoundPolicy(
+        _peer_config(
+            action_horizon=15,
+            planning_stride=2,
+            deployment_execution_horizon=15,
+            wmrm_cycle_steps=15,
+        )
+    )
+    allowed = model.layers[0]._role_mask(
+        n_visual=3,
+        n_memory=1,
+        n_action=15,
+        n_language=2,
+        n_task=0,
+        n_state=1,
+        device=torch.device("cpu"),
+    )
+    action_key_start = 4
+    tail_keys = slice(action_key_start + 6, action_key_start + 15)
+    assert not bool(allowed[: 3 + 6, tail_keys].any())
+    assert bool(allowed[3 + 6 : 3 + 15, tail_keys].all())
+
+
+def test_h15_prefix_condition_is_invariant_to_tail_query_values() -> None:
+    model = VACompoundPolicy(
+        _peer_config(
+            action_horizon=15,
+            planning_stride=2,
+            deployment_execution_horizon=15,
+            wmrm_cycle_steps=15,
+        )
+    ).eval()
+    vision, proprio, previous, language, mask = _policy_inputs(model.config)
+    with torch.no_grad():
+        first = model.encode_condition(
+            vision,
+            proprio,
+            previous,
+            language_hidden=language,
+            language_mask=mask,
+            skip_wmrm=True,
+        )
+        model.action_queries[6:].add_(100.0 * torch.randn_like(model.action_queries[6:]))
+        second = model.encode_condition(
+            vision,
+            proprio,
+            previous,
+            language_hidden=language,
+            language_mask=mask,
+            skip_wmrm=True,
+        )
+    torch.testing.assert_close(first[:, :6], second[:, :6], rtol=0.0, atol=1e-6)
+
+
+def test_h15_prefix_tail_migration_clones_existing_flow_into_tail() -> None:
+    from train import migrate_peer_h15_prefix_tail_flow_state
+    from va_compound.world_contract import (
+        PEER_GRADIENT_BOUNDARY_CONTRACT,
+        PEER_WORLD_TOPOLOGY_CONTRACT,
+    )
+
+    old = VACompoundPolicy(
+        _peer_config(
+            action_horizon=15,
+            planning_stride=2,
+            deployment_execution_horizon=2,
+            wmrm_cycle_steps=15,
+        )
+    )
+    new = VACompoundPolicy(
+        _peer_config(
+            action_horizon=15,
+            planning_stride=2,
+            deployment_execution_horizon=15,
+            wmrm_cycle_steps=15,
+        )
+    )
+    checkpoint = {
+        "config": {
+            "action_horizon": 15,
+            "va_world_mode": "peer_sync_h6",
+            "wmrm_cycle_steps": 15,
+        },
+        "training_contract": {
+            "peer_world_topology": PEER_WORLD_TOPOLOGY_CONTRACT,
+            "peer_gradient_boundary": PEER_GRADIENT_BOUNDARY_CONTRACT,
+        },
+        "model": old.state_dict(),
+    }
+    migrated = migrate_peer_h15_prefix_tail_flow_state(new, checkpoint)
+    new.load_state_dict(migrated, strict=True)
+    for name, value in new.tail_flow_head.state_dict().items():
+        torch.testing.assert_close(value, new.flow_head.state_dict()[name])
+
+
 def test_world_side_loss_reaches_wam_and_va_publishers_but_not_future_target() -> None:
     model = VACompoundPolicy(
         _peer_config(

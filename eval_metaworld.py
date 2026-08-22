@@ -885,7 +885,7 @@ LEGACY_TRAINING_CONTROL_STRIDE = 6
 LEGACY_EXECUTION_HORIZON = 6
 EXPECTED_WMRM_WORLD_HORIZON = 6
 ACTION_HORIZON = 8
-SUPPORTED_EXECUTION_HORIZONS = (1, 2, 3, 6)
+SUPPORTED_EXECUTION_HORIZONS = (1, 2, 3, 6, 15)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -974,7 +974,10 @@ def resolve_execution_horizon(
             "peer_sync_h6 checkpoint planning_stride must be one of "
             f"{SUPPORTED_EXECUTION_HORIZONS}, got {planning_stride}"
         )
-    default = planning_stride if peer_sync else LEGACY_EXECUTION_HORIZON
+    deployment_horizon = int(
+        getattr(config, "deployment_execution_horizon", 0) or planning_stride
+    )
+    default = deployment_horizon if peer_sync else LEGACY_EXECUTION_HORIZON
     value = default if explicit is None and legacy is None else int(
         explicit if explicit is not None else legacy
     )
@@ -982,10 +985,10 @@ def resolve_execution_horizon(
         raise ValueError(
             f"--execution-horizon must be one of {SUPPORTED_EXECUTION_HORIZONS}"
         )
-    if peer_sync and value != planning_stride:
+    if peer_sync and value != deployment_horizon:
         raise ValueError(
-            "peer_sync_h6 requires execution_horizon == checkpoint "
-            f"planning_stride ({value} != {planning_stride})"
+            "peer_sync_h6 requires execution_horizon == checkpoint deployment "
+            f"horizon ({value} != {deployment_horizon})"
         )
     return value
 
@@ -2365,6 +2368,10 @@ def main() -> None:
                 "va_backward_then_world_backward_one_optimizer_step_v1"
             ),
         }
+        if args.execution_horizon == 15:
+            required_p2_contract["peer_flow_topology"] = (
+                "h6_prefix_h9_tail_one_way_detached_flow_v1"
+            )
         p2_contract_mismatch = {
             key: (policy_contract.get(key), value)
             for key, value in required_p2_contract.items()
@@ -2380,7 +2387,8 @@ def main() -> None:
         expected_p2_arguments = {
             "control_stride": 2,
             "planning_stride": 2,
-            "wmrm_cycle_steps": 2,
+            "wmrm_cycle_steps": int(config.wmrm_cycle_steps),
+            "deployment_execution_horizon": args.execution_horizon,
             "flow_prefix_steps": 2,
         }
         for key, value in expected_p2_arguments.items():
@@ -2739,6 +2747,7 @@ def main() -> None:
             "scene_teacher, or a semantic compiler"
         )
     model = VACompoundPolicy(config).eval().to(device)
+    model.runtime_execution_horizon = args.execution_horizon
     ckpt_direct_head = bool(ckpt["config"].get("direct_head", False))
 
     if ckpt_direct_head == config.direct_head and not dense_forced:
@@ -2836,6 +2845,10 @@ def main() -> None:
     checkpoint_planning_stride = int(
         getattr(config, "planning_stride", LEGACY_EXECUTION_HORIZON)
     )
+    checkpoint_deployment_horizon = int(
+        getattr(config, "deployment_execution_horizon", 0)
+        or checkpoint_planning_stride
+    )
     if getattr(config, "va_world_mode", "legacy") == "peer_sync_h6":
         if (
             checkpoint_planning_stride != LEGACY_EXECUTION_HORIZON
@@ -2856,7 +2869,7 @@ def main() -> None:
             ),
             "execution_horizon": (
                 args.execution_horizon,
-                checkpoint_planning_stride,
+                checkpoint_deployment_horizon,
             ),
             "wmrm_cycle_steps": (
                 int(getattr(config, "wmrm_cycle_steps", 0)),
@@ -2876,11 +2889,13 @@ def main() -> None:
             raise ValueError(
                 f"peer_sync_h6 planning cadence mismatch: {cadence_mismatch}"
             )
-    planning_hz = float(control_hz) / float(checkpoint_planning_stride)
+    training_planning_hz = float(control_hz) / float(checkpoint_planning_stride)
+    deployment_planning_hz = float(control_hz) / float(args.execution_horizon)
     print(
         "eval: deployment cadence "
-        f"fps={control_hz}, planning_stride={checkpoint_planning_stride}, "
-        f"planning_hz={planning_hz:g}, "
+        f"fps={control_hz}, training_stride={checkpoint_planning_stride}, "
+        f"training_hz={training_planning_hz:g}, "
+        f"deployment_hz={deployment_planning_hz:g}, "
         f"prediction_horizon={training_prediction_horizon}, "
         f"execution_horizon={args.execution_horizon}"
     )

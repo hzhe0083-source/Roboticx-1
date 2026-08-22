@@ -55,6 +55,10 @@ class VACompoundConfig:
     action_horizon: int = 8
     # Number of executable actions consumed before the next policy query.
     planning_stride: int = 6
+    # Intended closed-loop execution chunk. 0 keeps the legacy behavior of
+    # executing ``planning_stride`` actions. Training windows may still be
+    # sampled every planning_stride frames while an H15 policy deploys P15.
+    deployment_execution_horizon: int = 0
     action_dim: int = 7
     proprio_dim: int = 14
     flow_layers: int = 2
@@ -329,6 +333,9 @@ class VACompoundConfig:
             raise ValueError("wmrm_cycle_steps must be positive")
         if self.planning_stride < 1:
             raise ValueError("planning_stride must be positive")
+        deployment_horizon = (
+            self.deployment_execution_horizon or self.planning_stride
+        )
         if self.wmrm_target == "vjepa" and self.main_vision_backbone != "vjepa":
             raise ValueError(
                 "vjepa world target requires V-JEPA main vision "
@@ -360,6 +367,27 @@ class VACompoundConfig:
             if self.planning_stride not in {1, 2, 3, 6}:
                 raise ValueError(
                     "peer_sync_h6 requires planning_stride in {1, 2, 3, 6}"
+                )
+            if not 1 <= deployment_horizon <= self.action_horizon:
+                raise ValueError(
+                    "planning_stride/deployment_execution_horizon must be within "
+                    "the action horizon"
+                )
+            if deployment_horizon not in {
+                self.planning_stride,
+                self.action_horizon,
+            }:
+                raise ValueError(
+                    "peer deployment must execute either the training stride "
+                    "or the complete action horizon"
+                )
+            if (
+                deployment_horizon == self.action_horizon
+                and self.wmrm_cycle_steps != self.action_horizon
+            ):
+                raise ValueError(
+                    "full-chunk peer deployment requires World to predict the "
+                    "same endpoint horizon"
                 )
             if self.wmrm_cycle_steps not in {
                 self.planning_stride,
@@ -1025,6 +1053,7 @@ class VACouplingLayer(nn.Module):
         dual_attention: bool = False,
         dense_readout_mtvj: bool = False,
         action_dense_readout: bool = False,
+        protected_action_prefix: int = 0,
     ) -> None:
         super().__init__()
         self.sequential = sequential
@@ -1039,6 +1068,9 @@ class VACouplingLayer(nn.Module):
         if attention_backend not in ("manual", "auto"):
             raise ValueError(f"unsupported VA attention backend: {attention_backend}")
         self.attention_backend = attention_backend
+        if protected_action_prefix < 0:
+            raise ValueError("protected_action_prefix must be non-negative")
+        self.protected_action_prefix = protected_action_prefix
         # 双注意力（第二轮架构重构 2026-08-08）：仅非 sequential 层（policy
         # 构造时 sequential 层传 False）。动作 query 的 physical 更新不含语言列，
         # 语言列走独立 semantic 注意力；融合门 g_A = σ(G([A_mean, lang_mean]))。
@@ -1211,6 +1243,24 @@ class VACouplingLayer(nn.Module):
         if self.mode == "uni_a":
             allowed[:n_visual] = False
             allowed[:n_visual, :n_visual] = True
+        if self.protected_action_prefix:
+            if not self.protected_action_prefix < n_action:
+                raise ValueError(
+                    "protected_action_prefix must be shorter than the action horizon"
+                )
+            action_key_start = n_visual + n_memory + n_task
+            tail_keys = slice(
+                action_key_start + self.protected_action_prefix,
+                action_key_start + n_action,
+            )
+            # Base visual/prefix/task queries cannot read the H9 extension.
+            # Tail queries remain free to read both the protected prefix and tail.
+            allowed[:, tail_keys] = False
+            tail_queries = slice(
+                n_visual + self.protected_action_prefix,
+                n_visual + n_action,
+            )
+            allowed[tail_queries, tail_keys] = True
         return allowed
 
     def forward(
@@ -1974,6 +2024,9 @@ class VACompoundPolicy(nn.Module):
     def __init__(self, config: VACompoundConfig) -> None:
         super().__init__()
         self.config = config
+        # Training sequences advance at planning_stride. Evaluators may switch
+        # this to the checkpoint's full-chunk deployment horizon.
+        self.runtime_execution_horizon = config.planning_stride
         self.vision_projection = nn.Linear(config.vision_dim, config.hidden_dim)
         self.state_projection = nn.Linear(config.proprio_dim + config.action_dim, config.hidden_dim)
         # Optional treatment-only modules must not consume the parent RNG stream:
@@ -2129,6 +2182,14 @@ class VACompoundPolicy(nn.Module):
                 ),
                 dense_readout_mtvj=config.dense_readout_mtvj,
                 action_dense_readout=(config.action_vision_backbone != "none"),
+                protected_action_prefix=(
+                    6
+                    if config.va_world_mode == "peer_sync_h6"
+                    and config.action_horizon == 15
+                    and (config.deployment_execution_horizon or config.planning_stride)
+                    == 15
+                    else 0
+                ),
             )
             for index in range(config.num_layers)
         )
@@ -2188,7 +2249,7 @@ class VACompoundPolicy(nn.Module):
                 dropout=config.dropout,
             )
         self.action_norm = nn.LayerNorm(config.hidden_dim)
-        self.flow_head = FlowMatchingHead(
+        flow_head_kwargs = dict(
             hidden_dim=config.hidden_dim,
             action_dim=config.action_dim,
             num_heads=config.num_heads,
@@ -2203,6 +2264,15 @@ class VACompoundPolicy(nn.Module):
                 if config.flow_semantic
                 else None
             ),
+        )
+        self.flow_head = FlowMatchingHead(**flow_head_kwargs)
+        self.tail_flow_head = (
+            FlowMatchingHead(**flow_head_kwargs)
+            if config.va_world_mode == "peer_sync_h6"
+            and config.action_horizon == 15
+            and (config.deployment_execution_horizon or config.planning_stride)
+            == 15
+            else None
         )
         if config.direct_head:
             self.direct_head = DirectActionHead(
@@ -2643,7 +2713,7 @@ class VACompoundPolicy(nn.Module):
                 raise ValueError("visual memory world_state must be a WAMState")
             if (
                 peer_mode
-                and self.wmrm.cycle_steps > self.config.planning_stride
+                and self.wmrm.cycle_steps > self.runtime_execution_horizon
                 and world_state.world_map is not None
             ):
                 # A long-horizon candidate is stale after receding-horizon P-step
@@ -2822,7 +2892,31 @@ class VACompoundPolicy(nn.Module):
                 "noisy_actions must have shape "
                 f"[batch, {self.config.action_horizon}, {self.config.action_dim}]"
             )
-        return self.flow_head(action_condition, noisy_actions, flow_time, semantic_context)
+        if self.tail_flow_head is None:
+            return self.flow_head(
+                action_condition, noisy_actions, flow_time, semantic_context
+            )
+
+        # The migrated H6 controller remains a closed prefix path. The H9
+        # extension may read the complete candidate chunk, but its loss owns
+        # only tail_flow_head parameters and cannot overwrite VA/H6 features.
+        prefix_horizon = 6
+        prefix_velocity = self.flow_head(
+            action_condition[:, :prefix_horizon],
+            noisy_actions[:, :prefix_horizon],
+            flow_time,
+            semantic_context,
+        )
+        tail_semantic = (
+            semantic_context.detach() if semantic_context is not None else None
+        )
+        tail_velocity = self.tail_flow_head(
+            action_condition.detach(),
+            noisy_actions,
+            flow_time,
+            tail_semantic,
+        )[:, prefix_horizon:]
+        return torch.cat((prefix_velocity, tail_velocity), dim=1)
 
     def forward(
         self,

@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
-# P2/H6-or-H15 MetaWorld closed-loop eval for the two hard tasks (10 trials/task).
+# H15/P15 MetaWorld closed-loop eval for the two hard tasks (10 trials/task).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PY=${PY:-/home/ryan/.venvs/pytorch-gpu/bin/python}
 DINO=${DINO:-/home/ryan/.cache/huggingface/hub/models--timm--vit_large_patch14_reg4_dinov2.lvd142m/snapshots/f3c408e77602bb412aa65fb03dfa0d5f95cb3832/model.safetensors}
-CKPT=${1:-checkpoints/mw_hard2_va_world_state_exchange_joint_h6_p2_v1.scratch.s20000.pt}
-FEATURES=${2:-data/hard2_peer_h6_p2_eval_v1.pt}
-EXECUTION_HORIZON=2
+[[ $# -ge 1 ]] || { echo "usage: bash $0 CHECKPOINT [FEATURES]" >&2; exit 2; }
+CKPT=$1
+FEATURES=${2:-data/hard2_peer_h15_p2_eval_v2.pt}
+EXECUTION_HORIZON=${EXECUTION_HORIZON:-15}
 NAME=$(basename "$CKPT" .pt)
-LOG=logs/${NAME}_eval10.log
-JSON=logs/${NAME}_eval10.json
+LOG=logs/${NAME}_p${EXECUTION_HORIZON}_eval10.log
+JSON=logs/${NAME}_p${EXECUTION_HORIZON}_eval10.json
 
 [[ -f "$CKPT" ]] || { echo "missing checkpoint: $CKPT" >&2; exit 1; }
 [[ -f "$FEATURES" ]] || { echo "missing features: $FEATURES" >&2; exit 1; }
@@ -26,6 +27,9 @@ payload = torch.load(ckpt_path, map_location="cpu", weights_only=True)
 cfg = payload.get("config") or {}
 action_horizon = int(cfg.get("action_horizon", 0))
 world_horizon = int(cfg.get("wmrm_cycle_steps", 0))
+deployment_horizon = int(
+    cfg.get("deployment_execution_horizon", 0) or cfg.get("planning_stride", 0)
+)
 data_contract = f"peer_sync_h{action_horizon}_p2_world_windows_v1"
 if action_horizon not in {6, 15} or world_horizon not in {2, 15}:
     raise SystemExit("unsupported action/World horizon")
@@ -41,12 +45,17 @@ bad_config = {
     for key, value in expected_config.items()
     if cfg.get(key) != value
 }
+if deployment_horizon != execution_horizon:
+    bad_config["deployment_execution_horizon"] = (
+        deployment_horizon,
+        execution_horizon,
+    )
 if bad_config:
     raise SystemExit(f"checkpoint is not peer 80Hz/P2: {bad_config}")
-if execution_horizon != cfg["planning_stride"]:
+if execution_horizon != deployment_horizon:
     raise SystemExit(
-        "execution_horizon must equal checkpoint planning_stride: "
-        f"{execution_horizon} != {cfg['planning_stride']}"
+        "execution_horizon must equal checkpoint deployment horizon: "
+        f"{execution_horizon} != {deployment_horizon}"
     )
 contract = payload.get("training_contract") or {}
 required_contract = {
@@ -55,6 +64,7 @@ required_contract = {
     "peer_gradient_boundary": "world_map_stopgrad_policy_projection_trainable_v1",
     "peer_data_isolation": "separate_va_world_episode_datasets_per_step_v1",
     "peer_dual_stream_optimizer": "va_backward_then_world_backward_one_optimizer_step_v1",
+    "peer_flow_topology": "h6_prefix_h9_tail_one_way_detached_flow_v1",
 }
 bad_contract = {
     key: (contract.get(key), value)
@@ -70,6 +80,7 @@ expected_arguments = {
     "control_stride": 2,
     "planning_stride": 2,
     "wmrm_cycle_steps": world_horizon,
+    "deployment_execution_horizon": execution_horizon,
     "flow_prefix_steps": 2,
 }
 for key, value in expected_arguments.items():
@@ -107,7 +118,7 @@ bad_metadata = {
 }
 if bad_metadata:
     raise SystemExit(f"features are not 80Hz/P2: {bad_metadata}")
-print("peer deployment preflight: PASS (80Hz/P2 receding horizon)")
+print("peer deployment preflight: PASS (80Hz/H15/P15 receding horizon)")
 PY
 
 mkdir -p logs

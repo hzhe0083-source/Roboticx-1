@@ -71,6 +71,8 @@ from va_compound.world_contract import (
     PEER_DATA_ISOLATION_CONTRACT,
     PEER_DUAL_STREAM_OPTIMIZER_CONTRACT,
     PEER_GRADIENT_BOUNDARY_CONTRACT,
+    PEER_H15_PREFIX_TAIL_FLOW_CONTRACT,
+    PEER_H15_PREFIX_TAIL_FLOW_MIGRATION,
     PEER_HIGH_FREQUENCY_CONTRACT,
     PEER_LEGACY_HIGH_FREQUENCY_CONTRACT,
     PEER_LEGACY_GRADIENT_BOUNDARY_CONTRACT,
@@ -197,6 +199,42 @@ def migrate_peer_world8_to_world7_state(
     expanded_queries[:6].copy_(saved_queries)
     state["action_queries"] = expanded_queries
     return state, reset_keys
+
+
+def migrate_peer_h15_prefix_tail_flow_state(
+    model: VACompoundPolicy,
+    checkpoint: dict,
+) -> dict[str, Tensor]:
+    """Keep s1752 VA/World and seed the isolated H9 decoder from its Flow head."""
+    saved_config = checkpoint.get("config") or {}
+    contract = checkpoint.get("training_contract") or {}
+    if (
+        saved_config.get("action_horizon") != 15
+        or saved_config.get("va_world_mode") != "peer_sync_h6"
+        or saved_config.get("wmrm_cycle_steps") != 15
+        or contract.get("peer_world_topology") != PEER_WORLD_TOPOLOGY_CONTRACT
+        or contract.get("peer_gradient_boundary") != PEER_GRADIENT_BOUNDARY_CONTRACT
+    ):
+        raise ValueError(
+            f"{PEER_H15_PREFIX_TAIL_FLOW_MIGRATION} requires the fixed-anchor "
+            "H15 peer checkpoint"
+        )
+    if model.tail_flow_head is None:
+        raise ValueError(
+            f"{PEER_H15_PREFIX_TAIL_FLOW_MIGRATION} requires prefix-tail Flow"
+        )
+    saved = checkpoint["model"]
+    if any(key.startswith("tail_flow_head.") for key in saved):
+        raise ValueError("source checkpoint already contains an isolated tail Flow head")
+    state = dict(saved)
+    for key in model.state_dict():
+        if not key.startswith("tail_flow_head."):
+            continue
+        source = "flow_head." + key.removeprefix("tail_flow_head.")
+        if source not in saved:
+            raise ValueError(f"source checkpoint lacks {source}")
+        state[key] = saved[source].clone()
+    return state
 
 
 def wmrm_next_feature_target(
@@ -1312,6 +1350,15 @@ def build_exact_run_contract(
             "action_source": PEER_WORLD_ACTION_SOURCE_CONTRACT,
             "readout": PEER_WORLD_READOUT_CONTRACT,
             "gradient_boundary": PEER_GRADIENT_BOUNDARY_CONTRACT,
+            "flow_topology": (
+                PEER_H15_PREFIX_TAIL_FLOW_CONTRACT
+                if getattr(config, "deployment_execution_horizon", 0) == 15
+                else None
+            ),
+            "deployment_execution_horizon": int(
+                getattr(config, "deployment_execution_horizon", 0)
+                or planning_stride
+            ),
             "data_isolation": PEER_DATA_ISOLATION_CONTRACT,
             "optimizer": PEER_DUAL_STREAM_OPTIMIZER_CONTRACT,
             "planning_stride": planning_stride,
@@ -4157,6 +4204,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--deployment-execution-horizon",
+        type=int,
+        default=0,
+        help=(
+            "closed-loop actions executed before replanning; 0 uses planning-stride. "
+            "H15 peer checkpoints may set 15 while training windows remain P2"
+        ),
+    )
+    parser.add_argument(
         "--sequences-per-episode",
         type=int,
         default=4,
@@ -5148,7 +5204,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--flow-prefix-steps",
         type=int,
         default=6,
-        help="flow horizon 前缀长度；默认 6，与闭环每次实际执行步数一致。",
+        help="flow loss/diagnostic split; deployment cadence is configured separately.",
     )
     parser.add_argument(
         "--flow-prefix-weight",
@@ -5267,11 +5323,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--resume-weights-migration",
-        choices=[PEER_WORLD8_TO_WORLD7_REPAIR_MIGRATION],
+        choices=[
+            PEER_WORLD8_TO_WORLD7_REPAIR_MIGRATION,
+            PEER_H15_PREFIX_TAIL_FLOW_MIGRATION,
+        ],
         help=(
-            "one-shot H6-to-H15 migration; keeps VA/Flow shared weights, action "
-            "readout, first six action queries, and map-to-VA projection while "
-            "rebuilding World dynamics and initializing nine new action queries"
+            "one named peer architecture migration: legacy H6-to-H15 World repair "
+            "or s1752 H15-to-isolated-prefix/tail Flow"
         ),
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -5304,6 +5362,8 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"--{name.replace('_', '-')} must be finite")
     if args.steps <= 0 or args.flow_steps <= 0:
         raise ValueError("training steps and flow steps must be positive")
+    if args.deployment_execution_horizon < 0:
+        raise ValueError("--deployment-execution-horizon must be non-negative")
     if not math.isfinite(args.pair_loss_weight) or args.pair_loss_weight < 0.0:
         raise ValueError("pair loss weight must be a non-negative finite value")
     if args.max_gradient_norm is not None and (
@@ -5345,6 +5405,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--va-data/--world-data are only supported by peer_sync_h6")
     if peer_world:
         planning_stride = int(getattr(args, "planning_stride", 6))
+        deployment_horizon = int(
+            getattr(args, "deployment_execution_horizon", 0)
+            or planning_stride
+        )
         if not dual_peer_data:
             raise ValueError(
                 "peer_sync_h6 joint training requires both --va-data and --world-data"
@@ -5377,6 +5441,13 @@ def validate_args(args: argparse.Namespace) -> None:
                 getattr(args, "wmrm_cycle_steps", 0)
             )
             in {planning_stride, 15},
+            "--deployment-execution-horizon == P or World horizon": (
+                deployment_horizon
+                in {
+                    planning_stride,
+                    int(getattr(args, "wmrm_cycle_steps", 0)),
+                }
+            ),
             "--flow-prefix-steps == --planning-stride": int(
                 getattr(args, "flow_prefix_steps", 0)
             )
@@ -6973,6 +7044,15 @@ def save_checkpoint(
                     == "peer_sync_h6"
                     else None
                 ),
+                "peer_flow_topology": (
+                    PEER_H15_PREFIX_TAIL_FLOW_CONTRACT
+                    if getattr(model, "tail_flow_head", None) is not None
+                    else None
+                ),
+                "deployment_execution_horizon": int(
+                    getattr(config, "deployment_execution_horizon", 0)
+                    or getattr(config, "planning_stride", 6)
+                ),
                 "peer_data_isolation": (
                     PEER_DATA_ISOLATION_CONTRACT
                     if getattr(config, "va_world_mode", "legacy")
@@ -7569,6 +7649,9 @@ def main() -> None:
             vision_dim=768,
             action_horizon=int(payload["actions"].shape[-2]),
             planning_stride=args.planning_stride,
+            deployment_execution_horizon=(
+                args.deployment_execution_horizon or args.planning_stride
+            ),
             action_dim=int(payload["actions"].shape[-1]),
             proprio_dim=int(payload["proprio"].shape[-1]),
             mode=args.mode,
@@ -7891,6 +7974,9 @@ def main() -> None:
             ),
             action_horizon=int(dataset.payload["actions"].shape[-2]),
             planning_stride=args.planning_stride,
+            deployment_execution_horizon=(
+                args.deployment_execution_horizon or args.planning_stride
+            ),
             action_dim=int(dataset.payload["actions"].shape[-1]),
             proprio_dim=int(dataset.payload["proprio"].shape[-1]),
             mode=args.mode,
@@ -8290,6 +8376,9 @@ def main() -> None:
         config = VACompoundConfig(
             mode=args.mode, num_layers=args.va_layers, qk_norm=args.qk_norm,
             planning_stride=args.planning_stride,
+            deployment_execution_horizon=(
+                args.deployment_execution_horizon or args.planning_stride
+            ),
             attention_variant=args.attention_variant,
             va_attention_backend=args.va_attention_backend,
             action_query_cond=args.action_query_cond,
@@ -8935,6 +9024,19 @@ def main() -> None:
                         "resume-weights migration: kept VA/Flow shared weights, "
                         "action readout, H6 query prefix, and DINO-to-VA projection; "
                         "initialized H15 tail + rebuilt all WAM dynamics",
+                        flush=True,
+                    )
+                elif (
+                    getattr(args, "resume_weights_migration", None)
+                    == PEER_H15_PREFIX_TAIL_FLOW_MIGRATION
+                ):
+                    state = migrate_peer_h15_prefix_tail_flow_state(
+                        model, resume_ckpt
+                    )
+                    model.load_state_dict(state, strict=True)
+                    print(
+                        "resume-weights migration: kept s1752 VA/World/H15; "
+                        "cloned Flow into isolated H6-prefix and H9-tail paths",
                         flush=True,
                     )
                 else:
