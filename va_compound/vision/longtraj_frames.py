@@ -11,8 +11,10 @@ LiveVJEPADataset 同契约：全部既有键 + ``frames [T, W, H, W, 3] uint8``
 """
 from __future__ import annotations
 
+import gc
 import io
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -23,6 +25,31 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parent.parent.parent
 ACTION_MASK_KEYS = ("action_valid_mask", "horizon_mask")
 PEER_SYNC_H6_CONTRACT = "peer_sync_h6_world_windows_v1"
+# One decoded-task table per process. Peer training builds two
+# LongTrajFramesDataset objects (VA + World); a per-dataset LRU of size 1
+# still keeps two full 480px caches and re-decodes on every task switch.
+# hard2 assembly-v3 is ~38 GiB decoded; two ranks × two copies plus a
+# third in-flight decode exceeds the 240 GiB notebook cgroup.
+_PROCESS_DECODED: OrderedDict[str, list[list[np.ndarray]]] = OrderedDict()
+_PROCESS_DECODED_CAP = 1
+
+
+def _decoded_cap(requested: int) -> int:
+    global _PROCESS_DECODED_CAP
+    _PROCESS_DECODED_CAP = max(_PROCESS_DECODED_CAP, max(1, int(requested)))
+    return _PROCESS_DECODED_CAP
+
+
+def _evict_decoded(keep: str | None = None) -> None:
+    while len(_PROCESS_DECODED) >= _PROCESS_DECODED_CAP:
+        oldest = next(iter(_PROCESS_DECODED))
+        if oldest == keep:
+            if len(_PROCESS_DECODED) == 1:
+                return
+            _PROCESS_DECODED.move_to_end(oldest)
+            oldest = next(iter(_PROCESS_DECODED))
+        del _PROCESS_DECODED[oldest]
+        gc.collect()
 
 
 def mtvj_collate(batch: list[dict]) -> dict:
@@ -104,8 +131,7 @@ class LongTrajFramesDataset:
         # 任务级预解码缓存（Codex P1-13 优化，2026-08-10）：locality sampler 下
         # 同任务 batch 连续 → 解码帧驻留内存（1 任务 ≈ 5.3GB），JPEG 只在任务
         # 切换时解码一次（~60s/任务）；配合 num_workers=0 单 worker 防多份拷贝。
-        self._decoded: dict[str, list[list[np.ndarray]]] = {}
-        self.decode_cache_tasks = max(1, int(decode_cache_tasks))
+        self.decode_cache_tasks = _decoded_cap(decode_cache_tasks)
         # DINO 特征缓存（2026-08-15）：feature_cache 给定时每个样本返回其
         # 帧窗在缓存中的行号（frame_cache_rows [T, W] int64），不再解 JPEG
         # 帧（include_frames=False 时无 frames 键）——训练循环从预计算特征读，
@@ -160,14 +186,13 @@ class LongTrajFramesDataset:
                 self.cached_raw_frames = cached_raw
 
     def _decode_task(self, task_file: str) -> list[list[np.ndarray]]:
-        cached = self._decoded.get(task_file)
+        cached = _PROCESS_DECODED.get(task_file)
         if cached is not None:
+            _PROCESS_DECODED.move_to_end(task_file)
             return cached
-        # 先释放旧任务解码缓存再解码新任务：避免「旧缓存 + 新任务全帧解码」双驻留
-        # 峰值（大任务 peg-unplug-side 15000 帧 ≈ 10GB，叠加旧缓存可触顶 OOM）。
-        while len(self._decoded) >= self.decode_cache_tasks:
-            oldest = next(iter(self._decoded))
-            del self._decoded[oldest]
+        # Evict before decoding so a process never holds LRU + in-flight frames.
+        # The cache is process-wide: VA and World datasets share it.
+        _evict_decoded()
         data = self._load_task(task_file)
         # 多线程解码（PIL JPEG 解码在 C 层释放 GIL，8 线程 ~8 倍加速）；
         # 存 480 原尺寸（resize 交给 GPU 预处理，phase2 同款，避免 CPU bicubic）。
@@ -185,10 +210,9 @@ class LongTrajFramesDataset:
             decoded.append(frames)
         print(f"  [longtraj] 解码 {task_file}: {sum(len(e) for e in decoded)} 帧, "
               f"{time.time()-t0:.0f}s", flush=True)
-        while len(self._decoded) >= self.decode_cache_tasks:
-            oldest = next(iter(self._decoded))
-            del self._decoded[oldest]
-        self._decoded[task_file] = decoded
+        _evict_decoded(keep=task_file)
+        _PROCESS_DECODED[task_file] = decoded
+        _PROCESS_DECODED.move_to_end(task_file)
         return decoded
 
     def _load_task(self, task_file: str) -> dict:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import math
@@ -1601,6 +1602,52 @@ def _maybe_build_action_vision_backbone(
     return backbone
 
 
+_IMAGENET_MEAN = (0.485, 0.456, 0.406)
+_IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+def _iter_imagenet_nchw_chunks(
+    frames_u8: np.ndarray,
+    device: torch.device,
+    *,
+    encode_batch: int,
+    image_size: int,
+):
+    """Upload uint8 NHWC frames and yield ImageNet-normalized NCHW GPU chunks.
+
+    Peer training encodes 192 frames per stream (batch 12 × T4 × W4) twice
+    each step. Expanding them to float32 on CPU made a ~0.5 GiB host tensor
+    per stream and left the GPU idle between microbatches.
+    """
+    if encode_batch < 1:
+        raise ValueError("encode_batch must be positive")
+    if frames_u8.dtype != np.uint8 or frames_u8.ndim != 4 or frames_u8.shape[-1] != 3:
+        raise ValueError(
+            "uint8 frames must be [N,H,W,3], got "
+            f"{tuple(frames_u8.shape)}/{frames_u8.dtype}"
+        )
+    images_u8 = torch.from_numpy(np.ascontiguousarray(frames_u8))
+    if device.type == "cuda":
+        images_u8 = images_u8.pin_memory()
+    mean = torch.tensor(_IMAGENET_MEAN, device=device, dtype=torch.float32).view(1, 3, 1, 1)
+    std = torch.tensor(_IMAGENET_STD, device=device, dtype=torch.float32).view(1, 3, 1, 1)
+    target = (image_size, image_size)
+    for start in range(0, images_u8.shape[0], encode_batch):
+        chunk = images_u8[start : start + encode_batch].to(
+            device, non_blocking=device.type == "cuda"
+        )
+        chunk = chunk.permute(0, 3, 1, 2).to(dtype=torch.float32).div_(255.0)
+        if tuple(chunk.shape[-2:]) != target:
+            chunk = F.interpolate(
+                chunk,
+                size=target,
+                mode="bicubic",
+                align_corners=False,
+                antialias=True,
+            )
+        yield start, (chunk - mean) / std
+
+
 def _action_vision_online_encode(
     frames,
     backbone,
@@ -1629,21 +1676,13 @@ def _action_vision_online_encode(
     selected = np.ascontiguousarray(frames_np[:, :, (1, 3), :, :, :].reshape(
         batch_size * sequence_length * 2, height, width, 3
     ))
-    images = torch.from_numpy(selected).permute(0, 3, 1, 2).float().div_(255.0)
     outputs: dict[int, list[Tensor]] = {5: [], 11: []}
-    mean = torch.tensor((0.485, 0.456, 0.406), device=device).view(1, 3, 1, 1)
-    std = torch.tensor((0.229, 0.224, 0.225), device=device).view(1, 3, 1, 1)
-    for start in range(0, images.shape[0], encode_batch):
-        chunk = images[start : start + encode_batch].to(device)
-        if tuple(chunk.shape[-2:]) != (backbone.image_size, backbone.image_size):
-            chunk = F.interpolate(
-                chunk,
-                size=(backbone.image_size, backbone.image_size),
-                mode="bicubic",
-                align_corners=False,
-                antialias=True,
-            )
-        chunk = (chunk - mean) / std
+    for _start, chunk in _iter_imagenet_nchw_chunks(
+        selected,
+        device,
+        encode_batch=encode_batch,
+        image_size=backbone.image_size,
+    ):
         hierarchical = backbone.forward_hierarchical_dense(chunk)
         for layer in (5, 11):
             outputs[layer].append(hierarchical[layer])
@@ -1733,23 +1772,15 @@ def _dino_main_online_encode(
     selected = np.ascontiguousarray(
         frames_np.reshape(batch_size * sequence_length * window, height, width, 3)
     )
-    images = torch.from_numpy(selected).permute(0, 3, 1, 2).float().div_(255.0)
-    mean = torch.tensor((0.485, 0.456, 0.406), device=device).view(1, 3, 1, 1)
-    std = torch.tensor((0.229, 0.224, 0.225), device=device).view(1, 3, 1, 1)
     chunks: list[Tensor] = []
     dense5: list[Tensor] = []
     dense11: list[Tensor] = []
-    for start in range(0, images.shape[0], encode_batch):
-        chunk = images[start : start + encode_batch].to(device)
-        if tuple(chunk.shape[-2:]) != (backbone.image_size, backbone.image_size):
-            chunk = F.interpolate(
-                chunk,
-                size=(backbone.image_size, backbone.image_size),
-                mode="bicubic",
-                align_corners=False,
-                antialias=True,
-            )
-        chunk = (chunk - mean) / std
+    for start, chunk in _iter_imagenet_nchw_chunks(
+        selected,
+        device,
+        encode_batch=encode_batch,
+        image_size=backbone.image_size,
+    ):
         hierarchical = backbone.forward_hierarchical_dense(chunk)
         tokens = hierarchical[11]
         if tokens.shape[-2] != 256 or tokens.shape[-1] != backbone.feature_dim:
@@ -7547,13 +7578,15 @@ def main() -> None:
                 longtraj_dir=getattr(args, "longtraj_dir", None),
                 min_sequence_length=args.min_sequence_length,
                 decode_cache_tasks=(
-                    getattr(args, "longtraj_decode_cache_tasks", None)
-                    or (
-                        1
-                        if dual_peer_data
-                        else 2
-                        if getattr(args, "dino_main_vision", False)
-                        else 1
+                    max(int(getattr(args, "longtraj_decode_cache_tasks", None) or 1), 2)
+                    if dual_peer_data
+                    else (
+                        getattr(args, "longtraj_decode_cache_tasks", None)
+                        or (
+                            2
+                            if getattr(args, "dino_main_vision", False)
+                            else 1
+                        )
                     )
                 ),
                 feature_cache=(
@@ -8050,7 +8083,7 @@ def main() -> None:
                 longtraj_dir=getattr(args, "longtraj_dir", None),
                 min_sequence_length=args.min_sequence_length,
                 decode_cache_tasks=(
-                    getattr(args, "longtraj_decode_cache_tasks", None) or 1
+                    max(int(getattr(args, "longtraj_decode_cache_tasks", None) or 1), 2)
                 ),
                 feature_cache=None,
                 include_frames=True,
@@ -9003,6 +9036,7 @@ def main() -> None:
         restore_rng_state(resume_rng_state)
 
     last_saved_global_step: int | None = None
+    visual_aux_pool = ThreadPoolExecutor(max_workers=1)
 
     def commit_successful_update(local_step: int, consumed_locality_batch: bool) -> None:
         """Advance all resumable state only after the optimizer update succeeds."""
@@ -9085,6 +9119,33 @@ def main() -> None:
                 consumed_locality_batch = isinstance(
                     sampler, (TaskLocalityWeightedSampler, TaskWeightedSampler)
                 )
+        next_global_step = global_step + 1
+        visual_aux_every = (
+            0
+            if getattr(args, "wmrm_only", False)
+            else int(args.mtvj_visual_aux_every)
+        )
+        visual_aux_future = None
+        if (
+            visual_aux_every > 0
+            and next_global_step % visual_aux_every == 0
+            and aux_tasks
+        ):
+            # OSMesa/llvmpipe render is CPU-only. Overlap it with the frozen
+            # DINO encode and VA forward so the GPU is not left idle.
+            visual_aux_future = visual_aux_pool.submit(
+                _prepare_mtvj_visual_aux_step,
+                aux_tasks,
+                aux_task_w,
+                env_by_description,
+                seed=args.seed,
+                global_step=next_global_step,
+                every=visual_aux_every,
+                aux_batch=args.mtvj_visual_aux_batch,
+                include_raw_frames=bool(
+                    getattr(args, "dino_main_vision", False)
+                ),
+            )
         if mtvj_backbone is not None:
             # MT-VJ（契约 §6）：在线 dense 编码——frames（live 数据集或合成冒烟）
             # → 冻结 V-JEPA forward_hierarchical_dense（fp16）→ {5,11} →
@@ -9326,22 +9387,6 @@ def main() -> None:
             if batch.get("is_perturbed") is not None
             and bool(batch["is_perturbed"].any())
             else sample_flow_matching_inputs(batch["actions"])
-        )
-
-        next_global_step = global_step + 1
-        prepared_visual_aux = _prepare_mtvj_visual_aux_step(
-            aux_tasks,
-            aux_task_w,
-            env_by_description,
-            seed=args.seed,
-            global_step=next_global_step,
-            every=(
-                0
-                if getattr(args, "wmrm_only", False)
-                else args.mtvj_visual_aux_every
-            ),
-            aux_batch=args.mtvj_visual_aux_batch,
-            include_raw_frames=bool(getattr(args, "dino_main_vision", False)),
         )
 
         def compute_loss(
@@ -9851,6 +9896,9 @@ def main() -> None:
         # 累积到同一优化器 step；辅助分支只反传 metric head，且视觉头与
         # VA/relation 分别 clip，避免大辅助梯度压小动作学习信号。
         aux_parts: dict[str, float] = {}
+        prepared_visual_aux = (
+            visual_aux_future.result() if visual_aux_future is not None else None
+        )
         if prepared_visual_aux is not None:
             aux_task, aux_rng, aux_sim_batch = prepared_visual_aux
             if getattr(args, "dino_main_vision", False):

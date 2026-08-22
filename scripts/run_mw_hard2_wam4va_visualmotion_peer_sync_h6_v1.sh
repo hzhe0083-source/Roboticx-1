@@ -21,6 +21,8 @@ ALLTASK_H48_REF=${ALLTASK_H48_REF:-data/metaworld_longtraj_windows_h48.pt}
 DATA_TAG=${DATA_TAG:-v1}
 # Resident decoded-task budget; empty keeps train.py's own default.
 DECODE_CACHE_TASKS=${DECODE_CACHE_TASKS:-}
+# Frozen DINO microbatch. 8 is the 16-GiB-safe default; 4090 24GB can try 32.
+MAIN_VISION_ENCODE_BATCH=${MAIN_VISION_ENCODE_BATCH:-8}
 # 1 = single process; >1 launches torchrun over that many local GPUs.  Global
 # --batch-size is split across ranks. Dual L20 (~48GB) held 24/card (global 48).
 # Dual RTX 4090 (24GB) cannot; start at global 16 (8/card) and raise if VRAM allows.
@@ -351,7 +353,7 @@ run_joint(){
     --world-action-rank-stage final \
     --dino-main-vision --dino-dense-metric --main-vision-checkpoint "$DINO" \
     --main-vision-grid 16 --main-vision-frames 4 --main-vision-temporal \
-    --main-vision-temporal-scale 1.0 --main-vision-encode-batch 8 \
+    --main-vision-temporal-scale 1.0 --main-vision-encode-batch "$MAIN_VISION_ENCODE_BATCH" \
     --metric-geometry-inject --wmrm-map-size 16 --wmrm-map-channels 1024 \
     --wmrm-world-grid 16 --wmrm-predictor st_blocks --wmrm-predictor-depth 6 \
     --wmrm-predictor-width 384 --wmrm-predictor-heads 12 --single-task \
