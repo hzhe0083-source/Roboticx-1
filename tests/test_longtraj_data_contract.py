@@ -361,6 +361,80 @@ class LongTrajBuilderContractTest(unittest.TestCase):
                 planning_stride=0,
             )
 
+    def test_peer_h15_p2_build_adds_explicit_endpoint_frames(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ref_path = root / "ref.pt"
+            source = root / "metaworld_longtraj_door-lock-v3.pt"
+            output = root / "peer_h15_p2.pt"
+            task_text = build.ENV_TO_TASK["door-lock-v3"]
+            torch.save(
+                {
+                    "normalization": self._normalization(),
+                    "metadata": {"tasks": [task_text]},
+                    "instruction_id": torch.tensor([0]),
+                    "language_hidden": torch.zeros(1, 2, 3),
+                    "language_mask": torch.ones(1, 2, dtype=torch.bool),
+                },
+                ref_path,
+            )
+            n = 40
+            jpeg = collect.compress_frames(
+                np.zeros((1, 2, 2, 3), dtype=np.uint8)
+            )[0]
+            timeline = np.arange(n, dtype=np.float32) / 100.0
+            values = np.repeat(timeline[:, None], 4, axis=1)
+            torch.save(
+                {
+                    "task": "door-lock-v3",
+                    "episodes": [
+                        {
+                            "frames": [jpeg] * n,
+                            "actions": values,
+                            "states": values,
+                            "first_success": n - 1,
+                            "action_executed": np.ones(n, dtype=bool),
+                            "action_supervision_valid": np.ones(n, dtype=bool),
+                            "recovery_mask": np.zeros(n, dtype=bool),
+                        }
+                    ],
+                },
+                source,
+            )
+
+            build.phase1(
+                15,
+                task="door-lock-v3",
+                input_paths=[source],
+                output_path=output,
+                ref_path=ref_path,
+                legacy_policy="error",
+                data_contract=build.PEER_SYNC_H15_P2_CONTRACT,
+                planning_stride=2,
+            )
+            payload = torch.load(output, map_location="cpu", weights_only=True)
+            metadata = payload["metadata"]
+            self.assertEqual(tuple(payload["actions"].shape), (10, 4, 15, 4))
+            self.assertEqual(metadata["contract"], build.PEER_SYNC_H15_P2_CONTRACT)
+            self.assertEqual(metadata["logged_action_chunk"], "full_h15")
+            self.assertEqual(metadata["world_target_horizon"], 15)
+            self.assertEqual(metadata["world_target_offsets"], [15, 17, 19, 21])
+            self.assertEqual(
+                [row[0] for row in payload["world_target_frame_refs"][0][2]],
+                [15, 17, 19, 21],
+            )
+            self.assertTrue(bool(payload["world_target_valid_mask"].all()))
+            from va_compound.longtraj_frames import LongTrajFramesDataset
+
+            dataset = LongTrajFramesDataset(
+                output,
+                longtraj_dir=root,
+                include_world_target_frames=True,
+            )
+            item = dataset[0]
+            self.assertEqual(tuple(item["world_target_frames"].shape), (4, 1, 2, 2, 3))
+            self.assertEqual(tuple(item["world_target_valid_mask"].shape), (4,))
+
     def test_legacy_contract_warns_or_fails_explicitly(self):
         n = 30
         ep = {

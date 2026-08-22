@@ -2358,8 +2358,8 @@ def main() -> None:
     ):
         required_p2_contract = {
             "peer_training_mode": "joint_dual_stream",
-            "peer_world_topology": "one_stage_delayed_world_minus_one_last_va_consume_v1",
-            "peer_gradient_boundary": "fully_differentiable_bidirectional_messages_v1",
+            "peer_world_topology": "world_minus_one_same_endpoint_fixed_current_anchor_v2",
+            "peer_gradient_boundary": "world_map_stopgrad_policy_projection_trainable_v1",
             "peer_data_isolation": "separate_va_world_episode_datasets_per_step_v1",
             "peer_dual_stream_optimizer": (
                 "va_backward_then_world_backward_one_optimizer_step_v1"
@@ -2860,9 +2860,12 @@ def main() -> None:
             ),
             "wmrm_cycle_steps": (
                 int(getattr(config, "wmrm_cycle_steps", 0)),
-                checkpoint_planning_stride,
+                training_prediction_horizon,
             ),
-            "action_horizon": (training_prediction_horizon, 6),
+            "action_horizon": (
+                training_prediction_horizon,
+                int(getattr(config, "action_horizon", 0)),
+            ),
         }
         cadence_mismatch = {
             key: values
@@ -3901,7 +3904,7 @@ def main() -> None:
                         )
                         if getattr(model, "wmrm", None) is not None:
                             expected_world_horizon = (
-                                checkpoint_planning_stride
+                                int(config.action_horizon)
                                 if peer_checkpoint
                                 else EXPECTED_WMRM_WORLD_HORIZON
                             )

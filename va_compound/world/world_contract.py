@@ -59,30 +59,47 @@ def world_late_stage_anchor_contract(weight: float = 0.0) -> dict[str, object]:
 WORLD_LATE_STAGE_ANCHOR = world_late_stage_anchor_contract(0.0)
 WORLD_LOGGED_BRANCH_CONTRACT = "matched_context_full_forward_v1"
 WORLD_ACTION_DONOR_CONTRACT = "train_split_task_cross_episode_proprio_nearest_v1"
-# VA has N layers; World proposes on layers 0..N-2. The last VA layer only
-# consumes the final world map (DINO MSE + next-decision handoff). The old
-# equal-depth contract left the last VA layer reading S_{N-2} while World
-# still produced an unseen S_{N-1} after action_condition.
+# VA has N layers; World proposes on layers 0..N-2. Each proposal predicts the
+# same next-decision endpoint from the current DINO anchor. The previous stage
+# map is detached refinement context, never an additive physical-state base.
 PEER_WORLD_TOPOLOGY_CONTRACT = (
-    "one_stage_delayed_world_minus_one_last_va_consume_v1"
+    "world_minus_one_same_endpoint_fixed_current_anchor_v2"
 )
 PEER_WORLD_ACTION_SOURCE_CONTRACT = "deterministic_readout_main_explicit_env_override_supervision_v1"
-PEER_GRADIENT_BOUNDARY_CONTRACT = "fully_differentiable_bidirectional_messages_v1"
+# The policy consumes the predicted map value, while its action loss trains the
+# map-to-policy projection/readers rather than changing the physical predictor.
+# World reconstruction and action-counterfactual objectives own the dynamics.
+PEER_GRADIENT_BOUNDARY_CONTRACT = (
+    "world_map_stopgrad_policy_projection_trainable_v1"
+)
+PEER_LEGACY_TOPOLOGY_CONTRACT = "one_stage_delayed_bidirectional_state_kv_v1"
+PEER_LEGACY_GRADIENT_BOUNDARY_CONTRACT = (
+    "fully_differentiable_bidirectional_messages_v1"
+)
+PEER_WORLD8_TO_WORLD7_REPAIR_MIGRATION = (
+    "peer_world8_h6_to_world7_h15_fixed_anchor_fresh_world_v3"
+)
 PEER_DATA_ISOLATION_CONTRACT = "separate_va_world_episode_datasets_per_step_v1"
 PEER_DUAL_STREAM_OPTIMIZER_CONTRACT = (
     "va_backward_then_world_backward_one_optimizer_step_v1"
 )
 PEER_PLANNING_STRIDES = frozenset({1, 2, 3, 6})
 PEER_HIGH_FREQUENCY_CONTRACT = {
+    "action_prediction": "full_action_chunk_each_decision_v2",
+    "world_transition": "logged_world_horizon_action_chunk_v2",
+    "world_target": "explicit_endpoint_at_world_horizon_v2",
+    "readout_auxiliary": "full_logged_action_chunk_v2",
+}
+PEER_LEGACY_HIGH_FREQUENCY_CONTRACT = {
     "action_prediction": "full_h6_each_decision_v1",
     "world_transition": "logged_h6_prefix_planning_stride_v1",
     "world_target": "adjacent_decision_at_data_stride_v1",
     "readout_auxiliary": "full_logged_h6_v1",
 }
 PEER_WORLD_READOUT_CONTRACT = {
-    "va_stream": "causal_deterministic_h6_readout_v1",
-    "world_stream": "explicit_logged_h6_model_uses_planning_prefix_v1",
-    "loss": "logged_h6_auxiliary_without_forward_label_injection_v1",
+    "va_stream": "causal_deterministic_action_chunk_readout_v2",
+    "world_stream": "explicit_logged_chunk_at_world_horizon_v2",
+    "loss": "logged_chunk_auxiliary_without_forward_label_injection_v2",
 }
 FEATURE_AUTOCAST_CONTRACT = "bf16_nograd_decode_cache_isolated_v1"
 WORLD_NO_REGRESSION = {
@@ -185,13 +202,16 @@ def validate_visual_world_training_split(
     if not actions.is_floating_point() or not bool(torch.isfinite(actions).all()):
         raise ValueError("visual World actions must be finite floating-point values")
     peer_mode = va_world_mode == "peer_sync_h6"
-    expected_shape = (4, 6, 4) if peer_mode else (4, 48, 4)
+    peer_horizon = int((payload.get("metadata") or {}).get("action_horizon", 6))
+    if peer_mode and peer_horizon not in {6, 15}:
+        raise ValueError("peer action horizon must be H6 or H15")
+    expected_shape = (4, peer_horizon, 4) if peer_mode else (4, 48, 4)
     if peer_mode and planning_stride not in PEER_PLANNING_STRIDES:
         raise ValueError("peer planning_stride must be one of 1/2/3/6")
     expected_protocol = (
-        PEER_SYNC_H6_CONTRACT
-        if peer_mode and planning_stride == 6
-        else f"peer_sync_h6_p{planning_stride}_world_windows_v1"
+        f"peer_sync_h{peer_horizon}_p{planning_stride}_world_windows_v1"
+        if peer_mode and (peer_horizon != 6 or planning_stride != 6)
+        else PEER_SYNC_H6_CONTRACT
         if peer_mode
         else MANIFEST_CONTRACT
     )
@@ -208,8 +228,10 @@ def validate_visual_world_training_split(
             raise ValueError(
                 f"peer_sync_h6 requires metadata.contract={expected_protocol!r}"
             )
-        if metadata.get("logged_action_chunk") != "full_h6":
-            raise ValueError("peer_sync_h6 requires the full logged H6 action chunk")
+        if metadata.get("logged_action_chunk") != f"full_h{peer_horizon}":
+            raise ValueError(
+                f"peer mode requires the full logged H{peer_horizon} action chunk"
+            )
         if int(metadata.get("control_stride", -1)) != planning_stride:
             raise ValueError(
                 "peer_sync_h6 data control_stride must equal planning_stride "
@@ -233,6 +255,19 @@ def validate_visual_world_training_split(
         for key in ("parent_identity", "source_identities", "output_identity"):
             if not metadata.get(key):
                 raise ValueError(f"peer_sync_h6 requires metadata.{key}")
+        if peer_horizon == 15:
+            target_valid = payload.get("world_target_valid_mask")
+            target_refs = payload.get("world_target_frame_refs")
+            if (
+                not isinstance(target_valid, Tensor)
+                or target_valid.dtype != torch.bool
+                or tuple(target_valid.shape) != tuple(actions.shape[:2])
+            ):
+                raise ValueError("H15 requires world_target_valid_mask bool [N,T]")
+            if not isinstance(target_refs, (list, tuple)) or len(target_refs) != len(actions):
+                raise ValueError("H15 requires one world_target_frame_ref per sample")
+            if metadata.get("world_target_horizon") != 15:
+                raise ValueError("H15 requires world_target_horizon=15")
     elif metadata_contract == PEER_SYNC_H6_CONTRACT:
         raise ValueError("legacy visual World rejects peer_sync_h6 data")
     if manifest_protocol != expected_protocol:
@@ -305,13 +340,23 @@ def validate_visual_world_training_split(
         )
 
     transition_rule = manifest.get("transition_rule") or {}
+    explicit_target_valid = payload.get("world_target_valid_mask")
+    transition_prefix = (
+        int(metadata.get("world_target_horizon", -1))
+        if explicit_target_valid is not None
+        else planning_stride if peer_mode else 6
+    )
     if int(transition_rule.get("current_action_prefix_steps", -1)) != (
-        planning_stride if peer_mode else 6
+        transition_prefix
     ):
-        raise ValueError("World split transition prefix does not match planning_stride")
-    transition = split_transition_mask(
-        action_valid,
-        prefix_steps=planning_stride if peer_mode else 6,
+        raise ValueError("World split transition prefix does not match World horizon")
+    transition = (
+        explicit_target_valid
+        if explicit_target_valid is not None
+        else split_transition_mask(
+            action_valid,
+            prefix_steps=planning_stride if peer_mode else 6,
+        )
     )
     transition_stats = (train_contract.get("mask_stats") or {}).get("transition") or {}
     if (
@@ -444,6 +489,7 @@ def validate_visual_world_resume_contract(
     planning_stride: int = 6,
     late_stage_anchor_weight: float = 0.0,
     stage_weight_overrides: dict[int, float] | None = None,
+    world_horizon: int | None = None,
 ) -> None:
     """Reject exact continuation from an old or differently split loss graph."""
 
@@ -458,10 +504,15 @@ def validate_visual_world_resume_contract(
         contract["world_stage_weight_overrides"] = canonical_stage_weight_overrides(
             contract.get("world_stage_weight_overrides")
         )
+    target_horizon = planning_stride if world_horizon is None else int(world_horizon)
+    if target_horizon < planning_stride:
+        raise ValueError("World target horizon cannot be shorter than planning_stride")
     expected = {
         "world_supervision": WORLD_SUPERVISION_CONTRACT,
         "world_transition": (
-            WORLD_TRANSITION_CONTRACT
+            f"explicit_endpoint_h{target_horizon}_v1"
+            if target_horizon > planning_stride
+            else WORLD_TRANSITION_CONTRACT
             if planning_stride == 6
             else f"current_first{planning_stride}_and_next_first_v1"
         ),

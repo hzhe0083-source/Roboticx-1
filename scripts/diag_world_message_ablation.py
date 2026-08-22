@@ -16,8 +16,8 @@ peer_sync_h6 的核心主张是 World 每个 stage 发布 world_message，作为
 """
 from __future__ import annotations
 
+import os
 import sys
-from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -31,44 +31,46 @@ MODE = sys.argv[3] if len(sys.argv) > 3 else "zero"
 if MODE not in {"zero", "frozen"}:
     raise SystemExit(f"mode must be 'zero' or 'frozen', got {MODE}")
 
-from va_compound.wmrm import WAM4VA  # noqa: E402
+from va_compound.policy.model import VACouplingLayer  # noqa: E402
 
-_orig_propose = WAM4VA.propose
+_orig_forward = VACouplingLayer.forward
+_orig_forward_sequential = VACouplingLayer.forward_sequential
 _stats = {"calls": 0, "message_norm": 0.0}
-_frozen: dict[int, torch.Tensor] = {}
+_frozen: list[torch.Tensor] = []
 
 
-def patched_propose(self, *args, **kwargs):
-    proposal = _orig_propose(self, *args, **kwargs)
-    message = proposal.world_message
+def _ablate(kwargs):
+    message = kwargs.get("state")
+    if message is None:
+        return kwargs
     _stats["calls"] += 1
     _stats["message_norm"] += float(message.detach().float().norm())
     if MODE == "zero":
         ablated = torch.zeros_like(message)
     else:
-        stage = int(kwargs.get("stage_index", 0))
-        if stage == 0 or stage not in _frozen:
-            _frozen[stage] = message.detach().clone()
-            _frozen[0] = _frozen.get(0, message.detach().clone())
-            ablated = message
-        else:
-            reference = _frozen[0]
-            ablated = (
-                reference
-                if reference.shape == message.shape
-                else message
-            )
-    return replace(proposal, world_message=ablated)
+        if not _frozen:
+            _frozen.append(message.detach().clone())
+        ablated = _frozen[0] if _frozen[0].shape == message.shape else message
+    return {**kwargs, "state": ablated}
 
 
-WAM4VA.propose = patched_propose
+def patched_forward(self, *args, **kwargs):
+    return _orig_forward(self, *args, **_ablate(kwargs))
+
+
+def patched_forward_sequential(self, *args, **kwargs):
+    return _orig_forward_sequential(self, *args, **_ablate(kwargs))
+
+
+VACouplingLayer.forward = patched_forward
+VACouplingLayer.forward_sequential = patched_forward_sequential
 print(f"[ABLATE] world_message mode={MODE}", flush=True)
 
 import eval_metaworld as E  # noqa: E402
 
-DINO = (
-    "/root/.cache/huggingface/hub/models--timm--vit_large_patch14_reg4_dinov2."
-    "lvd142m/snapshots/f3c408e77602bb412aa65fb03dfa0d5f95cb3832/model.safetensors"
+DINO = os.environ.get(
+    "DINO",
+    "/root/private_data/newhost_env/models/dinov2_vitl14_reg4.safetensors",
 )
 OUT = ROOT / "logs" / f"world_message_ablation_{MODE}.json"
 
@@ -78,7 +80,7 @@ sys.argv = [
     "--features", FEATURES,
     "--main-vision-checkpoint", DINO,
     "--task-ids", "0,16",
-    "--trials-per-task", "10",
+    "--trials-per-task", os.environ.get("TRIALS_PER_TASK", "10"),
     "--execution-horizon", "2",
     "--horizon", "500",
     "--direct-head", "auto",
@@ -93,7 +95,7 @@ finally:
     calls = _stats["calls"]
     mean_norm = _stats["message_norm"] / max(calls, 1)
     print(
-        f"[ABLATE] propose calls={calls} mean |world_message|={mean_norm:.4f} "
+        f"[ABLATE] reader calls={calls} mean |world_message|={mean_norm:.4f} "
         f"(pre-ablation magnitude, confirms the channel carried signal)",
         flush=True,
     )

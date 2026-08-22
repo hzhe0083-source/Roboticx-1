@@ -46,12 +46,14 @@ ST_NPY_DIR = Path("/media/ryan/robot-data")
 LEGACY_PERTURB_SETTLE_STEPS = 12
 PEER_SYNC_H6_CONTRACT = "peer_sync_h6_world_windows_v1"
 PEER_SYNC_H6_P2_CONTRACT = "peer_sync_h6_p2_world_windows_v1"
+PEER_SYNC_H15_P2_CONTRACT = "peer_sync_h15_p2_world_windows_v1"
 PEER_SYNC_H6_VERSION = 1
 PEER_SYNC_H6_P2_VERSION = 1
 PEER_SYNC_H6_P2_STRIDE = 2
 PEER_SYNC_H6_CONTRACTS = frozenset({
     PEER_SYNC_H6_CONTRACT,
     PEER_SYNC_H6_P2_CONTRACT,
+    PEER_SYNC_H15_P2_CONTRACT,
 })
 
 
@@ -452,9 +454,13 @@ def phase1(horizon: int, *, task: str | None = None,
     """
     if data_contract not in {None, *PEER_SYNC_H6_CONTRACTS}:
         raise ValueError(f"unknown data_contract={data_contract!r}")
-    if data_contract in PEER_SYNC_H6_CONTRACTS and horizon != 6:
+    expected_peer_horizon = (
+        15 if data_contract == PEER_SYNC_H15_P2_CONTRACT else 6
+    )
+    if data_contract in PEER_SYNC_H6_CONTRACTS and horizon != expected_peer_horizon:
         raise ValueError(
-            f"{data_contract} requires exact action horizon H6, got H{horizon}"
+            f"{data_contract} requires exact action horizon H{expected_peer_horizon}, "
+            f"got H{horizon}"
         )
     if (
         isinstance(planning_stride, (bool, np.bool_))
@@ -463,7 +469,7 @@ def phase1(horizon: int, *, task: str | None = None,
     ):
         raise ValueError(f"planning_stride must be a positive integer, got {planning_stride!r}")
     planning_stride = int(planning_stride)
-    if data_contract == PEER_SYNC_H6_P2_CONTRACT:
+    if data_contract in {PEER_SYNC_H6_P2_CONTRACT, PEER_SYNC_H15_P2_CONTRACT}:
         if planning_stride != PEER_SYNC_H6_P2_STRIDE:
             raise ValueError(
                 f"{PEER_SYNC_H6_P2_CONTRACT} requires planning_stride="
@@ -559,8 +565,10 @@ def phase1(horizon: int, *, task: str | None = None,
                 legacy_perturb_events_inferred += int(
                     semantics["perturb_start"] is not None
                 )
+            explicit_world_target = data_contract == PEER_SYNC_H15_P2_CONTRACT
             last_start = T - 1 - (
-                (SEQUENCE_LENGTH - 1) * planning_stride + (horizon - 1)
+                (SEQUENCE_LENGTH - 1) * planning_stride
+                + (horizon if explicit_world_target else horizon - 1)
             )
             if last_start < 0:
                 continue
@@ -571,6 +579,7 @@ def phase1(horizon: int, *, task: str | None = None,
                 ], dtype=np.int64)
                 action_valid_mask = semantics["valid"][target_idx]
                 decision_idx = s + np.arange(SEQUENCE_LENGTH) * planning_stride
+                endpoint_idx = decision_idx + horizon
                 # A pre-perturb observation cannot predict which random
                 # perturb/recovery branch will occur later in its H-step target.
                 # Keep recovery supervision once the perturb is observable.
@@ -599,6 +608,15 @@ def phase1(horizon: int, *, task: str | None = None,
                     clip_frame_indices(s + t * planning_stride)
                     for t in range(SEQUENCE_LENGTH)
                 ])  # [T, W]
+                world_target_frame_idx = (
+                    endpoint_idx[:, None].tolist()
+                    if explicit_world_target else None
+                )
+                world_target_valid = (
+                    action_valid_mask.all(axis=1)
+                    & semantics["frame_valid"][endpoint_idx]
+                    if explicit_world_target else None
+                )
                 W.append({
                     "actions": robust(acts, aq01, aq99).astype(np.float32),
                     "prev": robust(prev, aq01, aq99).astype(np.float32),
@@ -611,6 +629,8 @@ def phase1(horizon: int, *, task: str | None = None,
                     "task_file": source_key,
                     "ep_idx": ei,
                     "frame_idx": frame_idx.tolist(),
+                    "world_target_frame_idx": world_target_frame_idx,
+                    "world_target_valid": world_target_valid,
                     "action_valid_mask": action_valid_mask,
                     "recovery_mask": semantics["recovery"][target_idx],
                     "decision_recovery": semantics["recovery"][decision_idx],
@@ -685,7 +705,8 @@ def phase1(horizon: int, *, task: str | None = None,
             "action_dim": 4,
             "action_contract": "executed-clip-fullframe",
             "logged_action_chunk": (
-                "full_h6" if data_contract in PEER_SYNC_H6_CONTRACTS else "full_horizon"
+                f"full_h{horizon}"
+                if data_contract in PEER_SYNC_H6_CONTRACTS else "full_horizon"
             ),
             "parent_identity": parent_identity,
             "source_identities": source_identities,
@@ -706,6 +727,26 @@ def phase1(horizon: int, *, task: str | None = None,
             "legacy_perturb_events_inferred": legacy_perturb_events_inferred,
         },
     }
+    if data_contract == PEER_SYNC_H15_P2_CONTRACT:
+        payload["world_target_frame_refs"] = [
+            (w["task_file"], w["ep_idx"], w["world_target_frame_idx"])
+            for w in W
+        ]
+        payload["world_target_valid_mask"] = torch.from_numpy(
+            np.stack([w["world_target_valid"] for w in W])
+        )
+        payload["metadata"].update(
+            {
+                "world_target_horizon": horizon,
+                "world_target_offsets": [
+                    t * planning_stride + horizon
+                    for t in range(SEQUENCE_LENGTH)
+                ],
+                "world_target_frame_ref_contract": (
+                    "single_endpoint_frame_after_full_action_chunk_v1"
+                ),
+            }
+        )
     _save_new(payload, out_path, overwrite=overwrite)
     print(f"[out] {out_path}: {n} windows")
     return out_path

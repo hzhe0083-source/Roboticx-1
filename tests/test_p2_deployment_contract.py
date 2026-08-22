@@ -40,7 +40,7 @@ def test_legacy_deployment_keeps_six_step_default() -> None:
     assert resolve_execution_horizon(_args(), config) == 6
 
 
-def test_hard2_eval_launcher_is_fixed_to_peer_p2_h6() -> None:
+def test_hard2_eval_launcher_is_fixed_to_peer_p2_for_h6_or_h15() -> None:
     syntax = subprocess.run(
         ["bash", "-n", str(EVAL_RUNNER)],
         cwd=ROOT,
@@ -52,12 +52,13 @@ def test_hard2_eval_launcher_is_fixed_to_peer_p2_h6() -> None:
     for token in (
         "hard2_peer_h6_p2_eval_v1.pt",
         "EXECUTION_HORIZON=2",
-        '"contract": "peer_sync_h6_p2_world_windows_v1"',
+        'data_contract = f"peer_sync_h{action_horizon}_p2_world_windows_v1"',
+        "action_horizon not in {6, 15}",
         '"fps": 80',
         '"control_stride": 2',
         '"planning_stride": 2',
-        '"action_horizon": 6',
-        '"wmrm_cycle_steps": 2',
+        '"action_horizon": action_horizon',
+        '"wmrm_cycle_steps": world_horizon',
         '"flow_prefix_steps": 2',
         '"peer_training_mode": "joint_dual_stream"',
         '"peer_va_data_identity"',
@@ -83,8 +84,8 @@ def test_eval_preflight_rejects_p6_flow_prefix_checkpoint(tmp_path: Path) -> Non
             },
             "training_contract": {
                 "peer_training_mode": "joint_dual_stream",
-                "peer_world_topology": "one_stage_delayed_world_minus_one_last_va_consume_v1",
-                "peer_gradient_boundary": "fully_differentiable_bidirectional_messages_v1",
+                "peer_world_topology": "world_minus_one_same_endpoint_fixed_current_anchor_v2",
+                "peer_gradient_boundary": "world_map_stopgrad_policy_projection_trainable_v1",
                 "peer_data_isolation": "separate_va_world_episode_datasets_per_step_v1",
                 "peer_dual_stream_optimizer": (
                     "va_backward_then_world_backward_one_optimizer_step_v1"

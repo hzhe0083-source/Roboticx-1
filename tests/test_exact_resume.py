@@ -589,10 +589,10 @@ def test_peer_exact_contract_binds_dual_data_and_joint_loss_protocol() -> None:
 
     assert contract["peer_world"]["readout"] == PEER_WORLD_READOUT_CONTRACT
     assert contract["peer_world"]["readout"]["va_stream"] == (
-        "causal_deterministic_h6_readout_v1"
+        "causal_deterministic_action_chunk_readout_v2"
     )
     assert contract["peer_world"]["readout"]["world_stream"] == (
-        "explicit_logged_h6_model_uses_planning_prefix_v1"
+        "explicit_logged_chunk_at_world_horizon_v2"
     )
     assert contract["peer_world"]["optimizer"] == (
         PEER_DUAL_STREAM_OPTIMIZER_CONTRACT
@@ -1170,6 +1170,27 @@ def test_visual_world_exact_resume_binds_fixed_action_donors() -> None:
         identity,
         va_world_mode="peer_sync_h6",
     )
+    h15_peer_contract = {
+        **peer_contract,
+        "world_transition": "explicit_endpoint_h15_v1",
+        "planning_stride": 2,
+        "planning_hz": 40.0,
+    }
+    validate_visual_world_resume_contract(
+        {"training_contract": h15_peer_contract},
+        identity,
+        va_world_mode="peer_sync_h6",
+        planning_stride=2,
+        world_horizon=15,
+    )
+    with pytest.raises(ValueError, match="world_transition"):
+        validate_visual_world_resume_contract(
+            {"training_contract": h15_peer_contract},
+            identity,
+            va_world_mode="peer_sync_h6",
+            planning_stride=2,
+            world_horizon=2,
+        )
     stale_peer = copy.deepcopy(peer_contract)
     stale_peer["peer_world_readout"] = "masked_smooth_l1_logged_h6_v1"
     with pytest.raises(ValueError, match="peer_world_readout"):

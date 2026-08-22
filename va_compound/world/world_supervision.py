@@ -850,12 +850,23 @@ def prepare_visual_world_action_ranking(
     proprio = torch.as_tensor(payload["proprio"])
     task_ids = torch.as_tensor(payload["instruction_id"], dtype=torch.int64)
     episode_ids = torch.as_tensor(payload["episode_id"], dtype=torch.int64)
-    valid = transition_mask(
-        torch.as_tensor(payload["action_valid_mask"]),
-        cycle_steps=planning_stride,
+    metadata = payload.get("metadata") or {}
+    world_horizon = int(metadata.get("world_target_horizon", planning_stride))
+    if not 1 <= world_horizon <= actions.shape[2]:
+        raise ValueError("World target horizon is outside the logged action chunk")
+    explicit_valid = payload.get("world_target_valid_mask")
+    valid = (
+        torch.as_tensor(explicit_valid, dtype=torch.bool)
+        if explicit_valid is not None
+        else transition_mask(
+            torch.as_tensor(payload["action_valid_mask"]),
+            cycle_steps=planning_stride,
+        )
     )
+    if explicit_valid is not None and tuple(valid.shape) != tuple(actions.shape[:2]):
+        raise ValueError("world_target_valid_mask must have shape [N,T]")
     rows, times = torch.nonzero(valid, as_tuple=True)
-    flat_actions = actions[rows, times, :planning_stride]
+    flat_actions = actions[rows, times, :world_horizon]
     flat_proprio = proprio[rows, times]
     flat_tasks = task_ids[rows]
     flat_episodes = episode_ids[rows]
@@ -872,8 +883,8 @@ def prepare_visual_world_action_ranking(
     table = actions.new_zeros(
         (
             actions.shape[0],
-            actions.shape[1] - 1,
-            planning_stride,
+            valid.shape[1],
+            world_horizon,
             actions.shape[-1],
         )
     )

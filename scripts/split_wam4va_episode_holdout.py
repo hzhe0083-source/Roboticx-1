@@ -17,13 +17,16 @@ from torch import Tensor
 MANIFEST_CONTRACT = "wam4va_episode_holdout_manifest_v1"
 PEER_SYNC_H6_CONTRACT = "peer_sync_h6_world_windows_v1"
 PEER_SYNC_H6_P2_CONTRACT = "peer_sync_h6_p2_world_windows_v1"
+PEER_SYNC_H15_P2_CONTRACT = "peer_sync_h15_p2_world_windows_v1"
 PEER_SYNC_H6_CONTRACTS = frozenset({
     PEER_SYNC_H6_CONTRACT,
     PEER_SYNC_H6_P2_CONTRACT,
+    PEER_SYNC_H15_P2_CONTRACT,
 })
 MANIFEST_VERSION = 1
 LEGACY_SHAPE = (4, 48, 4)
 PEER_SHAPE = (4, 6, 4)
+PEER_H15_SHAPE = (4, 15, 4)
 TRANSITION_PREFIX_STEPS = 6
 TRANSITION_RULE = {
     "contract": "wam4va_world_transition_mask_v1",
@@ -45,6 +48,13 @@ PEER_SYNC_H6_P2_TRANSITION_RULE = {
     "current_action_prefix_steps": PEER_SYNC_H6_P2_TRANSITION_PREFIX_STEPS,
     "next_action_index": 0,
     "time_indices": "t=0..T-2",
+}
+PEER_SYNC_H15_P2_TRANSITION_RULE = {
+    "contract": "wam4va_explicit_endpoint_mask_v1",
+    "expression": "world_target_valid_mask[:, t]",
+    "current_action_prefix_steps": 15,
+    "target_offset_steps": 15,
+    "time_indices": "t=0..T-1",
 }
 MANIFEST_HASH_CONTRACT = (
     "sha256(canonical compact UTF-8 JSON with sorted keys and "
@@ -92,28 +102,41 @@ def _payload_protocol(payload: dict) -> tuple[str, tuple[int, int, int], int]:
     if contract in PEER_SYNC_H6_CONTRACTS:
         if int(metadata.get("contract_version", -1)) != 1:
             raise ValueError(f"{contract} requires contract_version=1")
-        if metadata.get("logged_action_chunk") != "full_h6":
-            raise ValueError(f"{contract} requires full logged H6 chunk")
+        expected_horizon = 15 if contract == PEER_SYNC_H15_P2_CONTRACT else 6
+        if metadata.get("logged_action_chunk") != f"full_h{expected_horizon}":
+            raise ValueError(
+                f"{contract} requires full logged H{expected_horizon} chunk"
+            )
         for key in ("parent_identity", "source_identities", "output_identity"):
             if not metadata.get(key):
                 raise ValueError(f"{contract} requires metadata.{key}")
-        if contract == PEER_SYNC_H6_P2_CONTRACT:
+        if contract in {PEER_SYNC_H6_P2_CONTRACT, PEER_SYNC_H15_P2_CONTRACT}:
             required = {
                 "fps": 80,
                 "planning_stride": 2,
                 "control_stride": 2,
                 "sequence_length": 4,
                 "decision_offsets": [0, 2, 4, 6],
-                "action_horizon": 6,
-                "action_label_offsets": [0, 1, 2, 3, 4, 5],
+                "action_horizon": expected_horizon,
+                "action_label_offsets": list(range(expected_horizon)),
             }
+            if contract == PEER_SYNC_H15_P2_CONTRACT:
+                required.update(
+                    world_target_horizon=15,
+                    world_target_offsets=[15, 17, 19, 21],
+                )
             for key, expected in required.items():
                 if metadata.get(key) != expected:
                     raise ValueError(
-                        f"{PEER_SYNC_H6_P2_CONTRACT} requires metadata.{key}="
+                        f"{contract} requires metadata.{key}="
                         f"{expected!r}, got {metadata.get(key)!r}"
                     )
-            return contract, PEER_SHAPE, PEER_SYNC_H6_P2_TRANSITION_PREFIX_STEPS
+            return (
+                contract,
+                PEER_H15_SHAPE if expected_horizon == 15 else PEER_SHAPE,
+                expected_horizon if expected_horizon == 15
+                else PEER_SYNC_H6_P2_TRANSITION_PREFIX_STEPS,
+            )
         return contract, PEER_SHAPE, TRANSITION_PREFIX_STEPS
     return MANIFEST_CONTRACT, LEGACY_SHAPE, TRANSITION_PREFIX_STEPS
 
@@ -147,6 +170,17 @@ def _validate_payload(payload: dict) -> tuple[Tensor, Tensor, Tensor, Tensor]:
             f"{label} split requires exact T{expected_shape[0]}/H{expected_shape[1]}/"
             f"A{expected_shape[2]}, got T{sequence}/H{horizon}/A{action_dim}"
         )
+    if protocol == PEER_SYNC_H15_P2_CONTRACT:
+        target_valid = payload.get("world_target_valid_mask")
+        target_refs = payload.get("world_target_frame_refs")
+        if (
+            not isinstance(target_valid, Tensor)
+            or target_valid.dtype != torch.bool
+            or tuple(target_valid.shape) != (n, sequence)
+        ):
+            raise ValueError("H15 world_target_valid_mask must be bool [N,T]")
+        if not isinstance(target_refs, (list, tuple)) or len(target_refs) != n:
+            raise ValueError("H15 requires one world_target_frame_ref per window")
     for name, value in (("instruction_id", task), ("episode_id", episode)):
         if (
             not isinstance(value, Tensor)
@@ -291,7 +325,12 @@ def mask_stats(payload: dict, indices: Tensor) -> dict:
     selected_valid = action_valid.index_select(0, indices)
     selected_recovery = recovery.index_select(0, indices)
     _, _, transition_prefix_steps = _payload_protocol(payload)
-    transitions = transition_mask(selected_valid, transition_prefix_steps)
+    explicit = payload.get("world_target_valid_mask")
+    transitions = (
+        torch.as_tensor(explicit, dtype=torch.bool).index_select(0, indices)
+        if explicit is not None
+        else transition_mask(selected_valid, transition_prefix_steps)
+    )
     return {
         "action_valid": _binary_stats(selected_valid),
         "recovery": _binary_stats(selected_recovery),
@@ -442,7 +481,8 @@ def _build_manifest(
                 "action_dim": expected_shape[2],
             },
             "logged_action_chunk": (
-                "full_h6" if data_protocol in PEER_SYNC_H6_CONTRACTS else "full_h48"
+                f"full_h{expected_shape[1]}"
+                if data_protocol in PEER_SYNC_H6_CONTRACTS else "full_h48"
             ),
             **(
                 {
@@ -453,9 +493,17 @@ def _build_manifest(
                         "control_stride",
                         "decision_offsets",
                         "action_label_offsets",
+                        *(
+                            ("world_target_horizon", "world_target_offsets")
+                            if data_protocol == PEER_SYNC_H15_P2_CONTRACT
+                            else ()
+                        ),
                     )
                 }
-                if data_protocol == PEER_SYNC_H6_P2_CONTRACT
+                if data_protocol in {
+                    PEER_SYNC_H6_P2_CONTRACT,
+                    PEER_SYNC_H15_P2_CONTRACT,
+                }
                 else {}
             ),
         },
@@ -482,8 +530,10 @@ def _build_manifest(
             "seed": int(seed),
         },
         "transition_rule": dict(
-            PEER_SYNC_H6_P2_TRANSITION_RULE
-            if transition_prefix_steps == PEER_SYNC_H6_P2_TRANSITION_PREFIX_STEPS
+            PEER_SYNC_H15_P2_TRANSITION_RULE
+            if data_protocol == PEER_SYNC_H15_P2_CONTRACT
+            else PEER_SYNC_H6_P2_TRANSITION_RULE
+            if data_protocol == PEER_SYNC_H6_P2_CONTRACT
             else TRANSITION_RULE
         ),
         "tasks": tasks,

@@ -83,7 +83,7 @@ def _spatial_inputs(config: VACompoundConfig):
     )
 
 
-def test_encode_condition_stage_map_detach_gradient_contract() -> None:
+def test_encode_condition_stage_detach_is_forward_only_for_candidate_context() -> None:
     config = _tiny_spatial_config()
     model = VACompoundPolicy(config).eval()
     vision, proprio, previous, language, mask, logged_action = _spatial_inputs(config)
@@ -123,7 +123,7 @@ def test_encode_condition_stage_map_detach_gradient_contract() -> None:
     torch.testing.assert_close(default_maps, explicit_maps, rtol=0.0, atol=0.0)
     torch.testing.assert_close(default_condition, detached_condition, rtol=0.0, atol=0.0)
     torch.testing.assert_close(default_maps, detached_maps, rtol=0.0, atol=0.0)
-    assert default_grad is not None and float(default_grad.abs().sum()) > 0.0
+    assert default_grad is not None and explicit_grad is not None
     torch.testing.assert_close(default_grad, explicit_grad, rtol=0.0, atol=0.0)
     assert detached_grad is None or int(torch.count_nonzero(detached_grad)) == 0
 
@@ -1049,8 +1049,8 @@ def test_st_predictor_starts_near_last_frame_and_uses_proposal() -> None:
     assert float(block.env_step.weight.grad.norm()) > 0
 
 
-def test_st_predictor_recurrent_map_uses_stable_residual_gradient() -> None:
-    """Map values recur, while their nonlinear context Jacobian does not compound."""
+def test_st_predictor_previous_candidate_is_context_not_residual_base() -> None:
+    """Every proposal is anchored to current DINO; prior candidates are read-only."""
     predictor = WAM4VA(
         32,
         world_dim=8,
@@ -1067,18 +1067,59 @@ def test_st_predictor_recurrent_map_uses_stable_residual_gradient() -> None:
     clip = torch.randn(2, 4, 12, 2, 2)
     cond = torch.randn(2, 5, 24)
     previous = torch.randn(2, 12, 2, 2, requires_grad=True)
+    with torch.no_grad():
+        predictor.out_proj.weight.zero_()
+        predictor.out_proj.bias.fill_(0.25)
 
     output = predictor(clip, cond, previous)
     output.sum().backward()
 
-    # The recurrent value is still the exact residual base, so credit reaches
-    # the prior stage through an identity path rather than a 32-deep product of
-    # predictor Jacobians.  The current predictor itself remains trainable.
-    torch.testing.assert_close(previous.grad, torch.ones_like(previous))
+    torch.testing.assert_close(output, clip[:, -1] + 0.25)
+    assert previous.grad is None
     assert any(
         parameter.grad is not None and float(parameter.grad.abs().sum()) > 0
         for parameter in predictor.parameters()
     )
+
+
+def test_same_transition_stage_proposals_do_not_accumulate_motion() -> None:
+    predictor = WAM4VA(
+        32,
+        world_dim=8,
+        proprio_dim=9,
+        dino_dim=12,
+        predictor="st_blocks",
+        predictor_depth=1,
+        predictor_width=24,
+        predictor_heads=4,
+        map_frames=4,
+        map_size=2,
+    ).st_predictor
+    assert predictor is not None
+    with torch.no_grad():
+        predictor.out_proj.weight.zero_()
+        predictor.out_proj.bias.fill_(1.0)
+    clip = torch.zeros(2, 4, 12, 2, 2)
+    cond = torch.zeros(2, 5, 24)
+    expected = torch.ones_like(clip[:, -1])
+    previous = None
+    for _ in range(7):
+        previous = predictor(clip, cond, previous)
+        torch.testing.assert_close(previous, expected)
+
+    with torch.no_grad():
+        predictor.out_proj.bias.zero_()
+    previous = None
+    for _ in range(7):
+        previous = predictor(clip, cond, previous)
+    repeated_grad = torch.autograd.grad(
+        previous.mean(), predictor.out_proj.bias
+    )[0]
+    one_stage = predictor(clip, cond, None)
+    one_stage_grad = torch.autograd.grad(
+        one_stage.mean(), predictor.out_proj.bias
+    )[0]
+    torch.testing.assert_close(repeated_grad, one_stage_grad)
 
 
 def test_belief_recurrence_is_gated_and_keeps_crediting_earlier_stages() -> None:
@@ -1178,12 +1219,8 @@ def test_stage_embed_is_not_written_into_persistent_belief() -> None:
     assert float(persisted.detach().std(dim=-1).mean()) > 0.05
 
 
-def test_stage0_reanchors_world_map_to_current_observation() -> None:
-    """Each decision starts map residual from the current DINO last frame.
-
-    Stages 1-7 still refine the in-decision map.  A huge previous_map must
-    not leak into stage 0's residual base.
-    """
+def test_every_stage_reanchors_world_map_to_current_observation() -> None:
+    """A stale candidate can condition a refinement but cannot shift its base."""
     torch.manual_seed(0)
     block = WAM4VA(
         32,
@@ -1207,6 +1244,9 @@ def test_stage0_reanchors_world_map_to_current_observation() -> None:
     env = torch.randn(2, 6, 4)
     stale = torch.full((2, 8, 4, 4), 50.0)
     fresh = WAMState(world_map=stale)
+    with torch.no_grad():
+        block.st_predictor.out_proj.weight.zero_()
+        block.st_predictor.out_proj.bias.fill_(1.0)
     stage0 = block.propose(
         action, vision, proprio, state=fresh, dino_tokens=tokens,
         env_action=env, stage_index=0,
@@ -1216,8 +1256,9 @@ def test_stage0_reanchors_world_map_to_current_observation() -> None:
         env_action=env, stage_index=1,
     )
     assert stage0.aux.z_tokens is not None and stage1.aux.z_tokens is not None
-    assert float(stage0.aux.z_tokens.detach().abs().mean()) < 10.0
-    assert float(stage1.aux.z_tokens.detach().abs().mean()) > 20.0
+    expected = block.encode_dino_map(tokens) + 1.0
+    torch.testing.assert_close(stage0.aux.z_tokens, expected)
+    torch.testing.assert_close(stage1.aux.z_tokens, expected)
 
 
 def test_belief_stays_bounded_past_deployment_recursion_depth() -> None:
@@ -1327,8 +1368,9 @@ def test_previous_map_is_read_not_only_added() -> None:
     _, _, _, zb = block.predict_world(
         action, proprio, belief, task, dino_tokens=tokens, env_action=env, previous_map=prev_b
     )
+    current = block.encode_dino_map(tokens)
     assert not torch.allclose(za, zb)
-    assert not torch.allclose(za - prev_a, zb - prev_b)
+    assert not torch.allclose(za - current, zb - current)
 
 
 def test_belief_read_is_live_so_write_depends_on_accumulated_memory() -> None:
@@ -1358,8 +1400,8 @@ def test_belief_read_is_live_so_write_depends_on_accumulated_memory() -> None:
     assert not torch.allclose(written_delta(low), written_delta(high), atol=1e-4)
 
 
-def test_world_map_gets_gradient_from_the_belief_memory_path() -> None:
-    """world_map 被优化成"好用的记忆"，而不只是"准确的重建"。
+def test_new_world_map_shapes_belief_without_rewriting_prior_candidate() -> None:
+    """The new map trains the belief path; prior candidate context stays read-only.
 
     ``belief_from_world(belief.detach(), world_tokens.detach())`` 曾把两个输入都
     切断，于是塑造 world_map 的只有重建损失和 VA 消息——唯一能表达"这张图作为跨
@@ -1409,5 +1451,4 @@ def test_world_map_gets_gradient_from_the_belief_memory_path() -> None:
     assert float(block.belief_from_world.o.weight.grad.abs().sum()) > 0
     assert block.st_predictor.out_proj.weight.grad is not None
     assert float(block.st_predictor.out_proj.weight.grad.abs().sum()) > 0
-    assert previous_map.grad is not None
-    assert float(previous_map.grad.abs().sum()) > 0
+    assert previous_map.grad is None

@@ -7,6 +7,8 @@ import pytest
 import torch
 
 from scripts.split_wam4va_episode_holdout import (
+    PEER_SYNC_H15_P2_CONTRACT,
+    PEER_SYNC_H15_P2_TRANSITION_RULE,
     PEER_SYNC_H6_P2_CONTRACT,
     PEER_SYNC_H6_P2_TRANSITION_RULE,
     TRANSITION_RULE,
@@ -88,6 +90,27 @@ def _peer_p2_payload() -> dict:
             "decision_offsets": [0, 2, 4, 6],
             "action_horizon": 6,
             "action_label_offsets": [0, 1, 2, 3, 4, 5],
+        }
+    )
+    return payload
+
+
+def _peer_h15_p2_payload() -> dict:
+    payload = _peer_p2_payload()
+    n = len(payload["actions"])
+    payload["actions"] = torch.zeros(n, 4, 15, 4)
+    payload["action_valid_mask"] = torch.ones(n, 4, 15, dtype=torch.bool)
+    payload["recovery_mask"] = torch.zeros(n, 4, 15, dtype=torch.bool)
+    payload["world_target_valid_mask"] = torch.ones(n, 4, dtype=torch.bool)
+    payload["world_target_frame_refs"] = list(payload["frame_refs"])
+    payload["metadata"].update(
+        {
+            "contract": PEER_SYNC_H15_P2_CONTRACT,
+            "logged_action_chunk": "full_h15",
+            "action_horizon": 15,
+            "action_label_offsets": list(range(15)),
+            "world_target_horizon": 15,
+            "world_target_offsets": [15, 17, 19, 21],
         }
     )
     return payload
@@ -303,6 +326,31 @@ def test_peer_h6_p2_split_rejects_incomplete_cadence_metadata() -> None:
     payload["metadata"]["planning_stride"] = 6
     with pytest.raises(ValueError, match="requires metadata.planning_stride=2"):
         build_split_plan(payload)
+
+
+def test_peer_h15_split_preserves_explicit_endpoint_contract(tmp_path) -> None:
+    source = tmp_path / "peer_h15_source.pt"
+    train_path = tmp_path / "peer_h15_train.pt"
+    eval_path = tmp_path / "peer_h15_eval.pt"
+    manifest_path = tmp_path / "peer_h15_split.json"
+    payload = _peer_h15_p2_payload()
+    payload["world_target_valid_mask"][0, 3] = False
+    torch.save(payload, source)
+
+    manifest = build_split_artifacts(
+        source, train_path, eval_path, manifest_path
+    )
+    assert manifest["data_protocol"]["shape"] == {
+        "sequence_length": 4,
+        "action_horizon": 15,
+        "action_dim": 4,
+    }
+    assert manifest["data_protocol"]["logged_action_chunk"] == "full_h15"
+    assert manifest["data_protocol"]["world_target_horizon"] == 15
+    assert manifest["transition_rule"] == PEER_SYNC_H15_P2_TRANSITION_RULE
+    assert manifest["source"]["mask_stats"]["transition"]["true"] == (
+        len(payload["actions"]) * 4 - 1
+    )
 
 
 def test_legacy_split_rejects_non_h48_and_peer_requires_complete_identity() -> None:

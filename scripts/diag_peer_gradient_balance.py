@@ -2,8 +2,8 @@
 
 `backward_peer_joint_losses` 先 `va_loss.backward()` 再 `world_loss.backward()`，
 两次反传累积到同一个 optimizer step。训练契约是
-`fully_differentiable_bidirectional_messages_v1`（双向全可微），所以 World 目标的
-梯度也会写进 VA 的层。日志里 world_objective≈12 而 flow≈0.11，但损失量级不等于
+World 目标会写进 VA 层；Flow 只训练预测图的 policy projection/reader，不再写入
+st_predictor。日志里 world_objective≈12 而 flow≈0.11，但损失量级不等于
 梯度量级，本脚本按参数分组精确测量两者的实际梯度贡献比。
 
 做法：在 VA backward 之后逐参数快照 `.grad`，World backward 之后再取差值，

@@ -56,6 +56,7 @@ _EXACT_RUN_OPERATIONAL_ARGS = {
     # This selects a narrowly controlled compatibility policy for validation; it
     # does not become part of the semantic run contract saved after migration.
     "resume_exact_contract_migration",
+    "resume_weights_migration",
     # Content/config identity is recorded separately, so an identical external
     # metric checkpoint copied to another filename is still the same input.
     "metric_visual_checkpoint",

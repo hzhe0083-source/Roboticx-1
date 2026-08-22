@@ -140,7 +140,7 @@ def test_world_transition_is_state_only_and_does_not_mutate_snapshot() -> None:
     torch.testing.assert_close(selected.world_message, transition.world_message[[2, 0]])
 
 
-def test_executable_action_readout_is_deterministic_h6_and_bounded() -> None:
+def test_executable_action_readout_is_deterministic_and_bounded() -> None:
     torch.manual_seed(3)
     readout = ExecutableActionReadout(hidden_dim=16, action_dim=4)
     action = torch.randn(2, 6, 16)
@@ -149,8 +149,11 @@ def test_executable_action_readout_is_deterministic_h6_and_bounded() -> None:
     assert first.shape == (2, 6, 4)
     torch.testing.assert_close(first, second, rtol=0.0, atol=0.0)
     assert bool((first >= -1.0).all() and (first <= 1.0).all())
-    with pytest.raises(ValueError, match="H6"):
-        ExecutableActionReadout(hidden_dim=16, action_dim=4, horizon=5)
+    assert ExecutableActionReadout(hidden_dim=16, action_dim=4, horizon=15)(
+        torch.randn(2, 15, 16)
+    ).shape == (2, 15, 4)
+    with pytest.raises(ValueError, match="positive"):
+        ExecutableActionReadout(hidden_dim=16, action_dim=4, horizon=0)
 
 
 @pytest.mark.parametrize("planning_stride", [1, 2, 3, 6])
@@ -173,9 +176,17 @@ def test_peer_rejects_unsupported_planning_stride(planning_stride: int) -> None:
         )
 
 
-def test_peer_rejects_world_cycle_different_from_planning_stride() -> None:
-    with pytest.raises(ValueError, match="wmrm_cycle_steps == planning_stride"):
-        _peer_config(planning_stride=2, wmrm_cycle_steps=6)
+def test_peer_allows_world_horizon_longer_than_execution_prefix() -> None:
+    config = _peer_config(
+        action_horizon=15, planning_stride=2, wmrm_cycle_steps=15
+    )
+    assert config.planning_stride == 2
+    assert config.wmrm_cycle_steps == config.action_horizon == 15
+
+
+def test_peer_rejects_world_horizon_matching_neither_prefix_nor_chunk() -> None:
+    with pytest.raises(ValueError, match="execution prefix or full action horizon"):
+        _peer_config(planning_stride=2, wmrm_cycle_steps=5)
 
 
 def test_peer_rejects_single_va_layer() -> None:
@@ -262,6 +273,36 @@ def test_causal_h6_readout_sends_only_executed_prefix_to_world() -> None:
         torch.testing.assert_close(world_action, readout[:, :2], rtol=0.0, atol=0.0)
 
 
+def test_h15_world_uses_the_full_candidate_chunk() -> None:
+    model = VACompoundPolicy(
+        _peer_config(
+            num_layers=3,
+            action_horizon=15,
+            planning_stride=2,
+            wmrm_cycle_steps=15,
+        )
+    ).eval()
+    vision, proprio, previous, language, mask = _policy_inputs(model.config)
+    world_actions: list[torch.Tensor] = []
+    original = model.wmrm.propose
+
+    def record(*args, **kwargs):
+        world_actions.append(kwargs["env_action"].detach().clone())
+        return original(*args, **kwargs)
+
+    with mock.patch.object(model.wmrm, "propose", side_effect=record), torch.no_grad():
+        model.encode_condition(
+            vision,
+            proprio,
+            previous,
+            language_hidden=language,
+            language_mask=mask,
+        )
+
+    assert len(world_actions) == 2
+    assert all(action.shape == (2, 15, 4) for action in world_actions)
+
+
 def test_va_and_wam_read_the_same_pre_stage_snapshot() -> None:
     model = VACompoundPolicy(_peer_config()).eval()
     vision, proprio, previous, language, mask = _policy_inputs(model.config)
@@ -340,8 +381,16 @@ def test_world_message_is_next_va_layers_attention_kv() -> None:
     )
 
 
-def test_flow_loss_reaches_va_reader_and_world_publisher() -> None:
-    model = VACompoundPolicy(_peer_config()).train()
+def test_flow_loss_trains_world_reader_but_not_visual_predictor() -> None:
+    model = VACompoundPolicy(
+        _peer_config(
+            num_layers=3,
+            wmrm_predictor="st_blocks",
+            wmrm_predictor_depth=1,
+            wmrm_predictor_width=16,
+            wmrm_predictor_heads=4,
+        )
+    ).train()
     vision, proprio, previous, language, mask = _policy_inputs(model.config)
     condition = model.encode_condition(
         vision,
@@ -365,6 +414,8 @@ def test_flow_loss_reaches_va_reader_and_world_publisher() -> None:
     assert publisher_grad is not None
     assert torch.isfinite(publisher_grad).all()
     assert float(publisher_grad.abs().sum()) > 0.0
+    assert model.wmrm.st_predictor.out_proj.weight.grad is None
+    assert model.world_action_readout.proj.weight.grad is None
 
 
 def test_world_side_loss_reaches_wam_and_va_publishers_but_not_future_target() -> None:
@@ -408,6 +459,68 @@ def test_world_side_loss_reaches_wam_and_va_publishers_but_not_future_target() -
     assert future_target.grad is None
 
 
+def test_old_world8_migration_rebuilds_dynamics_but_keeps_policy_interface() -> None:
+    from train import migrate_peer_world8_to_world7_state
+    from va_compound.world_contract import (
+        PEER_LEGACY_GRADIENT_BOUNDARY_CONTRACT,
+        PEER_LEGACY_TOPOLOGY_CONTRACT,
+    )
+
+    model = VACompoundPolicy(
+        _peer_config(
+            num_layers=8,
+            action_horizon=15,
+            planning_stride=2,
+            wmrm_cycle_steps=15,
+            wmrm_predictor="st_blocks",
+            wmrm_predictor_depth=1,
+            wmrm_predictor_width=16,
+            wmrm_predictor_heads=4,
+        )
+    )
+    initial_out = model.wmrm.st_predictor.out_proj.weight.detach().clone()
+    initial_stage = model.wmrm.stage_embed.weight.detach().clone()
+    initial_tail_queries = model.action_queries[6:].detach().clone()
+    state = dict(model.state_dict())
+    old_queries = state["action_queries"][:6].clone()
+    state["action_queries"] = old_queries
+    hidden = state["wmrm.stage_embed.weight"].shape[1]
+    state["wmrm.stage_embed.weight"] = torch.arange(
+        8 * hidden, dtype=torch.float32
+    ).reshape(8, hidden)
+    state["wmrm.st_predictor.out_proj.weight"] = torch.full_like(
+        state["wmrm.st_predictor.out_proj.weight"], 9.0
+    )
+    state["wmrm.dino_to_hid.weight"] = torch.full_like(
+        state["wmrm.dino_to_hid.weight"], 3.0
+    )
+    state["world_action_readout.proj.weight"] = torch.full_like(
+        state["world_action_readout.proj.weight"], 4.0
+    )
+    checkpoint = {
+        "config": {"num_layers": 8, "action_horizon": 6},
+        "training_contract": {
+            "peer_world_topology": PEER_LEGACY_TOPOLOGY_CONTRACT,
+            "peer_gradient_boundary": PEER_LEGACY_GRADIENT_BOUNDARY_CONTRACT,
+        },
+        "model": state,
+    }
+
+    migrated, reset = migrate_peer_world8_to_world7_state(model, checkpoint)
+    assert "wmrm.stage_embed.weight" not in migrated
+    assert "wmrm.st_predictor.out_proj.weight" not in migrated
+    assert int(torch.count_nonzero(migrated["wmrm.dino_to_hid.weight"] - 3.0)) == 0
+    missing, unexpected = model.load_state_dict(migrated, strict=False)
+    assert set(missing) == reset
+    assert not unexpected
+    torch.testing.assert_close(model.wmrm.stage_embed.weight, initial_stage)
+    torch.testing.assert_close(model.wmrm.st_predictor.out_proj.weight, initial_out)
+    assert int(torch.count_nonzero(model.wmrm.dino_to_hid.weight - 3.0)) == 0
+    assert int(torch.count_nonzero(model.world_action_readout.proj.weight - 4.0)) == 0
+    torch.testing.assert_close(model.action_queries[:6], old_queries)
+    torch.testing.assert_close(model.action_queries[6:], initial_tail_queries)
+
+
 def test_terminal_world_state_is_read_by_next_decisions_first_va_layer() -> None:
     model = VACompoundPolicy(_peer_config()).eval()
     vision, proprio, previous, language, mask = _policy_inputs(model.config)
@@ -439,6 +552,53 @@ def test_terminal_world_state_is_read_by_next_decisions_first_va_layer() -> None
             visual_memory=memory,
         )
     torch.testing.assert_close(seen[0], expected, rtol=0.0, atol=0.0)
+
+
+def test_long_horizon_map_is_decision_local_but_belief_persists() -> None:
+    model = VACompoundPolicy(
+        _peer_config(
+            num_layers=3,
+            action_horizon=15,
+            planning_stride=2,
+            wmrm_cycle_steps=15,
+            wmrm_predictor="st_blocks",
+            wmrm_predictor_depth=1,
+            wmrm_predictor_width=16,
+            wmrm_predictor_heads=4,
+        )
+    ).eval()
+    vision, proprio, previous, language, mask = _policy_inputs(model.config)
+    with torch.no_grad():
+        _, memory = model.encode_condition(
+            vision,
+            proprio,
+            previous,
+            language_hidden=language,
+            language_mask=mask,
+            return_visual_memory=True,
+        )
+    assert memory.world_state is not None
+    assert memory.world_state.world_map is not None
+    assert memory.world_state.belief is not None
+    seen: list[torch.Tensor | None] = []
+    original = model.layers[0].forward
+
+    def record_first(*args, **kwargs):
+        seen.append(kwargs.get("state"))
+        return original(*args, **kwargs)
+
+    with mock.patch.object(model.layers[0], "forward", side_effect=record_first), torch.no_grad():
+        model.encode_condition(
+            vision,
+            proprio,
+            previous,
+            language_hidden=language,
+            language_mask=mask,
+            visual_memory=memory,
+        )
+    torch.testing.assert_close(
+        seen[0], memory.world_state.belief, rtol=0.0, atol=0.0
+    )
 
 
 def test_explicit_env_action_overrides_readout_and_keeps_gradient() -> None:

@@ -297,14 +297,12 @@ class WAMProposal:
 
 
 class ExecutableActionReadout(nn.Module):
-    """Deterministic bounded H6 action belief for the World peer."""
+    """Deterministic bounded action-chunk belief for the World peer."""
 
     def __init__(self, hidden_dim: int, action_dim: int = 4, horizon: int = 6) -> None:
         super().__init__()
-        if hidden_dim < 1 or action_dim < 1:
-            raise ValueError("hidden_dim and action_dim must be positive")
-        if horizon != 6:
-            raise ValueError(f"ExecutableActionReadout requires H6, got H{horizon}")
+        if hidden_dim < 1 or action_dim < 1 or horizon < 1:
+            raise ValueError("hidden_dim, action_dim, and horizon must be positive")
         self.hidden_dim = hidden_dim
         self.action_dim = action_dim
         self.horizon = horizon
@@ -449,7 +447,7 @@ class _DeepWorldPredictor(nn.Module):
         return mask.masked_fill(~allowed, torch.finfo(dtype).min)
 
     def forward(self, clip: Tensor, cond: Tensor, previous_map: Tensor | None = None) -> Tensor:
-        """Predict/refine endpoint map; ``previous_map`` is a differentiable stage state."""
+        """Predict one endpoint; a prior candidate is context, never a new physical base."""
         if clip.ndim != 5:
             raise ValueError(f"clip must be [B, T, D, H, W], got {tuple(clip.shape)}")
         batch, frames, dim, height, width = clip.shape
@@ -468,12 +466,9 @@ class _DeepWorldPredictor(nn.Module):
         if previous_map is not None:
             if previous_map.shape != (batch, dim, height, width):
                 raise ValueError(f"previous_map shape mismatch: {tuple(previous_map.shape)}")
-            # The recurrent map remains the differentiable residual base below,
-            # so later World losses still train every earlier stage.  Treat its
-            # second use as predictor context as read-only memory: otherwise the
-            # 6-block nonlinear Jacobian is multiplied through all 8 stages and
-            # 4 decisions, which can make an otherwise finite forward pass have
-            # an arbitrarily large backward pass.
+            # Successive peer stages revise one candidate for the same P-step
+            # endpoint; they are not sequential environment transitions.  The
+            # prior candidate is therefore read-only refinement context.
             predictor_clip = torch.cat(
                 (clip[:, :-1], previous_map.detach()[:, None]), dim=1
             )
@@ -491,16 +486,11 @@ class _DeepWorldPredictor(nn.Module):
         last = hidden[:, -height * width :]
         residual = self.out_proj(self.out_norm(last))
         delta = residual.view(batch, height, width, dim).permute(0, 3, 1, 2)
-        base = clip[:, -1] if previous_map is None else previous_map
-        if previous_map is None:
-            # 首决策点 stage 0 的锚是真实 DINO 最后一帧，保持语义不衰减。
-            return base + delta
-        # 循环项（上一 stage 的 map）：8 个 stage 复用同一个 predictor，
-        # 每个 stage 都在上一 stage 的 map 上累加 delta。跨决策点的开环
-        # 在 propose() 里切断——stage 0 不传入 previous_map，残差基底回到
-        # 当前 DINO 最后一帧。固定收缩实测有害（同一 checkpoint 15% -> 5%），
-        # 所以这里保持纯加法。
-        return base + delta
+        # Every stage predicts the same next-decision map under a revised action
+        # proposal.  Reusing ``previous_map`` as the base applied the same logged
+        # P-step transition once per VA layer and forced the terminal stage to
+        # cancel an exploding penultimate map.
+        return clip[:, -1] + delta
 
 
 class WAM4VA(nn.Module):
@@ -1190,10 +1180,9 @@ class WAM4VA(nn.Module):
             env_action=env_action,
             reuse_aux=reuse_aux,
             stage_index=stage_index,
-            # Perceptual stream re-anchors every decision (stage 0): residual
-            # base is the current DINO last frame, not last decision's
-            # prediction.  Stages 1-7 still refine inside the decision.
-            # Cognitive stream (belief) persists across decisions.
+            # All stages share the current DINO anchor.  The previous candidate
+            # is detached predictor context; belief carries differentiable
+            # in-decision refinement and persists across decisions.
             previous_map=None if stage_index == 0 else snapshot.world_map,
         )
         next_world_map = (

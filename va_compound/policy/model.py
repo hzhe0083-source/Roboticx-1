@@ -53,8 +53,7 @@ class VACompoundConfig:
     num_layers: int = 4
     num_heads: int = 8
     action_horizon: int = 8
-    # Number of executable actions consumed before the next plan/world target.
-    # Peer mode keeps an H6 action belief but advances World by this H[:P] prefix.
+    # Number of executable actions consumed before the next policy query.
     planning_stride: int = 6
     action_dim: int = 7
     proprio_dim: int = 14
@@ -96,7 +95,7 @@ class VACompoundConfig:
     wmrm_inject: str = "all"
     # dino: 预测下一决策 DINO/投影 feature；vjepa: 下一决策 H11 池化；metric: 旧几何。
     wmrm_target: str = "dino"
-    wmrm_cycle_steps: int = 6  # P-step World target horizon; equals planning_stride in peer mode
+    wmrm_cycle_steps: int = 6  # action-conditioned World target horizon
     # Training proposal only: stop gradients between successive WMRM stage maps while
     # preserving their forward values. Logged/evaluator forwards choose explicitly.
     wmrm_detach_proposal_stage_state: bool = False
@@ -108,7 +107,7 @@ class VACompoundConfig:
     wmrm_predictor_width: int = 384
     wmrm_predictor_heads: int = 12
     # VA↔World execution topology. ``peer_sync_h6`` uses one pre-stage
-    # snapshot for both state transitions and a deterministic H6 executable readout.
+    # snapshot for both state transitions and a deterministic action-chunk readout.
     # World has N-1 stages so the last VA layer reads the final DINO map.
     va_world_mode: str = "legacy"  # "legacy" | "peer_sync_h6"
     # 顺序式 A→V→A 耦合（2026-08-07 审阅落地④）：每 N 层使用
@@ -356,15 +355,19 @@ class VACompoundConfig:
         if self.va_world_mode == "peer_sync_h6":
             if not self.wmrm:
                 raise ValueError("peer_sync_h6 requires wmrm=true")
-            if self.action_horizon != 6:
-                raise ValueError("peer_sync_h6 requires action_horizon=6")
+            if self.action_horizon not in {6, 15}:
+                raise ValueError("peer mode requires action_horizon in {6, 15}")
             if self.planning_stride not in {1, 2, 3, 6}:
                 raise ValueError(
                     "peer_sync_h6 requires planning_stride in {1, 2, 3, 6}"
                 )
-            if self.wmrm_cycle_steps != self.planning_stride:
+            if self.wmrm_cycle_steps not in {
+                self.planning_stride,
+                self.action_horizon,
+            }:
                 raise ValueError(
-                    "peer_sync_h6 requires wmrm_cycle_steps == planning_stride"
+                    "peer mode requires wmrm_cycle_steps to equal either the "
+                    "execution prefix or full action horizon"
                 )
             if self.action_dim != 4:
                 raise ValueError("peer_sync_h6 requires action_dim=4")
@@ -2638,6 +2641,19 @@ class VACompoundPolicy(nn.Module):
             )
             if not isinstance(world_state, WAMState):
                 raise ValueError("visual memory world_state must be a WAMState")
+            if (
+                peer_mode
+                and self.wmrm.cycle_steps > self.config.planning_stride
+                and world_state.world_map is not None
+            ):
+                # A long-horizon candidate is stale after receding-horizon P-step
+                # execution. Keep cognitive belief, but rebuild the physical map
+                # from the new observation at every decision.
+                world_state = WAMState(
+                    belief=world_state.belief,
+                    innovation=world_state.innovation,
+                    world_map=None,
+                )
             world_state.validate_for(
                 batch=action.shape[0],
                 hidden_dim=self.config.hidden_dim,
@@ -2654,8 +2670,13 @@ class VACompoundPolicy(nn.Module):
             if skip_wmrm:
                 world_message = None
             elif world_state.world_map is not None:
+                published_map = (
+                    world_state.world_map.detach()
+                    if peer_mode
+                    else world_state.world_map
+                )
                 world_message = self.wmrm.encode_world_tokens(
-                    world_state.world_map.to(device=vision.device, dtype=target_dtype)
+                    published_map.to(device=vision.device, dtype=target_dtype)
                 )
             elif world_state.belief is not None:
                 world_message = world_state.belief.to(
@@ -2714,9 +2735,9 @@ class VACompoundPolicy(nn.Module):
                 mask = language_cache.attention_mask
                 if mask is not None:
                     language_keys = language_keys * mask.to(dtype=language_keys.dtype)[:, :, None]
-                # Peer inputs always expose one complete causal/logged H6 action
-                # belief.  World advances only through the actually executable
-                # H[:P] prefix, so its target is the state P steps later.
+                # Peer inputs expose one complete causal/logged action chunk.
+                # The World endpoint matches that full candidate horizon, while
+                # deployment executes only planning_stride actions before replanning.
                 # Propose uses this VA layer's snapshot; the next VA layer reads
                 # the new map. The last VA layer is not in inject_layers, so it
                 # consumes the final world map and does not open another stage.
@@ -2737,9 +2758,7 @@ class VACompoundPolicy(nn.Module):
                             f"with shape {expected_env_action}, got "
                             f"{tuple(full_env_action.shape)}"
                         )
-                    snapshot_env_action = full_env_action[
-                        :, : self.config.planning_stride
-                    ]
+                    snapshot_env_action = full_env_action[:, : self.wmrm.cycle_steps]
                 else:
                     snapshot_env_action = env_action
                 proposal = self.wmrm.propose(
@@ -2755,9 +2774,16 @@ class VACompoundPolicy(nn.Module):
                 proposal.validate_finite(boundary=f"World stage {index} transition")
                 aux = proposal.aux
                 world_state = proposal.next_world_state
-                # Online VA↔World messages stay differentiable in both directions;
-                # realized future labels remain confined to the separate World loss.
-                world_message = proposal.world_message.to(
+                # Keep the predicted map semantically honest: Flow may train the
+                # map-to-policy projection and VA state readers, but not rewrite
+                # the future-DINO predictor into a control scratchpad. World loss
+                # and recurrent World state remain fully differentiable.
+                published_message = (
+                    self.wmrm.encode_world_tokens(world_state.world_map.detach())
+                    if peer_mode and world_state.world_map is not None
+                    else proposal.world_message
+                )
+                world_message = published_message.to(
                     device=vision.device, dtype=target_dtype
                 )
                 if detach_wmrm_stage_state:

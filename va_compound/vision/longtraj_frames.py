@@ -25,6 +25,7 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parent.parent.parent
 ACTION_MASK_KEYS = ("action_valid_mask", "horizon_mask")
 PEER_SYNC_H6_CONTRACT = "peer_sync_h6_world_windows_v1"
+PEER_SYNC_H15_P2_CONTRACT = "peer_sync_h15_p2_world_windows_v1"
 # One decoded-task table per process. Peer training builds two
 # LongTrajFramesDataset objects (VA + World); a per-dataset LRU of size 1
 # still keeps two full 480px caches and re-decodes on every task switch.
@@ -59,7 +60,7 @@ def mtvj_collate(batch: list[dict]) -> dict:
     out: dict[str, object] = {}
     for key in batch[0]:
         values = [b[key] for b in batch]
-        if key == "frames":
+        if key in {"frames", "world_target_frames"}:
             out[key] = np.stack(values)  # [B, T, W, H, W, 3] uint8
         else:
             out[key] = torch.stack([torch.as_tensor(v) for v in values])
@@ -87,7 +88,8 @@ class LongTrajFramesDataset:
                  min_sequence_length: int = 4,
                  decode_cache_tasks: int = 1,
                  feature_cache: str | Path | None = None,
-                 include_frames: bool = True) -> None:
+                 include_frames: bool = True,
+                 include_world_target_frames: bool = False) -> None:
         self.path = Path(path)
         self.longtraj_dir = Path(longtraj_dir) if longtraj_dir else ROOT / "data"
         self.payload = torch.load(self.path, map_location="cpu", weights_only=True)
@@ -112,9 +114,28 @@ class LongTrajFramesDataset:
             for key in ("parent_identity", "source_identities", "output_identity"):
                 if not metadata.get(key):
                     raise ValueError(f"{PEER_SYNC_H6_CONTRACT} requires metadata.{key}")
+        if metadata.get("contract") == PEER_SYNC_H15_P2_CONTRACT:
+            if tuple(actions.shape[1:]) != (4, 15, 4):
+                raise ValueError(
+                    f"{PEER_SYNC_H15_P2_CONTRACT} requires exact T4/H15/A4, "
+                    f"got {tuple(actions.shape[1:])}"
+                )
+            if metadata.get("logged_action_chunk") != "full_h15":
+                raise ValueError(
+                    f"{PEER_SYNC_H15_P2_CONTRACT} requires full logged H15 chunk"
+                )
         self.refs = self.payload["frame_refs"]  # [(task_file, ep_idx, frame_idx[T,W])]
         if len(self.refs) != self.length:
             raise ValueError("frame_refs 长度与样本数不一致")
+        self.world_target_refs = self.payload.get("world_target_frame_refs")
+        self.include_world_target_frames = bool(include_world_target_frames)
+        if self.include_world_target_frames and (
+            not isinstance(self.world_target_refs, (list, tuple))
+            or len(self.world_target_refs) != self.length
+        ):
+            raise ValueError(
+                "include_world_target_frames requires one world_target_frame_ref per sample"
+            )
         for key in ACTION_MASK_KEYS:
             if key in self.payload:
                 value = self.payload[key]
@@ -239,6 +260,7 @@ class LongTrajFramesDataset:
             "episode_id",
             "world_rank_shuffle_action",
             "world_rank_shuffle_mask",
+            "world_target_valid_mask",
         ):
             if key in self.payload:
                 item[key] = self.payload[key][index]
@@ -264,4 +286,13 @@ class LongTrajFramesDataset:
             for row in fidx
         ])  # [T, W, 480, 480, 3] uint8（零拷贝引用，与 phase2 契约一致）
         item["frames"] = frames
+        if self.include_world_target_frames:
+            target_file, target_ep, target_idx = self.world_target_refs[index]
+            target_frames = self._decode_task(target_file)[int(target_ep)]
+            item["world_target_frames"] = np.stack(
+                [
+                    np.stack([target_frames[int(frame)] for frame in row])
+                    for row in target_idx
+                ]
+            )
         return item

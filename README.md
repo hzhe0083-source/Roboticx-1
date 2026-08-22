@@ -21,13 +21,17 @@ recurrent visual memory. The action decoder is an AdaLN flow-matching head
 (six residual blocks, eight Euler steps). Prefix steps 0–1 have weight 1.0;
 the four tail steps have weight 0.036.
 
-**World (WAM4VA).** Under `peer_sync_h6`, the world model occupies the same
-eight stages. At stage \(i\) both peers read the committed snapshot from stage
+**World (WAM4VA).** Under `peer_sync_h6`, eight VA layers use seven World
+stages. At stage \(i\) both peers read the committed snapshot from stage
 \(i-1\) (one-stage delay). The world predictor publishes `world_message`
-tokens that the next VA layer consumes as attention K/V. It does not write a
-correction onto VA visual or action outputs.
+tokens that the next VA layer consumes as attention K/V; the last VA layer
+therefore consumes the fully supervised terminal map.
 
-**Coupling contract.** Messages are fully differentiable in both directions.
+**Coupling contract.** The predicted map value is live in the policy forward,
+but the action loss stops at the map publication boundary. It trains the
+map-to-policy projection and VA readers, while only the World objective trains
+the visual predictor. This prevents Flow from using a DINO map as a latent
+scratchpad.
 Each optimizer step uses one VA batch and one World batch from disjoint
 episodes, runs VA backward then World backward, and takes a single AdamW
 update.
@@ -38,7 +42,7 @@ WAM maintains two recurrent tensors with distinct lifetimes.
 
 | Stream | Tensor | Persistence |
 | --- | --- | --- |
-| Perceptual | `world_map` | Re-anchored at stage 0 of every decision onto the last frame of the current DINO clip. Stages 1–7 refine the residual inside that decision only. |
+| Perceptual | `world_map` | Every stage predicts the same next-decision endpoint from the current DINO last frame. The prior stage map is detached refinement context and the published candidate for the next VA layer, never a second physical-transition base. |
 | Cognitive | `belief` | Persists across decisions. Writes are a per-channel gated convex combination followed by RMSNorm. Stage embeddings are added at read time and are not stored in the bank. |
 
 Auxiliary stage losses decay as \(0.25^{7-i}\) with a floor of 0.1, so early

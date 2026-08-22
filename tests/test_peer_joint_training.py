@@ -159,7 +159,36 @@ def test_p2_world_ranking_uses_transition_prefix_but_keeps_h6_labels() -> None:
     assert payload["world_rank_shuffle_action"].shape == (4, 3, 2, 4)
     source = inspect.getsource(rollout_policy)
     assert ": model.config.action_horizon" in source
-    assert "logged_h6.to(dtype=final_readout.dtype)" in source
+    assert "logged_chunk.to(dtype=final_readout.dtype)" in source
+
+
+def test_h15_world_ranking_uses_full_endpoint_action_chunk(tmp_path: Path) -> None:
+    args = parse_args(
+        _peer_args(
+            tmp_path,
+            "--planning-stride",
+            "2",
+            "--control-stride",
+            "2",
+            "--wmrm-cycle-steps",
+            "15",
+            "--flow-prefix-steps",
+            "2",
+        )
+    )
+    validate_args(args)
+    payload = _payload([10, 11, 20, 21])
+    payload["actions"] = torch.arange(
+        4 * 4 * 15 * 4, dtype=torch.float32
+    ).reshape(4, 4, 15, 4)
+    payload["action_valid_mask"] = torch.ones(4, 4, 15, dtype=torch.bool)
+    payload["world_target_valid_mask"] = torch.ones(4, 4, dtype=torch.bool)
+    payload["metadata"] = {"world_target_horizon": 15}
+
+    prepare_visual_world_action_ranking(payload, planning_stride=2)
+
+    assert payload["world_rank_shuffle_action"].shape == (4, 4, 15, 4)
+    assert payload["world_rank_shuffle_mask"].shape == (4, 4)
 
 
 def test_joint_streams_fetch_independent_batches_and_restart_independently() -> None:

@@ -72,10 +72,14 @@ from va_compound.world_contract import (
     PEER_DUAL_STREAM_OPTIMIZER_CONTRACT,
     PEER_GRADIENT_BOUNDARY_CONTRACT,
     PEER_HIGH_FREQUENCY_CONTRACT,
+    PEER_LEGACY_HIGH_FREQUENCY_CONTRACT,
+    PEER_LEGACY_GRADIENT_BOUNDARY_CONTRACT,
+    PEER_LEGACY_TOPOLOGY_CONTRACT,
     PEER_PLANNING_STRIDES,
     PEER_WORLD_ACTION_SOURCE_CONTRACT,
     PEER_WORLD_READOUT_CONTRACT,
     PEER_WORLD_TOPOLOGY_CONTRACT,
+    PEER_WORLD8_TO_WORLD7_REPAIR_MIGRATION,
     WORLD_ACTION_DONOR_CONTRACT,
     WORLD_ACTION_RANKING,
     WORLD_LATE_STAGE_ANCHOR,
@@ -123,6 +127,78 @@ def visual_world_stage_weight_overrides(args: argparse.Namespace) -> dict[int, f
     return canonical_stage_weight_overrides(overrides)
 
 
+def migrate_peer_world8_to_world7_state(
+    model: VACompoundPolicy,
+    checkpoint: dict,
+) -> tuple[dict[str, Tensor], set[str]]:
+    """Keep s3052 policy weights while rebuilding dynamics trained on wrong physics."""
+    contract = checkpoint.get("training_contract") or {}
+    required = {
+        "peer_world_topology": PEER_LEGACY_TOPOLOGY_CONTRACT,
+        "peer_gradient_boundary": PEER_LEGACY_GRADIENT_BOUNDARY_CONTRACT,
+    }
+    mismatches = {
+        key: (contract.get(key), value)
+        for key, value in required.items()
+        if contract.get(key) != value
+    }
+    saved_config = checkpoint.get("config") or {}
+    if (
+        mismatches
+        or saved_config.get("num_layers") != 8
+        or saved_config.get("action_horizon") != 6
+    ):
+        raise ValueError(
+            f"{PEER_WORLD8_TO_WORLD7_REPAIR_MIGRATION} requires the old "
+            f"8-VA/8-World fully differentiable checkpoint: "
+            f"contract={mismatches}, num_layers={saved_config.get('num_layers')!r}"
+        )
+    if (
+        model.config.num_layers != 8
+        or model.config.wmrm_stage_count() != 7
+        or model.config.action_horizon != 15
+        or model.config.wmrm_cycle_steps != 15
+    ):
+        raise ValueError(
+            f"{PEER_WORLD8_TO_WORLD7_REPAIR_MIGRATION} requires runtime "
+            "8-VA/7-World H15 topology"
+        )
+
+    own = model.state_dict()
+    saved = checkpoint["model"]
+    policy_interface_keys = {
+        "wmrm.dino_to_hid.weight",
+        "wmrm.dino_to_hid.bias",
+    }
+    if not policy_interface_keys.issubset(saved) or not policy_interface_keys.issubset(own):
+        raise ValueError("peer World migration requires the DINO-to-policy interface")
+    reset_keys = {
+        key for key in own if key.startswith("wmrm.")
+    } - policy_interface_keys
+    # Predictor blocks, action conditioning, belief recurrence, and every stage
+    # code were trained under repeated-transition accumulation. Reusing any of
+    # them lets the terminal-correction solution immediately grow back. Keep
+    # only the map projection read by the already-trained VA state readers.
+    state = {
+        key: value
+        for key, value in saved.items()
+        if not key.startswith("wmrm.") or key in policy_interface_keys
+    }
+    saved_queries = saved.get("action_queries")
+    target_queries = own.get("action_queries")
+    if (
+        saved_queries is None
+        or target_queries is None
+        or tuple(saved_queries.shape) != (6, target_queries.shape[1])
+        or tuple(target_queries.shape) != (15, saved_queries.shape[1])
+    ):
+        raise ValueError("H15 migration requires action_queries [6,H] -> [15,H]")
+    expanded_queries = target_queries.clone()
+    expanded_queries[:6].copy_(saved_queries)
+    state["action_queries"] = expanded_queries
+    return state, reset_keys
+
+
 def wmrm_next_feature_target(
     model: VACompoundPolicy,
     batch: dict[str, Tensor],
@@ -132,6 +208,11 @@ def wmrm_next_feature_target(
     metric_g: Tensor | None = None,
 ) -> Tensor:
     """Next VA-cycle visual feature. Target encoder is stop-grad (JEPA-style)."""
+    explicit_target = batch.get("world_target_map")
+    if explicit_target is not None:
+        if time_index >= explicit_target.shape[1]:
+            raise ValueError("world_target_map lacks the requested decision index")
+        return explicit_target[:, time_index].detach()
     nxt = time_index + 1
     kind = getattr(model.config, "wmrm_target", "dino")
     if kind == "metric":
@@ -3124,15 +3205,20 @@ def rollout_policy(
             raise ValueError(
                 "visual World supervision requires the recorded action_valid_mask"
             )
-        transition_validity = world_transition_mask(
-            action_valid_mask,
-            cycle_steps=model.wmrm.cycle_steps,
+        explicit_validity = batch.get("world_target_valid_mask")
+        transition_validity = (
+            explicit_validity.to(dtype=torch.bool)
+            if explicit_validity is not None
+            else world_transition_mask(
+                action_valid_mask,
+                cycle_steps=model.wmrm.cycle_steps,
+            )
         )
         rank_shuffle_actions = batch.get("world_rank_shuffle_action")
         rank_shuffle_validity = batch.get("world_rank_shuffle_mask")
         expected_actions = (
             batch["actions"].shape[0],
-            batch["actions"].shape[1] - 1,
+            transition_validity.shape[1],
             model.wmrm.cycle_steps,
             batch["actions"].shape[-1],
         )
@@ -3212,18 +3298,18 @@ def rollout_policy(
             if peer_world_mode:
                 planning_stride = int(getattr(model.config, "planning_stride", 6))
                 if (
-                    model.config.action_horizon != 6
+                    model.config.action_horizon not in {6, 15}
                     or planning_stride not in PEER_PLANNING_STRIDES
-                    or cycle != planning_stride
+                    or cycle not in {planning_stride, model.config.action_horizon}
                 ):
                     raise ValueError(
-                        "peer_sync_h6 rollout requires H6 prediction with "
-                        "cycle_steps == planning_stride in {1,2,3,6}"
+                        "peer rollout requires H6/H15 prediction with World "
+                        "horizon equal to the execution prefix or full chunk"
                     )
                 if logged_peer_world_forward:
                     # The World dataset owns logged transition supervision. Feed
-                    # the complete H6 label to the model; peer encode slices H[:P]
-                    # for WAM while preserving full H6 for readout supervision.
+                    # the complete logged chunk to the model; the World horizon
+                    # selects either its P-step prefix or the full candidate.
                     world_action = batch["actions"][
                         :, time_index, : model.config.action_horizon
                     ].clamp(-1.0, 1.0)
@@ -3267,7 +3353,10 @@ def rollout_policy(
         if (
             train_world_model
             and model.wmrm is not None
-            and time_index + 1 < batch["actions"].shape[1]
+            and (
+                "world_target_map" in batch
+                or time_index + 1 < batch["actions"].shape[1]
+            )
         ):
             target = wmrm_next_feature_target(
                 model,
@@ -3295,14 +3384,14 @@ def rollout_policy(
                 logged_action = batch["actions"][
                     :, time_index, : model.wmrm.cycle_steps
                 ]
-                logged_h6 = batch["actions"][
+                logged_chunk = batch["actions"][
                     :, time_index, : model.config.action_horizon
                 ]
                 if peer_world_mode:
                     logged_auxes = list(proposal_auxes)
                     logged_pres = proposal_pres
                     # H[:P] conditions the World transition, while this auxiliary
-                    # always supervises the causal action readout against full H6.
+                    # always supervises the causal action readout against the full chunk.
                     if not proposal_pres:
                         raise RuntimeError(
                             "peer World stage did not expose its action snapshot"
@@ -3312,7 +3401,7 @@ def rollout_policy(
                         raise RuntimeError(
                             "final peer World stage did not expose deterministic readout"
                         )
-                    logged_readout = logged_h6.to(dtype=final_readout.dtype)
+                    logged_readout = logged_chunk.to(dtype=final_readout.dtype)
                     readout_error = F.smooth_l1_loss(
                         final_readout,
                         logged_readout,
@@ -5176,6 +5265,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "the selector is operational and is not saved as a run semantic"
         ),
     )
+    parser.add_argument(
+        "--resume-weights-migration",
+        choices=[PEER_WORLD8_TO_WORLD7_REPAIR_MIGRATION],
+        help=(
+            "one-shot H6-to-H15 migration; keeps VA/Flow shared weights, action "
+            "readout, first six action queries, and map-to-VA projection while "
+            "rebuilding World dynamics and initializing nine new action queries"
+        ),
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--save", type=Path)
     parser.add_argument(
@@ -5228,7 +5326,15 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "--resume-exact-contract-migration requires --resume-exact"
         )
+    if args.resume_weights_migration is not None and args.resume_weights is None:
+        raise ValueError(
+            "--resume-weights-migration requires --resume-weights"
+        )
     peer_world = getattr(args, "va_world_mode", "legacy") == "peer_sync_h6"
+    if args.resume_weights_migration is not None and not peer_world:
+        raise ValueError(
+            "--resume-weights-migration requires --va-world-mode peer_sync_h6"
+        )
     va_data = getattr(args, "va_data", None)
     world_data = getattr(args, "world_data", None)
     if (va_data is None) != (world_data is None):
@@ -5267,10 +5373,10 @@ def validate_args(args: argparse.Namespace) -> None:
                 getattr(args, "control_stride", 6)
             )
             == planning_stride,
-            "--wmrm-cycle-steps == --planning-stride": int(
+            "--wmrm-cycle-steps == execution prefix or H15": int(
                 getattr(args, "wmrm_cycle_steps", 0)
             )
-            == planning_stride,
+            in {planning_stride, 15},
             "--flow-prefix-steps == --planning-stride": int(
                 getattr(args, "flow_prefix_steps", 0)
             )
@@ -5332,12 +5438,11 @@ def validate_args(args: argparse.Namespace) -> None:
             "--world-split-manifest": split_manifest is not None,
             "--wam4va": bool(getattr(args, "wmrm", False)),
             "--wmrm-target dino": getattr(args, "wmrm_target", None) == "dino",
-            "--wmrm-cycle-steps 6 or peer planning stride": (
+            "--wmrm-cycle-steps matches peer horizon": (
                 int(getattr(args, "wmrm_cycle_steps", 0))
-                == (
-                    int(getattr(args, "planning_stride", 6))
-                    if peer_world
-                    else 6
+                in (
+                    {int(getattr(args, "planning_stride", 6)), 15}
+                    if peer_world else {6}
                 )
             ),
             "--wmrm-inject all": getattr(args, "wmrm_inject", None) == "all",
@@ -7086,7 +7191,10 @@ def save_checkpoint(
             {
                 "world_supervision": WORLD_SUPERVISION_CONTRACT,
                 "world_transition": (
-                    WORLD_TRANSITION_CONTRACT
+                    f"explicit_endpoint_h{int(config.wmrm_cycle_steps)}_v1"
+                    if int(config.wmrm_cycle_steps)
+                    > int(getattr(args, "planning_stride", 6))
+                    else WORLD_TRANSITION_CONTRACT
                     if int(getattr(args, "planning_stride", 6)) == 6
                     else "current_first"
                     f"{int(getattr(args, 'planning_stride', 6))}"
@@ -7123,8 +7231,8 @@ def save_checkpoint(
                     "world_action_rank_transitions"
                 ],
                 "world_action_source": (
-                    "logged_h6_transition_prefix_"
-                    f"{int(getattr(args, 'planning_stride', 6))}"
+                    f"logged_h{int(config.action_horizon)}_world_horizon_"
+                    f"{int(config.wmrm_cycle_steps)}"
                 ),
                 "world_target_stop_gradient": True,
                 "world_logged_branch": WORLD_LOGGED_BRANCH_CONTRACT,
@@ -7598,6 +7706,7 @@ def main() -> None:
                     args.dino_feature_cache is None
                     or getattr(args, "dino_roi_checkpoint", None) is not None
                 ),
+                include_world_target_frames=False,
             )
             print(
                 f"{'DINO-main' if args.dino_main_vision else 'MT-VJ'} data: "
@@ -8087,6 +8196,7 @@ def main() -> None:
                 ),
                 feature_cache=None,
                 include_frames=True,
+                include_world_target_frames=config.action_horizon == 15,
             )
             _enable_optional_action_masks(world_dataset)
             args.visual_world_split_identity = validate_visual_world_training_split(
@@ -8673,6 +8783,7 @@ def main() -> None:
                     int(getattr(args, "planning_stride", 6)),
                     float(getattr(args, "wmrm_late_stage_anchor_weight", 0.0)),
                     visual_world_stage_weight_overrides(args),
+                    world_horizon=int(config.wmrm_cycle_steps),
                 )
             # Fail before restoring model/optimizer/sampler/RNG if any data,
             # objective, sampler, architecture or optimizer semantic changed.
@@ -8696,16 +8807,32 @@ def main() -> None:
             and getattr(config, "va_world_mode", "legacy") == "peer_sync_h6"
         ):
             contract = resume_ckpt.get("training_contract") or {}
+            migrating_peer_world = (
+                getattr(args, "resume_weights_migration", None)
+                == PEER_WORLD8_TO_WORLD7_REPAIR_MIGRATION
+            )
             expected = {
                 "peer_training_mode": "joint_dual_stream",
-                "peer_world_topology": PEER_WORLD_TOPOLOGY_CONTRACT,
-                "peer_gradient_boundary": PEER_GRADIENT_BOUNDARY_CONTRACT,
+                "peer_world_topology": (
+                    PEER_LEGACY_TOPOLOGY_CONTRACT
+                    if migrating_peer_world
+                    else PEER_WORLD_TOPOLOGY_CONTRACT
+                ),
+                "peer_gradient_boundary": (
+                    PEER_LEGACY_GRADIENT_BOUNDARY_CONTRACT
+                    if migrating_peer_world
+                    else PEER_GRADIENT_BOUNDARY_CONTRACT
+                ),
                 "peer_data_isolation": PEER_DATA_ISOLATION_CONTRACT,
                 "peer_dual_stream_optimizer": PEER_DUAL_STREAM_OPTIMIZER_CONTRACT,
                 "planning_stride": int(getattr(args, "planning_stride", 6)),
                 "planning_hz": 80.0
                 / int(getattr(args, "planning_stride", 6)),
-                "peer_high_frequency_contract": PEER_HIGH_FREQUENCY_CONTRACT,
+                "peer_high_frequency_contract": (
+                    PEER_LEGACY_HIGH_FREQUENCY_CONTRACT
+                    if migrating_peer_world
+                    else PEER_HIGH_FREQUENCY_CONTRACT
+                ),
             }
             mismatches = {
                 key: (contract.get(key), value)
@@ -8732,6 +8859,12 @@ def main() -> None:
             "wmrm_predictor_width",
             "wmrm_predictor_heads",
         ):
+            if (
+                getattr(args, "resume_weights_migration", None)
+                == PEER_WORLD8_TO_WORLD7_REPAIR_MIGRATION
+                and key == "wmrm_cycle_steps"
+            ):
+                continue
             if key.startswith("wmrm_") and not getattr(config, "wmrm", False):
                 continue
             left = resume_config.get(key)
@@ -8785,7 +8918,27 @@ def main() -> None:
                 getattr(args, "resume_weights", None) is not None
                 and getattr(config, "va_world_mode", "legacy") == "peer_sync_h6"
             ):
-                model.load_state_dict(resume_ckpt["model"], strict=True)
+                if (
+                    getattr(args, "resume_weights_migration", None)
+                    == PEER_WORLD8_TO_WORLD7_REPAIR_MIGRATION
+                ):
+                    state, allowed_missing = migrate_peer_world8_to_world7_state(
+                        model, resume_ckpt
+                    )
+                    missing, unexpected = model.load_state_dict(state, strict=False)
+                    if set(missing) != allowed_missing or unexpected:
+                        raise ValueError(
+                            "peer World weights migration changed unrelated tensors: "
+                            f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
+                        )
+                    print(
+                        "resume-weights migration: kept VA/Flow shared weights, "
+                        "action readout, H6 query prefix, and DINO-to-VA projection; "
+                        "initialized H15 tail + rebuilt all WAM dynamics",
+                        flush=True,
+                    )
+                else:
+                    model.load_state_dict(resume_ckpt["model"], strict=True)
             elif args.c2_controller:
                 # Stage A → C² 迁移：仅允许新 C² keys（c2_head/control_projector）缺失；
                 # P 的 PCA 权重随后由 v6b 注入覆盖（保持与当前数据一致）。
@@ -8989,6 +9142,28 @@ def main() -> None:
             return_dense=True,
         )
         raw_batch["vision_tokens"] = vision_tokens
+        target_frames = raw_batch.pop("world_target_frames", None)
+        if target_frames is not None:
+            if isinstance(target_frames, torch.Tensor):
+                target_frames = target_frames.cpu().numpy()
+            target_tokens = _dino_main_online_encode(
+                target_frames,
+                main_vision_backbone,
+                device,
+                encode_batch=args.main_vision_encode_batch,
+                grid=config.main_vision_grid,
+                window=1,
+                return_dense=False,
+            )
+            batch_size, sequence, patches, dim = target_tokens.shape
+            grid = config.main_vision_grid
+            if patches != grid * grid:
+                raise RuntimeError(
+                    "explicit World endpoint must encode one complete patch grid"
+                )
+            raw_batch["world_target_map"] = target_tokens.reshape(
+                batch_size, sequence, grid, grid, dim
+            ).permute(0, 1, 4, 2, 3)
         metric_tokens, metric_g = _dino_metric_tokens(
             metric_head,
             relation_encoder,
