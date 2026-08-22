@@ -39,7 +39,6 @@ def _checkpoint(step: int = 1000, **overrides) -> dict:
         },
         "training_contract": {
             "action_decoder": "conditional_flow_matching",
-            "wam_enabled": False,
             "task35_precision_contract": True,
             "task35_metric_role_contract": TASK35_METRIC_ROLE_CONTRACT,
             "dino_roi_contract": DINO_METRIC_ROI_CONTRACT,

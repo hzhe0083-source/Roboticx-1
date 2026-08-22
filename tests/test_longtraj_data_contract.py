@@ -213,6 +213,228 @@ class LongTrajBuilderContractTest(unittest.TestCase):
                     legacy_policy="error",
                 )
 
+    def test_peer_h6_build_emits_explicit_identity_protocol(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ref_path = root / "ref.pt"
+            source = root / "metaworld_longtraj_door-lock-v3.pt"
+            output = root / "peer_h6.pt"
+            task_text = build.ENV_TO_TASK["door-lock-v3"]
+            torch.save({
+                "normalization": self._normalization(),
+                "metadata": {"tasks": [task_text]},
+                "instruction_id": torch.tensor([0]),
+                "language_hidden": torch.zeros(1, 2, 3),
+                "language_mask": torch.ones(1, 2, dtype=torch.bool),
+            }, ref_path)
+            n = 40
+            jpeg = collect.compress_frames(np.zeros((1, 2, 2, 3), dtype=np.uint8))[0]
+            torch.save({
+                "task": "door-lock-v3",
+                "episodes": [{
+                    "frames": [jpeg] * n,
+                    "actions": np.zeros((n, 4), dtype=np.float32),
+                    "states": np.zeros((n, 4), dtype=np.float32),
+                    "first_success": n - 1,
+                    "action_executed": np.ones(n, dtype=bool),
+                    "action_supervision_valid": np.ones(n, dtype=bool),
+                    "recovery_mask": np.zeros(n, dtype=bool),
+                }],
+            }, source)
+
+            build.phase1(
+                6,
+                task="door-lock-v3",
+                input_paths=[source],
+                output_path=output,
+                ref_path=ref_path,
+                legacy_policy="error",
+                data_contract=build.PEER_SYNC_H6_CONTRACT,
+            )
+            payload = torch.load(output, map_location="cpu", weights_only=True)
+            metadata = payload["metadata"]
+            self.assertEqual(tuple(payload["actions"].shape[1:]), (4, 6, 4))
+            self.assertEqual(metadata["contract"], build.PEER_SYNC_H6_CONTRACT)
+            self.assertEqual(metadata["logged_action_chunk"], "full_h6")
+            self.assertEqual(metadata["planning_stride"], 6)
+            self.assertEqual(metadata["control_stride"], 6)
+            self.assertEqual(metadata["decision_offsets"], [0, 6, 12, 18])
+            self.assertEqual(metadata["parent_identity"]["path"], str(ref_path.resolve()))
+            self.assertEqual(metadata["source_identities"][0]["path"], str(source.resolve()))
+            self.assertEqual(metadata["output_identity"]["path"], str(output.resolve()))
+            self.assertEqual(payload["frame_refs"][0][0], "door-lock-v3")
+
+            with self.assertRaisesRegex(ValueError, "requires exact action horizon H6"):
+                build.phase1(
+                    48,
+                    task="door-lock-v3",
+                    input_paths=[source],
+                    output_path=root / "bad.pt",
+                    ref_path=ref_path,
+                    data_contract=build.PEER_SYNC_H6_CONTRACT,
+                )
+
+    def test_peer_h6_p2_build_uses_t4_stride2_with_full_h6_labels(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ref_path = root / "ref.pt"
+            source = root / "metaworld_longtraj_door-lock-v3.pt"
+            output = root / "peer_h6_p2.pt"
+            task_text = build.ENV_TO_TASK["door-lock-v3"]
+            torch.save({
+                "normalization": self._normalization(),
+                "metadata": {"tasks": [task_text]},
+                "instruction_id": torch.tensor([0]),
+                "language_hidden": torch.zeros(1, 2, 3),
+                "language_mask": torch.ones(1, 2, dtype=torch.bool),
+            }, ref_path)
+            n = 20
+            jpeg = collect.compress_frames(np.zeros((1, 2, 2, 3), dtype=np.uint8))[0]
+            timeline = np.arange(n, dtype=np.float32) / 100.0
+            actions = np.repeat(timeline[:, None], 4, axis=1)
+            states = np.repeat(timeline[:, None], 4, axis=1)
+            torch.save({
+                "task": "door-lock-v3",
+                "episodes": [{
+                    "frames": [jpeg] * n,
+                    "actions": actions,
+                    "states": states,
+                    "first_success": n - 1,
+                    "action_executed": np.ones(n, dtype=bool),
+                    "action_supervision_valid": np.ones(n, dtype=bool),
+                    "recovery_mask": np.zeros(n, dtype=bool),
+                }],
+            }, source)
+
+            build.phase1(
+                6,
+                task="door-lock-v3",
+                input_paths=[source],
+                output_path=output,
+                ref_path=ref_path,
+                legacy_policy="error",
+                data_contract=build.PEER_SYNC_H6_P2_CONTRACT,
+                planning_stride=2,
+            )
+            payload = torch.load(output, map_location="cpu", weights_only=True)
+            metadata = payload["metadata"]
+            self.assertEqual(tuple(payload["actions"].shape), (5, 4, 6, 4))
+            self.assertEqual(metadata["contract"], build.PEER_SYNC_H6_P2_CONTRACT)
+            self.assertEqual(metadata["contract_version"], 1)
+            self.assertEqual(metadata["fps"], 80)
+            self.assertEqual(metadata["planning_stride"], 2)
+            self.assertEqual(metadata["control_stride"], 2)
+            self.assertEqual(metadata["sequence_length"], 4)
+            self.assertEqual(metadata["decision_offsets"], [0, 2, 4, 6])
+            self.assertEqual(metadata["action_horizon"], 6)
+            self.assertEqual(metadata["action_label_offsets"], [0, 1, 2, 3, 4, 5])
+            self.assertEqual(metadata["logged_action_chunk"], "full_h6")
+
+            expected = torch.tensor([
+                [0, 1, 2, 3, 4, 5],
+                [2, 3, 4, 5, 6, 7],
+                [4, 5, 6, 7, 8, 9],
+                [6, 7, 8, 9, 10, 11],
+            ], dtype=torch.float32) / 100.0
+            torch.testing.assert_close(payload["actions"][0, :, :, 0], expected)
+            self.assertEqual(
+                [indices[-1] for indices in payload["frame_refs"][0][2]],
+                [0, 2, 4, 6],
+            )
+
+    def test_peer_h6_p2_contract_rejects_ambiguous_cadence(self):
+        with self.assertRaisesRegex(ValueError, "requires planning_stride=2"):
+            build.phase1(
+                6,
+                data_contract=build.PEER_SYNC_H6_P2_CONTRACT,
+            )
+        with self.assertRaisesRegex(ValueError, "requires data_contract=.*p2"):
+            build.phase1(
+                6,
+                data_contract=build.PEER_SYNC_H6_CONTRACT,
+                planning_stride=2,
+            )
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            build.phase1(
+                6,
+                data_contract=build.PEER_SYNC_H6_P2_CONTRACT,
+                planning_stride=0,
+            )
+
+    def test_peer_h15_p2_build_adds_explicit_endpoint_frames(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ref_path = root / "ref.pt"
+            source = root / "metaworld_longtraj_door-lock-v3.pt"
+            output = root / "peer_h15_p2.pt"
+            task_text = build.ENV_TO_TASK["door-lock-v3"]
+            torch.save(
+                {
+                    "normalization": self._normalization(),
+                    "metadata": {"tasks": [task_text]},
+                    "instruction_id": torch.tensor([0]),
+                    "language_hidden": torch.zeros(1, 2, 3),
+                    "language_mask": torch.ones(1, 2, dtype=torch.bool),
+                },
+                ref_path,
+            )
+            n = 40
+            jpeg = collect.compress_frames(
+                np.zeros((1, 2, 2, 3), dtype=np.uint8)
+            )[0]
+            timeline = np.arange(n, dtype=np.float32) / 100.0
+            values = np.repeat(timeline[:, None], 4, axis=1)
+            torch.save(
+                {
+                    "task": "door-lock-v3",
+                    "episodes": [
+                        {
+                            "frames": [jpeg] * n,
+                            "actions": values,
+                            "states": values,
+                            "first_success": n - 1,
+                            "action_executed": np.ones(n, dtype=bool),
+                            "action_supervision_valid": np.ones(n, dtype=bool),
+                            "recovery_mask": np.zeros(n, dtype=bool),
+                        }
+                    ],
+                },
+                source,
+            )
+
+            build.phase1(
+                15,
+                task="door-lock-v3",
+                input_paths=[source],
+                output_path=output,
+                ref_path=ref_path,
+                legacy_policy="error",
+                data_contract=build.PEER_SYNC_H15_P2_CONTRACT,
+                planning_stride=2,
+            )
+            payload = torch.load(output, map_location="cpu", weights_only=True)
+            metadata = payload["metadata"]
+            self.assertEqual(tuple(payload["actions"].shape), (10, 4, 15, 4))
+            self.assertEqual(metadata["contract"], build.PEER_SYNC_H15_P2_CONTRACT)
+            self.assertEqual(metadata["logged_action_chunk"], "full_h15")
+            self.assertEqual(metadata["world_target_horizon"], 15)
+            self.assertEqual(metadata["world_target_offsets"], [15, 17, 19, 21])
+            self.assertEqual(
+                [row[0] for row in payload["world_target_frame_refs"][0][2]],
+                [15, 17, 19, 21],
+            )
+            self.assertTrue(bool(payload["world_target_valid_mask"].all()))
+            from va_compound.longtraj_frames import LongTrajFramesDataset
+
+            dataset = LongTrajFramesDataset(
+                output,
+                longtraj_dir=root,
+                include_world_target_frames=True,
+            )
+            item = dataset[0]
+            self.assertEqual(tuple(item["world_target_frames"].shape), (4, 1, 2, 2, 3))
+            self.assertEqual(tuple(item["world_target_valid_mask"].shape), (4,))
+
     def test_legacy_contract_warns_or_fails_explicitly(self):
         n = 30
         ep = {

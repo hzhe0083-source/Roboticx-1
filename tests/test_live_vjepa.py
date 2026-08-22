@@ -134,7 +134,11 @@ class TestDenseReadout:
 
 class TestArgValidation:
     def _args(self, **overrides) -> argparse.Namespace:
-        base = dict(
+        from train import parse_args
+
+        # 真实 parser 默认值打底，避免每次 validate_args 新读一个字段就要手工补夹具。
+        base = vars(parse_args([]))
+        base.update(
             steps=100, flow_steps=4, lr=3e-5, pair_loss_weight=1.0,
             single_task=True, batch_size=8, evsm=False, memory_split=False,
             future_predict=False, future_predict_weight=0.1,

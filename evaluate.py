@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from stats_ci import fmt_ci, macro_bootstrap_ci
+from va_compound.statistics import fmt_ci, macro_bootstrap_ci
 from train import FeatureDataset, ensure_sequence, move_batch
 from va_compound import VACompoundConfig, VACompoundPolicy
 
@@ -279,7 +279,7 @@ def main() -> None:
     summary = summarize(per_episode)
 
     # 宏平均 + bootstrap 95% CI（固定种子）：任务（instruction_id，缺失时退化为
-    # episode_id）为宏平均与重采样单元，口径见 stats_ci.py。
+    # episode_id）为宏平均与重采样单元，口径见 va_compound/statistics.py。
     if "instruction_id" in payload:
         group_field = payload["instruction_id"]
     else:

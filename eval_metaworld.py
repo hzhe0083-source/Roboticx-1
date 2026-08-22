@@ -19,7 +19,6 @@ import argparse
 import dataclasses
 import hashlib
 import os
-import sys
 from pathlib import Path
 from typing import Any, Callable
 
@@ -127,131 +126,6 @@ def _mtvj_metric_positions(
 _mtvj_visibility_gated_positions = _mtvj_metric_positions
 
 
-def _wam_spatial16_from_h11(h11: torch.Tensor) -> torch.Tensor:
-    """E7 WAM：H11 dense → 最后时间片 4×4 空间 token。
-
-    与 ``va_compound.wam_cache.wam_last_slice_pool`` 同一实现，避免
-    eval avg_pool2d 与 cache view+mean 日后漂移。
-    """
-    from va_compound.wam_cache import wam_last_slice_pool
-
-    return wam_last_slice_pool(h11)
-
-
-def _make_wam_residual_fn(wam, memory, spatial16, geo8, wam_alpha):
-    """E7 WAM M0 Task 4 闭包：decode_actions Euler 循环内 v += wam_alpha * wam(...)。
-
-    场景半边没有 GT 目标，走与训练相同的直线路径、目标取 0：
-    x_scene(τ) = (1-τ)·ε，ε 在本次 decode 内固定。每步重填 zeros 既不是
-    该路径，也会让 54 个场景 token 与 τ 脱节。
-    调用约定与 va_compound/model.py 的 wam_residual_fn(cond, x_t, t_k) 一致。
-    """
-    if memory is None or len(getattr(memory, "layers", ())) == 0:
-        raise ValueError(
-            "WAM residual 需要非空 VA 记忆快照 layers；"
-            "memory_split 路径的 layers=() 不能接 WAM"
-        )
-    scene_eps = None
-    geo_eps = None
-
-    def fn(cond, x_t, t_k):
-        nonlocal scene_eps, geo_eps
-        batch = x_t.shape[0]
-        flow_time = t_k.reshape(-1)
-        if flow_time.numel() == 1:
-            flow_time = flow_time.expand(batch)
-        if scene_eps is None:
-            scene_eps = torch.randn(batch, 3, 16, 768, device=x_t.device, dtype=x_t.dtype)
-            geo_eps = torch.randn(batch, 3, 2, 8, device=x_t.device, dtype=x_t.dtype)
-        tau = flow_time.to(dtype=x_t.dtype)
-        tau_s = tau[:, None, None, None]
-        x_scene = (1.0 - tau_s) * scene_eps
-        x_geo = (1.0 - tau_s) * geo_eps
-        dv, _ = wam(  # noqa
-            action_condition=cond, va_layers=memory.layers,
-            spatial_tokens=spatial16, geo_tokens=geo8,
-            noisy_actions=x_t,
-            noisy_scene_latents=x_scene,
-            noisy_scene_geo=x_geo,
-            flow_time=tau,
-        )
-        return wam_alpha * dv
-
-    return fn
-
-
-def _resolve_wam(ckpt: dict, args, config, device: torch.device):
-    """E7 WAM M0 Task 4：--wam auto|on|off 决议（返回 wam 或 None）。
-
-    auto = checkpoint 追加键 wam_model 存在则启用；on = 必须有 WAM 权重，
-    否则明确报错退出（拒绝旧 checkpoint 静默回退）；off = 永不启用。
-    --wam off 或 --wam-alpha 0 直接短路返回 None：不建 WAM、不建
-    wam_residual_fn 闭包、不传 wam_residual_fn（旧版「建闭包乘零」仍会
-    每决策步白跑一次 wam.forward，且轨迹与旧版非逐位一致）。wam=None 时
-    两个 decode 钩子均走旧版路径，行为逐位一致。
-    """
-    if args.wam == "off" or float(args.wam_alpha) == 0.0:
-        return None
-    wam_state = ckpt.get("wam_model")
-    if wam_state is None:
-        if args.wam == "on":
-            sys.exit(
-                "--wam on: checkpoint has no WAM weights (old checkpoint); "
-                "use auto/off"
-            )
-        return None
-    if getattr(config, "memory_split", False):
-        raise ValueError(
-            "WAM 需要 VA 层快照 layers；memory_split checkpoint 的 layers=() "
-            "不能启用 --wam"
-        )
-    if getattr(config, "direct_head", False) or getattr(config, "c2_controller", False):
-        raise ValueError(
-            "--wam 不支持 direct_head/c2_controller 解码"
-            "（WAM 残差只作用于 flow Euler 路径）"
-        )
-    if not (
-        getattr(config, "dense_readout_mtvj", False)
-        or getattr(args, "dense_readout_mtvj", False)
-    ):
-        raise ValueError(
-            "--wam 需要 dense_readout_mtvj（WAM spatial16 = H11 last-slice）"
-        )
-    if ckpt.get("mtvj_metric_head") is None:
-        raise ValueError(
-            "--wam 需要 mtvj metric head（WAM geo8 = p*visibility 8 维状态）"
-        )
-    training_contract = ckpt.get("training_contract", {}) or {}
-    if training_contract.get("metric_state_source") != MTVJ_METRIC_STATE_SOURCE:
-        raise ValueError(
-            "--wam 需要 v3 metric source（p_times_visibility_flat）；"
-            "legacy p_flat 与 WAM cache 的 geo8 契约不匹配"
-        )
-    # Task 1（va_compound/wam.py）为并行交付：延迟导入，wam 不可用时
-    # 不触碰该模块（import eval_metaworld 始终干净）。
-    from va_compound.wam import JointWorldActionFlow, wam_config_from_state
-
-    wam_cfg = wam_config_from_state(
-        ckpt.get("wam_config"),
-        action_horizon=int(getattr(config, "action_horizon", ACTION_HORIZON)),
-        action_dim=int(getattr(config, "action_dim", 4)),
-        hidden_dim=int(getattr(config, "hidden_dim", 512)),
-    )
-    wam = JointWorldActionFlow(wam_cfg)
-    wam.load_state_dict(wam_state)
-    wam.to(device).eval()
-    for param in wam.parameters():
-        param.requires_grad_(False)
-    print(
-        f"eval: WAM enabled from checkpoint wam_model "
-        f"(action_horizon={wam_cfg.action_horizon}, "
-        f"action_dim={wam_cfg.action_dim}, "
-        f"hidden_dim={wam_cfg.hidden_dim}, "
-        f"num_layers={wam_cfg.num_layers}, alpha={args.wam_alpha})"
-    )
-    return wam
-
-
 def select_eval_tasks(
     all_tasks: list[str], task_ids: str | None, max_tasks: int
 ) -> list[tuple[int, str]]:
@@ -268,8 +142,12 @@ def select_eval_tasks(
     return [(index, all_tasks[index]) for index in indices]
 
 
-METAWORLD_TASK_CONFIG = Path(
-    "/home/ryan/Documents/robot/Evoagent/Evo-1/evo1_lerobot/lerobot/envs/metaworld_config.json"
+METAWORLD_TASK_CONFIG = (
+    Path(__file__).resolve().parent / "metaworld_config.json"
+    if (Path(__file__).resolve().parent / "metaworld_config.json").is_file()
+    else Path(
+        "/home/ryan/Documents/robot/Evoagent/Evo-1/evo1_lerobot/lerobot/envs/metaworld_config.json"
+    )
 )
 
 
@@ -306,6 +184,28 @@ def require_task35_peg_insert_side(
 def evaluation_episode_seed(global_task_id: int, trial: int) -> int:
     """Stable seed independent of task subset/order."""
     return 1000 * int(global_task_id) + int(trial)
+
+
+def parse_trial_range(spec: str | None, trials_per_task: int) -> tuple[int, int]:
+    """Parse ``START:END`` into a half-open trial slice for sharded evaluation.
+
+    Seeds come from ``evaluation_episode_seed(task, trial)`` alone, so a shard
+    reproduces exactly the trials a serial run would produce for those indices.
+    """
+    if spec is None:
+        return 0, int(trials_per_task)
+    text = spec.strip()
+    if text.count(":") != 1:
+        raise ValueError(f"--trial-range must be START:END, got {spec!r}")
+    start_text, stop_text = (part.strip() for part in text.split(":"))
+    start = 0 if not start_text else int(start_text)
+    stop = int(trials_per_task) if not stop_text else int(stop_text)
+    if not 0 <= start < stop <= int(trials_per_task):
+        raise ValueError(
+            f"--trial-range {spec!r} must satisfy "
+            f"0 <= start < stop <= --trials-per-task ({trials_per_task})"
+        )
+    return start, stop
 
 
 TASK35_EVAL50_SEEDS = tuple(range(35000, 35050))
@@ -390,7 +290,7 @@ def validate_task35_eval50_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "paired seeds 35000-35049": seeds == expected,
         "execute_steps 6": int(payload.get("execute_steps") or 0) == 6,
         "horizon 500": int(payload.get("horizon") or 0) == 500,
-        "WAM off": payload.get("wam") == "off",
+        "WAM4VA state exchange off": payload.get("wmrm_state_exchange") is False,
         "FM decoder": payload.get("action_decoder") == "conditional_flow_matching",
         "peg-insert-side-v3": payload.get("env_name") == "peg-insert-side-v3",
         "success count matches": int(payload.get("successes") or 0)
@@ -933,7 +833,7 @@ def _decision_mtvj_context(
     roi_head: nn.Module | None = None,
     roi_alpha: float = 0.0,
 ) -> tuple[dict, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
-    """One closed-loop decision of MT-VJ dense + metric + WAM geo8.
+    """One closed-loop decision of MT-VJ dense + metric context.
 
     Returns ``(dense_kwargs, metric_g, vision_override, metric_g_prev_next)``.
     ``vision_override`` is Pool16(H11) when local slots are off, else None
@@ -979,17 +879,118 @@ def _decision_mtvj_context(
     )
 
 
-def _wam_geo8_from_metric(metric_g: torch.Tensor | None, device) -> torch.Tensor:
-    if metric_g is None:
-        return torch.zeros(1, 8, device=device)
-    if metric_g.ndim == 1:
-        return metric_g[None]
-    return metric_g
-
-
 VISION_WINDOW = 4
-DECISION_STRIDE = 6  # 80 FPS, decide every 6 frames (13.3 Hz), matches training
+OBSERVATION_STRIDE = 2
+LEGACY_TRAINING_CONTROL_STRIDE = 6
+LEGACY_EXECUTION_HORIZON = 6
+EXPECTED_WMRM_WORLD_HORIZON = 6
 ACTION_HORIZON = 8
+SUPPORTED_EXECUTION_HORIZONS = (1, 2, 3, 6, 15)
+
+
+@dataclasses.dataclass(frozen=True)
+class Plan:
+    """A decoded action plan indexed by absolute environment time."""
+
+    start_step: int
+    actions: np.ndarray
+
+    def __post_init__(self) -> None:
+        actions = np.asarray(self.actions)
+        if self.start_step < 0:
+            raise ValueError("plan start_step must be non-negative")
+        if actions.ndim != 2 or actions.shape[0] < 1:
+            raise ValueError("plan actions must have shape [time, action_dim]")
+        object.__setattr__(self, "actions", actions)
+
+    @property
+    def stop_step(self) -> int:
+        return self.start_step + self.actions.shape[0]
+
+    def action_at(self, step: int) -> np.ndarray:
+        if not self.start_step <= step < self.stop_step:
+            raise IndexError(
+                f"step {step} is outside plan [{self.start_step}, {self.stop_step})"
+            )
+        return self.actions[step - self.start_step]
+
+
+class SynchronousPlanQueue:
+    """Absolute-time queue with synchronous, hard plan replacement."""
+
+    def __init__(self, execution_horizon: int) -> None:
+        if execution_horizon not in SUPPORTED_EXECUTION_HORIZONS:
+            raise ValueError(
+                "execution_horizon must be one of "
+                f"{SUPPORTED_EXECUTION_HORIZONS}, got {execution_horizon}"
+            )
+        self.execution_horizon = execution_horizon
+        self._plan: Plan | None = None
+
+    def needs_plan(self, step: int) -> bool:
+        return self._plan is None or step >= self._plan.stop_step
+
+    def replace(self, step: int, actions: np.ndarray) -> Plan:
+        decoded = np.asarray(actions)
+        if decoded.ndim != 2 or decoded.shape[0] < self.execution_horizon:
+            raise ValueError(
+                "decoded plan must have shape [time, action_dim] and contain at least "
+                f"execution_horizon={self.execution_horizon} actions"
+            )
+        self._plan = Plan(step, decoded[: self.execution_horizon])
+        return self._plan
+
+    @property
+    def plan(self) -> Plan | None:
+        """The active plan, exposed read-only for telemetry and tests."""
+        return self._plan
+
+    def action_at(self, step: int) -> np.ndarray:
+        if self._plan is None:
+            raise RuntimeError("no active plan")
+        return self._plan.action_at(step)
+
+
+def resolve_execution_horizon(
+    args: argparse.Namespace,
+    config: Any | None = None,
+) -> int:
+    explicit = getattr(args, "execution_horizon", None)
+    legacy = getattr(args, "execute_steps", None)
+    if explicit is not None and legacy is not None and explicit != legacy:
+        raise ValueError(
+            "--execution-horizon and legacy --execute-steps disagree: "
+            f"{explicit} != {legacy}"
+        )
+    peer_sync = (
+        config is not None
+        and getattr(config, "va_world_mode", "legacy") == "peer_sync_h6"
+    )
+    planning_stride = int(
+        getattr(config, "planning_stride", LEGACY_EXECUTION_HORIZON)
+    )
+    if peer_sync and planning_stride not in SUPPORTED_EXECUTION_HORIZONS:
+        raise ValueError(
+            "peer_sync_h6 checkpoint planning_stride must be one of "
+            f"{SUPPORTED_EXECUTION_HORIZONS}, got {planning_stride}"
+        )
+    deployment_horizon = int(
+        getattr(config, "deployment_execution_horizon", 0) or planning_stride
+    )
+    default = deployment_horizon if peer_sync else LEGACY_EXECUTION_HORIZON
+    value = default if explicit is None and legacy is None else int(
+        explicit if explicit is not None else legacy
+    )
+    if value not in SUPPORTED_EXECUTION_HORIZONS:
+        raise ValueError(
+            f"--execution-horizon must be one of {SUPPORTED_EXECUTION_HORIZONS}"
+        )
+    if peer_sync and value != deployment_horizon:
+        raise ValueError(
+            "peer_sync_h6 requires execution_horizon == checkpoint deployment "
+            f"horizon ({value} != {deployment_horizon})"
+        )
+    return value
 
 
 def parse_args() -> argparse.Namespace:
@@ -1012,7 +1013,7 @@ def parse_args() -> argparse.Namespace:
         "4 帧历史窗 [d-6, d-4, d-2, d] → 冻结 V-JEPA forward_hierarchical_dense "
         "→ dense_evidence 注入 encode_condition（config.dense_readout_mtvj 强制 "
         "True；ckpt 无 dense 权重时零初始化初始等价）。与 c2/recovery 部署互斥"
-        "（servo plan 分支已接同一 dense/metric/WAM 上下文）",
+        "（servo plan 分支已接同一 dense/metric 上下文）",
     )
     parser.add_argument(
         "--action-vision-checkpoint",
@@ -1080,20 +1081,26 @@ def parse_args() -> argparse.Namespace:
         "closed-loop frames remain encoded online.",
     )
     parser.add_argument(
-        "--wam",
-        choices=("auto", "on", "off"),
-        default="auto",
-        help="E7 WAM M0：联合世界动作流残差。auto = checkpoint 有 wam_model 追加键"
-        "则启用；on = 必须启用（旧 checkpoint 无 WAM 权重时报错退出）；"
-        "off = 永不启用（行为与旧版逐位一致）。",
-    )
-    parser.add_argument(
-        "--wam-alpha",
-        type=float,
-        default=1.0,
-        help="WAM 残差速度缩放系数（默认 1.0；0 = 名义动作，消融对照）。",
+        "--record-action-chunks",
+        action="store_true",
+        help="Include decoded normalized chunks in per-trial JSON for paired divergence analysis.",
     )
     parser.add_argument("--trials-per-task", type=int, default=10)
+    parser.add_argument(
+        "--trial-range",
+        type=str,
+        default=None,
+        help="分片评测的 trial 半开区间 START:END（缺省 = 全部）。每个 trial 开头都用 "
+        "evaluation_episode_seed 重新播种 numpy/env/torch，跨 trial 无 RNG 依赖，"
+        "因此分片结果与串行逐 trial 完全一致。用于把 trial 拆到多进程并行：闭环"
+        "评测 GPU 利用率仅 0~6%%，瓶颈是单线程软件渲染（容器无 /dev/dri，EGL 退回 "
+        "llvmpipe，硬件渲染不可用），并行是唯一的大幅加速手段。",
+    )
+    parser.add_argument(
+        "--show-window",
+        action="store_true",
+        help="实时显示闭环 corner2 RGB 画面；按 q 可提前关闭显示窗口",
+    )
     parser.add_argument(
         "--output-json",
         type=Path,
@@ -1137,7 +1144,7 @@ def parse_args() -> argparse.Namespace:
         "--task35-precision-contract",
         action="store_true",
         help="最终 task35 评测 fail-fast：H6/grid16/temporal/geometry/ROI、"
-        "execute=6、50 trials、stage telemetry、WAM off。",
+        "execute=6、50 trials、stage telemetry、WAM4VA state exchange off。",
     )
     parser.add_argument(
         "--debug-stage-metrics",
@@ -1169,6 +1176,26 @@ def parse_args() -> argparse.Namespace:
         "契约缺口对照（2026-08-06 Codex 判决顺序第 3 步）",
     )
     parser.add_argument(
+        "--world-reset-every",
+        type=int,
+        default=4,
+        help="每 N 个决策点只重置 world_state（WAMState）为 None，保留 VA 视觉记忆"
+        "（0 = 不重置）。训练 sequence_length=4 时 world_state 只跨 4 步累积"
+        "（每步 8 stage propose）；peer_sync_h6 长 horizon 闭环把同一段无约束 belief "
+        "循环推到数千次 propose 而发散到 NaN。此参数把部署的 world 递归深度截断回"
+        "训练分布，是零训练代价的分布对齐（对应 --memory-reset-every 但只动 world）。",
+    )
+    parser.add_argument(
+        "--world-map-reset-every",
+        type=int,
+        default=0,
+        help="每 N 个决策点只把 world_map 置 None、保留 belief（0 = 不重置）。"
+        "wmrm.py 的 map 基底是 previous_map，跨 stage 与跨决策点持续累积，一集 2000 "
+        "次 propose 全在自己上一次预测上加残差、从不重锚真实观测；--world-reset-every "
+        "压住了这个发散，但代价是 belief 每 4 个决策点一起被清空。此参数用 N=1 把 map "
+        "的开环深度截断到单个决策点的 8 个 stage，同时让 belief 跨整集存活。",
+    )
+    parser.add_argument(
         "--prev-zero",
         action="store_true",
         help="把 previous_action 输入恒置零（归一化 0）。previous_action 训练用真值、"
@@ -1176,11 +1203,21 @@ def parse_args() -> argparse.Namespace:
         "自激对照（2026-08-06 Codex 16-task panel 条件）",
     )
     parser.add_argument(
+        "--execution-horizon",
+        type=int,
+        default=None,
+        choices=SUPPORTED_EXECUTION_HORIZONS,
+        help=(
+            "部署时每次硬替换执行的动作数；仅支持 1/2/3/6。"
+            "peer_sync_h6 默认且必须等于 checkpoint planning_stride；"
+            "legacy 默认 6。"
+        ),
+    )
+    parser.add_argument(
         "--execute-steps",
         type=int,
-        default=DECISION_STRIDE,
-        help="每决策执行 chunk 的原始步数（决策节奏 = 此值）。SmolVLA 每个原始步都重新"
-        "推理（execute=1），我们默认 6 步/决策——协议差距探针（2026-08-06 Codex）",
+        default=None,
+        help="legacy alias for --execution-horizon; retained for old launchers.",
     )
     parser.add_argument(
         "--direct-head",
@@ -1195,7 +1232,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="C² 部署（Codex 修正 5）：VA 生成 {ū,c̄,K} 的重规划间隔（原始步）。"
-        "默认 6 = DECISION_STRIDE；token 0..5 顺序消费后重规划",
+        "默认 6，与该 legacy checkpoint 的训练控制步幅一致；token 0..5 顺序消费后重规划",
     )
     parser.add_argument(
         "--feedback-stride",
@@ -1394,6 +1431,38 @@ def plan_refresh_due(decision_count: int, plan_refresh: int) -> bool:
     if decision_count == 1:
         return True
     return plan_refresh > 0 and (decision_count - 1) % plan_refresh == 0
+
+
+def _reset_world_state(memory):
+    """只把 ``VisualMemory.world_state`` 置 None，保留 VA 视觉记忆。
+
+    ``VisualMemory`` 是 frozen dataclass，必须用 ``dataclasses.replace`` 重建。
+    ``world_state=None`` 会在下一次 ``encode_condition`` 里触发 ``WAMState()``
+    重新初始化（model.py 对 None 有兜底）。peer_sync_h6 的 belief 是无约束
+    循环，训练 sequence_length=4 只验证了 4 步窗口；长 horizon 闭环把它推到
+    数千次 propose 而发散到 NaN，这里把 world 递归深度截断回训练分布。
+    """
+    if memory is None or getattr(memory, "world_state", None) is None:
+        return memory
+    return dataclasses.replace(memory, world_state=None)
+
+
+def _reset_world_map(memory):
+    """只把 ``WAMState.world_map`` 置 None，保留 belief。
+
+    ``world_map`` 的残差基底是 ``clip[:, -1] if previous_map is None else
+    previous_map``（wmrm.py），所以置 None 让下一个 stage 重新锚定到真实 DINO 帧。
+    ``--world-reset-every`` 清整个 ``WAMState``，belief 一起没了（250 决策点 / 4 =
+    每集 62 次），而 belief 正是 WAM 存在的理由。此参数只截断 map 的开环深度。
+    """
+    if memory is None:
+        return memory
+    world_state = getattr(memory, "world_state", None)
+    if world_state is None or getattr(world_state, "world_map", None) is None:
+        return memory
+    return dataclasses.replace(
+        memory, world_state=dataclasses.replace(world_state, world_map=None)
+    )
 
 
 def c2_schedule(
@@ -2013,9 +2082,7 @@ def run_c2_recovery_eval(
     language_mask = features["language_mask"][row : row + 1].to(device)
     language_cache = model.build_language_cache(hidden, language_mask)
 
-    config_path = (
-        Path("/home/ryan/Documents/robot/Evoagent/Evo-1/evo1_lerobot/lerobot/envs/metaworld_config.json")
-    )
+    config_path = METAWORLD_TASK_CONFIG
     mw_config = json.load(open(config_path))
     if "button-press-v3" not in mw_config["TASK_DESCRIPTIONS"]:
         raise ValueError("button-press-v3 missing from metaworld_config.json")
@@ -2049,9 +2116,9 @@ def run_c2_recovery_eval(
             img = env.render()
             frame_buffer.append(img)
             if step == 0:
-                while len(frame_buffer) < (VISION_WINDOW - 1) * DECISION_STRIDE + 1:
+                while len(frame_buffer) < (VISION_WINDOW - 1) * LEGACY_TRAINING_CONTROL_STRIDE + 1:
                     frame_buffer.insert(0, img)
-            if len(frame_buffer) > (VISION_WINDOW - 1) * DECISION_STRIDE + 1:
+            if len(frame_buffer) > (VISION_WINDOW - 1) * LEGACY_TRAINING_CONTROL_STRIDE + 1:
                 frame_buffer.pop(0)
             indices = list(range(-2 * VISION_WINDOW + 1, 0, 2))
             frames = [frame_buffer[len(frame_buffer) + i] for i in indices]
@@ -2284,7 +2351,56 @@ def main() -> None:
     device = torch.device(args.device)
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     config = VACompoundConfig(**ckpt["config"])
+    args.execution_horizon = resolve_execution_horizon(args, config)
+    # Keep the old field available to existing validation/reporting callers.
+    args.execute_steps = args.execution_horizon
     policy_contract = ckpt.get("training_contract", {}) or {}
+    if (
+        getattr(config, "va_world_mode", "legacy") == "peer_sync_h6"
+        and int(getattr(config, "planning_stride", LEGACY_EXECUTION_HORIZON)) == 2
+    ):
+        required_p2_contract = {
+            "peer_training_mode": "joint_dual_stream",
+            "peer_world_topology": "world_minus_one_same_endpoint_fixed_current_anchor_v2",
+            "peer_gradient_boundary": "world_map_stopgrad_policy_projection_trainable_v1",
+            "peer_data_isolation": "separate_va_world_episode_datasets_per_step_v1",
+            "peer_dual_stream_optimizer": (
+                "va_backward_then_world_backward_one_optimizer_step_v1"
+            ),
+        }
+        if args.execution_horizon == 15:
+            required_p2_contract["peer_flow_topology"] = (
+                "h6_prefix_h9_tail_one_way_detached_flow_v1"
+            )
+        p2_contract_mismatch = {
+            key: (policy_contract.get(key), value)
+            for key, value in required_p2_contract.items()
+            if policy_contract.get(key) != value
+        }
+        for identity_key in ("peer_va_data_identity", "peer_world_data_identity"):
+            identity = policy_contract.get(identity_key)
+            if not isinstance(identity, dict) or not identity.get("full_file_sha256"):
+                p2_contract_mismatch[identity_key] = (identity, "strong identity")
+        exact_arguments = (ckpt.get("exact_run_contract") or {}).get(
+            "arguments"
+        ) or {}
+        expected_p2_arguments = {
+            "control_stride": 2,
+            "planning_stride": 2,
+            "wmrm_cycle_steps": int(config.wmrm_cycle_steps),
+            "deployment_execution_horizon": args.execution_horizon,
+            "flow_prefix_steps": 2,
+        }
+        for key, value in expected_p2_arguments.items():
+            if exact_arguments.get(key) != value:
+                p2_contract_mismatch[f"exact_run_contract.arguments.{key}"] = (
+                    exact_arguments.get(key),
+                    value,
+                )
+        if p2_contract_mismatch:
+            raise ValueError(
+                f"peer P2 checkpoint training contract mismatch: {p2_contract_mismatch}"
+            )
     action_vision_enabled = config.action_vision_backbone != "none"
     if action_vision_enabled:
         if args.action_vision_checkpoint is None:
@@ -2480,7 +2596,7 @@ def main() -> None:
             "execute_steps 6": args.execute_steps == 6,
             "horizon 500": args.horizon == 500,
             "stage telemetry": args.debug_stage_metrics,
-            "WAM off": args.wam == "off",
+            "WAM4VA state exchange off": not getattr(config, "wmrm", False),
             "FM checkpoint": policy_contract.get("action_decoder")
             == "conditional_flow_matching",
             "FM decoder not overridden": args.direct_head in {"auto", "off"},
@@ -2552,7 +2668,7 @@ def main() -> None:
             "50 trials": args.trials_per_task == 50,
             "task35 only": args.task_ids == "35",
             "stage telemetry": args.debug_stage_metrics,
-            "WAM off": args.wam == "off",
+            "WAM4VA state exchange off": not getattr(config, "wmrm", False),
             "FM decoder not overridden": args.direct_head in {"auto", "off"},
         }
         missing = [name for name, enabled in requirements.items() if not enabled]
@@ -2570,11 +2686,6 @@ def main() -> None:
     )
     print(f"eval: action_horizon={ACTION_HORIZON} (from checkpoint config), "
           f"flow_steps={flow_steps} (from checkpoint contract)")
-    # E7 WAM M0 Task 4：--wam auto|on|off 决议（见 _resolve_wam）。off 或
-    # alpha=0 短路返回 None：不建 WAM、不建 wam_residual_fn 闭包，两个 decode
-    # 钩子均不传 wam_residual_fn。wam_model 为追加键，旧 checkpoint 无此键时
-    # wam=None，后续决策循环行为与旧版逐位一致。
-    wam = _resolve_wam(ckpt, args, config, device)
     # spatial-pooling ckpt 评估：vision_pooling 存在 training_contract 而非 config。
     vision_pooling = str(
         (ckpt.get("training_contract", {}) or {}).get("vision_pooling", "flat")
@@ -2611,14 +2722,6 @@ def main() -> None:
                 "acceptance and causal diagnostics must stay on the FM decoder"
             )
         config = dataclasses.replace(config, direct_head=args.direct_head == "on")
-    if wam is not None and (
-        getattr(config, "direct_head", False) or getattr(config, "c2_controller", False)
-    ):
-        # --direct-head on/off 强制换解码器发生在 WAM 决议之后，补一道 fail-fast。
-        raise ValueError(
-            "--wam 不支持 direct_head/c2_controller 解码"
-            "（WAM 残差只作用于 flow Euler 路径）"
-        )
     # MT-VJ（契约 §5/§7）：--dense-readout-mtvj 强制打开 model 的 dense 层
     # （与 train.py _mtvj_config_kwargs 同构）。ckpt 无 dense 权重时 W_o 零初始化
     # → 初始输出逐位等价（下方非严格加载 + 警告）。
@@ -2644,36 +2747,20 @@ def main() -> None:
             "scene_teacher, or a semantic compiler"
         )
     model = VACompoundPolicy(config).eval().to(device)
+    model.runtime_execution_horizon = args.execution_horizon
     ckpt_direct_head = bool(ckpt["config"].get("direct_head", False))
-
-    def _mark_legacy_vision_gate(missing_keys) -> None:
-        gate_missing = [
-            key for key in missing_keys if key.startswith("wmrm.vision_gate_proj.")
-        ]
-        if gate_missing and getattr(model, "wmrm", None) is not None:
-            model.wmrm.legacy_ungated_vision = True
-            print(
-                "eval: checkpoint has no vision_gate; "
-                "use training-time ungated world→vision write",
-                flush=True,
-            )
 
     if ckpt_direct_head == config.direct_head and not dense_forced:
         missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
-        other_missing = [
-            key for key in missing if not key.startswith("wmrm.vision_gate_proj.")
-        ]
-        if unexpected or other_missing:
+        if unexpected or missing:
             raise RuntimeError(
                 "checkpoint/model mismatch: "
-                f"missing={other_missing[:8]} unexpected={list(unexpected)[:8]}"
+                f"missing={list(missing)[:8]} unexpected={list(unexpected)[:8]}"
             )
-        _mark_legacy_vision_gate(missing)
     elif dense_forced:
         # --dense-readout-mtvj 强制：ckpt 训练时未开 dense 层 → dense 权重缺失，
         # 非严格加载（W_o 零初始化 → 初始输出与无 dense 路径逐位一致）。
         missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
-        _mark_legacy_vision_gate(missing)
         print(
             f"eval: --dense-readout-mtvj 强制 dense 层（ckpt config "
             f"dense_readout_mtvj={bool(ckpt['config'].get('dense_readout_mtvj', False))}）；"
@@ -2683,7 +2770,6 @@ def main() -> None:
         # --direct-head on/off 强制换解码器（消融）：另一头的 head 未训练，
         # 用非严格加载 + 显式警告。
         missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
-        _mark_legacy_vision_gate(missing)
         print(
             f"eval: forced decoder override direct_head={config.direct_head} "
             f"(ckpt had {ckpt_direct_head}); missing={len(missing)} "
@@ -2733,6 +2819,86 @@ def main() -> None:
     )
 
     features = torch.load(args.features, map_location="cpu", weights_only=True)
+    feature_metadata = features.get("metadata") or {}
+    try:
+        training_control_stride = int(feature_metadata["control_stride"])
+        control_hz = int(feature_metadata["fps"])
+        training_prediction_horizon = int(feature_metadata["action_horizon"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "feature metadata must define integer control_stride, fps, and action_horizon"
+        ) from exc
+    raw_planning_stride = feature_metadata.get("planning_stride")
+    try:
+        training_planning_stride = (
+            training_control_stride
+            if raw_planning_stride is None
+            else int(raw_planning_stride)
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("feature metadata planning_stride must be an integer") from exc
+    if training_prediction_horizon != config.action_horizon:
+        raise ValueError(
+            "feature/checkpoint action horizon mismatch: "
+            f"{training_prediction_horizon} != {config.action_horizon}"
+        )
+    checkpoint_planning_stride = int(
+        getattr(config, "planning_stride", LEGACY_EXECUTION_HORIZON)
+    )
+    checkpoint_deployment_horizon = int(
+        getattr(config, "deployment_execution_horizon", 0)
+        or checkpoint_planning_stride
+    )
+    if getattr(config, "va_world_mode", "legacy") == "peer_sync_h6":
+        if (
+            checkpoint_planning_stride != LEGACY_EXECUTION_HORIZON
+            and raw_planning_stride is None
+        ):
+            raise ValueError(
+                "P2 peer feature metadata must explicitly define planning_stride"
+            )
+        peer_cadence = {
+            "fps": (control_hz, 80),
+            "control_stride": (
+                training_control_stride,
+                checkpoint_planning_stride,
+            ),
+            "planning_stride": (
+                training_planning_stride,
+                checkpoint_planning_stride,
+            ),
+            "execution_horizon": (
+                args.execution_horizon,
+                checkpoint_deployment_horizon,
+            ),
+            "wmrm_cycle_steps": (
+                int(getattr(config, "wmrm_cycle_steps", 0)),
+                training_prediction_horizon,
+            ),
+            "action_horizon": (
+                training_prediction_horizon,
+                int(getattr(config, "action_horizon", 0)),
+            ),
+        }
+        cadence_mismatch = {
+            key: values
+            for key, values in peer_cadence.items()
+            if values[0] != values[1]
+        }
+        if cadence_mismatch:
+            raise ValueError(
+                f"peer_sync_h6 planning cadence mismatch: {cadence_mismatch}"
+            )
+    training_planning_hz = float(control_hz) / float(checkpoint_planning_stride)
+    deployment_planning_hz = float(control_hz) / float(args.execution_horizon)
+    print(
+        "eval: deployment cadence "
+        f"fps={control_hz}, training_stride={checkpoint_planning_stride}, "
+        f"training_hz={training_planning_hz:g}, "
+        f"deployment_hz={deployment_planning_hz:g}, "
+        f"prediction_horizon={training_prediction_horizon}, "
+        f"execution_horizon={args.execution_horizon}"
+    )
     if args.task35_precision_contract or args.task35_causal_ablation != "none":
         all_tasks = features["metadata"]["tasks"]
         selected_early = select_eval_tasks(all_tasks, args.task_ids, args.max_tasks)
@@ -2755,7 +2921,9 @@ def main() -> None:
         # chunk 一次），feedback_stride=1（每原始步刷新读出并消费 token，
         # Codex 修正 5）。
         args.plan_stride = (
-            args.plan_stride if args.plan_stride is not None else DECISION_STRIDE
+            args.plan_stride
+            if args.plan_stride is not None
+            else LEGACY_EXECUTION_HORIZON
         )
         args.feedback_stride = (
             args.feedback_stride if args.feedback_stride is not None else 1
@@ -3027,6 +3195,15 @@ def main() -> None:
     per_task = {}
     trial_records: list[dict[str, Any]] = []
     completed_trials = 0
+    trial_start, trial_stop = parse_trial_range(
+        args.trial_range, args.trials_per_task
+    )
+    if (trial_start, trial_stop) != (0, args.trials_per_task):
+        print(
+            f"eval: trial shard [{trial_start}, {trial_stop}) of "
+            f"{args.trials_per_task} per task",
+            flush=True,
+        )
     for local_task_index, (global_task_index, task_text) in enumerate(selected_tasks):
         env_name = descriptions_to_env.get(task_text)
         if env_name is None:
@@ -3043,7 +3220,7 @@ def main() -> None:
         env.model.cam_pos[2] = [0.75, 0.075, 0.7]  # corner2 位置（lerobot 采集同款）
         env._freeze_rand_vec = False
         wins = 0
-        for trial in range(args.trials_per_task):
+        for trial in range(trial_start, trial_stop):
             episode_seed = evaluation_episode_seed(global_task_index, trial)
             # MetaWorld v3 的 reset_model 在部分版本仍读全局 NumPy RNG；
             # 仅传 env.reset(seed=...) 不足以固定任务布局。显式同步后，基线与
@@ -3089,7 +3266,6 @@ def main() -> None:
                 if servo_runtime is not None
                 else np.zeros((ACTION_HORIZON, 4))
             )
-            chunk_start_step = 0  # 2026-08-06：--execute-steps 变节奏时 chunk 相位
             memory = None
             metric_g_prev = None  # MT-VJ：上一决策的 g_t（ν_t = g_t − g_{t−1}，每 trial 重置）
             success = False
@@ -3102,6 +3278,8 @@ def main() -> None:
                 "best_obj_step": -1,
             }
             decision_count = 0  # 2026-08-06：--memory-reset-every 的决策计数器
+            recorded_chunks: list[list[list[float]]] = []
+            plan_queue = SynchronousPlanQueue(args.execution_horizon)
             plan_step = None  # C²/伺服：上次规划的原始步
             c2_token = 0  # C²/伺服：自规划以来消费的 token 索引
             c2_params = None  # C²：缓存的 {ū, c̄, K}
@@ -3112,6 +3290,14 @@ def main() -> None:
             servo_first = True  # 首决策 a_prev=None（ν≡0，servo.py 契约）
             for step in range(args.horizon):
                 img = env.render()  # 数据图像与本地渲染一致（实测 MAE 0.48 vs flip 55，勿加 flip）
+                if args.show_window:
+                    import cv2
+
+                    title = "MetaWorld closed-loop (q to stop)"
+                    cv2.imshow(title, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        cv2.destroyAllWindows()
+                        args.show_window = False
                 frame_buffer.append(img)
                 if step == 0:
                     # 2026-08-06 评估缺陷修复：原实现首决策前执行 chunk 的初始零值
@@ -3121,9 +3307,9 @@ def main() -> None:
                     # 用首帧重复填充窗口使 step 0 立即推理：与训练首决策窗口同分布
                     # （prepare 的 clip_frame_indices 以 max(0, d-offset*stride)
                     # 钳制，episode 首窗口本身由重复帧组成）。
-                    while len(frame_buffer) < (VISION_WINDOW - 1) * DECISION_STRIDE + 1:
+                    while len(frame_buffer) < (VISION_WINDOW - 1) * LEGACY_TRAINING_CONTROL_STRIDE + 1:
                         frame_buffer.insert(0, img)
-                if len(frame_buffer) > (VISION_WINDOW - 1) * DECISION_STRIDE + 1:
+                if len(frame_buffer) > (VISION_WINDOW - 1) * LEGACY_TRAINING_CONTROL_STRIDE + 1:
                     frame_buffer.pop(0)
                 # 与训练一致的时间升序 [d-6, d-4, d-2, d]（clip_frame_indices 返回
                 # video_start + max(0, d - offset*stride)，offset 升序 → 最老帧在前）
@@ -3366,13 +3552,11 @@ def main() -> None:
                                     ),
                                     image_size=render_size,
                                 ).detach().cpu().float()
-                            decode_kwargs = {}
                             servo_dense_kwargs: dict = {}
-                            servo_metric_g = None
                             if args.dense_readout_mtvj and mtvj_backbone is not None:
                                 (
                                     servo_dense_kwargs,
-                                    servo_metric_g,
+                                    _,
                                     servo_vision,
                                     metric_g_prev,
                                 ) = _decision_mtvj_context(
@@ -3425,26 +3609,11 @@ def main() -> None:
                                 return_visual_memory=True,
                                 **servo_dense_kwargs,
                             )
-                            if wam is not None:
-                                wam_dense = servo_dense_kwargs.get("dense_evidence")
-                                spatial16 = (
-                                    _wam_spatial16_from_h11(wam_dense[11])
-                                    if wam_dense is not None and 11 in wam_dense
-                                    else torch.zeros(1, 16, 768, device=device)
-                                )
-                                decode_kwargs["wam_residual_fn"] = _make_wam_residual_fn(
-                                    wam,
-                                    memory,
-                                    spatial16,
-                                    _wam_geo8_from_metric(servo_metric_g, device),
-                                    args.wam_alpha,
-                                )
                             if args.flow_samples == 1:
                                 decoded = model.decode_actions(
                                     cond,
                                     steps=flow_steps,
                                     semantic_context=semantic_ctx,
-                                    **decode_kwargs,
                                 )
                             else:
                                 decoded = torch.stack(
@@ -3453,7 +3622,6 @@ def main() -> None:
                                             cond,
                                             steps=flow_steps,
                                             semantic_context=semantic_ctx,
-                                            **decode_kwargs,
                                         )
                                         for _ in range(args.flow_samples)
                                     ]
@@ -3532,13 +3700,27 @@ def main() -> None:
                         c2_token += 1
                     else:
                         norm_action = last_norm
-                elif step % args.execute_steps == 0 and len(frame_buffer) >= VISION_WINDOW:
+                elif plan_queue.needs_plan(step) and len(frame_buffer) >= VISION_WINDOW:
                     if (
                         args.memory_reset_every > 0
                         and decision_count > 0
                         and decision_count % args.memory_reset_every == 0
                     ):
                         memory = None  # 契约缺口对照：截断递归记忆到训练深度
+                    if (
+                        args.world_reset_every > 0
+                        and decision_count > 0
+                        and decision_count % args.world_reset_every == 0
+                    ):
+                        # peer_sync_h6 长 horizon：world_state 对齐训练 4 步窗口，
+                        # 只重置 WAMState（保留 VA 视觉记忆），避免 belief 发散。
+                        memory = _reset_world_state(memory)
+                    if (
+                        args.world_map_reset_every > 0
+                        and decision_count > 0
+                        and decision_count % args.world_map_reset_every == 0
+                    ):
+                        memory = _reset_world_map(memory)
                     decision_count += 1
                     # 与训练一致的时间升序 [d-6, d-4, d-2, d]（clip_frame_indices 返回
                     # video_start + max(0, d - offset*stride)，offset 升序 → 最老帧在前）
@@ -3730,54 +3912,71 @@ def main() -> None:
                             )
                         world_action = None
                         proposal_noise = None
+                        decoded_proposal = None
+                        peer_checkpoint = (
+                            getattr(config, "va_world_mode", "legacy")
+                            == "peer_sync_h6"
+                        )
                         if getattr(model, "wmrm", None) is not None:
-                            if model.wmrm.cycle_steps != args.execute_steps:
+                            expected_world_horizon = (
+                                int(config.action_horizon)
+                                if peer_checkpoint
+                                else EXPECTED_WMRM_WORLD_HORIZON
+                            )
+                            if (
+                                model.wmrm.cycle_steps
+                                != expected_world_horizon
+                            ):
                                 raise ValueError(
-                                    "WAM4VA cycle_steps must equal closed-loop execute_steps: "
-                                    f"{model.wmrm.cycle_steps} != {args.execute_steps}"
+                                    "WAM4VA world_horizon must match its deployment "
+                                    "planning cycle: "
+                                    f"{model.wmrm.cycle_steps} != "
+                                    f"{expected_world_horizon}"
                                 )
                             if args.flow_samples != 1:
                                 raise ValueError(
-                                    "WAM4VA closed loop requires --flow-samples 1 so the "
-                                    "world-conditioned proposal and executed decode share noise"
+                                    "WAM4VA closed loop requires --flow-samples 1"
                                 )
-                            proposal_cond, _ = model.encode_condition(
-                                vision_in,
-                                proprio[0],
-                                previous[0],
-                                language_cache=task_caches[local_task_index],
-                                visual_memory=memory,
-                                return_visual_memory=True,
-                                skip_wmrm=True,
-                                **dense_kwargs,
-                            )
-                            proposal_noise = torch.randn(
-                                proposal_cond.shape[0],
-                                config.action_horizon,
-                                config.action_dim,
-                                device=proposal_cond.device,
-                                dtype=proposal_cond.dtype,
-                            )
-                            decoded_proposal = model.decode_actions(
-                                proposal_cond,
-                                steps=flow_steps,
-                                noise=proposal_noise,
-                                semantic_context=(
-                                    vision_in
-                                    if (
-                                        getattr(config, "flow_semantic", False)
-                                        and not config.direct_head
+                            if not peer_checkpoint:
+                                # Legacy WMRM deployment needs a preliminary flow
+                                # proposal as the executable World-action input.
+                                proposal_cond, _ = model.encode_condition(
+                                    vision_in,
+                                    proprio[0],
+                                    previous[0],
+                                    language_cache=task_caches[local_task_index],
+                                    visual_memory=memory,
+                                    return_visual_memory=True,
+                                    skip_wmrm=True,
+                                    **dense_kwargs,
+                                )
+                                proposal_noise = torch.randn(
+                                    proposal_cond.shape[0],
+                                    config.action_horizon,
+                                    config.action_dim,
+                                    device=proposal_cond.device,
+                                    dtype=proposal_cond.dtype,
+                                )
+                                decoded_proposal = model.decode_actions(
+                                    proposal_cond,
+                                    steps=flow_steps,
+                                    noise=proposal_noise,
+                                    semantic_context=(
+                                        vision_in
+                                        if (
+                                            getattr(config, "flow_semantic", False)
+                                            and not config.direct_head
+                                        )
+                                        else None
+                                    ),
+                                )
+                                cycle = model.wmrm.cycle_steps
+                                if decoded_proposal.shape[1] < cycle:
+                                    raise ValueError(
+                                        f"decoded action horizon {decoded_proposal.shape[1]} "
+                                        f"is shorter than WAM4VA cycle {cycle}"
                                     )
-                                    else None
-                                ),
-                            )
-                            cycle = model.wmrm.cycle_steps
-                            if decoded_proposal.shape[1] < cycle:
-                                raise ValueError(
-                                    f"decoded action horizon {decoded_proposal.shape[1]} "
-                                    f"is shorter than WAM4VA cycle {cycle}"
-                                )
-                            world_action = decoded_proposal[:, :cycle].clamp(-1.0, 1.0)
+                                world_action = decoded_proposal[:, :cycle].clamp(-1.0, 1.0)
                         cond, memory = model.encode_condition(
                             vision_in,
                             proprio[0],
@@ -3799,32 +3998,12 @@ def main() -> None:
                             )
                             else None
                         )
-                        decode_kwargs = {}
-                        if wam is not None:
-                            # E7 WAM M0 Task 4：spatial16 = H11 最后时间片
-                            # 24×24 → 4×4 块均值；geo8 = 当前决策 metric head
-                            # 的 p*vis 8 维状态（与 _mtvj_metric_positions
-                            # 同源，含 ROI 精修与 v2/v3 source 选择）。
-                            wam_dense = dense_kwargs.get("dense_evidence")
-                            spatial16 = (
-                                _wam_spatial16_from_h11(wam_dense[11])
-                                if wam_dense is not None and 11 in wam_dense
-                                else torch.zeros(1, 16, 768, device=device)
-                            )
-                            decode_kwargs["wam_residual_fn"] = _make_wam_residual_fn(
-                                wam,
-                                memory,
-                                spatial16,
-                                _wam_geo8_from_metric(metric_g, device),
-                                args.wam_alpha,
-                            )
                         if args.flow_samples == 1:
                             decoded = model.decode_actions(
                                 cond,
                                 steps=flow_steps,
                                 noise=proposal_noise,
                                 semantic_context=semantic_ctx,
-                                **decode_kwargs,
                             )
                         else:
                             decoded = torch.stack(
@@ -3833,18 +4012,22 @@ def main() -> None:
                                         cond,
                                         steps=flow_steps,
                                         semantic_context=semantic_ctx,
-                                        **decode_kwargs,
                                     )
                                     for _ in range(args.flow_samples)
                                 ]
                             ).mean(dim=0)
                         chunk = decoded[0].cpu().numpy()
-                        chunk_start_step = step
+                        # Standard evaluation uses an absolute-time synchronous plan;
+                        # execution_horizon controls the hard replacement prefix while
+                        # peer WMRM consumes the same checkpoint planning prefix.
+                        plan_queue.replace(step, chunk)
+                        if args.record_action_chunks:
+                            recorded_chunks.append(chunk.astype(float).tolist())
                         if args.debug_first_action and not _DEBUG_FA_DONE.get("x"):
                             _DEBUG_FA_DONE["x"] = True
                             print(f"DEBUG first chunk0={np.round(chunk[0], 4)}")
                             if args.align_init and _ALIGN_ACTS is not None:
-                                dc = (step // DECISION_STRIDE)
+                                dc = step // LEGACY_EXECUTION_HORIZON
                                 if dc < len(_ALIGN_ACTS):
                                     ref = _ALIGN_ACTS[dc][0]
                                     print(
@@ -3857,13 +4040,13 @@ def main() -> None:
                 # 存盘即 clip），再反归一化到环境原始动作空间；prev 反馈同样用裁剪值。
                 # servo 部署的 norm_action 由伺服分支给出（clip(ā + correction)），
                 # 不能再用 chunk 覆盖。
-                norm_action = (
-                    np.clip(
-                        chunk[(step - chunk_start_step) % ACTION_HORIZON], -1.0, 1.0
-                    )
-                    if (not config.c2_controller and servo_runtime is None)
-                    else norm_action
-                )
+                if not config.c2_controller and servo_runtime is None:
+                    if plan_queue.needs_plan(step):
+                        raise RuntimeError(
+                            f"synchronous action plan missing at environment step {step}"
+                        )
+                    norm_action = np.clip(plan_queue.action_at(step), -1.0, 1.0)
+
                 action = norm_action * (aq99 - aq01) / 2 + (aq99 + aq01) / 2
                 obs, reward, terminated, truncated, info = env.step(action)
                 last_norm = norm_action
@@ -3905,6 +4088,8 @@ def main() -> None:
                     "min_obj_to_target": float(stage_metrics["obj_to_target"]),
                     "best_obj_step": int(stage_metrics["best_obj_step"]),
                 }
+            if args.record_action_chunks:
+                record["action_chunks"] = recorded_chunks
             trial_records.append(record)
             print(
                 f"trial task={global_task_index} trial={trial} seed={episode_seed} "
@@ -3957,7 +4142,7 @@ def main() -> None:
         if len(scores) == 1:
             # 单任务无法按 task bootstrap：唯一 task 被重复抽样只会产生 [p,p]
             # 的伪窄区间。此时不确定性单位应是独立 trial，使用 Wilson 区间。
-            from stats_ci import binomial_wilson_ci
+            from va_compound.statistics import binomial_wilson_ci
 
             est, lo, hi = binomial_wilson_ci(total, trials)
             ci_kind, ci_estimate, ci_low, ci_high = "wilson", est, lo, hi
@@ -3967,7 +4152,7 @@ def main() -> None:
             )
         else:
             # 多任务宏平均：以 task 为有放回重采样单元（固定种子）。
-            from stats_ci import macro_bootstrap_ci
+            from va_compound.statistics import macro_bootstrap_ci
 
             group_ids = np.arange(len(scores))
             est, lo, hi = macro_bootstrap_ci(
@@ -3998,10 +4183,31 @@ def main() -> None:
                 "low_95": None if ci_low is None else float(ci_low),
                 "high_95": None if ci_high is None else float(ci_high),
             },
-            "execute_steps": int(args.execute_steps),
+            "execute_steps": int(args.execution_horizon),
+            "prediction_horizon": int(config.action_horizon),
+            "execution_horizon": int(args.execution_horizon),
+            "world_horizon": (
+                int(model.wmrm.cycle_steps)
+                if getattr(model, "wmrm", None) is not None
+                else None
+            ),
+            "flow_solver_steps": int(flow_steps),
+            "source_fps": int(control_hz),
+            "control_hz": int(control_hz),
+            "training_control_stride": int(training_control_stride),
+            "control_stride": int(training_control_stride),
+            "planning_stride": int(checkpoint_planning_stride),
+            "planning_hz": float(planning_hz),
+            "world_transition_stride": int(training_control_stride),
+            "observation_stride": int(OBSERVATION_STRIDE),
+            "memory_reset_every": int(args.memory_reset_every),
+            "wmrm_mode": (
+                "state-exchange"
+                if getattr(model, "wmrm", None) is not None
+                else "disabled"
+            ),
             "horizon": int(args.horizon),
             "flow_samples": int(args.flow_samples),
-            "wam": args.wam,
             "action_decoder": (
                 "c2_controller"
                 if config.c2_controller
@@ -4011,6 +4217,7 @@ def main() -> None:
                     else "conditional_flow_matching"
                 )
             ),
+            "wmrm_state_exchange": getattr(model, "wmrm", None) is not None,
             "task35_precision_contract": bool(args.task35_precision_contract),
             "task35_causal_ablation": args.task35_causal_ablation,
             "dino_feature_cache": (

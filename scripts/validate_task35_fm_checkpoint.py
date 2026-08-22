@@ -108,7 +108,7 @@ def validate_task35_fm_checkpoint(
     requirements = {
         "FM decoder": contract.get("action_decoder") == "conditional_flow_matching",
         "not Direct": config.direct_head is False and contract.get("action_decoder") != "direct_head",
-        "WAM off": contract.get("wam_enabled") is False and "wam_model" not in checkpoint,
+        "World off": config.wmrm is False,
         "H6": int(config.action_horizon) == 6,
         "grid16": int(config.main_vision_grid) == 16,
         "four frames": int(config.main_vision_frames) == 4,

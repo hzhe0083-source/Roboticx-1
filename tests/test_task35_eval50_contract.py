@@ -42,7 +42,7 @@ def _payload(
         "success_rate": successes / len(trials) if trials else 0.0,
         "execute_steps": execute_steps,
         "horizon": 500,
-        "wam": "off",
+        "wmrm_state_exchange": False,
         "action_decoder": "conditional_flow_matching",
         "env_name": "peg-insert-side-v3",
         "task35_precision_contract": precision,

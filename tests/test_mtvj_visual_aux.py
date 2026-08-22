@@ -17,6 +17,7 @@ from torch import nn
 from train import (
     _mtvj_visual_aux_loss,
     _mtvj_visual_aux_sample,
+    _prepare_mtvj_visual_aux_step,
     parse_args,
     validate_args,
 )
@@ -162,10 +163,14 @@ def test_mtvj_visual_aux_argument_contract() -> None:
     with pytest.raises(ValueError, match="requires --dense-readout-mtvj"):
         validate_args(no_dense)
 
-    no_weighted = parse_args(base)
-    no_weighted.task_sampling = "balanced"
-    with pytest.raises(ValueError, match="requires --task-sampling weighted"):
-        validate_args(no_weighted)
+    balanced = parse_args(base)
+    balanced.task_sampling = "balanced"
+    validate_args(balanced)
+
+    no_weighted_or_balanced = parse_args(base)
+    no_weighted_or_balanced.task_sampling = "uniform"
+    with pytest.raises(ValueError, match=r"weighted\|balanced"):
+        validate_args(no_weighted_or_balanced)
 
     with_sam = parse_args(base)
     with_sam.sam_rho = 0.5
@@ -211,3 +216,44 @@ def test_mtvj_visual_aux_sample_rejects_unmapped_description() -> None:
             seed=0,
             global_step=8,
         )
+
+
+def test_visual_aux_cpu_batch_is_scheduled_once_and_consumed_once(monkeypatch) -> None:
+    calls = []
+
+    def fake_batch(task, rng, n):
+        calls.append((task, n))
+        return _fake_make_metric_batch(task, rng, n)
+
+    monkeypatch.setattr("prepare_metaworld_metric.make_metric_batch", fake_batch)
+    common = dict(
+        task_descriptions=["Pick and place an object"],
+        task_weights=torch.ones(1, dtype=torch.float64),
+        env_by_description={"Pick and place an object": "pick-place-v3"},
+        seed=9,
+        every=10,
+        aux_batch=2,
+        include_raw_frames=False,
+    )
+
+    assert _prepare_mtvj_visual_aux_step(global_step=9, **common) is None
+    prepared = _prepare_mtvj_visual_aux_step(global_step=10, **common)
+    assert prepared is not None
+    task, rng, sim_batch = prepared
+    assert calls == [("pick-place-v3", 2)]
+
+    loss, _ = _mtvj_visual_aux_loss(
+        FakeBackbone(),
+        FakeMetricHead(),
+        task,
+        rng,
+        aux_batch=2,
+        lang_aux_cache=_lang_cache(),
+        device=torch.device("cpu"),
+        loc_lambda=1.0,
+        vis_lambda=0.5,
+        sim_batch=sim_batch,
+    )
+
+    assert torch.isfinite(loss)
+    assert calls == [("pick-place-v3", 2)]

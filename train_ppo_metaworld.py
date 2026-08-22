@@ -84,6 +84,73 @@ class ValueHead(nn.Module):
         return self.net(action_condition.mean(dim=1))  # [B, D] -> [B, 1]
 
 
+def _validate_ppo_checkpoint_config(config: VACompoundConfig) -> None:
+    """Reject checkpoint modes whose rollout semantics PPO cannot reproduce."""
+    if getattr(config, "va_world_mode", "legacy") == "peer_sync_h6":
+        raise ValueError(
+            "PPO does not support peer_sync_h6 checkpoints: peer World state "
+            "advances from the readout before the exploratory Flow action is known, "
+            "so rollout and recomputed-policy semantics cannot be aligned. Use a "
+            "legacy PPO checkpoint/config instead."
+        )
+
+
+def _stack_visual_memories(memories: list[VisualMemory]) -> VisualMemory:
+    """Batch recurrent snapshots without dropping optional or World state."""
+    if not memories:
+        raise ValueError("cannot stack an empty visual-memory list")
+
+    def stack_optional(name: str):
+        values = [getattr(memory, name) for memory in memories]
+        present = [value is not None for value in values]
+        if any(present) and not all(present):
+            raise ValueError(f"visual-memory field {name} is only partially present")
+        return None if not any(present) else torch.cat(values, dim=0)
+
+    layer_count = len(memories[0].layers)
+    if any(len(memory.layers) != layer_count for memory in memories):
+        raise ValueError("visual memories have inconsistent layer counts")
+    world_states = [memory.world_state for memory in memories]
+    world_present = [state is not None for state in world_states]
+    if any(world_present) and not all(world_present):
+        raise ValueError("visual-memory world_state is only partially present")
+    world_state = None
+    if all(world_present):
+        state_type = type(world_states[0])
+        if any(type(state) is not state_type for state in world_states):
+            raise ValueError("visual memories have inconsistent world_state types")
+
+        def stack_world_field(name: str):
+            values = [getattr(state, name) for state in world_states]
+            present = [value is not None for value in values]
+            if any(present) and not all(present):
+                raise ValueError(f"world-state field {name} is only partially present")
+            return None if not any(present) else torch.cat(values, dim=0)
+
+        world_state = state_type(
+            belief=stack_world_field("belief"),
+            innovation=stack_world_field("innovation"),
+            world_map=stack_world_field("world_map"),
+        )
+
+    gates = [memory.gate for memory in memories]
+    # ``gate`` is scalar diagnostics rather than recurrent tensor state. Keep it
+    # when homogeneous; otherwise mark the batched diagnostic unavailable.
+    gate = gates[0] if all(value == gates[0] for value in gates) else None
+    return VisualMemory(
+        layers=tuple(
+            torch.cat([memory.layers[index] for memory in memories], dim=0)
+            for index in range(layer_count)
+        ),
+        evidence=stack_optional("evidence"),
+        task=stack_optional("task"),
+        task_spec=stack_optional("task_spec"),
+        pending_future=stack_optional("pending_future"),
+        gate=gate,
+        world_state=world_state,
+    )
+
+
 class RolloutBuffer:
     """Per-macro-transition storage for PPO (TBPTT=1)."""
 
@@ -260,18 +327,18 @@ def ppo_update(buffer, model, noise_schedule, value_head, actor_opt, critic_opt,
 
     Batched update (2026-08-06): the minibatch is stacked into one
     encode_condition + one flow_trajectory_log_prob call (both batch-aware)
-    instead of per-sample loops.  Transitions whose consumed memory is None
-    (first decision of an episode) cannot be stacked and stay on the
-    per-sample path; they are a small fraction of each minibatch.  The
-    log-prob math is unchanged (test_flow_ppo.py keeps the equivalence
-    guarantee)."""
+    instead of per-sample loops. Transitions are grouped by whether consumed
+    memory is present, then their scores are restored to the original shuffled
+    minibatch order before PPO targets are paired. The log-prob math is
+    unchanged (test_flow_ppo.py keeps the equivalence guarantee)."""
     n = len(buffer)
     idx = list(range(n))
     for _ in range(PPO_EPOCHS):
         random.shuffle(idx)
         for start in range(0, n, MINIBATCH):
             mb = idx[start : start + MINIBATCH]
-            logps, vpreds = [], []
+            logps_by_index: dict[int, torch.Tensor] = {}
+            vpreds_by_index: dict[int, torch.Tensor] = {}
 
             def score_group(group: list[int]) -> None:
                 if not group:
@@ -280,23 +347,11 @@ def ppo_update(buffer, model, noise_schedule, value_head, actor_opt, critic_opt,
                 proprio = torch.cat([buffer.frames[i][1] for i in group]).to(device)
                 previous = torch.cat([buffer.frames[i][2] for i in group]).to(device)
                 memories = [buffer.frames[i][3] for i in group]
-                if memories[0] is None:
-                    memory = None
-                elif memories[0].evidence is not None:
-                    # VA2 (memory_split): the recurrent state is the
-                    # causal-decomposed (evidence, task) pair; layers is empty.
-                    memory = VisualMemory(
-                        layers=(),
-                        evidence=torch.cat([m.evidence for m in memories], dim=0),
-                        task=torch.cat([m.task for m in memories], dim=0),
-                    )
-                else:
-                    memory = VisualMemory(
-                        layers=tuple(
-                            torch.cat([m.layers[k] for m in memories], dim=0)
-                            for k in range(len(memories[0].layers))
-                        )
-                    )
+                memory = (
+                    None
+                    if memories[0] is None
+                    else _stack_visual_memories(memories)
+                )
                 cond = model.encode_condition(
                     tokens,
                     proprio,
@@ -313,13 +368,17 @@ def ppo_update(buffer, model, noise_schedule, value_head, actor_opt, critic_opt,
                 path = [torch.stack([buffer.paths[i][k][0] for i in group]).to(device)
                         for k in range(len(buffer.paths[group[0]]))]
                 logp = model.flow_trajectory_log_prob(path, cond, sigma)
-                logps.append(logp)
-                vpreds.append(value_head(cond.detach()))
+                vpred = value_head(cond.detach()).squeeze(-1)
+                for group_offset, buffer_index in enumerate(group):
+                    logps_by_index[buffer_index] = logp[group_offset]
+                    vpreds_by_index[buffer_index] = vpred[group_offset]
 
             score_group([i for i in mb if buffer.frames[i][3] is not None])
             score_group([i for i in mb if buffer.frames[i][3] is None])
-            logps = torch.cat(logps)
-            vpreds = torch.cat(vpreds).squeeze(-1)
+            # Regrouping changes execution order, not PPO sample order. Restore
+            # the exact shuffled minibatch order before pairing with old/adv/ret.
+            logps = torch.stack([logps_by_index[i] for i in mb])
+            vpreds = torch.stack([vpreds_by_index[i] for i in mb])
             old = torch.tensor([buffer.old_logp[i] for i in mb], device=device, dtype=torch.float32)
             ratio = torch.exp(logps - old)
             adv = torch.tensor(
@@ -366,6 +425,7 @@ def main() -> None:
 
     ckpt = torch.load(args.il_checkpoint, map_location="cpu", weights_only=True)
     config = VACompoundConfig(**ckpt["config"])
+    _validate_ppo_checkpoint_config(config)
     model = VACompoundPolicy(config).eval().to(device)
     model.load_state_dict(ckpt["model"])
     print(f"IL checkpoint: {args.il_checkpoint.name} (VA {config.num_layers} layers)")

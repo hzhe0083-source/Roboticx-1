@@ -232,7 +232,7 @@ Frozen Qwen full model → Task Contract text + 24 role tokens → V-JEPA role g
 - 闭环演化 7.1%→16.3%→17.8%:轨迹时间覆盖从 7.1→16.3(数据覆盖增益大),Qwen-conditioned action queries 只 16.3→17.8(语言接口增益小)
 - 2-task pilot:Direct Head 训练任务 10/10,held-out 全 0 → 模型能学会训练任务但没有可迁移控制结构
 - **语言敏感性 ≠ 语言泛化**:wrong instruction 只证明 ∂L/∂a ≠ 0;模型完全可能把 49 条 embedding 当 49 个连续 task ID(embedding 1→button policy...仍是任务索引)
-- **task-ID 对照不干净**:eval_mw_lang_ablation.py 评估时临时让 Qwen 编码 "task 0/1/2...",这些 hidden 从未在训练出现 → 结果变差只是输入分布变化。正确对照:从头用完整指令训练的模型 A vs 从头用可学习 task-ID embedding 训练的模型 B,数据/步数/参数/种子全同,再比同分布成功率、paraphrase、same-state fork、held-out 组合
+- **task-ID 对照不干净**:scripts/eval/eval_mw_lang_ablation.py 评估时临时让 Qwen 编码 "task 0/1/2...",这些 hidden 从未在训练出现 → 结果变差只是输入分布变化。正确对照:从头用完整指令训练的模型 A vs 从头用可学习 task-ID embedding 训练的模型 B,数据/步数/参数/种子全同,再比同分布成功率、paraphrase、same-state fork、held-out 组合
 - **MetaWorld 测的主要不是语言理解**:多数任务场景高度不同,视觉可直接判断任务;没有真正 same-state command forks,shared-CF loss 在 MetaWorld 没启用(只训 FM + future latent)
 - 成功概率拆解:`P(success) ≈ P(understand)·P(ground)·P(control)·P(recover)`——目前只改善第一个因子
 

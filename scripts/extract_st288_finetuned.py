@@ -4,7 +4,7 @@
 动机：Stage B 训练是 live 在线编码（V-JEPA 全量解冻），评估时若用预计算
 v5 特征（原始冻结 V-JEPA）会与微调权重不匹配；开环/语言消融必须用同一
 backbone 重新编码。输出格式与 Stage A 的 mw_local288 一致（raw fp16 memmap
-+ meta.pt），供 eval_mw_lang_ablation.py --local-slots-data 直接消费。
++ meta.pt），供 scripts/eval/eval_mw_lang_ablation.py --local-slots-data 直接消费。
 
 默认产出 ST288（2×12×12=288 池化槽，既有行为逐位不变）；``--dense``（Step 0
 dense readout，C²-IRF v2 设计 §七）产出 2×24×24=1152 全量 patch 特征（不池化），

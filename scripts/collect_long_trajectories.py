@@ -363,13 +363,41 @@ def _apply_perturb(env, kind: str, mag: float,
         env.data.mocap_pos[0] += delta
         return {"applied": True, "delta": delta.astype(np.float32)}
     else:
-        from scripts.prepare_mw_perturbations import move_obj1
+        from mw_expert_replay import move_body
+
         delta = np.zeros(3)
         theta = rng.uniform(0, 2 * np.pi)
         delta[:2] = mag * np.array([np.cos(theta), np.sin(theta)])
-        try:
-            move_obj1(env, delta)
-        except RuntimeError:
+
+        def _is_robot_body(env, bid: int) -> bool:
+            while bid > 0:
+                name = env.model.body(bid).name or ""
+                if name.startswith(("right", "left")) or "claw" in name or name == "hand":
+                    return True
+                bid = int(env.model.body_parentid[bid])
+            return False
+
+        cur = env._get_obs()[4:7].copy()
+        moved = False
+        for i in range(env.model.nsite):
+            if _is_robot_body(env, int(env.model.site_bodyid[i])):
+                continue
+            if np.allclose(env.data.site_xpos[i], cur, atol=0.02):
+                move_body(env, int(env.model.site_bodyid[i]), delta)
+                moved = True
+                break
+        if not moved:
+            for bid in range(env.model.nbody):
+                if _is_robot_body(env, bid):
+                    continue
+                name = env.model.body(bid).name
+                if not name:
+                    continue
+                if np.allclose(env.data.body(bid).xpos, cur, atol=0.02):
+                    move_body(env, bid, delta)
+                    moved = True
+                    break
+        if not moved:
             return {"applied": False, "delta": np.zeros(3, dtype=np.float32)}
         return {"applied": True, "delta": delta.astype(np.float32)}
 
@@ -407,6 +435,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-eval-seeds",
         action="store_true",
         help="Allow episode seeds in 35000-35049 (eval50 inits). Default is forbid.",
+    )
+    parser.add_argument(
+        "--normalization-ref", type=Path, default=None,
+        help="继承 action/state q01/q99 的来源文件；缺省是 9.8GB 的 "
+        "data/metaworld_fullframe_executed.pt。只读取其 ``normalization`` 字段，"
+        "所以任何已继承同一份归一化的文件都等价（可用小参考文件避免搬 9.8GB）。",
     )
     parser.add_argument(
         "--output", type=Path,
@@ -563,8 +597,16 @@ def main(argv: list[str] | None = None) -> None:
 
     # ---- 统一归一化：继承 fullframe executed 的 q01/q99（Codex：禁止单独算） ----
     import torch
-    src = torch.load(ROOT / "data" / "metaworld_fullframe_executed.pt",
-                     map_location="cpu", weights_only=True)
+    norm_ref = args.normalization_ref or (
+        ROOT / "data" / "metaworld_fullframe_executed.pt"
+    )
+    if not Path(norm_ref).is_file():
+        raise SystemExit(
+            f"missing normalization reference: {norm_ref}\n"
+            "继承 q01/q99 是硬契约（禁止单独算）。若默认的 9.8GB fullframe 文件不在，"
+            "用 --normalization-ref 指向任一已继承同一份归一化的文件。"
+        )
+    src = torch.load(norm_ref, map_location="cpu", weights_only=True)
     aq01, aq99 = src["normalization"]["action_q01"], src["normalization"]["action_q99"]
     sq01, sq99 = src["normalization"]["state_q01"], src["normalization"]["state_q99"]
     norm = dict(src["normalization"])

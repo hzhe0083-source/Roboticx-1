@@ -135,8 +135,13 @@ def test_metric_batch_raw_frames_are_opt_in_and_keep_480(monkeypatch) -> None:
             return None
 
     monkeypatch.setattr(metric_data, "make_env", lambda *args, **kwargs: FakeEnv())
+    monkeypatch.setattr(
+        metric_data,
+        "_Renderer",
+        lambda env: SimpleNamespace(close=lambda: None),
+    )
 
-    def fake_sample(env, task, rng, w, *, include_raw_frames=False):
+    def fake_sample(env, task, rng, w, *, include_raw_frames=False, renderer=None):
         record = {
             "frames": np.zeros((w, 384, 384, 3), dtype=np.uint8),
             "keypoints": np.zeros((4, 2), dtype=np.float32),

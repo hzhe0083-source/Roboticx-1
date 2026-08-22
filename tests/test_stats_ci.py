@@ -1,8 +1,13 @@
-"""stats_ci 统计口径工具测试。"""
+"""va_compound.statistics 统计口径工具测试。"""
 import numpy as np
 import pytest
 
-from stats_ci import binomial_wilson_ci, bootstrap_ci, fmt_ci, macro_bootstrap_ci
+from va_compound.statistics import (
+    binomial_wilson_ci,
+    bootstrap_ci,
+    fmt_ci,
+    macro_bootstrap_ci,
+)
 
 
 def test_binomial_wilson_ci_single_task_is_non_degenerate():

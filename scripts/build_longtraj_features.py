@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import io
 import sys
 import time
@@ -43,6 +44,17 @@ VISION_STRIDE = 2
 REF = ROOT / "data" / "metaworld_fullframe_executed.pt"
 ST_NPY_DIR = Path("/media/ryan/robot-data")
 LEGACY_PERTURB_SETTLE_STEPS = 12
+PEER_SYNC_H6_CONTRACT = "peer_sync_h6_world_windows_v1"
+PEER_SYNC_H6_P2_CONTRACT = "peer_sync_h6_p2_world_windows_v1"
+PEER_SYNC_H15_P2_CONTRACT = "peer_sync_h15_p2_world_windows_v1"
+PEER_SYNC_H6_VERSION = 1
+PEER_SYNC_H6_P2_VERSION = 1
+PEER_SYNC_H6_P2_STRIDE = 2
+PEER_SYNC_H6_CONTRACTS = frozenset({
+    PEER_SYNC_H6_CONTRACT,
+    PEER_SYNC_H6_P2_CONTRACT,
+    PEER_SYNC_H15_P2_CONTRACT,
+})
 
 
 def win_out(horizon: int, task: str | None = None) -> Path:
@@ -54,6 +66,24 @@ def st_paths(horizon: int, task: str | None = None) -> tuple[Path, Path]:
     suffix = "" if task is None else f"_{task}"
     return (ST_NPY_DIR / f"longtraj_st288_h{horizon}{suffix}.npy",
             ST_NPY_DIR / f"longtraj_st288_h{horizon}{suffix}_meta.pt")
+
+
+def _sha256_file(path: Path, block_bytes: int = 8 * 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(block_bytes), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _file_identity(path: Path) -> dict[str, object]:
+    resolved = path.expanduser().resolve(strict=True)
+    stat = resolved.stat()
+    return {
+        "path": str(resolved),
+        "sha256": _sha256_file(resolved),
+        "size_bytes": int(stat.st_size),
+    }
 
 
 def _frame_ref_key(path: Path) -> str:
@@ -413,6 +443,8 @@ def phase1(horizon: int, *, task: str | None = None,
            output_path: Path | None = None,
            ref_path: Path = REF,
            legacy_policy: str = "warn",
+           data_contract: str | None = None,
+           planning_stride: int = CONTROL_STRIDE,
            overwrite: bool = False) -> Path:
     """窗口切片（动作/状态/prev/帧索引），无 GPU。horizon=action chunk 长度。
 
@@ -420,6 +452,37 @@ def phase1(horizon: int, *, task: str | None = None,
     output, so a door-lock repair cannot replace the all-task H48 dataset.
     ``input_paths`` can select a clean collector file explicitly.
     """
+    if data_contract not in {None, *PEER_SYNC_H6_CONTRACTS}:
+        raise ValueError(f"unknown data_contract={data_contract!r}")
+    expected_peer_horizon = (
+        15 if data_contract == PEER_SYNC_H15_P2_CONTRACT else 6
+    )
+    if data_contract in PEER_SYNC_H6_CONTRACTS and horizon != expected_peer_horizon:
+        raise ValueError(
+            f"{data_contract} requires exact action horizon H{expected_peer_horizon}, "
+            f"got H{horizon}"
+        )
+    if (
+        isinstance(planning_stride, (bool, np.bool_))
+        or not isinstance(planning_stride, (int, np.integer))
+        or planning_stride <= 0
+    ):
+        raise ValueError(f"planning_stride must be a positive integer, got {planning_stride!r}")
+    planning_stride = int(planning_stride)
+    if data_contract in {PEER_SYNC_H6_P2_CONTRACT, PEER_SYNC_H15_P2_CONTRACT}:
+        if planning_stride != PEER_SYNC_H6_P2_STRIDE:
+            raise ValueError(
+                f"{PEER_SYNC_H6_P2_CONTRACT} requires planning_stride="
+                f"{PEER_SYNC_H6_P2_STRIDE}, got {planning_stride}"
+            )
+    elif planning_stride != CONTROL_STRIDE:
+        raise ValueError(
+            f"planning_stride={planning_stride} requires data_contract="
+            f"{PEER_SYNC_H6_P2_CONTRACT}; legacy contracts remain stride="
+            f"{CONTROL_STRIDE}"
+        )
+
+    ref_path = Path(ref_path).expanduser().resolve(strict=True)
     ref = torch.load(ref_path, map_location="cpu", weights_only=True)
     aq01, aq99 = ref["normalization"]["action_q01"], ref["normalization"]["action_q99"]
     sq01, sq99 = ref["normalization"]["state_q01"], ref["normalization"]["state_q99"]
@@ -458,6 +521,7 @@ def phase1(horizon: int, *, task: str | None = None,
             path for name in ENV_TO_TASK
             if (path := ROOT / "data" / f"metaworld_longtraj_{name}.pt").is_file()
         )
+    files = [path.expanduser().resolve(strict=False) for path in files]
     missing_files = [str(path) for path in files if not path.is_file()]
     if missing_files:
         raise FileNotFoundError(f"longtraj input files not found: {missing_files}")
@@ -482,7 +546,11 @@ def phase1(horizon: int, *, task: str | None = None,
             tid = ref["metadata"]["tasks"].index(task_text)
         except ValueError as exc:
             raise ValueError(f"{path}: task text absent from reference: {task_text!r}") from exc
-        source_key = _frame_ref_key(path)
+        source_key = (
+            data["task"]
+            if data_contract in PEER_SYNC_H6_CONTRACTS
+            else _frame_ref_key(path)
+        )
         for ei, ep in enumerate(data["episodes"]):
             episodes_seen += 1
             frames_jpeg = ep["frames"]      # list[bytes]
@@ -497,16 +565,21 @@ def phase1(horizon: int, *, task: str | None = None,
                 legacy_perturb_events_inferred += int(
                     semantics["perturb_start"] is not None
                 )
-            last_start = T - 1 - ((SEQUENCE_LENGTH - 1) * CONTROL_STRIDE + (horizon - 1))
+            explicit_world_target = data_contract == PEER_SYNC_H15_P2_CONTRACT
+            last_start = T - 1 - (
+                (SEQUENCE_LENGTH - 1) * planning_stride
+                + (horizon if explicit_world_target else horizon - 1)
+            )
             if last_start < 0:
                 continue
-            for s in range(0, last_start + 1, CONTROL_STRIDE):
+            for s in range(0, last_start + 1, planning_stride):
                 target_idx = np.asarray([
-                    [s + t * CONTROL_STRIDE + h for h in range(horizon)]
+                    [s + t * planning_stride + h for h in range(horizon)]
                     for t in range(SEQUENCE_LENGTH)
                 ], dtype=np.int64)
                 action_valid_mask = semantics["valid"][target_idx]
-                decision_idx = s + np.arange(SEQUENCE_LENGTH) * CONTROL_STRIDE
+                decision_idx = s + np.arange(SEQUENCE_LENGTH) * planning_stride
+                endpoint_idx = decision_idx + horizon
                 # A pre-perturb observation cannot predict which random
                 # perturb/recovery branch will occur later in its H-step target.
                 # Keep recovery supervision once the perturb is observable.
@@ -522,19 +595,28 @@ def phase1(horizon: int, *, task: str | None = None,
                 acts = np.asarray(actions)[target_idx]
                 prev = np.stack([
                     np.zeros(4, dtype=np.float32)
-                    if s + t * CONTROL_STRIDE == 0
-                    else actions[s + t * CONTROL_STRIDE - 1]
+                    if s + t * planning_stride == 0
+                    else actions[s + t * planning_stride - 1]
                     for t in range(SEQUENCE_LENGTH)
                 ])
                 proprio = np.stack([
-                    states[s + t * CONTROL_STRIDE] for t in range(SEQUENCE_LENGTH)
+                    states[s + t * planning_stride] for t in range(SEQUENCE_LENGTH)
                 ])
                 # 帧索引：每个决策点的 4 帧窗口（编码阶段取帧）。
                 # 存纯 list（Codex P0-4：numpy 使 weights_only=True 加载失败）。
                 frame_idx = np.stack([
-                    clip_frame_indices(s + t * CONTROL_STRIDE)
+                    clip_frame_indices(s + t * planning_stride)
                     for t in range(SEQUENCE_LENGTH)
                 ])  # [T, W]
+                world_target_frame_idx = (
+                    endpoint_idx[:, None].tolist()
+                    if explicit_world_target else None
+                )
+                world_target_valid = (
+                    action_valid_mask.all(axis=1)
+                    & semantics["frame_valid"][endpoint_idx]
+                    if explicit_world_target else None
+                )
                 W.append({
                     "actions": robust(acts, aq01, aq99).astype(np.float32),
                     "prev": robust(prev, aq01, aq99).astype(np.float32),
@@ -547,6 +629,8 @@ def phase1(horizon: int, *, task: str | None = None,
                     "task_file": source_key,
                     "ep_idx": ei,
                     "frame_idx": frame_idx.tolist(),
+                    "world_target_frame_idx": world_target_frame_idx,
+                    "world_target_valid": world_target_valid,
                     "action_valid_mask": action_valid_mask,
                     "recovery_mask": semantics["recovery"][target_idx],
                     "decision_recovery": semantics["recovery"][decision_idx],
@@ -559,6 +643,14 @@ def phase1(horizon: int, *, task: str | None = None,
         raise ValueError("phase1 produced zero windows with valid action supervision")
     print(f"phase1(h={horizon}): {n} windows, tasks={len(set(w['task_id'] for w in W))}")
     instruction_id = torch.tensor([w["task_id"] for w in W], dtype=torch.long)
+    output_identity = {
+        "contract": data_contract or "language_conditioned_mt50_longtraj_v2",
+        "path": str(out_path.expanduser().resolve(strict=False)),
+        "shape": {"windows": n, "sequence_length": SEQUENCE_LENGTH,
+                  "action_horizon": horizon, "action_dim": 4},
+    }
+    parent_identity = _file_identity(ref_path)
+    source_identities = [_file_identity(path) for path in files]
     payload = {
         "actions": torch.from_numpy(np.stack([w["actions"] for w in W])),
         "previous_action": torch.from_numpy(np.stack([w["prev"] for w in W])),
@@ -590,12 +682,35 @@ def phase1(horizon: int, *, task: str | None = None,
         "language_mask": task_language_mask_t[instruction_id],
         "normalization": norm,
         "metadata": {
-            "contract": "language_conditioned_mt50_longtraj_v2",
-            "contract_version": 2,
+            "contract": data_contract or "language_conditioned_mt50_longtraj_v2",
+            "contract_version": (
+                (
+                    PEER_SYNC_H6_P2_VERSION
+                    if data_contract == PEER_SYNC_H6_P2_CONTRACT
+                    else PEER_SYNC_H6_VERSION
+                )
+                if data_contract in PEER_SYNC_H6_CONTRACTS
+                else 2
+            ),
             "tasks": ref["metadata"]["tasks"],
-            "fps": FPS, "control_stride": CONTROL_STRIDE,
+            "fps": FPS,
+            "planning_stride": planning_stride,
+            "control_stride": planning_stride,
+            "sequence_length": SEQUENCE_LENGTH,
+            "decision_offsets": [
+                t * planning_stride for t in range(SEQUENCE_LENGTH)
+            ],
             "action_horizon": horizon,
+            "action_label_offsets": list(range(horizon)),
+            "action_dim": 4,
             "action_contract": "executed-clip-fullframe",
+            "logged_action_chunk": (
+                f"full_h{horizon}"
+                if data_contract in PEER_SYNC_H6_CONTRACTS else "full_horizon"
+            ),
+            "parent_identity": parent_identity,
+            "source_identities": source_identities,
+            "output_identity": output_identity,
             "observation_action_alignment": "frame/state[i] is pre-action; action[i] executed once",
             "action_valid_mask": (
                 "[N,T,H], excludes settle, actions after first_success, and recovery "
@@ -612,6 +727,26 @@ def phase1(horizon: int, *, task: str | None = None,
             "legacy_perturb_events_inferred": legacy_perturb_events_inferred,
         },
     }
+    if data_contract == PEER_SYNC_H15_P2_CONTRACT:
+        payload["world_target_frame_refs"] = [
+            (w["task_file"], w["ep_idx"], w["world_target_frame_idx"])
+            for w in W
+        ]
+        payload["world_target_valid_mask"] = torch.from_numpy(
+            np.stack([w["world_target_valid"] for w in W])
+        )
+        payload["metadata"].update(
+            {
+                "world_target_horizon": horizon,
+                "world_target_offsets": [
+                    t * planning_stride + horizon
+                    for t in range(SEQUENCE_LENGTH)
+                ],
+                "world_target_frame_ref_contract": (
+                    "single_endpoint_frame_after_full_action_chunk_v1"
+                ),
+            }
+        )
     _save_new(payload, out_path, overwrite=overwrite)
     print(f"[out] {out_path}: {n} windows")
     return out_path
@@ -774,6 +909,16 @@ if __name__ == "__main__":
     ap.add_argument("--st-npy", type=Path, help="phase2 特征 memmap 输出")
     ap.add_argument("--st-meta", type=Path, help="phase2 metadata 输出")
     ap.add_argument(
+        "--data-contract", choices=tuple(sorted(PEER_SYNC_H6_CONTRACTS)),
+        help=("emit an explicit peer H6 protocol; the P2 contract additionally "
+              "requires --planning-stride 2"),
+    )
+    ap.add_argument(
+        "--planning-stride", type=int, default=CONTROL_STRIDE,
+        help=("decision/control cadence in source frames; default 6 preserves old "
+              f"datasets, while {PEER_SYNC_H6_P2_CONTRACT} requires 2"),
+    )
+    ap.add_argument(
         "--legacy-policy", choices=("warn", "error", "infer"), default="warn",
         help=("旧数据策略：warn 保持兼容性警告；error 拒绝；infer 严格识别旧采集器"
               "唯一的12步零动作扰动块并修正 success/mask（歧义时失败）"),
@@ -789,6 +934,8 @@ if __name__ == "__main__":
             output_path=args.output,
             ref_path=args.ref,
             legacy_policy=args.legacy_policy,
+            data_contract=args.data_contract,
+            planning_stride=args.planning_stride,
             overwrite=args.overwrite,
         )
     else:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import random
 from types import SimpleNamespace
 
@@ -12,13 +13,39 @@ from train import (
     SAM,
     TaskLocalityWeightedSampler,
     TaskWeightedSampler,
+    WORLD_ACTION_DONOR_CONTRACT,
+    WORLD_ACTION_RANKING,
+    WORLD_LOGGED_BRANCH_CONTRACT,
+    WORLD_LOSS_COMPONENT_WEIGHTS,
+    WORLD_NO_REGRESSION,
+    PEER_DATA_ISOLATION_CONTRACT,
+    PEER_DUAL_STREAM_OPTIMIZER_CONTRACT,
+    PEER_GRADIENT_BOUNDARY_CONTRACT,
+    PEER_HIGH_FREQUENCY_CONTRACT,
+    PEER_WORLD_ACTION_SOURCE_CONTRACT,
+    PEER_WORLD_READOUT_CONTRACT,
+    PEER_WORLD_TOPOLOGY_CONTRACT,
+    WORLD_STAGE_AUXILIARY_DECAY,
+    WORLD_STAGE_AUXILIARY_FLOOR,
+    WORLD_STATIC_COPY_CONSTRAINT,
+    WORLD_SUPERVISION_CONTRACT,
+    WORLD_TRANSITION_CONTRACT,
     build_dataset_content_identity,
     build_exact_resume_state,
     build_exact_run_contract,
+    clip_update_gradients,
+    named_optimizer_parameters,
+    validate_args,
+    validate_finite_update_scalars,
+    validate_optimizer_update_state,
+    validate_update_gradients,
+    final_checkpoint_save_due,
     parse_args,
     restore_exact_resume_state,
     save_checkpoint,
     validate_exact_run_contract,
+    validate_visual_world_resume_contract,
+    world_action_ranking_contract,
 )
 
 
@@ -196,7 +223,196 @@ def test_main_checkpoint_contains_exact_training_state(tmp_path) -> None:
     assert loaded["optimizer_state"]["kind"] == "adamw"
     assert loaded["sampler_state"] == sampler.state_dict()
     assert set(loaded["rng_state"]) == {"python", "numpy", "torch_cpu", "torch_cuda"}
+    assert loaded["rng_state"]["numpy"]["state"].dtype == torch.int64
     assert loaded["exact_run_contract"]["contract_version"] == 1
+
+
+def test_peer_checkpoint_contains_both_sampler_states_and_data_identities(
+    tmp_path,
+) -> None:
+    path = tmp_path / "peer.pt"
+    args = parse_args(
+        [
+            "--single-task",
+            "--save",
+            str(path),
+            "--wam4va",
+            "--va-world-mode",
+            "peer_sync_h6",
+            "--va-data",
+            "va.pt",
+            "--world-data",
+            "world.pt",
+        ]
+    )
+    model, optimizer = _model_and_optimizer()
+    va_sampler = _sampler()
+    world_sampler = _sampler()
+    va_identity = {"full_file_sha256": "va"}
+    world_identity = {"full_file_sha256": "world"}
+    va_sampler.bind_dataset_content_identity(va_identity)
+    world_sampler.bind_dataset_content_identity(world_identity)
+    va_sampler.advance()
+    world_sampler.advance(2)
+    config = SimpleNamespace(va_world_mode="peer_sync_h6")
+    exact_contract = build_exact_run_contract(
+        args,
+        config,
+        optimizer,
+        va_sampler,
+        world_sampler=world_sampler,
+    )
+
+    save_checkpoint(
+        args,
+        config,
+        model,
+        None,
+        optimizer=optimizer,
+        global_step=2,
+        sampler=va_sampler,
+        world_sampler=world_sampler,
+        exact_run_contract=exact_contract,
+    )
+
+    loaded = torch.load(path, map_location="cpu", weights_only=True)
+    assert loaded["sampler_state"] == va_sampler.state_dict()
+    assert loaded["world_sampler_state"] == world_sampler.state_dict()
+    peer = loaded["exact_run_contract"]["peer_world"]
+    assert peer["va_data_identity"] == va_identity
+    assert peer["world_data_identity"] == world_identity
+
+
+def test_final_checkpoint_skips_same_step_periodic_save(tmp_path) -> None:
+    path = tmp_path / "policy.pt"
+    assert not final_checkpoint_save_due(path, 1000, 1000)
+
+
+def test_final_checkpoint_kept_for_nonperiodic_final_step(tmp_path) -> None:
+    path = tmp_path / "policy.pt"
+    assert final_checkpoint_save_due(path, 1001, 1000)
+
+
+def test_step_copy_collision_does_not_overwrite_archive(tmp_path) -> None:
+    path = tmp_path / "policy.pt"
+    args = parse_args(
+        ["--single-task", "--save", str(path), "--save-step-copies"]
+    )
+    model, optimizer = _model_and_optimizer()
+    save_checkpoint(
+        args,
+        SimpleNamespace(),
+        model,
+        None,
+        optimizer=optimizer,
+        global_step=7,
+        sampler=_sampler(),
+    )
+    step_path = tmp_path / "policy_s7.pt"
+    archived = step_path.read_bytes()
+
+    with torch.no_grad():
+        next(model.parameters()).add_(1.0)
+    with pytest.raises(FileExistsError, match="refusing to overwrite"):
+        save_checkpoint(
+            args,
+            SimpleNamespace(),
+            model,
+            None,
+            optimizer=optimizer,
+            global_step=7,
+            sampler=_sampler(),
+        )
+
+    assert step_path.read_bytes() == archived
+    assert not (tmp_path / "policy_s7.pt.tmp").exists()
+
+
+def test_update_guards_reject_nonfinite_without_optimizer_mutation() -> None:
+    model = nn.Linear(1, 1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
+    parameter_snapshot = {
+        name: value.detach().clone() for name, value in model.named_parameters()
+    }
+    optimizer_snapshot = optimizer.state_dict()
+    loss = torch.tensor(float("nan"), requires_grad=True)
+    with pytest.raises(FloatingPointError, match="non-finite update loss total"):
+        validate_finite_update_scalars([("total", loss)])
+    assert optimizer.state_dict() == optimizer_snapshot
+    for name, value in model.named_parameters():
+        torch.testing.assert_close(value, parameter_snapshot[name])
+
+
+def test_gradient_guard_names_first_bad_value_and_clip_is_finite() -> None:
+    model = nn.Linear(2, 1)
+    named = list(
+        named_optimizer_parameters(
+            torch.optim.AdamW(model.parameters()), ("model", model)
+        )
+    )
+    model.weight.grad = torch.tensor([[1.0, float("inf")]])
+    model.bias.grad = torch.tensor([1.0])
+    with pytest.raises(FloatingPointError, match="non-finite gradient model.weight"):
+        validate_update_gradients(named)
+    model.weight.grad = torch.tensor([[3.0, 4.0]])
+    norm = validate_update_gradients(named, max_norm=10.0)
+    assert norm == pytest.approx(5.0990195)
+    assert clip_update_gradients(named, max_norm=1.0) == pytest.approx(norm)
+    assert torch.isfinite(model.weight.grad).all()
+
+
+def test_gradient_threshold_applies_only_to_aggregate_norm() -> None:
+    parameter = nn.Parameter(torch.tensor([0.0]))
+    parameter.grad = torch.tensor([2.0])
+    assert validate_update_gradients([("parameter", parameter)], max_norm=3.0) == 2.0
+    with pytest.raises(FloatingPointError, match="aggregate_norm"):
+        validate_update_gradients([("parameter", parameter)], max_norm=1.0)
+
+
+def test_optimizer_guard_rejects_nan_lr_and_nonfinite_state() -> None:
+    model = nn.Linear(1, 1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
+    optimizer.param_groups[0]["lr"] = float("nan")
+    with pytest.raises(ValueError, match=r"group\[0\] lr"):
+        validate_optimizer_update_state(optimizer)
+
+    optimizer.param_groups[0]["lr"] = 1e-2
+    parameter = next(model.parameters())
+    optimizer.state[parameter]["exp_avg"] = torch.tensor([float("inf")])
+    with pytest.raises(FloatingPointError, match="optimizer state"):
+        validate_optimizer_update_state(optimizer)
+
+
+def test_validate_args_rejects_nan_learning_rate() -> None:
+    args = parse_args(["--single-task", "--lr", "nan"])
+    with pytest.raises(ValueError, match="--lr must be a positive finite value"):
+        validate_args(args)
+
+
+def test_parameter_guard_rejects_nonfinite_value_before_update() -> None:
+    model = nn.Linear(1, 1)
+    with torch.no_grad():
+        model.weight.fill_(float("nan"))
+    model.weight.grad = torch.ones_like(model.weight)
+    with pytest.raises(FloatingPointError, match="non-finite parameter model.weight"):
+        validate_update_gradients([("model.weight", model.weight)])
+
+
+def test_sam_guard_can_restore_perturbation_without_base_step() -> None:
+    model = nn.Linear(1, 1)
+    optimizer = SAM(model.parameters(), torch.optim.AdamW, rho=0.1, lr=1e-2)
+    original = {
+        name: value.detach().clone() for name, value in model.named_parameters()
+    }
+    model(torch.ones(1, 1)).backward()
+    optimizer.first_step(zero_grad=True)
+    model.weight.grad = torch.tensor([[float("nan")]])
+    with pytest.raises(FloatingPointError, match="model.weight"):
+        validate_update_gradients([("model.weight", model.weight)])
+    optimizer.restore_step(zero_grad=True)
+    for name, value in model.named_parameters():
+        assert torch.equal(value, original[name]), f"SAM restore changed bits for {name}"
+    assert optimizer.base_optimizer.state_dict()["state"] == {}
 
 
 def test_sam_roundtrip_uses_base_adamw_state() -> None:
@@ -323,3 +539,694 @@ def test_exact_contract_rejects_changed_objective_args(
     )
     with pytest.raises(ValueError, match=field):
         validate_exact_run_contract(baseline, current)
+
+
+def test_va_world_mode_cli_requires_joint_dual_data() -> None:
+    assert parse_args([]).va_world_mode == "legacy"
+    peer = parse_args(
+        ["--wam4va", "--va-only", "--va-world-mode", "peer_sync_h6"]
+    )
+    with pytest.raises(ValueError, match="both --va-data and --world-data"):
+        validate_args(peer)
+
+
+def test_legacy_preserves_nonzero_adep_weight() -> None:
+    legacy = parse_args(["--wam4va", "--wmrm-adep-weight", "0.1"])
+    validate_args(legacy)
+    assert legacy.wmrm_adep_weight == pytest.approx(0.1)
+
+
+def test_peer_exact_contract_binds_dual_data_and_joint_loss_protocol() -> None:
+    _, optimizer = _model_and_optimizer()
+    args = parse_args(
+        [
+            "--wam4va",
+            "--va-world-mode",
+            "peer_sync_h6",
+            "--va-data",
+            "va.pt",
+            "--world-data",
+            "world.pt",
+        ]
+    )
+    config = SimpleNamespace(
+        num_layers=8,
+        action_horizon=6,
+        wmrm=True,
+        va_world_mode="peer_sync_h6",
+    )
+    va_sampler = _sampler()
+    world_sampler = _sampler()
+    va_sampler.bind_dataset_content_identity({"full_file_sha256": "va"})
+    world_sampler.bind_dataset_content_identity({"full_file_sha256": "world"})
+    contract = build_exact_run_contract(
+        args,
+        config,
+        optimizer,
+        va_sampler,
+        world_sampler=world_sampler,
+    )
+
+    assert contract["peer_world"]["readout"] == PEER_WORLD_READOUT_CONTRACT
+    assert contract["peer_world"]["readout"]["va_stream"] == (
+        "causal_deterministic_action_chunk_readout_v2"
+    )
+    assert contract["peer_world"]["readout"]["world_stream"] == (
+        "explicit_logged_chunk_at_world_horizon_v2"
+    )
+    assert contract["peer_world"]["optimizer"] == (
+        PEER_DUAL_STREAM_OPTIMIZER_CONTRACT
+    )
+    assert contract["peer_world"]["va_data_identity"]["full_file_sha256"] == "va"
+    assert contract["peer_world"]["world_data_identity"]["full_file_sha256"] == (
+        "world"
+    )
+
+    changed = copy.deepcopy(contract)
+    changed["peer_world"]["readout"]["loss"] = "label_writeback_v0"
+    with pytest.raises(ValueError, match="peer_world.readout.loss"):
+        validate_exact_run_contract(contract, changed)
+
+
+def test_peer_p2_exact_contract_binds_planning_frequency() -> None:
+    _, optimizer = _model_and_optimizer()
+    args = parse_args(
+        [
+            "--wam4va",
+            "--va-world-mode",
+            "peer_sync_h6",
+            "--va-data",
+            "va.pt",
+            "--world-data",
+            "world.pt",
+            "--planning-stride",
+            "2",
+            "--control-stride",
+            "2",
+            "--wmrm-cycle-steps",
+            "2",
+            "--flow-prefix-steps",
+            "2",
+        ]
+    )
+    config = SimpleNamespace(
+        num_layers=8,
+        action_horizon=6,
+        planning_stride=2,
+        wmrm=True,
+        wmrm_cycle_steps=2,
+        va_world_mode="peer_sync_h6",
+    )
+    contract = build_exact_run_contract(
+        args, config, optimizer, _sampler(), world_sampler=_sampler()
+    )
+
+    assert contract["model_config"]["planning_stride"] == 2
+    assert contract["peer_world"]["planning_stride"] == 2
+    assert contract["peer_world"]["planning_hz"] == pytest.approx(40.0)
+    assert contract["peer_world"]["high_frequency"] == (
+        PEER_HIGH_FREQUENCY_CONTRACT
+    )
+
+    changed = copy.deepcopy(contract)
+    changed["peer_world"]["planning_stride"] = 6
+    with pytest.raises(ValueError, match="peer_world.planning_stride"):
+        validate_exact_run_contract(contract, changed)
+
+
+def test_old_exact_contract_normalizes_to_legacy_world_mode() -> None:
+    saved = _contract()
+    current = copy.deepcopy(saved)
+    current["arguments"]["va_world_mode"] = "legacy"
+    current["model_config"]["va_world_mode"] = "legacy"
+    snapshot = copy.deepcopy(saved)
+    validate_exact_run_contract(saved, current)
+    assert saved == snapshot
+
+    peer = copy.deepcopy(current)
+    peer["arguments"]["va_world_mode"] = "peer_sync_h6"
+    peer["model_config"]["va_world_mode"] = "peer_sync_h6"
+    with pytest.raises(ValueError, match="va_world_mode"):
+        validate_exact_run_contract(saved, peer)
+
+
+def test_exact_contract_binds_wmrm_proposal_stage_detach() -> None:
+    _, optimizer = _model_and_optimizer()
+    baseline_args = parse_args(["--wam4va"])
+    changed_args = parse_args(["--wam4va", "--wmrm-detach-proposal-stage-state"])
+    config = SimpleNamespace(
+        num_layers=8,
+        action_horizon=48,
+        wmrm=True,
+        wmrm_detach_proposal_stage_state=False,
+    )
+    baseline = build_exact_run_contract(baseline_args, config, optimizer, _sampler())
+    current = build_exact_run_contract(changed_args, config, optimizer, _sampler())
+    with pytest.raises(ValueError, match="wmrm_detach_proposal_stage_state"):
+        validate_exact_run_contract(baseline, current)
+
+
+def test_controlled_detach_migration_allows_only_false_or_absent_to_true() -> None:
+    _, optimizer = _model_and_optimizer()
+    legacy_args = parse_args(["--wam4va"])
+    candidate_args = parse_args(
+        ["--wam4va", "--wmrm-detach-proposal-stage-state"]
+    )
+    legacy_config = SimpleNamespace(
+        num_layers=8,
+        action_horizon=48,
+        wmrm=True,
+        wmrm_detach_proposal_stage_state=False,
+    )
+    candidate_config = SimpleNamespace(
+        num_layers=8,
+        action_horizon=48,
+        wmrm=True,
+        wmrm_detach_proposal_stage_state=True,
+    )
+    saved = build_exact_run_contract(
+        legacy_args, legacy_config, optimizer, _sampler()
+    )
+    current = build_exact_run_contract(
+        candidate_args, candidate_config, optimizer, _sampler()
+    )
+    saved["arguments"].pop("wmrm_detach_proposal_stage_state")
+    saved["arguments"].pop("max_gradient_norm")
+    saved["model_config"].pop("wmrm_detach_proposal_stage_state")
+    snapshot = copy.deepcopy(saved)
+
+    validate_exact_run_contract(
+        saved,
+        current,
+        migration_id="wmrm_detach_proposal_stage_state_v1",
+    )
+    assert saved == snapshot
+
+    changed = copy.deepcopy(current)
+    changed["arguments"]["flow_tail_weight"] = 0.2
+    with pytest.raises(ValueError, match="controlled exact-resume migration.*flow_tail_weight"):
+        validate_exact_run_contract(
+            saved,
+            changed,
+            migration_id="wmrm_detach_proposal_stage_state_v1",
+        )
+
+
+def test_controlled_detach_migration_id_is_operational_and_not_a_bypass() -> None:
+    _, optimizer = _model_and_optimizer()
+    args = parse_args(
+        [
+            "--wam4va",
+            "--wmrm-detach-proposal-stage-state",
+            "--resume-exact-contract-migration",
+            "wmrm_detach_proposal_stage_state_v1",
+        ]
+    )
+    config = SimpleNamespace(
+        num_layers=8,
+        action_horizon=48,
+        wmrm=True,
+        wmrm_detach_proposal_stage_state=True,
+    )
+    contract = build_exact_run_contract(args, config, optimizer, _sampler())
+    assert "resume_exact_contract_migration" not in contract["arguments"]
+    with pytest.raises(ValueError, match="no coherent old-false-both"):
+        validate_exact_run_contract(
+            contract,
+            contract,
+            migration_id="wmrm_detach_proposal_stage_state_v1",
+        )
+    with pytest.raises(ValueError, match="unsupported"):
+        validate_exact_run_contract(contract, contract, migration_id="wrong_v1")
+
+
+def test_controlled_detach_migration_rejects_partial_representation_transition() -> None:
+    _, optimizer = _model_and_optimizer()
+    saved = _contract()
+    current = copy.deepcopy(saved)
+    saved["arguments"]["wmrm_detach_proposal_stage_state"] = False
+    saved["model_config"]["wmrm_detach_proposal_stage_state"] = False
+    current["arguments"]["wmrm_detach_proposal_stage_state"] = True
+    current["model_config"]["wmrm_detach_proposal_stage_state"] = False
+    with pytest.raises(ValueError, match="controlled exact-resume migration"):
+        validate_exact_run_contract(
+            saved,
+            current,
+            migration_id="wmrm_detach_proposal_stage_state_v1",
+        )
+
+
+def test_controlled_detach_migration_rejects_contradictory_saved_contract() -> None:
+    saved = _contract()
+    current = copy.deepcopy(saved)
+    saved["arguments"]["wmrm_detach_proposal_stage_state"] = False
+    saved["model_config"]["wmrm_detach_proposal_stage_state"] = True
+    current["arguments"]["wmrm_detach_proposal_stage_state"] = True
+    current["model_config"]["wmrm_detach_proposal_stage_state"] = True
+    with pytest.raises(ValueError, match="controlled exact-resume migration"):
+        validate_exact_run_contract(
+            saved,
+            current,
+            migration_id="wmrm_detach_proposal_stage_state_v1",
+        )
+
+
+def test_migrated_restore_preserves_checkpoint_and_exact_training_state() -> None:
+    model, optimizer = _model_and_optimizer()
+    sampler = _sampler()
+    _seed_training_rngs()
+    _update(model, optimizer, sampler)
+    saved_contract = _contract()
+    saved_contract["arguments"].update(
+        {"wmrm_detach_proposal_stage_state": False, "max_gradient_norm": None}
+    )
+    saved_contract["model_config"]["wmrm_detach_proposal_stage_state"] = False
+    checkpoint = {"model": copy.deepcopy(model.state_dict())}
+    checkpoint.update(build_exact_resume_state(optimizer, 1, sampler, saved_contract))
+    checkpoint_snapshot = copy.deepcopy(checkpoint)
+
+    restored_model, restored_optimizer = _model_and_optimizer()
+    restored_sampler = _sampler()
+    restored_model.load_state_dict(checkpoint["model"])
+    current_contract = copy.deepcopy(saved_contract)
+    current_contract["arguments"]["wmrm_detach_proposal_stage_state"] = True
+    current_contract["model_config"]["wmrm_detach_proposal_stage_state"] = True
+    step = restore_exact_resume_state(
+        checkpoint,
+        restored_optimizer,
+        restored_sampler,
+        runtime_exact_run_contract=current_contract,
+        migration_id="wmrm_detach_proposal_stage_state_v1",
+    )
+
+    assert step == 1
+    assert restored_optimizer.state_dict() == optimizer.state_dict()
+    assert restored_sampler.state_dict() == sampler.state_dict()
+    assert checkpoint.keys() == checkpoint_snapshot.keys()
+    assert checkpoint["exact_run_contract"] == checkpoint_snapshot["exact_run_contract"]
+    for name, value in checkpoint["model"].items():
+        torch.testing.assert_close(value, checkpoint_snapshot["model"][name], rtol=0, atol=0)
+
+
+def test_controlled_world_weight_migration_allows_only_1_to_0_5_without_mutation() -> None:
+    saved = _contract()
+    saved["arguments"]["wmrm_world_weight"] = 1.0
+    current = copy.deepcopy(saved)
+    current["arguments"]["wmrm_world_weight"] = 0.5
+    saved_snapshot = copy.deepcopy(saved)
+    current_snapshot = copy.deepcopy(current)
+
+    validate_exact_run_contract(
+        saved,
+        current,
+        migration_id="wmrm_world_weight_1_to_0_5_v1",
+    )
+
+    assert saved == saved_snapshot
+    assert current == current_snapshot
+
+
+@pytest.mark.parametrize(
+    ("saved_weight", "current_weight", "extra_mismatch"),
+    [
+        (0.5, 1.0, False),
+        (1.0, 1.0, False),
+        (0.5, 0.5, False),
+        (0.75, 0.5, False),
+        (1.0, 0.25, False),
+        (1, 0.5, False),
+        (None, 0.5, False),
+        (1.0, None, False),
+        (1.0, 0.5, True),
+    ],
+)
+def test_controlled_world_weight_migration_rejects_reverse_unnecessary_and_additional_mismatch(
+    saved_weight, current_weight, extra_mismatch: bool
+) -> None:
+    saved = _contract()
+    current = copy.deepcopy(saved)
+    saved["arguments"]["wmrm_world_weight"] = saved_weight
+    current["arguments"]["wmrm_world_weight"] = current_weight
+    if extra_mismatch:
+        current["arguments"]["flow_tail_weight"] = 0.2
+
+    with pytest.raises(
+        ValueError,
+        match="controlled exact-resume migration.*wmrm_world_weight_1_to_0_5_v1.*refused",
+    ):
+        validate_exact_run_contract(
+            saved,
+            current,
+            migration_id="wmrm_world_weight_1_to_0_5_v1",
+        )
+
+
+def test_static_constraint_weight_migration_is_strict_and_isolated() -> None:
+    saved = _contract()
+    saved["arguments"].update(
+        wmrm_static_constraint_weight=4.0,
+        wmrm_world_weight=1.0,
+        wmrm_detach_proposal_stage_state=True,
+    )
+    current = copy.deepcopy(saved)
+    current["arguments"]["wmrm_static_constraint_weight"] = 2.0
+
+    validate_exact_run_contract(
+        saved, current, migration_id="wmrm_static_constraint_weight_4_to_2_v1"
+    )
+
+    for key, value in (
+        ("wmrm_world_weight", 0.5),
+        ("wmrm_detach_proposal_stage_state", False),
+        ("flow_tail_weight", 0.2),
+    ):
+        bad = copy.deepcopy(current)
+        bad["arguments"][key] = value
+        with pytest.raises(ValueError, match="controlled exact-resume migration"):
+            validate_exact_run_contract(
+                saved, bad, migration_id="wmrm_static_constraint_weight_4_to_2_v1"
+            )
+
+
+def test_static_constraint_weight_cli_is_semantic_and_migration_id_operational() -> None:
+    _, optimizer = _model_and_optimizer()
+    args = parse_args(
+        [
+            "--wam4va", "--visual-world-supervision",
+            "--wmrm-world-weight", "1.0",
+            "--wmrm-static-constraint-weight", "2.0",
+            "--wmrm-detach-proposal-stage-state",
+            "--resume-exact", "checkpoint.pt",
+            "--resume-exact-contract-migration",
+            "wmrm_static_constraint_weight_4_to_2_v1",
+        ]
+    )
+    config = SimpleNamespace(
+        num_layers=8, action_horizon=48, wmrm=True,
+        wmrm_detach_proposal_stage_state=True,
+    )
+    contract = build_exact_run_contract(args, config, optimizer, _sampler())
+    assert contract["arguments"]["wmrm_static_constraint_weight"] == 2.0
+    assert contract["arguments"]["wmrm_world_weight"] == 1.0
+    assert "resume_exact_contract_migration" not in contract["arguments"]
+
+
+def test_action_rank_per_sample_cap_migration_is_strict_and_isolated() -> None:
+    saved = _contract()
+    saved["arguments"].update(
+        wmrm_action_rank_per_sample_cap=None,
+        wmrm_static_constraint_weight=2.0,
+        wmrm_world_weight=1.0,
+        wmrm_detach_proposal_stage_state=True,
+    )
+    current = copy.deepcopy(saved)
+    current["arguments"]["wmrm_action_rank_per_sample_cap"] = 0.2
+    saved_snapshot = copy.deepcopy(saved)
+
+    validate_exact_run_contract(
+        saved, current, migration_id="wmrm_action_rank_cap_none_to_0_2_v1"
+    )
+    assert saved == saved_snapshot
+
+    for cap in (None, 0.1, 1, "0.2"):
+        bad = copy.deepcopy(current)
+        bad["arguments"]["wmrm_action_rank_per_sample_cap"] = cap
+        with pytest.raises(ValueError, match="controlled exact-resume migration"):
+            validate_exact_run_contract(
+                saved, bad, migration_id="wmrm_action_rank_cap_none_to_0_2_v1"
+            )
+
+    for key, value in (
+        ("wmrm_static_constraint_weight", 4.0),
+        ("wmrm_world_weight", 0.5),
+        ("wmrm_detach_proposal_stage_state", False),
+    ):
+        bad = copy.deepcopy(current)
+        bad["arguments"][key] = value
+        with pytest.raises(ValueError, match="controlled exact-resume migration"):
+            validate_exact_run_contract(
+                saved, bad, migration_id="wmrm_action_rank_cap_none_to_0_2_v1"
+            )
+
+    bad = copy.deepcopy(current)
+    bad["arguments"]["flow_tail_weight"] = 0.2
+    with pytest.raises(ValueError, match="flow_tail_weight"):
+        validate_exact_run_contract(
+            saved, bad, migration_id="wmrm_action_rank_cap_none_to_0_2_v1"
+        )
+
+
+def test_action_rank_cap_cli_is_semantic_and_migration_selector_operational() -> None:
+    _, optimizer = _model_and_optimizer()
+    args = parse_args([
+        "--wam4va", "--visual-world-supervision",
+        "--wmrm-action-rank-per-sample-cap", "0.2",
+        "--resume-exact", "checkpoint.pt",
+        "--resume-exact-contract-migration", "wmrm_action_rank_cap_none_to_0_2_v1",
+    ])
+    config = SimpleNamespace(num_layers=8, action_horizon=48, wmrm=True)
+    contract = build_exact_run_contract(args, config, optimizer, _sampler())
+    assert contract["arguments"]["wmrm_action_rank_per_sample_cap"] == 0.2
+    assert "resume_exact_contract_migration" not in contract["arguments"]
+
+
+def test_controlled_world_weight_migration_id_is_operational_not_semantic() -> None:
+    _, optimizer = _model_and_optimizer()
+    args = parse_args(
+        [
+            "--wam4va",
+            "--wmrm-world-weight",
+            "0.5",
+            "--resume-exact",
+            "checkpoint.pt",
+            "--resume-exact-contract-migration",
+            "wmrm_world_weight_1_to_0_5_v1",
+        ]
+    )
+    config = SimpleNamespace(num_layers=8, action_horizon=48, wmrm=True)
+    contract = build_exact_run_contract(args, config, optimizer, _sampler())
+
+    assert args.resume_exact_contract_migration == "wmrm_world_weight_1_to_0_5_v1"
+    assert contract["arguments"]["wmrm_world_weight"] == 0.5
+    assert "resume_exact_contract_migration" not in contract["arguments"]
+
+
+def test_world_weight_migrated_restore_preserves_model_adamw_sampler_and_rng() -> None:
+    model, optimizer = _model_and_optimizer()
+    sampler = _sampler()
+    _seed_training_rngs()
+    _update(model, optimizer, sampler)
+    saved_contract = _contract()
+    saved_contract["arguments"]["wmrm_world_weight"] = 1.0
+    checkpoint = {"model": copy.deepcopy(model.state_dict())}
+    checkpoint.update(build_exact_resume_state(optimizer, 1, sampler, saved_contract))
+    checkpoint_snapshot = copy.deepcopy(checkpoint)
+
+    expected_python = random.random()
+    expected_numpy = float(np.random.random())
+    expected_torch = torch.rand(())
+
+    restored_model, restored_optimizer = _model_and_optimizer()
+    restored_sampler = _sampler()
+    restored_model.load_state_dict(checkpoint["model"], strict=True)
+    current_contract = copy.deepcopy(saved_contract)
+    current_contract["arguments"]["wmrm_world_weight"] = 0.5
+    step = restore_exact_resume_state(
+        checkpoint,
+        restored_optimizer,
+        restored_sampler,
+        runtime_exact_run_contract=current_contract,
+        migration_id="wmrm_world_weight_1_to_0_5_v1",
+    )
+
+    assert step == 1
+    assert restored_optimizer.state_dict() == optimizer.state_dict()
+    assert restored_sampler.state_dict() == sampler.state_dict()
+    assert random.random() == expected_python
+    assert float(np.random.random()) == expected_numpy
+    torch.testing.assert_close(torch.rand(()), expected_torch, rtol=0.0, atol=0.0)
+    assert checkpoint.keys() == checkpoint_snapshot.keys()
+    assert checkpoint["exact_run_contract"] == checkpoint_snapshot["exact_run_contract"]
+    for name, value in checkpoint_snapshot["model"].items():
+        torch.testing.assert_close(checkpoint["model"][name], value, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(restored_model.state_dict()[name], value, rtol=0.0, atol=0.0)
+
+
+def test_world_weight_migration_restore_refuses_before_mutating_training_state() -> None:
+    model, optimizer = _model_and_optimizer()
+    sampler = _sampler()
+    _seed_training_rngs()
+    _update(model, optimizer, sampler)
+    saved_contract = _contract()
+    saved_contract["arguments"]["wmrm_world_weight"] = 1.0
+    checkpoint = build_exact_resume_state(optimizer, 1, sampler, saved_contract)
+
+    fresh_model, fresh_optimizer = _model_and_optimizer()
+    del fresh_model
+    fresh_sampler = _sampler()
+    optimizer_snapshot = copy.deepcopy(fresh_optimizer.state_dict())
+    sampler_snapshot = copy.deepcopy(fresh_sampler.state_dict())
+    python_rng_snapshot = random.getstate()
+    numpy_rng_snapshot = np.random.get_state()
+    torch_rng_snapshot = torch.get_rng_state().clone()
+    current_contract = copy.deepcopy(saved_contract)
+    current_contract["arguments"]["wmrm_world_weight"] = 0.5
+    current_contract["arguments"]["flow_tail_weight"] = 0.2
+
+    with pytest.raises(ValueError, match="flow_tail_weight"):
+        restore_exact_resume_state(
+            checkpoint,
+            fresh_optimizer,
+            fresh_sampler,
+            runtime_exact_run_contract=current_contract,
+            migration_id="wmrm_world_weight_1_to_0_5_v1",
+        )
+
+    assert fresh_optimizer.state_dict() == optimizer_snapshot
+    assert fresh_sampler.state_dict() == sampler_snapshot
+    assert random.getstate() == python_rng_snapshot
+    current_numpy_rng = np.random.get_state()
+    assert current_numpy_rng[0] == numpy_rng_snapshot[0]
+    np.testing.assert_array_equal(current_numpy_rng[1], numpy_rng_snapshot[1])
+    assert current_numpy_rng[2:] == numpy_rng_snapshot[2:]
+    assert torch.equal(torch.get_rng_state(), torch_rng_snapshot)
+
+
+def test_exact_contract_allows_checkpoint_archive_policy_changes() -> None:
+    _, optimizer = _model_and_optimizer()
+    baseline_args = parse_args(["--single-task"])
+    changed_args = parse_args(["--single-task", "--save-step-copies"])
+    config = SimpleNamespace(num_layers=8, action_horizon=48)
+
+    baseline = build_exact_run_contract(
+        baseline_args, config, optimizer, _sampler()
+    )
+    current = build_exact_run_contract(
+        changed_args, config, optimizer, _sampler()
+    )
+
+    assert baseline == current
+
+
+def test_visual_world_exact_resume_binds_fixed_action_donors() -> None:
+    identity = {
+        "manifest_sha256": "m" * 64,
+        "source_sha256": "s" * 64,
+        "world_action_donor_sha256": "d" * 64,
+        "world_action_donor_transitions": 3297,
+        "world_action_rank_transitions": 2931,
+    }
+    contract = {
+        "world_supervision": WORLD_SUPERVISION_CONTRACT,
+        "world_transition": WORLD_TRANSITION_CONTRACT,
+        "world_loss_weights": WORLD_LOSS_COMPONENT_WEIGHTS,
+        "world_stage_auxiliary_decay": WORLD_STAGE_AUXILIARY_DECAY,
+        "world_stage_auxiliary_floor": WORLD_STAGE_AUXILIARY_FLOOR,
+        "world_no_regression": WORLD_NO_REGRESSION,
+        "world_static_copy_constraint": WORLD_STATIC_COPY_CONSTRAINT,
+        "world_action_ranking": WORLD_ACTION_RANKING,
+        "world_action_donor_contract": WORLD_ACTION_DONOR_CONTRACT,
+        "world_action_donor_sha256": identity["world_action_donor_sha256"],
+        "world_action_donor_transitions": identity[
+            "world_action_donor_transitions"
+        ],
+        "world_action_rank_transitions": identity[
+            "world_action_rank_transitions"
+        ],
+        "world_logged_branch": WORLD_LOGGED_BRANCH_CONTRACT,
+        "split_manifest_sha256": identity["manifest_sha256"],
+        "split_source_sha256": identity["source_sha256"],
+    }
+    checkpoint = {"training_contract": contract}
+    validate_visual_world_resume_contract(checkpoint, identity)
+    validate_visual_world_resume_contract(
+        checkpoint, identity, late_stage_anchor_weight=0.0
+    )
+    with pytest.raises(ValueError, match="world_late_stage_anchor"):
+        validate_visual_world_resume_contract(
+            checkpoint, identity, late_stage_anchor_weight=0.25
+        )
+    with pytest.raises(ValueError, match="world_stage_weight_overrides"):
+        validate_visual_world_resume_contract(
+            checkpoint, identity, stage_weight_overrides={5: 0.5, 6: 1.0}
+        )
+
+    peer_contract = {
+        **contract,
+        "va_world_mode": "peer_sync_h6",
+        "peer_world_topology": PEER_WORLD_TOPOLOGY_CONTRACT,
+        "peer_world_action_source": PEER_WORLD_ACTION_SOURCE_CONTRACT,
+        "peer_world_readout": PEER_WORLD_READOUT_CONTRACT,
+        "peer_training_mode": "joint_dual_stream",
+        "peer_gradient_boundary": PEER_GRADIENT_BOUNDARY_CONTRACT,
+        "peer_data_isolation": PEER_DATA_ISOLATION_CONTRACT,
+        "peer_dual_stream_optimizer": PEER_DUAL_STREAM_OPTIMIZER_CONTRACT,
+        "planning_stride": 6,
+        "planning_hz": 80.0 / 6,
+        "peer_high_frequency_contract": PEER_HIGH_FREQUENCY_CONTRACT,
+    }
+    validate_visual_world_resume_contract(
+        {"training_contract": peer_contract},
+        identity,
+        va_world_mode="peer_sync_h6",
+    )
+    h15_peer_contract = {
+        **peer_contract,
+        "world_transition": "explicit_endpoint_h15_v1",
+        "planning_stride": 2,
+        "planning_hz": 40.0,
+    }
+    validate_visual_world_resume_contract(
+        {"training_contract": h15_peer_contract},
+        identity,
+        va_world_mode="peer_sync_h6",
+        planning_stride=2,
+        world_horizon=15,
+    )
+    with pytest.raises(ValueError, match="world_transition"):
+        validate_visual_world_resume_contract(
+            {"training_contract": h15_peer_contract},
+            identity,
+            va_world_mode="peer_sync_h6",
+            planning_stride=2,
+            world_horizon=2,
+        )
+    stale_peer = copy.deepcopy(peer_contract)
+    stale_peer["peer_world_readout"] = "masked_smooth_l1_logged_h6_v1"
+    with pytest.raises(ValueError, match="peer_world_readout"):
+        validate_visual_world_resume_contract(
+            {"training_contract": stale_peer},
+            identity,
+            va_world_mode="peer_sync_h6",
+        )
+
+    cap_ranking = world_action_ranking_contract("cycle", 0.2)
+    with pytest.raises(ValueError, match="world_action_ranking"):
+        validate_visual_world_resume_contract(
+            checkpoint, identity, cap_ranking, static_constraint_weight=4.0
+        )
+    validate_visual_world_resume_contract(
+        checkpoint,
+        identity,
+        cap_ranking,
+        static_constraint_weight=4.0,
+        migration_id="wmrm_action_rank_cap_none_to_0_2_v1",
+    )
+
+    final_ranking = world_action_ranking_contract("final")
+    final_checkpoint = {
+        "training_contract": {
+            **contract,
+            "world_action_ranking": final_ranking,
+        }
+    }
+    validate_visual_world_resume_contract(
+        final_checkpoint, identity, final_ranking
+    )
+    with pytest.raises(ValueError, match="world_action_ranking"):
+        validate_visual_world_resume_contract(final_checkpoint, identity)
+
+    changed = {**checkpoint, "training_contract": {**contract}}
+    changed["training_contract"]["world_action_donor_sha256"] = "x" * 64
+    with pytest.raises(ValueError, match="world_action_donor_sha256"):
+        validate_visual_world_resume_contract(changed, identity)

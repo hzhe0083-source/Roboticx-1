@@ -225,7 +225,7 @@ def vjepa21_backbone() -> VJEPA21Backbone:
     ckpt = hub_dir / "checkpoints" / VJEPA21_CHECKPOINT_NAME
     if not ckpt.is_file():
         pytest.skip(
-            f"本地 V-JEPA 2.1 checkpoint 缺失（{ckpt}）；先运行 prepare_models.py。"
+            f"本地 V-JEPA 2.1 checkpoint 缺失（{ckpt}）；先运行 scripts/data/prepare_models.py。"
             "真实模型用例跳过，形状契约由 fake-backbone 用例覆盖"
         )
     device = "cuda" if torch.cuda.is_available() else "cpu"

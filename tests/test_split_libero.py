@@ -120,7 +120,7 @@ def test_write_slices_list_sequences(tmp_path: Path) -> None:
 def test_aligned_heldout_same_ordinals_per_task() -> None:
     """--aligned-heldout: every task holds out the same episode ordinals, so
     the r-th kept row of each task corresponds to the same original episode
-    (row-position alignment needed by prepare_libero_paired.py)."""
+    (row-position alignment needed by scripts/data/prepare_libero_paired.py)."""
     p = make_payload()
     train, held, report, unit = split_rows(
         p["episode_id"], p["instruction_id"], p["pair_id"], 3, seed=0,
