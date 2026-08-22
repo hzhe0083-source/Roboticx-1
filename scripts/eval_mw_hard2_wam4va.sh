@@ -9,9 +9,19 @@ DINO=${DINO:-/home/ryan/.cache/huggingface/hub/models--timm--vit_large_patch14_r
 CKPT=$1
 FEATURES=${2:-data/hard2_peer_h15_p2_eval_v2.pt}
 EXECUTION_HORIZON=${EXECUTION_HORIZON:-15}
+PEER_WORLD_OFF=${PEER_WORLD_OFF:-0}
+WORLD_ARGS=()
+WORLD_SUFFIX=
+if [[ "$PEER_WORLD_OFF" == 1 ]]; then
+  WORLD_ARGS=(--peer-world-off)
+  WORLD_SUFFIX=_worldoff
+elif [[ "$PEER_WORLD_OFF" != 0 ]]; then
+  echo "PEER_WORLD_OFF must be 0 or 1" >&2
+  exit 2
+fi
 NAME=$(basename "$CKPT" .pt)
-LOG=logs/${NAME}_p${EXECUTION_HORIZON}_eval10.log
-JSON=logs/${NAME}_p${EXECUTION_HORIZON}_eval10.json
+LOG=logs/${NAME}_p${EXECUTION_HORIZON}${WORLD_SUFFIX}_eval10.log
+JSON=logs/${NAME}_p${EXECUTION_HORIZON}${WORLD_SUFFIX}_eval10.json
 
 [[ -f "$CKPT" ]] || { echo "missing checkpoint: $CKPT" >&2; exit 1; }
 [[ -f "$FEATURES" ]] || { echo "missing features: $FEATURES" >&2; exit 1; }
@@ -138,4 +148,5 @@ PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 \
   --flow-samples 1 \
   --device cuda \
   --output-json "$JSON" \
+  "${WORLD_ARGS[@]}" \
   2>&1 | tee "$LOG"

@@ -64,6 +64,7 @@ def test_hard2_eval_launcher_is_fixed_to_h15_p15() -> None:
     for token in (
         "hard2_peer_h15_p2_eval_v2.pt",
         "EXECUTION_HORIZON=${EXECUTION_HORIZON:-15}",
+        "PEER_WORLD_OFF=${PEER_WORLD_OFF:-0}",
         'data_contract = f"peer_sync_h{action_horizon}_p2_world_windows_v1"',
         "action_horizon not in {6, 15}",
         '"fps": 80',
@@ -78,6 +79,7 @@ def test_hard2_eval_launcher_is_fixed_to_h15_p15() -> None:
         '"peer_va_data_identity"',
         '"peer_world_data_identity"',
         '--execution-horizon "$EXECUTION_HORIZON"',
+        'WORLD_ARGS=(--peer-world-off)',
     ):
         assert token in text
     assert "--execute-steps" not in text

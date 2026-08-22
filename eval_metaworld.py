@@ -1161,6 +1161,14 @@ def parse_args() -> argparse.Namespace:
         "not precision acceptance.",
     )
     parser.add_argument(
+        "--peer-world-off",
+        action="store_true",
+        help=(
+            "causal closed-loop control: bypass peer World state exchange while "
+            "keeping checkpoint, Flow sampling, observations, and episode seeds fixed"
+        ),
+    )
+    parser.add_argument(
         "--flow-samples",
         type=int,
         default=1,
@@ -2352,6 +2360,8 @@ def main() -> None:
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     config = VACompoundConfig(**ckpt["config"])
     args.execution_horizon = resolve_execution_horizon(args, config)
+    if args.peer_world_off and config.va_world_mode != "peer_sync_h6":
+        raise ValueError("--peer-world-off requires a peer_sync_h6 checkpoint")
     # Keep the old field available to existing validation/reporting callers.
     args.execute_steps = args.execution_horizon
     policy_contract = ckpt.get("training_contract", {}) or {}
@@ -3985,6 +3995,7 @@ def main() -> None:
                             visual_memory=memory,
                             return_visual_memory=True,
                             env_action=world_action,
+                            skip_wmrm=args.peer_world_off,
                             **dense_kwargs,
                         )
                         # 训练侧 flow_semantic 时槽输出（vision_in）作为 flow
@@ -4197,15 +4208,20 @@ def main() -> None:
             "training_control_stride": int(training_control_stride),
             "control_stride": int(training_control_stride),
             "planning_stride": int(checkpoint_planning_stride),
-            "planning_hz": float(planning_hz),
+            "planning_hz": float(deployment_planning_hz),
+            "training_planning_hz": float(training_planning_hz),
+            "deployment_planning_hz": float(deployment_planning_hz),
             "world_transition_stride": int(training_control_stride),
             "observation_stride": int(OBSERVATION_STRIDE),
             "memory_reset_every": int(args.memory_reset_every),
             "wmrm_mode": (
-                "state-exchange"
+                "ablated"
+                if args.peer_world_off
+                else "state-exchange"
                 if getattr(model, "wmrm", None) is not None
                 else "disabled"
             ),
+            "peer_world_off": bool(args.peer_world_off),
             "horizon": int(args.horizon),
             "flow_samples": int(args.flow_samples),
             "action_decoder": (
@@ -4217,7 +4233,10 @@ def main() -> None:
                     else "conditional_flow_matching"
                 )
             ),
-            "wmrm_state_exchange": getattr(model, "wmrm", None) is not None,
+            "wmrm_state_exchange": (
+                getattr(model, "wmrm", None) is not None
+                and not args.peer_world_off
+            ),
             "task35_precision_contract": bool(args.task35_precision_contract),
             "task35_causal_ablation": args.task35_causal_ablation,
             "dino_feature_cache": (
