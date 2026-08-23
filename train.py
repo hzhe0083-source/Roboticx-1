@@ -7815,6 +7815,15 @@ def main() -> None:
                     )
                 model.wam.load_state_dict(resume_ckpt["wam_model"])
                 print("wam: WAM 权重从 resume checkpoint 恢复")
+            wmrm = getattr(model, "wmrm", None)
+            if wmrm is not None and wmrm.mark_legacy_vision_gate_if_absent(
+                resume_ckpt.get("model") or {}
+            ):
+                print(
+                    "resume: checkpoint has no vision_gate; "
+                    "use training-time ungated world→vision write",
+                    flush=True,
+                )
             print(f"resumed from {resume_path}")
         if exact_resume:
             global_step = restore_exact_resume_state(

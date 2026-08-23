@@ -2646,12 +2646,10 @@ def main() -> None:
     model = VACompoundPolicy(config).eval().to(device)
     ckpt_direct_head = bool(ckpt["config"].get("direct_head", False))
 
-    def _mark_legacy_vision_gate(missing_keys) -> None:
-        gate_missing = [
-            key for key in missing_keys if key.startswith("wmrm.vision_gate_proj.")
-        ]
-        if gate_missing and getattr(model, "wmrm", None) is not None:
-            model.wmrm.legacy_ungated_vision = True
+    def _mark_legacy_vision_gate() -> None:
+        if getattr(model, "wmrm", None) is None:
+            return
+        if model.wmrm.mark_legacy_vision_gate_if_absent(ckpt["model"]):
             print(
                 "eval: checkpoint has no vision_gate; "
                 "use training-time ungated world→vision write",
@@ -2668,12 +2666,12 @@ def main() -> None:
                 "checkpoint/model mismatch: "
                 f"missing={other_missing[:8]} unexpected={list(unexpected)[:8]}"
             )
-        _mark_legacy_vision_gate(missing)
+        _mark_legacy_vision_gate()
     elif dense_forced:
         # --dense-readout-mtvj 强制：ckpt 训练时未开 dense 层 → dense 权重缺失，
         # 非严格加载（W_o 零初始化 → 初始输出与无 dense 路径逐位一致）。
         missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
-        _mark_legacy_vision_gate(missing)
+        _mark_legacy_vision_gate()
         print(
             f"eval: --dense-readout-mtvj 强制 dense 层（ckpt config "
             f"dense_readout_mtvj={bool(ckpt['config'].get('dense_readout_mtvj', False))}）；"
@@ -2683,7 +2681,7 @@ def main() -> None:
         # --direct-head on/off 强制换解码器（消融）：另一头的 head 未训练，
         # 用非严格加载 + 显式警告。
         missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
-        _mark_legacy_vision_gate(missing)
+        _mark_legacy_vision_gate()
         print(
             f"eval: forced decoder override direct_head={config.direct_head} "
             f"(ckpt had {ckpt_direct_head}); missing={len(missing)} "

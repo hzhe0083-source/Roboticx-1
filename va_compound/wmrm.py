@@ -514,6 +514,31 @@ class WAM4VA(nn.Module):
         flat = self.env_seq(steps.flatten(1))
         return tokens, flat
 
+    def mark_legacy_vision_gate_if_absent(self, state_keys) -> bool:
+        """Restore pre-gate world→vision writes when a checkpoint lacks the gate.
+
+        New WAM4VA modules zero-init ``vision_gate_proj`` so the write is off
+        until the gate learns. Checkpoints trained before that layer existed
+        wrote ``vision + message`` with no gate. Loading them with a zero gate
+        silently drops the trained write; eval already special-cased this, but
+        ordinary ``--resume`` did not.
+
+        The Python flag keeps the current process exactly ungated. The open
+        bias is also written so a later save/reload still approximates that
+        write (tanh(8) ≈ 1) even though the flag is not part of state_dict.
+        """
+        has_gate = any(
+            key == "vision_gate_proj.weight"
+            or str(key).endswith(".vision_gate_proj.weight")
+            for key in state_keys
+        )
+        if has_gate:
+            return False
+        self.legacy_ungated_vision = True
+        nn.init.zeros_(self.vision_gate_proj.weight)
+        nn.init.constant_(self.vision_gate_proj.bias, 8.0)
+        return True
+
     def _world_condition(
         self,
         proprio: Tensor,

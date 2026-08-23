@@ -531,6 +531,106 @@ def test_handshake_gets_spatial_world_tokens() -> None:
     assert aux.z_tokens.shape == (2, 8, 4, 4)
 
 
+def test_legacy_checkpoint_without_vision_gate_keeps_ungated_write() -> None:
+    torch.manual_seed(11)
+    trained = WorldMediatedResidualModulation(
+        32,
+        world_dim=8,
+        rank=4,
+        proprio_dim=9,
+        dino_dim=8,
+        map_size=4,
+        map_frames=2,
+        map_grid=4,
+        world_grid=4,
+        env_action_dim=4,
+    )
+    trained.vision_from_world.o.weight.data.normal_(0, 0.2)
+    trained.vision_from_world.o.bias.data.normal_(0, 0.05)
+    action = torch.randn(2, 5, 32)
+    vision = torch.randn(2, 6, 32)
+    proprio = torch.randn(2, 9)
+    env = torch.randn(2, 6, 4)
+    tokens = torch.randn(2, 32, 8)
+    with torch.no_grad():
+        _, aux, _, _ = trained(
+            action, vision, proprio, dino_tokens=tokens, env_action=env
+        )
+        ungated = vision + trained.vision_from_world(vision, aux.world_tokens)
+
+    legacy_state = {
+        key: value
+        for key, value in trained.state_dict().items()
+        if not key.startswith("vision_gate_proj.")
+    }
+    resumed = WorldMediatedResidualModulation(
+        32,
+        world_dim=8,
+        rank=4,
+        proprio_dim=9,
+        dino_dim=8,
+        map_size=4,
+        map_frames=2,
+        map_grid=4,
+        world_grid=4,
+        env_action_dim=4,
+    )
+    missing, unexpected = resumed.load_state_dict(legacy_state, strict=False)
+    assert any(key.startswith("vision_gate_proj.") for key in missing)
+    assert not unexpected
+    # Zero-init gate would drop the trained world→vision write.
+    with torch.no_grad():
+        dropped = resumed.mix_world_into_vision(vision, aux)
+    torch.testing.assert_close(dropped, vision, rtol=0.0, atol=0.0)
+    assert resumed.mark_legacy_vision_gate_if_absent(legacy_state)
+    assert resumed.legacy_ungated_vision
+    with torch.no_grad():
+        restored = resumed.mix_world_into_vision(vision, aux)
+    torch.testing.assert_close(restored, ungated, rtol=0.0, atol=0.0)
+
+    # A later save includes the open gate, so reload without the Python flag
+    # still writes the world message instead of silently gating it off.
+    saved = resumed.state_dict()
+    reloaded = WorldMediatedResidualModulation(
+        32,
+        world_dim=8,
+        rank=4,
+        proprio_dim=9,
+        dino_dim=8,
+        map_size=4,
+        map_frames=2,
+        map_grid=4,
+        world_grid=4,
+        env_action_dim=4,
+    )
+    reloaded.load_state_dict(saved)
+    assert not reloaded.mark_legacy_vision_gate_if_absent(saved)
+    assert not reloaded.legacy_ungated_vision
+    with torch.no_grad():
+        _, saved_aux, _, _ = reloaded(
+            action, vision, proprio, dino_tokens=tokens, env_action=env
+        )
+        persisted = reloaded.mix_world_into_vision(vision, saved_aux)
+    torch.testing.assert_close(persisted, ungated, rtol=0.0, atol=1e-5)
+
+
+def test_policy_resume_marks_missing_wmrm_vision_gate() -> None:
+    config = _tiny_config(wmrm=True)
+    policy = VACompoundPolicy(config)
+    state = {
+        key: value
+        for key, value in policy.state_dict().items()
+        if not key.startswith("wmrm.vision_gate_proj.")
+    }
+    resumed = VACompoundPolicy(config)
+    missing, unexpected = resumed.load_state_dict(state, strict=False)
+    assert any(key.startswith("wmrm.vision_gate_proj.") for key in missing)
+    assert not unexpected
+    assert resumed.wmrm is not None
+    assert resumed.wmrm.mark_legacy_vision_gate_if_absent(state)
+    assert resumed.wmrm.legacy_ungated_vision
+
+
 def test_zero_vision_gate_can_learn_from_nonzero_world_message() -> None:
     block = WorldMediatedResidualModulation(
         32,
