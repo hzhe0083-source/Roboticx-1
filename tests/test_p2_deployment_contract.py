@@ -15,10 +15,16 @@ ROOT = Path(__file__).resolve().parents[1]
 EVAL_RUNNER = ROOT / "scripts" / "eval_mw_hard2_wam4va.sh"
 
 
-def _args(*, execution_horizon=None, execute_steps=None) -> SimpleNamespace:
+def _args(
+    *,
+    execution_horizon=None,
+    execute_steps=None,
+    allow_execution_horizon_ablation=False,
+) -> SimpleNamespace:
     return SimpleNamespace(
         execution_horizon=execution_horizon,
         execute_steps=execute_steps,
+        allow_execution_horizon_ablation=allow_execution_horizon_ablation,
     )
 
 
@@ -45,6 +51,32 @@ def test_h15_peer_defaults_to_full_chunk_deployment() -> None:
     assert resolve_execution_horizon(_args(execution_horizon=15), config) == 15
     with pytest.raises(ValueError, match="deployment horizon"):
         resolve_execution_horizon(_args(execution_horizon=2), config)
+
+
+@pytest.mark.parametrize("execution_horizon", (2, 6, 15))
+def test_h15_peer_allows_explicit_execution_horizon_ablation(
+    execution_horizon: int,
+) -> None:
+    config = SimpleNamespace(
+        va_world_mode="peer_sync_h6",
+        planning_stride=2,
+        deployment_execution_horizon=15,
+    )
+    args = _args(
+        execution_horizon=execution_horizon,
+        allow_execution_horizon_ablation=True,
+    )
+    assert resolve_execution_horizon(args, config) == execution_horizon
+
+
+def test_execution_horizon_ablation_rejects_legacy_checkpoint() -> None:
+    config = SimpleNamespace(va_world_mode="legacy", planning_stride=2)
+    args = _args(
+        execution_horizon=6,
+        allow_execution_horizon_ablation=True,
+    )
+    with pytest.raises(ValueError, match="requires a peer_sync_h6 checkpoint"):
+        resolve_execution_horizon(args, config)
 
 
 def test_legacy_deployment_keeps_six_step_default() -> None:

@@ -966,6 +966,13 @@ def resolve_execution_horizon(
         config is not None
         and getattr(config, "va_world_mode", "legacy") == "peer_sync_h6"
     )
+    allow_ablation = bool(
+        getattr(args, "allow_execution_horizon_ablation", False)
+    )
+    if allow_ablation and not peer_sync:
+        raise ValueError(
+            "--allow-execution-horizon-ablation requires a peer_sync_h6 checkpoint"
+        )
     planning_stride = int(
         getattr(config, "planning_stride", LEGACY_EXECUTION_HORIZON)
     )
@@ -985,7 +992,7 @@ def resolve_execution_horizon(
         raise ValueError(
             f"--execution-horizon must be one of {SUPPORTED_EXECUTION_HORIZONS}"
         )
-    if peer_sync and value != deployment_horizon:
+    if peer_sync and value != deployment_horizon and not allow_ablation:
         raise ValueError(
             "peer_sync_h6 requires execution_horizon == checkpoint deployment "
             f"horizon ({value} != {deployment_horizon})"
@@ -1216,9 +1223,17 @@ def parse_args() -> argparse.Namespace:
         default=None,
         choices=SUPPORTED_EXECUTION_HORIZONS,
         help=(
-            "部署时每次硬替换执行的动作数；仅支持 1/2/3/6。"
-            "peer_sync_h6 默认且必须等于 checkpoint planning_stride；"
+            "部署时每次硬替换执行的动作数；仅支持 1/2/3/6/15。"
+            "peer_sync_h6 默认且必须等于 checkpoint deployment horizon；"
             "legacy 默认 6。"
+        ),
+    )
+    parser.add_argument(
+        "--allow-execution-horizon-ablation",
+        action="store_true",
+        help=(
+            "仅用于闭环评测消融：允许执行步数不同于 peer checkpoint 的部署"
+            "步数。不会改写 checkpoint 的训练/部署合同。"
         ),
     )
     parser.add_argument(
@@ -2360,6 +2375,10 @@ def main() -> None:
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     config = VACompoundConfig(**ckpt["config"])
     args.execution_horizon = resolve_execution_horizon(args, config)
+    checkpoint_deployment_horizon = int(
+        getattr(config, "deployment_execution_horizon", 0)
+        or getattr(config, "planning_stride", LEGACY_EXECUTION_HORIZON)
+    )
     if args.peer_world_off and config.va_world_mode != "peer_sync_h6":
         raise ValueError("--peer-world-off requires a peer_sync_h6 checkpoint")
     # Keep the old field available to existing validation/reporting callers.
@@ -2378,7 +2397,7 @@ def main() -> None:
                 "va_backward_then_world_backward_one_optimizer_step_v1"
             ),
         }
-        if args.execution_horizon == 15:
+        if checkpoint_deployment_horizon == 15:
             required_p2_contract["peer_flow_topology"] = (
                 "h6_prefix_h9_tail_one_way_detached_flow_v1"
             )
@@ -2398,7 +2417,7 @@ def main() -> None:
             "control_stride": 2,
             "planning_stride": 2,
             "wmrm_cycle_steps": int(config.wmrm_cycle_steps),
-            "deployment_execution_horizon": args.execution_horizon,
+            "deployment_execution_horizon": checkpoint_deployment_horizon,
             "flow_prefix_steps": 2,
         }
         for key, value in expected_p2_arguments.items():
@@ -2855,10 +2874,6 @@ def main() -> None:
     checkpoint_planning_stride = int(
         getattr(config, "planning_stride", LEGACY_EXECUTION_HORIZON)
     )
-    checkpoint_deployment_horizon = int(
-        getattr(config, "deployment_execution_horizon", 0)
-        or checkpoint_planning_stride
-    )
     if getattr(config, "va_world_mode", "legacy") == "peer_sync_h6":
         if (
             checkpoint_planning_stride != LEGACY_EXECUTION_HORIZON
@@ -2879,7 +2894,11 @@ def main() -> None:
             ),
             "execution_horizon": (
                 args.execution_horizon,
-                checkpoint_deployment_horizon,
+                (
+                    args.execution_horizon
+                    if args.allow_execution_horizon_ablation
+                    else checkpoint_deployment_horizon
+                ),
             ),
             "wmrm_cycle_steps": (
                 int(getattr(config, "wmrm_cycle_steps", 0)),
@@ -2907,7 +2926,9 @@ def main() -> None:
         f"training_hz={training_planning_hz:g}, "
         f"deployment_hz={deployment_planning_hz:g}, "
         f"prediction_horizon={training_prediction_horizon}, "
-        f"execution_horizon={args.execution_horizon}"
+        f"execution_horizon={args.execution_horizon}, "
+        f"checkpoint_execution_horizon={checkpoint_deployment_horizon}, "
+        f"execution_ablation={int(args.allow_execution_horizon_ablation)}"
     )
     if args.task35_precision_contract or args.task35_causal_ablation != "none":
         all_tasks = features["metadata"]["tasks"]
@@ -4197,6 +4218,12 @@ def main() -> None:
             "execute_steps": int(args.execution_horizon),
             "prediction_horizon": int(config.action_horizon),
             "execution_horizon": int(args.execution_horizon),
+            "checkpoint_deployment_execution_horizon": int(
+                checkpoint_deployment_horizon
+            ),
+            "execution_horizon_ablation": bool(
+                args.allow_execution_horizon_ablation
+            ),
             "world_horizon": (
                 int(model.wmrm.cycle_steps)
                 if getattr(model, "wmrm", None) is not None
