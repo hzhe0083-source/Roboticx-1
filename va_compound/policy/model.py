@@ -92,6 +92,10 @@ class VACompoundConfig:
     future_predict: bool = False
     # WAM4VA：独立世界状态通过下一层 attention K/V 与 VA 交换信息。
     wmrm: bool = False
+    # Give World the same complete Qwen token sequence that VA reads.  Legacy
+    # checkpoints keep the old four-query language summary unless explicitly
+    # enabled, so the new parameter set is an intentional architecture change.
+    wmrm_full_language_tokens: bool = False
     wmrm_world_dim: int = 8
     # all = 每层更新 World state；last = 仅末层；even = 奇数层+末层。
     # peer_sync_h6 still requires this flag to be "all", but World is one
@@ -110,6 +114,9 @@ class VACompoundConfig:
     wmrm_predictor_depth: int = 6
     wmrm_predictor_width: int = 384
     wmrm_predictor_heads: int = 12
+    # Fail-fast tensor-content checks are valuable in tests/debug runs, but each
+    # CUDA truth-value check synchronizes the host inside the recurrent hot path.
+    runtime_integrity_checks: bool = True
     # VA↔World execution topology. ``peer_sync_h6`` uses one pre-stage
     # snapshot for both state transitions and a deterministic action-chunk readout.
     # World has N-1 stages so the last VA layer reads the final DINO map.
@@ -216,6 +223,10 @@ class VACompoundConfig:
     # （2×16×16=512 token，1024 维）+ Δt；LanguageMetricField 以 h_dim=1024、
     # grid=16 从零训练。复用 dense_readout_mtvj 的逐层 dense K/V 机制。
     dino_dense_metric: bool = False
+    # Formal slot-free policy contract.  Legacy metric/local-slot experiments
+    # remain loadable when this is false, but a slot-free run cannot silently
+    # route simulator-derived geometry into VA/World/action.
+    slot_free_policy: bool = False
     # 8-D ``p * visibility`` geometry 直接进入 state/action query 条件，绕过
     # 512 dense + 2 metric token 的共享 softmax 稀释。Linear 严格 zero-init，
     # 从旧架构迁移时初始行为等价；默认关闭保持旧 state_dict 键集合不变。
@@ -319,6 +330,17 @@ class VACompoundConfig:
                     "dino_dense_metric requires dense_readout_mtvj "
                     "（逐层 dense K/V 机制复用）"
                 )
+        if self.wmrm_full_language_tokens and not self.wmrm:
+            raise ValueError("wmrm_full_language_tokens requires wmrm=true")
+        if self.slot_free_policy and (
+            self.metric_geometry_inject
+            or self.dino_dense_metric
+            or self.local_slots
+        ):
+            raise ValueError(
+                "slot_free_policy forbids metric geometry, metric relation tokens, "
+                "and local fixed-slot readers"
+            )
         if self.wmrm and self.memory_split:
             raise ValueError("wmrm is mutually exclusive with memory_split (P2 last-layer hook)")
         if self.wmrm and (self.direct_head or self.c2_controller):
@@ -364,9 +386,9 @@ class VACompoundConfig:
                 raise ValueError("peer_sync_h6 requires wmrm=true")
             if self.action_horizon not in {6, 15}:
                 raise ValueError("peer mode requires action_horizon in {6, 15}")
-            if self.planning_stride not in {1, 2, 3, 6}:
+            if self.planning_stride not in {1, 2, 3, 6, 15}:
                 raise ValueError(
-                    "peer_sync_h6 requires planning_stride in {1, 2, 3, 6}"
+                    "peer_sync_h6 requires planning_stride in {1, 2, 3, 6, 15}"
                 )
             if not 1 <= deployment_horizon <= self.action_horizon:
                 raise ValueError(
@@ -440,6 +462,9 @@ class LanguageCache:
     layers: tuple[LayerLanguageCache, ...]
     attention_mask: Tensor
     role_queries: Tensor | None = None  # [B, K, hidden] PULSE-VA 角色查询（一次性缓存）
+    # The original full Qwen sequence.  VA consumes its per-layer projections
+    # above; full-language World consumes this same read-only sequence directly.
+    tokens: Tensor | None = None
 
     def detach(self) -> "LanguageCache":
         return LanguageCache(
@@ -448,6 +473,7 @@ class LanguageCache:
             role_queries=(
                 self.role_queries.detach() if self.role_queries is not None else None
             ),
+            tokens=self.tokens.detach() if self.tokens is not None else None,
         )
 
     def to(
@@ -461,6 +487,11 @@ class LanguageCache:
             role_queries=(
                 self.role_queries.to(device=device, dtype=dtype)
                 if self.role_queries is not None
+                else None
+            ),
+            tokens=(
+                self.tokens.to(device=device, dtype=dtype)
+                if self.tokens is not None
                 else None
             ),
         )
@@ -2057,6 +2088,11 @@ class VACompoundPolicy(nn.Module):
             with torch.random.fork_rng(devices=[]):
                 self.wmrm = WAM4VA(
                     config.hidden_dim,
+                    language_dim=(
+                        config.language_dim
+                        if config.wmrm_full_language_tokens
+                        else None
+                    ),
                     world_dim=config.wmrm_world_dim,
                     proprio_dim=config.proprio_dim,
                     num_heads=config.num_heads,
@@ -2073,6 +2109,7 @@ class VACompoundPolicy(nn.Module):
                     predictor_width=config.wmrm_predictor_width,
                     predictor_heads=config.wmrm_predictor_heads,
                     max_stages=config.wmrm_stage_count(),
+                    runtime_integrity_checks=config.runtime_integrity_checks,
                 )
         else:
             self.wmrm = None
@@ -2084,6 +2121,7 @@ class VACompoundPolicy(nn.Module):
                     config.hidden_dim,
                     action_dim=config.action_dim,
                     horizon=config.action_horizon,
+                    runtime_integrity_checks=config.runtime_integrity_checks,
                 )
         else:
             self.world_action_readout = None
@@ -2325,7 +2363,10 @@ class VACompoundPolicy(nn.Module):
             if detach:
                 role_queries = role_queries.detach()
         cache = LanguageCache(
-            layers=caches, attention_mask=language_mask.bool(), role_queries=role_queries
+            layers=caches,
+            attention_mask=language_mask.bool(),
+            role_queries=role_queries,
+            tokens=language_hidden,
         )
         return cache.detach() if detach else cache
 
@@ -2480,6 +2521,12 @@ class VACompoundPolicy(nn.Module):
             raise ValueError("provide exactly one of language_hidden or language_cache")
         if vision_tokens.ndim != 3:
             raise ValueError("vision_tokens must have shape [batch, tokens, vision_dim]")
+        if self.config.slot_free_policy and (
+            metric_g is not None or metric_tokens is not None
+        ):
+            raise ValueError(
+                "slot_free_policy rejects metric_g and metric_tokens at the policy boundary"
+            )
 
         target_dtype = self.vision_projection.weight.dtype
         vision = self.project_shared_eye(vision_tokens)
@@ -2798,13 +2845,26 @@ class VACompoundPolicy(nn.Module):
                 and not skip_wmrm
                 and index in inject_layers
             ):
-                lang_key = layer_cache.key
-                language_keys = lang_key.transpose(1, 2).reshape(
-                    lang_key.shape[0], lang_key.shape[2], self.config.hidden_dim
-                )
                 mask = language_cache.attention_mask
-                if mask is not None:
-                    language_keys = language_keys * mask.to(dtype=language_keys.dtype)[:, :, None]
+                if self.config.wmrm_full_language_tokens:
+                    language_tokens = language_cache.tokens
+                    if language_tokens is None:
+                        raise ValueError(
+                            "wmrm_full_language_tokens requires raw tokens in LanguageCache"
+                        )
+                    language_keys = None
+                    world_language_mask = mask
+                else:
+                    lang_key = layer_cache.key
+                    language_keys = lang_key.transpose(1, 2).reshape(
+                        lang_key.shape[0], lang_key.shape[2], self.config.hidden_dim
+                    )
+                    if mask is not None:
+                        language_keys = language_keys * mask.to(
+                            dtype=language_keys.dtype
+                        )[:, :, None]
+                    language_tokens = None
+                    world_language_mask = None
                 # Peer inputs expose one complete causal/logged action chunk.
                 # The World endpoint matches that full candidate horizon, while
                 # deployment executes only planning_stride actions before replanning.
@@ -2837,11 +2897,16 @@ class VACompoundPolicy(nn.Module):
                     proprio.to(dtype=snapshot_action.dtype),
                     state=world_state,
                     language_keys=language_keys,
+                    language_tokens=language_tokens,
+                    language_mask=world_language_mask,
                     dino_tokens=vision_tokens.to(dtype=target_dtype),
                     env_action=snapshot_env_action,
                     stage_index=index,
                 )
-                proposal.validate_finite(boundary=f"World stage {index} transition")
+                if self.config.runtime_integrity_checks:
+                    proposal.validate_finite(
+                        boundary=f"World stage {index} transition"
+                    )
                 aux = proposal.aux
                 world_state = proposal.next_world_state
                 # Keep the predicted map semantically honest: Flow may train the

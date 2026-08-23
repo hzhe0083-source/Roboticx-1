@@ -26,6 +26,11 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 ACTION_MASK_KEYS = ("action_valid_mask", "horizon_mask")
 PEER_SYNC_H6_CONTRACT = "peer_sync_h6_world_windows_v1"
 PEER_SYNC_H15_P2_CONTRACT = "peer_sync_h15_p2_world_windows_v1"
+PEER_SYNC_H15_P15_CONTRACT = "peer_sync_h15_p15_world_windows_v1"
+PEER_SYNC_H15_CONTRACTS = {
+    PEER_SYNC_H15_P2_CONTRACT,
+    PEER_SYNC_H15_P15_CONTRACT,
+}
 # One decoded-task table per process. Peer training builds two
 # LongTrajFramesDataset objects (VA + World); a per-dataset LRU of size 1
 # still keeps two full 480px caches and re-decodes on every task switch.
@@ -114,16 +119,47 @@ class LongTrajFramesDataset:
             for key in ("parent_identity", "source_identities", "output_identity"):
                 if not metadata.get(key):
                     raise ValueError(f"{PEER_SYNC_H6_CONTRACT} requires metadata.{key}")
-        if metadata.get("contract") == PEER_SYNC_H15_P2_CONTRACT:
+        if metadata.get("contract") in PEER_SYNC_H15_CONTRACTS:
+            contract = metadata["contract"]
             if tuple(actions.shape[1:]) != (4, 15, 4):
                 raise ValueError(
-                    f"{PEER_SYNC_H15_P2_CONTRACT} requires exact T4/H15/A4, "
+                    f"{contract} requires exact T4/H15/A4, "
                     f"got {tuple(actions.shape[1:])}"
                 )
             if metadata.get("logged_action_chunk") != "full_h15":
                 raise ValueError(
-                    f"{PEER_SYNC_H15_P2_CONTRACT} requires full logged H15 chunk"
+                    f"{contract} requires full logged H15 chunk"
                 )
+            if contract == PEER_SYNC_H15_P15_CONTRACT:
+                required_cadence = {
+                    "planning_stride": 15,
+                    "control_stride": 15,
+                    "decision_offsets": [0, 15, 30, 45],
+                    "world_target_horizon": 15,
+                    "world_target_offsets": [15, 30, 45, 60],
+                }
+                mismatches = {
+                    key: (metadata.get(key), expected)
+                    for key, expected in required_cadence.items()
+                    if metadata.get(key) != expected
+                }
+                if mismatches:
+                    raise ValueError(
+                        f"{contract} cadence metadata mismatch: {mismatches}"
+                    )
+                previous_action = self.payload.get("previous_action")
+                if (
+                    not isinstance(previous_action, torch.Tensor)
+                    or tuple(previous_action.shape) != tuple(actions.shape[:2]) + (4,)
+                ):
+                    raise ValueError(
+                        f"{contract} requires previous_action [N,4,4]"
+                    )
+                if not torch.equal(previous_action[:, 1:], actions[:, :-1, 14]):
+                    raise ValueError(
+                        f"{contract} requires each next previous_action to equal "
+                        "the prior P15 segment token14"
+                    )
         self.refs = self.payload["frame_refs"]  # [(task_file, ep_idx, frame_idx[T,W])]
         if len(self.refs) != self.length:
             raise ValueError("frame_refs 长度与样本数不一致")

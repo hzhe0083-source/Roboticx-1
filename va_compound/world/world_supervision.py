@@ -853,7 +853,9 @@ def prepare_visual_world_action_ranking(
     )
 
     if planning_stride not in PEER_PLANNING_STRIDES:
-        raise ValueError("planning_stride must be one of 1/2/3/6")
+        raise ValueError(
+            f"planning_stride must be one of {sorted(PEER_PLANNING_STRIDES)}"
+        )
 
     actions = torch.as_tensor(payload["actions"])
     proprio = torch.as_tensor(payload["proprio"])

@@ -114,6 +114,7 @@ class VACompoundTests(unittest.TestCase):
         _, _, _, language, mask = self.inputs(config)
         cache = model.build_language_cache(language, mask, detach=True).to(dtype=torch.float64)
         self.assertEqual(cache.layers[0].key.dtype, torch.float64)
+        self.assertEqual(cache.tokens.dtype, torch.float64)
         self.assertEqual(cache.attention_mask.dtype, torch.bool)
 
     def test_language_mask_shape_is_validated(self) -> None:

@@ -85,11 +85,17 @@ PEER_H15_PREFIX_TAIL_FLOW_CONTRACT = (
 PEER_H15_PREFIX_TAIL_FLOW_MIGRATION = (
     "peer_h15_uniform_to_prefix_tail_flow_from_s1752_v1"
 )
+PEER_H15_P2_TO_P15_TEMPORAL_MIGRATION = (
+    "peer_h15_p2_to_p15_temporal_weights_only_v1"
+)
 PEER_DATA_ISOLATION_CONTRACT = "separate_va_world_episode_datasets_per_step_v1"
+PEER_SHARED_FULL_DATA_CONTRACT = (
+    "shared_full_va_world_payload_independent_batches_per_step_v1"
+)
 PEER_DUAL_STREAM_OPTIMIZER_CONTRACT = (
     "va_backward_then_world_backward_one_optimizer_step_v1"
 )
-PEER_PLANNING_STRIDES = frozenset({1, 2, 3, 6})
+PEER_PLANNING_STRIDES = frozenset({1, 2, 3, 6, 15})
 PEER_HIGH_FREQUENCY_CONTRACT = {
     "action_prediction": "full_action_chunk_each_decision_v2",
     "world_transition": "logged_world_horizon_action_chunk_v2",
@@ -233,7 +239,9 @@ def validate_visual_world_training_split(
         raise ValueError("peer action horizon must be H6 or H15")
     expected_shape = (4, peer_horizon, 4) if peer_mode else (4, 48, 4)
     if peer_mode and planning_stride not in PEER_PLANNING_STRIDES:
-        raise ValueError("peer planning_stride must be one of 1/2/3/6")
+        raise ValueError(
+            f"peer planning_stride must be one of {sorted(PEER_PLANNING_STRIDES)}"
+        )
     expected_protocol = (
         f"peer_sync_h{peer_horizon}_p{planning_stride}_world_windows_v1"
         if peer_mode and (peer_horizon != 6 or planning_stride != 6)
@@ -294,6 +302,14 @@ def validate_visual_world_training_split(
                 raise ValueError("H15 requires one world_target_frame_ref per sample")
             if metadata.get("world_target_horizon") != 15:
                 raise ValueError("H15 requires world_target_horizon=15")
+            expected_world_offsets = [
+                15 + index * planning_stride for index in range(expected_shape[0])
+            ]
+            if metadata.get("world_target_offsets") != expected_world_offsets:
+                raise ValueError(
+                    "H15 world_target_offsets must match each recurrent decision: "
+                    f"{expected_world_offsets}"
+                )
     elif metadata_contract == PEER_SYNC_H6_CONTRACT:
         raise ValueError("legacy visual World rejects peer_sync_h6 data")
     if manifest_protocol != expected_protocol:
@@ -470,8 +486,49 @@ def validate_peer_data_isolation(
     world_payload: dict,
     *,
     planning_stride: int | None = None,
+    shared_full_data: bool = False,
 ) -> dict[str, object]:
-    """Prove that peer VA and World supervision use disjoint episode rows."""
+    """Validate either disjoint peer data or one exact shared full-data payload."""
+
+    def first_identity_mismatch(left, right, path: str = "payload") -> str | None:
+        if isinstance(left, Tensor) or isinstance(right, Tensor):
+            if not isinstance(left, Tensor) or not isinstance(right, Tensor):
+                return path
+            if (
+                left.dtype != right.dtype
+                or tuple(left.shape) != tuple(right.shape)
+                or not torch.equal(left, right)
+            ):
+                return path
+            return None
+        if isinstance(left, dict) or isinstance(right, dict):
+            if not isinstance(left, dict) or not isinstance(right, dict):
+                return path
+            if set(left) != set(right):
+                return f"{path}.keys"
+            for key in sorted(left, key=str):
+                mismatch = first_identity_mismatch(
+                    left[key], right[key], f"{path}.{key}"
+                )
+                if mismatch is not None:
+                    return mismatch
+            return None
+        if isinstance(left, (list, tuple)) or isinstance(right, (list, tuple)):
+            if type(left) is not type(right) or len(left) != len(right):
+                return path
+            for index, (left_item, right_item) in enumerate(
+                zip(left, right, strict=True)
+            ):
+                mismatch = first_identity_mismatch(
+                    left_item, right_item, f"{path}[{index}]"
+                )
+                if mismatch is not None:
+                    return mismatch
+            return None
+        try:
+            return None if bool(left == right) else path
+        except (TypeError, ValueError):
+            return path
 
     def integer_vector(payload: dict, key: str, stream: str) -> Tensor:
         value = payload.get(key)
@@ -491,7 +548,14 @@ def validate_peer_data_isolation(
     va_episodes = {int(value) for value in va_episode.tolist()}
     world_episodes = {int(value) for value in world_episode.tolist()}
     overlap = sorted(va_episodes & world_episodes)
-    if overlap:
+    if shared_full_data:
+        mismatch = first_identity_mismatch(va_payload, world_payload)
+        if mismatch is not None:
+            raise ValueError(
+                "--peer-shared-full-data requires identical VA/World payload "
+                f"identity; first mismatch: {mismatch}"
+            )
+    elif overlap:
         raise ValueError(
             "peer VA/World datasets must be episode-disjoint; overlapping "
             f"episode_id values: {overlap[:12]}"
@@ -529,9 +593,15 @@ def validate_peer_data_isolation(
                     f"{planning_stride}"
                 )
     return {
-        "contract": PEER_DATA_ISOLATION_CONTRACT,
+        "contract": (
+            PEER_SHARED_FULL_DATA_CONTRACT
+            if shared_full_data
+            else PEER_DATA_ISOLATION_CONTRACT
+        ),
         "va_episode_count": len(va_episodes),
         "world_episode_count": len(world_episodes),
+        "shared_full_data": bool(shared_full_data),
+        "shared_windows": int(va_episode.numel()) if shared_full_data else 0,
         "task_ids": va_tasks,
     }
 
@@ -542,21 +612,37 @@ def validate_peer_resume_weights_contract(
     planning_stride: int,
     migrating_peer_world: bool = False,
     migrating_prefix_tail_flow: bool = False,
+    migrating_p2_to_p15: bool = False,
     action_horizon: int | None = None,
     world_horizon: int | None = None,
     deployment_execution_horizon: int | None = None,
     peer_flow_topology: str | None = None,
     assembly_metric_role_contract: str | None = None,
+    peer_data_isolation_contract: str = PEER_DATA_ISOLATION_CONTRACT,
 ) -> dict[str, object] | None:
     """Validate peer weights-only initialization and name known migrations.
 
     Exact resume is intentionally handled by
     :func:`validate_visual_world_resume_contract`, which requires the current
-    contracts verbatim.  This validator permits only the two shape-compatible
-    weights-only semantic transitions needed by the current run: final-only to
-    all-stage readout supervision, and the absent legacy assembly role contract
-    to the explicitly supplied reward-center contract.
+    contracts verbatim. This validator permits only named, shape-compatible
+    weights-only semantic transitions. P2-to-P15 changes the recurrent decision
+    cadence without changing parameter shapes, so it must be recorded explicitly.
     """
+
+    if migrating_p2_to_p15:
+        if (
+            int(planning_stride) != 15
+            or action_horizon != 15
+            or world_horizon != 15
+            or deployment_execution_horizon != 15
+        ):
+            raise ValueError(
+                f"{PEER_H15_P2_TO_P15_TEMPORAL_MIGRATION} requires "
+                "H15/P15 action, World, and deployment horizons"
+            )
+        source_planning_stride = 2
+    else:
+        source_planning_stride = int(planning_stride)
 
     expected = {
         "peer_training_mode": "joint_dual_stream",
@@ -570,11 +656,11 @@ def validate_peer_resume_weights_contract(
             if migrating_peer_world
             else PEER_GRADIENT_BOUNDARY_CONTRACT
         ),
-        "peer_data_isolation": PEER_DATA_ISOLATION_CONTRACT,
+        "peer_data_isolation": peer_data_isolation_contract,
         "peer_dual_stream_optimizer": PEER_DUAL_STREAM_OPTIMIZER_CONTRACT,
         "peer_world_action_source": PEER_WORLD_ACTION_SOURCE_CONTRACT,
-        "planning_stride": int(planning_stride),
-        "planning_hz": 80.0 / int(planning_stride),
+        "planning_stride": source_planning_stride,
+        "planning_hz": 80.0 / source_planning_stride,
         "peer_high_frequency_contract": (
             PEER_LEGACY_HIGH_FREQUENCY_CONTRACT
             if migrating_peer_world
@@ -582,6 +668,19 @@ def validate_peer_resume_weights_contract(
         ),
     }
     migrations: list[dict[str, object]] = []
+    if migrating_p2_to_p15:
+        migrations.append(
+            {
+                "kind": PEER_H15_P2_TO_P15_TEMPORAL_MIGRATION,
+                "source_planning_stride": 2,
+                "source_decision_offsets": [0, 2, 4, 6],
+                "source_world_target_offsets": [15, 17, 19, 21],
+                "target_planning_stride": 15,
+                "target_decision_offsets": [0, 15, 30, 45],
+                "target_world_target_offsets": [15, 30, 45, 60],
+                "target_previous_action": "prior_p15_segment_token14",
+            }
+        )
     if not migrating_peer_world:
         expected["peer_world_readout"] = PEER_WORLD_READOUT_CONTRACT
         expected["peer_flow_topology"] = (
@@ -662,6 +761,7 @@ def validate_visual_world_resume_contract(
     stage_weight_overrides: dict[int, float] | None = None,
     world_horizon: int | None = None,
     assembly_metric_role_contract: str | None = None,
+    peer_data_isolation_contract: str = PEER_DATA_ISOLATION_CONTRACT,
 ) -> None:
     """Reject exact continuation from an old or differently split loss graph."""
 
@@ -728,7 +828,7 @@ def validate_visual_world_resume_contract(
                 "peer_world_readout": PEER_WORLD_READOUT_CONTRACT,
                 "peer_training_mode": "joint_dual_stream",
                 "peer_gradient_boundary": PEER_GRADIENT_BOUNDARY_CONTRACT,
-                "peer_data_isolation": PEER_DATA_ISOLATION_CONTRACT,
+                "peer_data_isolation": peer_data_isolation_contract,
                 "peer_dual_stream_optimizer": PEER_DUAL_STREAM_OPTIMIZER_CONTRACT,
                 "planning_stride": planning_stride,
                 "planning_hz": 80.0 / planning_stride,

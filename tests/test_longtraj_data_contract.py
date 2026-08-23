@@ -435,6 +435,95 @@ class LongTrajBuilderContractTest(unittest.TestCase):
             self.assertEqual(tuple(item["world_target_frames"].shape), (4, 1, 2, 2, 3))
             self.assertEqual(tuple(item["world_target_valid_mask"].shape), (4,))
 
+    def test_peer_h15_p15_build_matches_replanning_and_previous_action(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ref_path = root / "ref.pt"
+            source = root / "metaworld_longtraj_door-lock-v3.pt"
+            output = root / "peer_h15_p15.pt"
+            task_text = build.ENV_TO_TASK["door-lock-v3"]
+            torch.save(
+                {
+                    "normalization": self._normalization(),
+                    "metadata": {"tasks": [task_text]},
+                    "instruction_id": torch.tensor([0]),
+                    "language_hidden": torch.zeros(1, 2, 3),
+                    "language_mask": torch.ones(1, 2, dtype=torch.bool),
+                },
+                ref_path,
+            )
+            n = 80
+            jpeg = collect.compress_frames(
+                np.zeros((1, 2, 2, 3), dtype=np.uint8)
+            )[0]
+            timeline = np.arange(n, dtype=np.float32) / 100.0
+            values = np.repeat(timeline[:, None], 4, axis=1)
+            torch.save(
+                {
+                    "task": "door-lock-v3",
+                    "episodes": [
+                        {
+                            "frames": [jpeg] * n,
+                            "actions": values,
+                            "states": values,
+                            "first_success": n - 1,
+                            "action_executed": np.ones(n, dtype=bool),
+                            "action_supervision_valid": np.ones(n, dtype=bool),
+                            "recovery_mask": np.zeros(n, dtype=bool),
+                        }
+                    ],
+                },
+                source,
+            )
+
+            build.phase1(
+                15,
+                task="door-lock-v3",
+                input_paths=[source],
+                output_path=output,
+                ref_path=ref_path,
+                legacy_policy="error",
+                data_contract=build.PEER_SYNC_H15_P15_CONTRACT,
+                planning_stride=15,
+            )
+            payload = torch.load(output, map_location="cpu", weights_only=True)
+            metadata = payload["metadata"]
+            self.assertEqual(tuple(payload["actions"].shape), (2, 4, 15, 4))
+            self.assertEqual(metadata["decision_offsets"], [0, 15, 30, 45])
+            self.assertEqual(metadata["world_target_offsets"], [15, 30, 45, 60])
+            self.assertEqual(
+                [indices[-1] for indices in payload["frame_refs"][0][2]],
+                [0, 15, 30, 45],
+            )
+            self.assertEqual(
+                [indices[0] for indices in payload["world_target_frame_refs"][0][2]],
+                [15, 30, 45, 60],
+            )
+            torch.testing.assert_close(
+                payload["previous_action"][:, 1:],
+                payload["actions"][:, :-1, 14],
+                rtol=0.0,
+                atol=0.0,
+            )
+            torch.testing.assert_close(
+                payload["previous_action"][1, 0],
+                payload["actions"][0, 0, 14],
+                rtol=0.0,
+                atol=0.0,
+            )
+
+            from va_compound.longtraj_frames import LongTrajFramesDataset
+
+            LongTrajFramesDataset(output, longtraj_dir=root)
+
+    def test_peer_h15_p15_contract_rejects_p2_cadence(self):
+        with self.assertRaisesRegex(ValueError, "requires planning_stride=15"):
+            build.phase1(
+                15,
+                data_contract=build.PEER_SYNC_H15_P15_CONTRACT,
+                planning_stride=2,
+            )
+
     def test_legacy_contract_warns_or_fails_explicitly(self):
         n = 30
         ep = {

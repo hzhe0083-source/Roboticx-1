@@ -202,3 +202,162 @@ def test_sampler_state_rejects_world_size_change() -> None:
     )
     with pytest.raises(ValueError, match="world_size"):
         dual.load_state_dict(single.state_dict())
+
+
+def test_full_sampler_covers_all_10722_rows_once_with_even_ddp_tail() -> None:
+    n_rows = 10_722
+    instruction = torch.arange(n_rows) % 49
+    episode = torch.arange(n_rows) // 7
+    kwargs = dict(
+        instruction_id=instruction,
+        episode_id=episode,
+        task_weights=torch.ones(49),
+        batch_size=48,
+        seed=31,
+        block_batches=4,
+        sampling_mode="full",
+    )
+    global_sampler = TaskLocalityWeightedSampler(**kwargs)
+    rank0 = TaskLocalityWeightedSampler(**kwargs, rank=0, world_size=2)
+    rank1 = TaskLocalityWeightedSampler(**kwargs, rank=1, world_size=2)
+
+    full = list(global_sampler)
+    local0 = list(rank0)
+    local1 = list(rank1)
+    assert len(full) == len(local0) == len(local1) == 224
+    assert [len(batch) for batch in full[:-1]] == [48] * 223
+    assert len(full[-1]) == 18
+    assert len(local0[-1]) == len(local1[-1]) == 9
+    assert sum(map(len, local0)) == sum(map(len, local1)) == n_rows // 2
+    flattened = [index for batch in full for index in batch]
+    assert len(flattened) == n_rows
+    assert sorted(flattened) == list(range(n_rows))
+    flattened_tasks = [global_sampler.task_ids[index] for index in flattened]
+    task_runs = [
+        task
+        for offset, task in enumerate(flattened_tasks)
+        if offset == 0 or task != flattened_tasks[offset - 1]
+    ]
+    assert len(task_runs) == 49
+    assert sorted(task_runs) == list(range(49))
+    assert all(
+        len({global_sampler.task_ids[index] for index in batch}) <= 2
+        for batch in full
+    )
+    for left, right, parent in zip(local0, local1, full, strict=True):
+        assert len(left) == len(right)
+        assert set(left).isdisjoint(right)
+        assert sorted(left + right) == sorted(parent)
+
+
+def test_full_sampler_23_epoch_cursor_and_state_roundtrip() -> None:
+    n_rows = 10_722
+    sampler = TaskLocalityWeightedSampler(
+        instruction_id=torch.arange(n_rows) % 49,
+        episode_id=torch.arange(n_rows) // 7,
+        task_weights=torch.ones(49),
+        batch_size=48,
+        seed=37,
+        sampling_mode="full",
+        rank=1,
+        world_size=2,
+    )
+    steps_per_epoch = len(sampler)
+    assert steps_per_epoch == 224
+    sampler.advance(23 * steps_per_epoch - 1)
+    assert sampler.epoch == 22
+    assert sampler.batch_cursor == 223
+    assert [len(batch) for batch in sampler] == [9]
+
+    resumed = TaskLocalityWeightedSampler(
+        instruction_id=torch.arange(n_rows) % 49,
+        episode_id=torch.arange(n_rows) // 7,
+        task_weights=torch.ones(49),
+        batch_size=48,
+        seed=37,
+        sampling_mode="full",
+        rank=1,
+        world_size=2,
+    )
+    resumed.load_state_dict(sampler.state_dict())
+    assert resumed.state_dict()["sampler_contract_version"] == 3
+    assert resumed.state_dict()["full_schedule_contract"] == "task_contiguous_stream_v1"
+    assert list(resumed) == list(sampler)
+    resumed.advance()
+    assert resumed.epoch == 23
+    assert resumed.batch_cursor == 0
+
+
+def test_full_sampler_can_share_task_order_but_shuffle_rows_independently() -> None:
+    instruction = torch.repeat_interleave(torch.arange(4), 13)
+    episode = torch.arange(len(instruction)) // 3
+    kwargs = dict(
+        instruction_id=instruction,
+        episode_id=episode,
+        task_weights=torch.ones(4),
+        batch_size=8,
+        sampling_mode="full",
+        task_order_seed=17,
+    )
+    va = TaskLocalityWeightedSampler(**kwargs, seed=0)
+    world = TaskLocalityWeightedSampler(**kwargs, seed=1)
+
+    va_batches = list(va)
+    world_batches = list(world)
+    va_task_rows = [
+        [va.task_ids[index] for index in batch] for batch in va_batches
+    ]
+    world_task_rows = [
+        [world.task_ids[index] for index in batch] for batch in world_batches
+    ]
+    assert va_task_rows == world_task_rows
+    assert va_batches != world_batches
+
+    incompatible = TaskLocalityWeightedSampler(
+        **{**kwargs, "task_order_seed": 18}, seed=0
+    )
+    with pytest.raises(ValueError, match="task_order_seed"):
+        incompatible.load_state_dict(va.state_dict())
+
+
+def test_full_sampler_rejects_uneven_ddp_tail() -> None:
+    with pytest.raises(ValueError, match="divide evenly across world_size"):
+        TaskLocalityWeightedSampler(
+            instruction_id=torch.zeros(11, dtype=torch.long),
+            episode_id=torch.arange(11),
+            task_weights=torch.ones(1),
+            batch_size=8,
+            sampling_mode="full",
+            world_size=2,
+        )
+
+
+def test_full_sampler_even_tail_preserves_manual_ddp_mean_gradient() -> None:
+    n_rows = 10_722
+    kwargs = dict(
+        instruction_id=torch.arange(n_rows) % 49,
+        episode_id=torch.arange(n_rows) // 7,
+        task_weights=torch.ones(49),
+        batch_size=48,
+        seed=41,
+        sampling_mode="full",
+    )
+    global_tail = list(TaskLocalityWeightedSampler(**kwargs))[-1]
+    rank0_tail = list(
+        TaskLocalityWeightedSampler(**kwargs, rank=0, world_size=2)
+    )[-1]
+    rank1_tail = list(
+        TaskLocalityWeightedSampler(**kwargs, rank=1, world_size=2)
+    )[-1]
+    values = torch.linspace(-1.0, 1.0, n_rows)
+    global_parameter = torch.nn.Parameter(torch.tensor(0.75))
+    rank0_parameter = torch.nn.Parameter(global_parameter.detach().clone())
+    rank1_parameter = torch.nn.Parameter(global_parameter.detach().clone())
+
+    (global_parameter * values[global_tail]).square().mean().backward()
+    (rank0_parameter * values[rank0_tail]).square().mean().backward()
+    (rank1_parameter * values[rank1_tail]).square().mean().backward()
+
+    # manual_post_backward_grad_allreduce_v1 averages the two local gradients.
+    averaged = (rank0_parameter.grad + rank1_parameter.grad) / 2
+    torch.testing.assert_close(averaged, global_parameter.grad)

@@ -18,10 +18,15 @@ MANIFEST_CONTRACT = "wam4va_episode_holdout_manifest_v1"
 PEER_SYNC_H6_CONTRACT = "peer_sync_h6_world_windows_v1"
 PEER_SYNC_H6_P2_CONTRACT = "peer_sync_h6_p2_world_windows_v1"
 PEER_SYNC_H15_P2_CONTRACT = "peer_sync_h15_p2_world_windows_v1"
+PEER_SYNC_H15_P15_CONTRACT = "peer_sync_h15_p15_world_windows_v1"
+PEER_SYNC_H15_CONTRACTS = frozenset({
+    PEER_SYNC_H15_P2_CONTRACT,
+    PEER_SYNC_H15_P15_CONTRACT,
+})
 PEER_SYNC_H6_CONTRACTS = frozenset({
     PEER_SYNC_H6_CONTRACT,
     PEER_SYNC_H6_P2_CONTRACT,
-    PEER_SYNC_H15_P2_CONTRACT,
+    *PEER_SYNC_H15_CONTRACTS,
 })
 MANIFEST_VERSION = 1
 LEGACY_SHAPE = (4, 48, 4)
@@ -56,6 +61,7 @@ PEER_SYNC_H15_P2_TRANSITION_RULE = {
     "target_offset_steps": 15,
     "time_indices": "t=0..T-1",
 }
+PEER_SYNC_H15_P15_TRANSITION_RULE = dict(PEER_SYNC_H15_P2_TRANSITION_RULE)
 MANIFEST_HASH_CONTRACT = (
     "sha256(canonical compact UTF-8 JSON with sorted keys and "
     "manifest_id/manifest_sha256 omitted)"
@@ -68,6 +74,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-output", type=Path, required=True)
     parser.add_argument("--eval-output", type=Path, required=True)
     parser.add_argument("--manifest-output", type=Path, required=True)
+    parser.add_argument(
+        "--reuse-existing-eval",
+        action="store_true",
+        help=(
+            "keep --eval-output immutable and build the train split as the exact "
+            "episode-level complement of that existing eval payload"
+        ),
+    )
     parser.add_argument("--heldout-fraction", type=float, default=0.10)
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
@@ -102,7 +116,7 @@ def _payload_protocol(payload: dict) -> tuple[str, tuple[int, int, int], int]:
     if contract in PEER_SYNC_H6_CONTRACTS:
         if int(metadata.get("contract_version", -1)) != 1:
             raise ValueError(f"{contract} requires contract_version=1")
-        expected_horizon = 15 if contract == PEER_SYNC_H15_P2_CONTRACT else 6
+        expected_horizon = 15 if contract in PEER_SYNC_H15_CONTRACTS else 6
         if metadata.get("logged_action_chunk") != f"full_h{expected_horizon}":
             raise ValueError(
                 f"{contract} requires full logged H{expected_horizon} chunk"
@@ -110,20 +124,29 @@ def _payload_protocol(payload: dict) -> tuple[str, tuple[int, int, int], int]:
         for key in ("parent_identity", "source_identities", "output_identity"):
             if not metadata.get(key):
                 raise ValueError(f"{contract} requires metadata.{key}")
-        if contract in {PEER_SYNC_H6_P2_CONTRACT, PEER_SYNC_H15_P2_CONTRACT}:
+        if contract in {
+            PEER_SYNC_H6_P2_CONTRACT,
+            PEER_SYNC_H15_P2_CONTRACT,
+            PEER_SYNC_H15_P15_CONTRACT,
+        }:
+            planning_stride = 15 if contract == PEER_SYNC_H15_P15_CONTRACT else 2
             required = {
                 "fps": 80,
-                "planning_stride": 2,
-                "control_stride": 2,
+                "planning_stride": planning_stride,
+                "control_stride": planning_stride,
                 "sequence_length": 4,
-                "decision_offsets": [0, 2, 4, 6],
+                "decision_offsets": [
+                    index * planning_stride for index in range(4)
+                ],
                 "action_horizon": expected_horizon,
                 "action_label_offsets": list(range(expected_horizon)),
             }
-            if contract == PEER_SYNC_H15_P2_CONTRACT:
+            if contract in PEER_SYNC_H15_CONTRACTS:
                 required.update(
                     world_target_horizon=15,
-                    world_target_offsets=[15, 17, 19, 21],
+                    world_target_offsets=[
+                        15 + index * planning_stride for index in range(4)
+                    ],
                 )
             for key, expected in required.items():
                 if metadata.get(key) != expected:
@@ -170,7 +193,7 @@ def _validate_payload(payload: dict) -> tuple[Tensor, Tensor, Tensor, Tensor]:
             f"{label} split requires exact T{expected_shape[0]}/H{expected_shape[1]}/"
             f"A{expected_shape[2]}, got T{sequence}/H{horizon}/A{action_dim}"
         )
-    if protocol == PEER_SYNC_H15_P2_CONTRACT:
+    if protocol in PEER_SYNC_H15_CONTRACTS:
         target_valid = payload.get("world_target_valid_mask")
         target_refs = payload.get("world_target_frame_refs")
         if (
@@ -181,6 +204,18 @@ def _validate_payload(payload: dict) -> tuple[Tensor, Tensor, Tensor, Tensor]:
             raise ValueError("H15 world_target_valid_mask must be bool [N,T]")
         if not isinstance(target_refs, (list, tuple)) or len(target_refs) != n:
             raise ValueError("H15 requires one world_target_frame_ref per window")
+        if protocol == PEER_SYNC_H15_P15_CONTRACT:
+            previous_action = payload.get("previous_action")
+            if (
+                not isinstance(previous_action, Tensor)
+                or tuple(previous_action.shape) != (n, sequence, action_dim)
+            ):
+                raise ValueError("H15/P15 requires previous_action [N,T,A]")
+            if not torch.equal(previous_action[:, 1:], actions[:, :-1, 14]):
+                raise ValueError(
+                    "H15/P15 requires next previous_action to equal prior "
+                    "segment token14"
+                )
     for name, value in (("instruction_id", task), ("episode_id", episode)):
         if (
             not isinstance(value, Tensor)
@@ -495,14 +530,14 @@ def _build_manifest(
                         "action_label_offsets",
                         *(
                             ("world_target_horizon", "world_target_offsets")
-                            if data_protocol == PEER_SYNC_H15_P2_CONTRACT
+                            if data_protocol in PEER_SYNC_H15_CONTRACTS
                             else ()
                         ),
                     )
                 }
                 if data_protocol in {
                     PEER_SYNC_H6_P2_CONTRACT,
-                    PEER_SYNC_H15_P2_CONTRACT,
+                    *PEER_SYNC_H15_CONTRACTS,
                 }
                 else {}
             ),
@@ -530,7 +565,9 @@ def _build_manifest(
             "seed": int(seed),
         },
         "transition_rule": dict(
-            PEER_SYNC_H15_P2_TRANSITION_RULE
+            PEER_SYNC_H15_P15_TRANSITION_RULE
+            if data_protocol == PEER_SYNC_H15_P15_CONTRACT
+            else PEER_SYNC_H15_P2_TRANSITION_RULE
             if data_protocol == PEER_SYNC_H15_P2_CONTRACT
             else PEER_SYNC_H6_P2_TRANSITION_RULE
             if data_protocol == PEER_SYNC_H6_P2_CONTRACT
@@ -720,16 +757,215 @@ def build_split_artifacts(
     return manifest
 
 
+def build_complement_artifacts(
+    input_path: Path,
+    existing_eval_path: Path,
+    train_output: Path,
+    manifest_output: Path,
+) -> dict:
+    """Build ``SOURCE - existing eval episodes`` without rewriting eval.
+
+    This is used when an elected episode-level eval artifact must remain frozen
+    while both training objectives need the exhaustive complement.  The
+    existing eval rows must be an exact, complete episode subset of ``input``.
+    """
+
+    input_path = input_path.expanduser().resolve(strict=True)
+    existing_eval_path = existing_eval_path.expanduser().resolve(strict=True)
+    train_output = train_output.expanduser().resolve(strict=False)
+    manifest_output = manifest_output.expanduser().resolve(strict=False)
+    protected = {input_path, existing_eval_path}
+    if train_output in protected or manifest_output in protected:
+        raise ValueError("full-train/manifest outputs cannot replace source or eval")
+    if train_output == manifest_output:
+        raise ValueError("full-train and manifest outputs must be distinct")
+
+    source_before = input_path.stat()
+    eval_before = existing_eval_path.stat()
+    source_sha256 = sha256_file(input_path)
+    eval_sha256 = sha256_file(existing_eval_path)
+    payload = torch.load(input_path, map_location="cpu", weights_only=True)
+    eval_payload = torch.load(
+        existing_eval_path, map_location="cpu", weights_only=True
+    )
+    source_after = input_path.stat()
+    eval_after = existing_eval_path.stat()
+    if (source_before.st_size, source_before.st_mtime_ns) != (
+        source_after.st_size,
+        source_after.st_mtime_ns,
+    ):
+        raise RuntimeError(f"source changed while reading: {input_path}")
+    if (eval_before.st_size, eval_before.st_mtime_ns) != (
+        eval_after.st_size,
+        eval_after.st_mtime_ns,
+    ):
+        raise RuntimeError(f"eval changed while reading: {existing_eval_path}")
+
+    task, episode, _, _ = _validate_payload(payload)
+    eval_task, eval_episode, _, _ = _validate_payload(eval_payload)
+    if _payload_protocol(payload) != _payload_protocol(eval_payload):
+        raise ValueError("source and existing eval use different data protocols")
+
+    eval_episode_ids = {int(value) for value in eval_episode.tolist()}
+    if not eval_episode_ids:
+        raise ValueError("existing eval has no episodes")
+    source_episode_ids = {int(value) for value in episode.tolist()}
+    missing_episodes = sorted(eval_episode_ids - source_episode_ids)
+    if missing_episodes:
+        raise ValueError(
+            "existing eval episodes are absent from source: "
+            f"{missing_episodes[:12]}"
+        )
+    eval_indices = torch.tensor(
+        [
+            index
+            for index, episode_id in enumerate(episode.tolist())
+            if int(episode_id) in eval_episode_ids
+        ],
+        dtype=torch.long,
+    )
+    eval_index_set = set(eval_indices.tolist())
+    train_indices = torch.tensor(
+        [index for index in range(len(task)) if index not in eval_index_set],
+        dtype=torch.long,
+    )
+    if len(eval_indices) != len(eval_task):
+        raise ValueError(
+            "existing eval does not contain every source row from its episodes: "
+            f"source subset={len(eval_indices)}, eval={len(eval_task)}"
+        )
+
+    total = len(task)
+    for key, value in payload.items():
+        if key == "metadata":
+            continue
+        if isinstance(value, Tensor) and value.ndim > 0 and value.shape[0] == total:
+            candidate = eval_payload.get(key)
+            expected = value.index_select(0, eval_indices)
+            if not isinstance(candidate, Tensor) or not torch.equal(expected, candidate):
+                raise ValueError(f"existing eval rows differ from source on tensor {key}")
+        elif isinstance(value, (list, tuple)) and len(value) == total:
+            candidate = eval_payload.get(key)
+            expected = [value[int(index)] for index in eval_indices]
+            actual = list(candidate) if isinstance(candidate, (list, tuple)) else None
+            if actual != expected:
+                raise ValueError(f"existing eval rows differ from source on sequence {key}")
+
+    groups: dict[int, set[int]] = {}
+    episode_owner: dict[int, int] = {}
+    for task_id, episode_id in zip(task.tolist(), episode.tolist(), strict=True):
+        task_id, episode_id = int(task_id), int(episode_id)
+        owner = episode_owner.setdefault(episode_id, task_id)
+        if owner != task_id:
+            raise ValueError(
+                f"episode_id={episode_id} belongs to multiple tasks: {owner}, {task_id}"
+            )
+        groups.setdefault(task_id, set()).add(episode_id)
+    eval_episodes_by_task = {
+        task_id: sorted(episodes & eval_episode_ids)
+        for task_id, episodes in sorted(groups.items())
+    }
+    train_episodes_by_task = {
+        task_id: sorted(episodes - eval_episode_ids)
+        for task_id, episodes in sorted(groups.items())
+    }
+    if any(not episodes for episodes in eval_episodes_by_task.values()):
+        raise ValueError("existing eval must retain at least one episode for every task")
+    if any(not episodes for episodes in train_episodes_by_task.values()):
+        raise ValueError("full train must retain at least one episode for every task")
+    plan = {
+        "train_indices": train_indices,
+        "eval_indices": eval_indices,
+        "train_episodes_by_task": train_episodes_by_task,
+        "eval_episodes_by_task": eval_episodes_by_task,
+        "all_episodes_by_task": {
+            task_id: sorted(episodes) for task_id, episodes in sorted(groups.items())
+        },
+    }
+    source = {
+        "path": str(input_path),
+        "sha256": source_sha256,
+        "size_bytes": int(source_after.st_size),
+    }
+    heldout_fraction = len(eval_episode_ids) / len(source_episode_ids)
+    manifest = _build_manifest(
+        payload,
+        source,
+        plan,
+        train_output=train_output,
+        eval_output=existing_eval_path,
+        manifest_output=manifest_output,
+        heldout_fraction=heldout_fraction,
+        seed=0,
+    )
+    eval_metadata = eval_payload.get("metadata") or {}
+    manifest["selection"] = {
+        "unit": "episode_id",
+        "stratify_by": "instruction_id",
+        "rule": "exact_existing_eval_episode_complement_v1",
+        "heldout_fraction": heldout_fraction,
+        "existing_eval_path": str(existing_eval_path),
+        "existing_eval_sha256": eval_sha256,
+        "existing_eval_manifest_id": eval_metadata.get("split_manifest_id"),
+        "existing_eval_manifest_sha256": eval_metadata.get("split_manifest_sha256"),
+    }
+    manifest["validation"]["existing_eval_payload_reused"] = True
+    manifest.pop("manifest_id", None)
+    manifest.pop("manifest_sha256", None)
+    digest = canonical_manifest_sha256(manifest)
+    manifest["manifest_id"] = f"wam4va-episode-holdout-v1-{digest[:16]}"
+    manifest["manifest_sha256"] = digest
+    train_payload = _subset_payload(
+        payload,
+        train_indices,
+        split_name="train",
+        manifest=manifest,
+    )
+
+    train_target, train_temporary = _target_and_temp(train_output)
+    manifest_target, manifest_temporary = _target_and_temp(manifest_output)
+    for target, temporary in (
+        (train_target, train_temporary),
+        (manifest_target, manifest_temporary),
+    ):
+        if target.exists():
+            raise FileExistsError(f"refusing to overwrite existing output: {target}")
+        if temporary.exists():
+            raise FileExistsError(f"stale temporary output exists: {temporary}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        torch.save(train_payload, train_temporary)
+        manifest_temporary.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        train_temporary.replace(train_target)
+        manifest_temporary.replace(manifest_target)
+    finally:
+        for temporary in (train_temporary, manifest_temporary):
+            if temporary.exists():
+                temporary.unlink()
+    return manifest
+
+
 def main() -> None:
     args = parse_args()
-    manifest = build_split_artifacts(
-        args.input,
-        args.train_output,
-        args.eval_output,
-        args.manifest_output,
-        heldout_fraction=args.heldout_fraction,
-        seed=args.seed,
-    )
+    if args.reuse_existing_eval:
+        manifest = build_complement_artifacts(
+            args.input,
+            args.eval_output,
+            args.train_output,
+            args.manifest_output,
+        )
+    else:
+        manifest = build_split_artifacts(
+            args.input,
+            args.train_output,
+            args.eval_output,
+            args.manifest_output,
+            heldout_fraction=args.heldout_fraction,
+            seed=args.seed,
+        )
     print(
         f"split {manifest['manifest_id']}: "
         f"train={manifest['splits']['train']['windows']} windows, "

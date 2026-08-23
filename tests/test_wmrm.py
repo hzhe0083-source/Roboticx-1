@@ -463,6 +463,114 @@ def test_language_keys_condition_world_transition_without_writing_va() -> None:
     assert not torch.equal(aux_a.task_summary, aux_b.task_summary)
 
 
+def test_full_language_world_reads_tokens_directly_and_masks_padding() -> None:
+    torch.manual_seed(19)
+    block = WAM4VA(
+        32,
+        language_dim=24,
+        world_dim=8,
+        proprio_dim=9,
+        num_heads=4,
+    ).eval()
+    assert block.task_queries is None
+    assert block.task_attention is None
+    assert block.language_read is not None
+
+    action = torch.randn(2, 5, 32)
+    vision = torch.randn(2, 6, 32)
+    proprio = torch.randn(2, 9)
+    valid = torch.randn(2, 3, 24)
+    padded = torch.cat((valid, torch.randn(2, 4, 24) * 100.0), dim=1)
+    valid_mask = torch.ones(2, 3, dtype=torch.bool)
+    padded_mask = torch.tensor(
+        [[1, 1, 1, 0, 0, 0, 0], [1, 1, 1, 0, 0, 0, 0]],
+        dtype=torch.bool,
+    )
+
+    with torch.no_grad():
+        short = block.propose(
+            action,
+            vision,
+            proprio,
+            language_tokens=valid,
+            language_mask=valid_mask,
+        )
+        long = block.propose(
+            action,
+            vision,
+            proprio,
+            language_tokens=padded,
+            language_mask=padded_mask,
+        )
+
+    torch.testing.assert_close(short.aux.task_summary, long.aux.task_summary)
+    torch.testing.assert_close(short.aux.predict_belief, long.aux.predict_belief)
+    torch.testing.assert_close(short.aux.progress, long.aux.progress)
+
+
+def test_full_language_world_rejects_missing_or_empty_mask() -> None:
+    block = WAM4VA(
+        32,
+        language_dim=24,
+        world_dim=8,
+        proprio_dim=9,
+        num_heads=4,
+    ).eval()
+    action = torch.randn(2, 5, 32)
+    vision = torch.randn(2, 6, 32)
+    proprio = torch.randn(2, 9)
+    language = torch.randn(2, 3, 24)
+
+    with pytest.raises(ValueError, match="language_mask"):
+        block.propose(
+            action,
+            vision,
+            proprio,
+            language_tokens=language,
+        )
+    with pytest.raises(ValueError, match="valid token"):
+        block.propose(
+            action,
+            vision,
+            proprio,
+            language_tokens=language,
+            language_mask=torch.zeros(2, 3, dtype=torch.bool),
+        )
+
+
+def test_full_language_world_can_skip_only_mask_content_check() -> None:
+    block = WAM4VA(
+        32,
+        language_dim=24,
+        world_dim=8,
+        proprio_dim=9,
+        num_heads=4,
+        runtime_integrity_checks=False,
+    ).eval()
+    action = torch.randn(2, 5, 32)
+    vision = torch.randn(2, 6, 32)
+    proprio = torch.randn(2, 9)
+    language = torch.randn(2, 3, 24)
+
+    with torch.no_grad():
+        proposal = block.propose(
+            action,
+            vision,
+            proprio,
+            language_tokens=language,
+            language_mask=torch.zeros(2, 3, dtype=torch.bool),
+        )
+    assert proposal.aux.task_summary.shape == (2, 32)
+    with pytest.raises(ValueError, match="matching"):
+        block.propose(
+            action,
+            vision,
+            proprio,
+            language_tokens=language,
+            language_mask=torch.zeros(2, 2, dtype=torch.bool),
+        )
+
+
 def test_span_ids_cover_horizon_when_not_divisible() -> None:
     block = WAM4VA(
         32, world_dim=8, proprio_dim=9, n_spans=3, cycle_steps=8

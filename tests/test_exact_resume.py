@@ -23,6 +23,7 @@ from train import (
     PEER_DATA_ISOLATION_CONTRACT,
     PEER_DUAL_STREAM_OPTIMIZER_CONTRACT,
     PEER_GRADIENT_BOUNDARY_CONTRACT,
+    PEER_H15_P2_TO_P15_TEMPORAL_MIGRATION,
     PEER_H15_PREFIX_TAIL_FLOW_CONTRACT,
     PEER_HIGH_FREQUENCY_CONTRACT,
     PEER_READOUT_V2_HIGH_FREQUENCY_CONTRACT,
@@ -45,6 +46,7 @@ from train import (
     validate_args,
     validate_finite_update_scalars,
     validate_optimizer_update_state,
+    validate_preclip_gradient_norms,
     validate_update_gradients,
     final_checkpoint_save_due,
     parse_args,
@@ -387,6 +389,25 @@ def test_gradient_threshold_applies_only_to_aggregate_norm() -> None:
     assert validate_update_gradients([("parameter", parameter)], max_norm=3.0) == 2.0
     with pytest.raises(FloatingPointError, match="aggregate_norm"):
         validate_update_gradients([("parameter", parameter)], max_norm=1.0)
+
+
+def test_gradient_threshold_uses_clip_returned_preclip_group_norms() -> None:
+    first = nn.Parameter(torch.tensor([0.0]))
+    second = nn.Parameter(torch.tensor([0.0]))
+    first.grad = torch.tensor([3.0])
+    second.grad = torch.tensor([4.0])
+    first_preclip = clip_update_gradients([("first", first)], max_norm=1.0)
+    second_preclip = clip_update_gradients([("second", second)], max_norm=1.0)
+
+    assert validate_preclip_gradient_norms(
+        first_preclip, second_preclip, max_norm=6.0
+    ) == pytest.approx(5.0)
+    with pytest.raises(FloatingPointError, match="aggregate_norm"):
+        validate_preclip_gradient_norms(
+            first_preclip, second_preclip, max_norm=4.5
+        )
+    assert first.grad.norm().item() == pytest.approx(1.0)
+    assert second.grad.norm().item() == pytest.approx(1.0)
 
 
 def test_optimizer_guard_rejects_nan_lr_and_nonfinite_state() -> None:
@@ -1316,6 +1337,41 @@ def test_weights_only_allows_only_named_peer_semantic_migrations() -> None:
         )
         is None
     )
+
+    p15_record = validate_peer_resume_weights_contract(
+        current,
+        planning_stride=15,
+        migrating_p2_to_p15=True,
+        action_horizon=15,
+        world_horizon=15,
+        deployment_execution_horizon=15,
+        peer_flow_topology=PEER_H15_PREFIX_TAIL_FLOW_CONTRACT,
+        assembly_metric_role_contract=ASSEMBLY_METRIC_ROLE_CONTRACT,
+    )
+    assert p15_record is not None
+    assert p15_record["migrations"] == [
+        {
+            "kind": PEER_H15_P2_TO_P15_TEMPORAL_MIGRATION,
+            "source_planning_stride": 2,
+            "source_decision_offsets": [0, 2, 4, 6],
+            "source_world_target_offsets": [15, 17, 19, 21],
+            "target_planning_stride": 15,
+            "target_decision_offsets": [0, 15, 30, 45],
+            "target_world_target_offsets": [15, 30, 45, 60],
+            "target_previous_action": "prior_p15_segment_token14",
+        }
+    ]
+    with pytest.raises(ValueError, match="requires H15/P15"):
+        validate_peer_resume_weights_contract(
+            current,
+            planning_stride=2,
+            migrating_p2_to_p15=True,
+            action_horizon=15,
+            world_horizon=15,
+            deployment_execution_horizon=15,
+            peer_flow_topology=PEER_H15_PREFIX_TAIL_FLOW_CONTRACT,
+            assembly_metric_role_contract=ASSEMBLY_METRIC_ROLE_CONTRACT,
+        )
 
     legacy = copy.deepcopy(current)
     legacy["peer_high_frequency_contract"] = (

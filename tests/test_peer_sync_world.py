@@ -156,6 +156,25 @@ def test_executable_action_readout_is_deterministic_and_bounded() -> None:
         ExecutableActionReadout(hidden_dim=16, action_dim=4, horizon=0)
 
 
+def test_executable_action_readout_runtime_checks_default_on_and_can_skip() -> None:
+    action = torch.zeros(2, 6, 16)
+    action[0, 0, 0] = float("nan")
+    with pytest.raises(FloatingPointError, match="readout input"):
+        ExecutableActionReadout(16, action_dim=4)(action)
+
+    unchecked = ExecutableActionReadout(
+        16,
+        action_dim=4,
+        runtime_integrity_checks=False,
+    )
+    with mock.patch(
+        "va_compound.world.wmrm._require_finite",
+        side_effect=AssertionError("finite check entered"),
+    ):
+        output = unchecked(action)
+    assert torch.isnan(output).any()
+
+
 @pytest.mark.parametrize("planning_stride", [1, 2, 3, 6])
 def test_peer_planning_stride_matches_world_cycle(planning_stride: int) -> None:
     config = _peer_config(
@@ -181,6 +200,18 @@ def test_peer_allows_world_horizon_longer_than_execution_prefix() -> None:
         action_horizon=15, planning_stride=2, wmrm_cycle_steps=15
     )
     assert config.planning_stride == 2
+    assert config.wmrm_cycle_steps == config.action_horizon == 15
+
+
+def test_peer_supports_true_h15_p15_replanning() -> None:
+    config = _peer_config(
+        action_horizon=15,
+        planning_stride=15,
+        deployment_execution_horizon=15,
+        wmrm_cycle_steps=15,
+    )
+    assert config.planning_stride == 15
+    assert config.deployment_execution_horizon == 15
     assert config.wmrm_cycle_steps == config.action_horizon == 15
 
 
@@ -232,6 +263,108 @@ def test_peer_world_is_one_stage_shorter_and_last_va_consumes_final_map() -> Non
     assert proposes == [0, 1]
     assert last_state[0] is not None
     torch.testing.assert_close(last_state[0], messages[-1], rtol=0.0, atol=0.0)
+
+
+def test_full_language_tokens_and_mask_reach_every_world_stage_read_only() -> None:
+    model = VACompoundPolicy(
+        _peer_config(num_layers=3, wmrm_full_language_tokens=True)
+    ).eval()
+    vision, proprio, previous, language, mask = _policy_inputs(model.config)
+    cache = model.build_language_cache(language, mask)
+    before_tokens = cache.tokens.clone()
+    before_mask = cache.attention_mask.clone()
+    calls: list[dict] = []
+    original = model.wmrm.propose
+
+    def record(*args, **kwargs):
+        calls.append(kwargs.copy())
+        return original(*args, **kwargs)
+
+    with mock.patch.object(model.wmrm, "propose", side_effect=record), torch.no_grad():
+        _, memory = model.encode_condition(
+            vision,
+            proprio,
+            previous,
+            language_cache=cache,
+            return_visual_memory=True,
+        )
+
+    assert len(calls) == model.config.wmrm_stage_count()
+    for call in calls:
+        assert call["language_keys"] is None
+        assert call["language_tokens"] is cache.tokens
+        assert call["language_mask"] is cache.attention_mask
+        assert call["language_tokens"].shape == language.shape
+        assert call["language_mask"].shape == mask.shape
+    torch.testing.assert_close(cache.tokens, before_tokens, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(cache.attention_mask, before_mask, rtol=0.0, atol=0.0)
+    assert set(vars(memory.world_state)) == {"belief", "innovation", "world_map"}
+
+
+def test_full_language_padding_is_invisible_to_va_and_world() -> None:
+    model = VACompoundPolicy(
+        _peer_config(wmrm_full_language_tokens=True)
+    ).eval()
+    vision, proprio, previous, language, _ = _policy_inputs(model.config)
+    valid = language[:, :3]
+    short_mask = torch.ones(valid.shape[:2], dtype=torch.bool)
+    padded = torch.cat((valid, torch.randn(2, 4, model.config.language_dim) * 100.0), dim=1)
+    padded_mask = torch.cat(
+        (short_mask, torch.zeros(2, 4, dtype=torch.bool)), dim=1
+    )
+
+    with torch.no_grad():
+        short_condition = model.encode_condition(
+            vision,
+            proprio,
+            previous,
+            language_hidden=valid,
+            language_mask=short_mask,
+        )
+        short_summaries = [aux.task_summary.clone() for aux in model.last_wmrm_auxes]
+        padded_condition = model.encode_condition(
+            vision,
+            proprio,
+            previous,
+            language_hidden=padded,
+            language_mask=padded_mask,
+        )
+        padded_summaries = [aux.task_summary.clone() for aux in model.last_wmrm_auxes]
+
+    torch.testing.assert_close(short_condition, padded_condition)
+    assert len(short_summaries) == len(padded_summaries)
+    for short, long in zip(short_summaries, padded_summaries, strict=True):
+        torch.testing.assert_close(short, long)
+
+
+def test_slot_free_policy_rejects_fixed_metric_inputs() -> None:
+    model = VACompoundPolicy(
+        _peer_config(
+            wmrm_full_language_tokens=True,
+            slot_free_policy=True,
+        )
+    ).eval()
+    assert model.geometry_projection is None
+    vision, proprio, previous, language, mask = _policy_inputs(model.config)
+
+    with pytest.raises(ValueError, match="slot_free_policy"):
+        model.encode_condition(
+            vision,
+            proprio,
+            previous,
+            language_hidden=language,
+            language_mask=mask,
+            metric_g=torch.zeros(2, 8),
+        )
+    with pytest.raises(ValueError, match="slot_free_policy"):
+        model.encode_condition(
+            vision,
+            proprio,
+            previous,
+            language_hidden=language,
+            language_mask=mask,
+            metric_tokens=torch.zeros(2, 2, model.config.hidden_dim),
+        )
 
 
 def test_causal_h6_readout_sends_only_executed_prefix_to_world() -> None:
@@ -792,6 +925,88 @@ def test_nonfinite_world_message_is_rejected_before_next_layer() -> None:
             language_mask=mask,
         )
     assert calls == 1
+
+
+def test_disabled_runtime_checks_skip_world_stage_finite_validation() -> None:
+    model = VACompoundPolicy(
+        _peer_config(runtime_integrity_checks=False)
+    ).eval()
+    vision, proprio, previous, language, mask = _policy_inputs(model.config)
+    original = model.wmrm.propose
+
+    def inject_nonfinite(*args, **kwargs):
+        transition = original(*args, **kwargs)
+        message = transition.world_message.clone()
+        message[0, 0, 0] = float("nan")
+        return replace(transition, world_message=message)
+
+    with mock.patch.object(
+        model.wmrm, "propose", side_effect=inject_nonfinite
+    ), mock.patch.object(
+        WAMProposal,
+        "validate_finite",
+        side_effect=AssertionError("stage finite check entered"),
+    ), torch.no_grad():
+        condition = model.encode_condition(
+            vision,
+            proprio,
+            previous,
+            language_hidden=language,
+            language_mask=mask,
+        )
+    # The injected message can be the final published World state and therefore
+    # need not feed back into this call's action condition.  Reaching this point
+    # while ``validate_finite`` is patched to raise is the contract under test.
+    assert condition.shape == (
+        vision.shape[0],
+        model.config.action_horizon,
+        model.config.hidden_dim,
+    )
+
+
+def test_runtime_checks_toggle_preserves_finite_output_and_gradients() -> None:
+    checked = VACompoundPolicy(
+        _peer_config(wmrm_full_language_tokens=True)
+    ).eval()
+    unchecked = VACompoundPolicy(
+        _peer_config(
+            wmrm_full_language_tokens=True,
+            runtime_integrity_checks=False,
+        )
+    ).eval()
+    unchecked.load_state_dict(checked.state_dict(), strict=True)
+    inputs = _policy_inputs(checked.config)
+
+    def run(model):
+        model.zero_grad(set_to_none=True)
+        condition = model.encode_condition(
+            inputs[0],
+            inputs[1],
+            inputs[2],
+            language_hidden=inputs[3],
+            language_mask=inputs[4],
+        )
+        condition.square().mean().backward()
+        gradients = {
+            name: parameter.grad.detach().clone()
+            for name, parameter in model.named_parameters()
+            if parameter.grad is not None
+        }
+        return condition.detach(), gradients
+
+    checked_output, checked_gradients = run(checked)
+    unchecked_output, unchecked_gradients = run(unchecked)
+    torch.testing.assert_close(
+        checked_output, unchecked_output, rtol=0.0, atol=0.0
+    )
+    assert checked_gradients.keys() == unchecked_gradients.keys()
+    for name in checked_gradients:
+        torch.testing.assert_close(
+            checked_gradients[name],
+            unchecked_gradients[name],
+            rtol=0.0,
+            atol=0.0,
+        )
 
 
 def test_visual_memory_world_state_detach_to_index_and_episode_reset() -> None:

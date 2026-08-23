@@ -10,9 +10,12 @@ import torch
 from scripts.split_wam4va_episode_holdout import (
     PEER_SYNC_H15_P2_CONTRACT,
     PEER_SYNC_H15_P2_TRANSITION_RULE,
+    PEER_SYNC_H15_P15_CONTRACT,
+    PEER_SYNC_H15_P15_TRANSITION_RULE,
     PEER_SYNC_H6_P2_CONTRACT,
     PEER_SYNC_H6_P2_TRANSITION_RULE,
     TRANSITION_RULE,
+    build_complement_artifacts,
     build_split_artifacts,
     build_split_plan,
     canonical_manifest_sha256,
@@ -113,6 +116,20 @@ def _peer_h15_p2_payload() -> dict:
             "action_label_offsets": list(range(15)),
             "world_target_horizon": 15,
             "world_target_offsets": [15, 17, 19, 21],
+        }
+    )
+    return payload
+
+
+def _peer_h15_p15_payload() -> dict:
+    payload = _peer_h15_p2_payload()
+    payload["metadata"].update(
+        {
+            "contract": PEER_SYNC_H15_P15_CONTRACT,
+            "planning_stride": 15,
+            "control_stride": 15,
+            "decision_offsets": [0, 15, 30, 45],
+            "world_target_offsets": [15, 30, 45, 60],
         }
     )
     return payload
@@ -240,6 +257,54 @@ def test_builds_task_stratified_split_and_shared_manifest(tmp_path) -> None:
         "assembly-v3",
         "door-unlock-v3",
     ]
+
+
+def test_builds_full_train_as_exact_existing_eval_complement(tmp_path) -> None:
+    source = tmp_path / "source.pt"
+    staged_train = tmp_path / "staged_train.pt"
+    elected_eval = tmp_path / "elected_eval.pt"
+    staged_manifest = tmp_path / "staged_split.json"
+    full_train_path = tmp_path / "full_train.pt"
+    full_manifest_path = tmp_path / "full_split.json"
+    torch.save(_peer_h15_p15_payload(), source)
+    build_split_artifacts(
+        source,
+        staged_train,
+        elected_eval,
+        staged_manifest,
+        heldout_fraction=0.50,
+        seed=7,
+    )
+    eval_sha = hashlib.sha256(elected_eval.read_bytes()).hexdigest()
+
+    returned = build_complement_artifacts(
+        source,
+        elected_eval,
+        full_train_path,
+        full_manifest_path,
+    )
+    full_train = torch.load(full_train_path, map_location="cpu", weights_only=True)
+    elected = torch.load(elected_eval, map_location="cpu", weights_only=True)
+    manifest = json.loads(full_manifest_path.read_text(encoding="utf-8"))
+
+    assert returned == manifest
+    assert hashlib.sha256(elected_eval.read_bytes()).hexdigest() == eval_sha
+    assert canonical_manifest_sha256(manifest) == manifest["manifest_sha256"]
+    assert manifest["selection"]["rule"] == "exact_existing_eval_episode_complement_v1"
+    assert manifest["selection"]["existing_eval_sha256"] == eval_sha
+    assert len(full_train["actions"]) + len(elected["actions"]) == 40
+    assert set(full_train["episode_id"].tolist()).isdisjoint(
+        elected["episode_id"].tolist()
+    )
+    assert full_train["metadata"]["split_contract"] == manifest
+    assert full_train["metadata"]["split_name"] == "train"
+    validate_visual_world_training_split(
+        full_train,
+        full_train_path,
+        full_manifest_path,
+        va_world_mode="peer_sync_h6",
+        planning_stride=15,
+    )
 
 
 def test_visual_world_split_validator_accepts_and_binds_all49_tasks(
@@ -466,6 +531,31 @@ def test_peer_h15_split_preserves_explicit_endpoint_contract(tmp_path) -> None:
     assert manifest["source"]["mask_stats"]["transition"]["true"] == (
         len(payload["actions"]) * 4 - 1
     )
+
+
+def test_peer_h15_p15_split_preserves_temporal_contract(tmp_path) -> None:
+    source = tmp_path / "peer_h15_p15_source.pt"
+    train_path = tmp_path / "peer_h15_p15_train.pt"
+    eval_path = tmp_path / "peer_h15_p15_eval.pt"
+    manifest_path = tmp_path / "peer_h15_p15_split.json"
+    payload = _peer_h15_p15_payload()
+    torch.save(payload, source)
+
+    manifest = build_split_artifacts(
+        source, train_path, eval_path, manifest_path
+    )
+    assert manifest["data_protocol"]["contract"] == PEER_SYNC_H15_P15_CONTRACT
+    assert manifest["data_protocol"]["planning_stride"] == 15
+    assert manifest["data_protocol"]["decision_offsets"] == [0, 15, 30, 45]
+    assert manifest["data_protocol"]["world_target_offsets"] == [15, 30, 45, 60]
+    assert manifest["transition_rule"] == PEER_SYNC_H15_P15_TRANSITION_RULE
+
+
+def test_peer_h15_p15_split_rejects_stale_previous_action() -> None:
+    payload = _peer_h15_p15_payload()
+    payload["actions"][:, 0, 14] = 1.0
+    with pytest.raises(ValueError, match="previous_action.*token14"):
+        build_split_plan(payload)
 
 
 def test_legacy_split_rejects_non_h48_and_peer_requires_complete_identity() -> None:

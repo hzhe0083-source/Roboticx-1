@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
@@ -72,6 +72,7 @@ from va_compound.world_contract import (
     PEER_DATA_ISOLATION_CONTRACT,
     PEER_DUAL_STREAM_OPTIMIZER_CONTRACT,
     PEER_GRADIENT_BOUNDARY_CONTRACT,
+    PEER_H15_P2_TO_P15_TEMPORAL_MIGRATION,
     PEER_H15_PREFIX_TAIL_FLOW_CONTRACT,
     PEER_H15_PREFIX_TAIL_FLOW_MIGRATION,
     PEER_HIGH_FREQUENCY_CONTRACT,
@@ -80,6 +81,7 @@ from va_compound.world_contract import (
     PEER_PLANNING_STRIDES,
     PEER_READOUT_V2_HIGH_FREQUENCY_CONTRACT,
     PEER_READOUT_V2_TO_V3_WEIGHTS_MIGRATION,
+    PEER_SHARED_FULL_DATA_CONTRACT,
     PEER_WORLD_ACTION_SOURCE_CONTRACT,
     PEER_WORLD_READOUT_CONTRACT,
     PEER_WORLD_READOUT_V2_CONTRACT,
@@ -998,9 +1000,12 @@ class TaskWeightedSampler(Sampler[list[int]]):
 class TaskLocalityWeightedSampler(Sampler[list[int]]):
     """有限、可恢复的任务局部性采样器，且在任务块内按 episode 均衡。
 
-    每个 epoch 严格产生 ``N // batch_size`` 个 batch；每个抽样块含至多
-    ``block_batches`` 个同任务 batch（为保持真实权重，相邻同任务块可连续），
-    在 JPEG 解码局部性与跨任务曝光之间取折中。
+    ``weighted`` / ``balanced`` 每个 epoch 严格产生 ``N // batch_size`` 个
+    batch；``full`` 则产生 ``ceil(N / batch_size)`` 个 batch，并让每一行
+    恰好出现一次。weighted/balanced 抽样块含至多 ``block_batches`` 个同任务
+    batch，在 JPEG 解码局部性与跨任务曝光之间取折中。``full`` 不拆任务块：
+    随机任务顺序后把一个任务的全部行连续铺平，再按 global batch 切分，
+    因此任务边界批可能混合相邻任务。
     块内轮询 episode，不再让长轨迹因滑窗更多而被额外过采样。
     ``__iter__`` 不自行推进 cursor；只有优化器更新成功后由主循环调用
     :meth:`advance`，使 checkpoint 能精确指向“已完成更新”的下一批。
@@ -1016,6 +1021,7 @@ class TaskLocalityWeightedSampler(Sampler[list[int]]):
         block_batches: int = 16,
         sampling_mode: str = "weighted",
         *,
+        task_order_seed: int | None = None,
         rank: int = 0,
         world_size: int = 1,
     ) -> None:
@@ -1043,8 +1049,10 @@ class TaskLocalityWeightedSampler(Sampler[list[int]]):
             raise ValueError("instruction_id/episode_id must have the same non-zero length")
         if task_weights.ndim != 1:
             raise ValueError("task_weights must be 1-D")
-        if sampling_mode not in {"weighted", "balanced"}:
-            raise ValueError("sampling_mode must be 'weighted' or 'balanced'")
+        if sampling_mode not in {"weighted", "balanced", "full"}:
+            raise ValueError(
+                "sampling_mode must be 'weighted', 'balanced', or 'full'"
+            )
         self.task_ids = [int(value) for value in instruction_id.tolist()]
         self.episode_ids = [int(value) for value in episode_id.tolist()]
         self.task_w = task_weights.to(torch.float64)
@@ -1052,6 +1060,9 @@ class TaskLocalityWeightedSampler(Sampler[list[int]]):
         self.seed = int(seed)
         self.block_batches = int(block_batches)
         self.sampling_mode = sampling_mode
+        self.task_order_seed = (
+            self.seed if task_order_seed is None else int(task_order_seed)
+        )
         self.rank = int(rank)
         self.world_size = int(world_size)
         self.epoch = 0
@@ -1069,6 +1080,11 @@ class TaskLocalityWeightedSampler(Sampler[list[int]]):
         self.task_probs = torch.stack([self.task_w[t] for t in self.tasks])
         self.task_probs = self.task_probs / self.task_probs.sum().clamp_min(1e-12)
         self._n = len(self.task_ids)
+        if self.sampling_mode == "full" and self._n % self.world_size:
+            raise ValueError(
+                "full sampling requires dataset size to divide evenly across "
+                f"world_size: {self._n} rows / {self.world_size} ranks"
+            )
         digest_input = torch.stack(
             (instruction_id.to(torch.int64), episode_id.to(torch.int64)), dim=1
         ).cpu().contiguous().numpy().tobytes()
@@ -1085,6 +1101,8 @@ class TaskLocalityWeightedSampler(Sampler[list[int]]):
         self.dataset_fingerprint = hashlib.sha256(encoded).hexdigest()
 
     def __len__(self) -> int:
+        if self.sampling_mode == "full":
+            return math.ceil(self._n / self.batch_size)
         return max(1, self._n // self.batch_size)
 
     def _choose_task(self, rng: random.Random, previous: int | None) -> int:
@@ -1106,6 +1124,41 @@ class TaskLocalityWeightedSampler(Sampler[list[int]]):
 
     def _build_epoch(self) -> list[list[int]]:
         rng = random.Random(self.seed + self.epoch)
+        if self.sampling_mode == "full":
+            # Keep every task contiguous so each decoded task is visited once
+            # per epoch.  A separate task-order RNG lets shared VA/World streams
+            # align task switches while their row RNGs remain independent.
+            task_order = list(self.tasks)
+            task_rng = random.Random(self.task_order_seed + self.epoch)
+            task_rng.shuffle(task_order)
+            epoch_rows: list[int] = []
+            for task in task_order:
+                episode_queues = [
+                    list(rows) for rows in self.by_task_episode[task].values()
+                ]
+                for queue in episode_queues:
+                    rng.shuffle(queue)
+                rng.shuffle(episode_queues)
+                task_rows: list[int] = []
+                active = episode_queues
+                while active:
+                    rng.shuffle(active)
+                    next_active: list[list[int]] = []
+                    for queue in active:
+                        task_rows.append(queue.pop())
+                        if queue:
+                            next_active.append(queue)
+                    active = next_active
+                epoch_rows.extend(task_rows)
+
+            batches = [
+                epoch_rows[start : start + self.batch_size]
+                for start in range(0, len(epoch_rows), self.batch_size)
+            ]
+            if len(batches) != len(self) or sum(map(len, batches)) != self._n:
+                raise RuntimeError("full sampler built an invalid epoch schedule")
+            return batches
+
         # 每个 (task, episode) 维护独立无放回队列；耗尽才重洗。
         queues: dict[tuple[int, int], list[int]] = {}
         offsets: dict[tuple[int, int], int] = {}
@@ -1190,7 +1243,7 @@ class TaskLocalityWeightedSampler(Sampler[list[int]]):
         self.batch_cursor = total % len(self)
 
     def state_dict(self) -> dict:
-        return {
+        state = {
             "sampler_contract_version": 3,
             "epoch": self.epoch,
             "batch_cursor": self.batch_cursor,
@@ -1203,6 +1256,14 @@ class TaskLocalityWeightedSampler(Sampler[list[int]]):
             "task_weights": [float(self.task_w[task]) for task in self.tasks],
             "world_size": self.world_size,
         }
+        if self.sampling_mode == "full":
+            state.update(
+                {
+                    "full_schedule_contract": "task_contiguous_stream_v1",
+                    "task_order_seed": self.task_order_seed,
+                }
+            )
+        return state
 
     def load_state_dict(self, state: dict) -> None:
         expected = {
@@ -1215,6 +1276,13 @@ class TaskLocalityWeightedSampler(Sampler[list[int]]):
             "active_tasks": self.tasks,
             "task_weights": [float(self.task_w[task]) for task in self.tasks],
         }
+        if self.sampling_mode == "full":
+            expected.update(
+                {
+                    "full_schedule_contract": "task_contiguous_stream_v1",
+                    "task_order_seed": self.task_order_seed,
+                }
+            )
         # Absent ``world_size`` is a single-process checkpoint (the field was
         # added when data-parallel sharding landed).  A changed GPU count must
         # not silently keep the same cursor: the yielded rows would be a
@@ -1365,7 +1433,11 @@ def build_exact_run_contract(
                 getattr(config, "deployment_execution_horizon", 0)
                 or planning_stride
             ),
-            "data_isolation": PEER_DATA_ISOLATION_CONTRACT,
+            "data_isolation": (
+                PEER_SHARED_FULL_DATA_CONTRACT
+                if getattr(args, "peer_shared_full_data", False)
+                else PEER_DATA_ISOLATION_CONTRACT
+            ),
             "optimizer": PEER_DUAL_STREAM_OPTIMIZER_CONTRACT,
             "planning_stride": planning_stride,
             "planning_hz": 80.0 / planning_stride,
@@ -4025,6 +4097,103 @@ def next_peer_joint_batches(
     return va_batch, world_batch, va_iterator, world_iterator
 
 
+class PeerJointBatchPrefetcher:
+    """Keep a bounded FIFO of VA+World batches on one background thread."""
+
+    def __init__(
+        self,
+        va_iterator,
+        va_loader,
+        world_iterator,
+        world_loader,
+        *,
+        depth: int = 1,
+    ) -> None:
+        if depth < 1:
+            raise ValueError("peer batch prefetch depth must be positive")
+        self.va_iterator = va_iterator
+        self.va_loader = va_loader
+        self.world_iterator = world_iterator
+        self.world_loader = world_loader
+        self.depth = int(depth)
+        self._pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="peer-batch-prefetch"
+        )
+        self._futures = deque()
+
+    @property
+    def queued_batches(self) -> int:
+        return len(self._futures)
+
+    def _fetch_next(self):
+        result = next_peer_joint_batches(
+            self.va_iterator,
+            self.va_loader,
+            self.world_iterator,
+            self.world_loader,
+        )
+        self.va_iterator = result[2]
+        self.world_iterator = result[3]
+        return result
+
+    def submit(self) -> None:
+        if len(self._futures) >= self.depth:
+            raise RuntimeError("peer batch prefetch queue is full")
+        self._futures.append(self._pool.submit(self._fetch_next))
+
+    def fill(self, max_batches: int) -> int:
+        """Fill up to both ``depth`` and the caller's safe batch limit."""
+        if max_batches < 0:
+            raise ValueError("peer batch prefetch max_batches must be non-negative")
+        target = min(self.depth, int(max_batches))
+        added = 0
+        while len(self._futures) < target:
+            self.submit()
+            added += 1
+        return added
+
+    def result(self):
+        if not self._futures:
+            raise RuntimeError("peer batch prefetch has no in-flight batch")
+        return self._futures.popleft().result()
+
+    def close(self) -> None:
+        self._pool.shutdown(wait=True)
+
+
+def peer_prefetch_must_wait_for_commit(*samplers) -> bool:
+    """Do not rebuild an exhausted iterator until its sampler enters next epoch."""
+    return any(
+        isinstance(sampler, (TaskLocalityWeightedSampler, TaskWeightedSampler))
+        and sampler.batch_cursor + 1 >= len(sampler)
+        for sampler in samplers
+        if sampler is not None
+    )
+
+
+def peer_prefetch_fill_limit(
+    remaining_steps: int,
+    *samplers,
+    current_batch_consumed: bool = False,
+) -> int:
+    """Cap queued fetches to this run and the current committed sampler epoch."""
+    if remaining_steps < 0:
+        raise ValueError("remaining prefetch steps must be non-negative")
+    locality_samplers = [
+        sampler
+        for sampler in samplers
+        if isinstance(sampler, (TaskLocalityWeightedSampler, TaskWeightedSampler))
+    ]
+    if not locality_samplers:
+        return int(remaining_steps)
+    consumed = int(current_batch_consumed)
+    epoch_remaining = min(
+        len(sampler) - sampler.batch_cursor - consumed
+        for sampler in locality_samplers
+    )
+    return min(int(remaining_steps), max(0, epoch_remaining))
+
+
 def backward_peer_joint_losses(va_loss: Tensor, world_loss_or_forward):
     """Backprop VA, then build/backprop World, accumulating into one update."""
     if va_loss.ndim != 0:
@@ -4200,7 +4369,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         help=(
             "peer_sync_h6 joint training: logged-transition World dataset. "
-            "Its episodes must not overlap --va-data"
+            "Its episodes must not overlap --va-data unless "
+            "--peer-shared-full-data is explicit"
+        ),
+    )
+    parser.add_argument(
+        "--peer-shared-full-data",
+        action="store_true",
+        help=(
+            "peer_sync_h6: let the independent VA and World loaders use one "
+            "identical full-training payload instead of episode-disjoint payloads"
         ),
     )
     parser.add_argument(
@@ -4230,9 +4408,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=6,
         help=(
-            "每次 H6 预测后实际执行的动作数 P；peer_sync_h6 支持 "
-            "1/2/3/6，且必须等于 control-stride、wmrm-cycle-steps 和 "
-            "flow-prefix-steps"
+            "每次动作块预测后实际执行的动作数 P；peer_sync_h6 支持 "
+            "1/2/3/6/15，且必须等于 control-stride 和 flow-prefix-steps；"
+            "World horizon 可等于 P 或完整动作 horizon"
         ),
     )
     parser.add_argument(
@@ -4241,7 +4419,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0,
         help=(
             "closed-loop actions executed before replanning; 0 uses planning-stride. "
-            "H15 peer checkpoints may set 15 while training windows remain P2"
+            "H15/P15 checkpoints execute and train on the same 15-step cadence"
         ),
     )
     parser.add_argument(
@@ -4437,6 +4615,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         dest="wmrm",
         help="WAM4VA：同 --wmrm。WAM 发布预测世界状态供下一层 VA 注意力读取",
+    )
+    parser.add_argument(
+        "--wmrm-full-language-tokens",
+        action="store_true",
+        help=(
+            "让 World 的每个 belief token 直接 masked-attend 同一份完整 Qwen "
+            "token 序列；不再经固定 task queries 压成一个向量"
+        ),
+    )
+    parser.add_argument(
+        "--disable-runtime-integrity-checks",
+        dest="runtime_integrity_checks",
+        action="store_false",
+        default=True,
+        help=(
+            "跳过 World 热路径中诊断性 finite/mask-content CUDA 检查；"
+            "形状、dtype和训练计算不变（默认仍开启 fail-fast）"
+        ),
     )
     parser.add_argument(
         "--va-world-mode",
@@ -4890,6 +5086,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "联合微调。",
     )
     parser.add_argument(
+        "--slot-free-policy",
+        action="store_true",
+        help=(
+            "正式无槽策略契约：禁止 metric_g、metric relation tokens 和固定 "
+            "local-slot reader 进入 VA/World/action"
+        ),
+    )
+    parser.add_argument(
         "--metric-geometry-inject",
         action="store_true",
         help="把 metric/ROI 的 8-D p×visibility 经 zero-init Linear 直接加到 "
@@ -5167,20 +5371,35 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "step 时间降至 GPU 上限。0 = 现状主进程串行）",
     )
     parser.add_argument(
+        "--peer-batch-prefetch",
+        action="store_true",
+        help=(
+            "peer 双数据流用一个后台线程有界预取 VA+World batch；默认关闭。"
+            "epoch 边界会等成功更新推进 sampler 后再重启 iterator"
+        ),
+    )
+    parser.add_argument(
+        "--peer-batch-prefetch-depth",
+        type=int,
+        default=1,
+        help="peer 后台预取的最大联合 batch 数（默认 1）",
+    )
+    parser.add_argument(
         "--task-sampling",
-        choices=("uniform", "balanced", "weighted"),
+        choices=("uniform", "balanced", "weighted", "full"),
         default="uniform",
         help="难度分层采样（E7 用 weighted，2026-08-09）：按 instruction_id → "
         "MT50 难度权重（easy 0.5/med 1.0/hard 2.0/vh 3.0，scripts/mt50_difficulty.py）"
         "多项式抽样，困难任务过采样、简单任务降采样；balanced = 每个 epoch "
-        "严格均衡所有活跃任务；uniform = 按数据行均匀采样（会继承窗口数偏置）",
+        "严格均衡所有活跃任务；full = 每 epoch 无放回完整遍历所有行；"
+        "uniform = 按数据行均匀采样（会继承窗口数偏置）",
     )
     parser.add_argument(
         "--task-locality-block-batches",
         type=int,
         default=16,
         help="MT-VJ weighted/balanced sampler 每个同任务块的 batch 数（默认 16；"
-        "解码切换成为瓶颈时可调到 32）。",
+        "解码切换成为瓶颈时可调到 32）；full 固定保持整个任务连续。",
     )
     parser.add_argument(
         "--fork-data",
@@ -5358,10 +5577,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=[
             PEER_WORLD8_TO_WORLD7_REPAIR_MIGRATION,
             PEER_H15_PREFIX_TAIL_FLOW_MIGRATION,
+            PEER_H15_P2_TO_P15_TEMPORAL_MIGRATION,
         ],
         help=(
-            "one named peer architecture migration: legacy H6-to-H15 World repair "
-            "or s1752 H15-to-isolated-prefix/tail Flow"
+            "one named peer weights migration: legacy H6-to-H15 World repair, "
+            "s1752 H15-to-isolated-prefix/tail Flow, or H15 P2-to-P15 cadence"
         ),
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -5429,12 +5649,21 @@ def validate_args(args: argparse.Namespace) -> None:
         )
     va_data = getattr(args, "va_data", None)
     world_data = getattr(args, "world_data", None)
+    shared_full_data = bool(getattr(args, "peer_shared_full_data", False))
     if (va_data is None) != (world_data is None):
         raise ValueError("--va-data and --world-data must be provided together")
     dual_peer_data = peer_world and va_data is not None and world_data is not None
     primary_data = va_data if dual_peer_data else args.data
+    if int(getattr(args, "peer_batch_prefetch_depth", 1)) < 1:
+        raise ValueError("--peer-batch-prefetch-depth must be positive")
+    if getattr(args, "peer_batch_prefetch", False) and not dual_peer_data:
+        raise ValueError(
+            "--peer-batch-prefetch requires peer_sync_h6 --va-data/--world-data"
+        )
     if not peer_world and (va_data is not None or world_data is not None):
         raise ValueError("--va-data/--world-data are only supported by peer_sync_h6")
+    if shared_full_data and not peer_world:
+        raise ValueError("--peer-shared-full-data requires --va-world-mode peer_sync_h6")
     if peer_world:
         planning_stride = int(getattr(args, "planning_stride", 6))
         deployment_horizon = int(
@@ -5450,8 +5679,10 @@ def validate_args(args: argparse.Namespace) -> None:
                 "peer_sync_h6 dual-stream training uses --va-data/--world-data, "
                 "not --data"
             )
-        if va_data.expanduser().resolve(strict=False) == world_data.expanduser().resolve(
-            strict=False
+        if (
+            not shared_full_data
+            and va_data.expanduser().resolve(strict=False)
+            == world_data.expanduser().resolve(strict=False)
         ):
             raise ValueError("--va-data and --world-data must be different files")
         if getattr(args, "wmrm_only", False) or getattr(args, "va_only", False):
@@ -5463,7 +5694,7 @@ def validate_args(args: argparse.Namespace) -> None:
             "--visual-world-supervision": bool(
                 getattr(args, "visual_world_supervision", False)
             ),
-            "--planning-stride 1/2/3/6": planning_stride
+            "--planning-stride 1/2/3/6/15": planning_stride
             in PEER_PLANNING_STRIDES,
             "--control-stride == --planning-stride": int(
                 getattr(args, "control_stride", 6)
@@ -5500,8 +5731,8 @@ def validate_args(args: argparse.Namespace) -> None:
             == "none",
             "no --perturb-data/--fork-data": args.perturb_data is None
             and args.fork_data is None,
-            "--task-sampling balanced/weighted": args.task_sampling
-            in {"balanced", "weighted"},
+            "--task-sampling balanced/weighted/full": args.task_sampling
+            in {"balanced", "weighted", "full"},
         }
         missing = [name for name, enabled in required.items() if not enabled]
         if missing:
@@ -5844,14 +6075,15 @@ def validate_args(args: argparse.Namespace) -> None:
         if not (
             primary_data is not None
             and args.single_task
-            and args.task_sampling in {"weighted", "balanced"}
+            and args.task_sampling in {"weighted", "balanced", "full"}
             and (
                 args.dense_readout_mtvj
                 or getattr(args, "dino_main_vision", False)
             )
         ):
             raise ValueError(
-                "--resume-exact currently requires the single-task weighted/balanced "
+                "--resume-exact currently requires the single-task "
+                "weighted/balanced/full "
                 "MT-VJ or DINO-main data path (TaskLocalityWeightedSampler or "
                 "TaskWeightedSampler)"
             )
@@ -5867,6 +6099,29 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--evsm-temp must be positive")
     if getattr(args, "wmrm", False) and args.memory_split:
         raise ValueError("--wmrm is mutually exclusive with --memory-split")
+    if getattr(args, "wmrm_full_language_tokens", False) and not getattr(
+        args, "wmrm", False
+    ):
+        raise ValueError("--wmrm-full-language-tokens requires --wam4va")
+    if getattr(args, "slot_free_policy", False):
+        forbidden_slots = {
+            "--dino-dense-metric": bool(getattr(args, "dino_dense_metric", False)),
+            "--metric-geometry-inject": bool(
+                getattr(args, "metric_geometry_inject", False)
+            ),
+            "--local-slots-data": getattr(args, "local_slots_data", None) is not None,
+            "--mtvj-train-metric-head": bool(
+                getattr(args, "mtvj_train_metric_head", False)
+            ),
+            "--mtvj-train-relation": bool(
+                getattr(args, "mtvj_train_relation", False)
+            ),
+        }
+        enabled_slots = [name for name, enabled in forbidden_slots.items() if enabled]
+        if enabled_slots:
+            raise ValueError(
+                "--slot-free-policy forbids " + ", ".join(enabled_slots)
+            )
     if getattr(args, "wmrm", False) and (args.direct_head or args.c2_controller):
         raise ValueError("--wmrm/--wam4va is mutually exclusive with --direct-head/--c2-controller")
     if getattr(args, "wmrm_only", False) and not getattr(args, "wmrm", False):
@@ -6386,10 +6641,9 @@ def validate_optimizer_update_state(
     """Validate optimizer hyperparameters, parameters, and existing tensor state.
 
     This full state scan runs once after startup/resume. Per update, callers repeat
-    the cheap param-group validation and use :func:`validate_update_gradients` to
-    scan live parameters; AdamW state is not transactionally copied or rescanned
-    because finite source state plus guarded parameters, gradients, and arithmetic
-    inputs make the next ordinary update finite.
+    only the cheap param-group validation; ``clip_grad_norm_`` supplies the
+    aggregate pre-clip norm and rejects non-finite gradients. AdamW state is not
+    transactionally copied or rescanned in the hot path.
     """
     base = optimizer.base_optimizer if isinstance(optimizer, SAM) else optimizer
     for group_index, group in enumerate(base.param_groups):
@@ -6548,7 +6802,7 @@ def clip_main_and_optional_predictor_gradients(
 
 
 def clip_update_gradients(named_parameters, *, max_norm: float) -> float:
-    """Clip already-validated gradients, with PyTorch's finite-error guard."""
+    """Clip gradients and return their pre-clip norm, rejecting non-finite input."""
     unique_parameters = []
     seen: set[int] = set()
     for _, parameter in named_parameters:
@@ -6562,6 +6816,25 @@ def clip_update_gradients(named_parameters, *, max_norm: float) -> float:
             error_if_nonfinite=True,
         ).item()
     )
+
+
+def validate_preclip_gradient_norms(
+    *group_norms: float | None,
+    max_norm: float | None = None,
+) -> float:
+    """Combine clip_grad_norm_ pre-clip norms and apply the update threshold."""
+    values = [float(value) for value in group_norms if value is not None]
+    norm = math.sqrt(math.fsum(value * value for value in values))
+    if not math.isfinite(norm):
+        raise FloatingPointError(
+            f"non-finite aggregate gradient norm: value={norm!r}"
+        )
+    if max_norm is not None and norm > max_norm:
+        raise FloatingPointError(
+            f"gradient threshold exceeded aggregate_norm: value={norm!r} "
+            f"> threshold={max_norm!r}"
+        )
+    return norm
 
 
 def scale_semantic_lora_grads(text_backbone: nn.Module, scale: float) -> None:
@@ -7086,7 +7359,11 @@ def save_checkpoint(
                     or getattr(config, "planning_stride", 6)
                 ),
                 "peer_data_isolation": (
-                    PEER_DATA_ISOLATION_CONTRACT
+                    (
+                        PEER_SHARED_FULL_DATA_CONTRACT
+                        if getattr(args, "peer_shared_full_data", False)
+                        else PEER_DATA_ISOLATION_CONTRACT
+                    )
                     if getattr(config, "va_world_mode", "legacy")
                     == "peer_sync_h6"
                     else None
@@ -7722,6 +7999,7 @@ def main() -> None:
             dual_attention=args.dual_attention,
             flow_semantic=args.flow_semantic,
             wmrm=args.wmrm,
+            wmrm_full_language_tokens=args.wmrm_full_language_tokens,
             va_world_mode=args.va_world_mode,
             wmrm_inject=args.wmrm_inject,
             wmrm_target=getattr(args, "wmrm_target", "dino"),
@@ -7745,6 +8023,8 @@ def main() -> None:
             wmrm_predictor_depth=getattr(args, "wmrm_predictor_depth", 6),
             wmrm_predictor_width=getattr(args, "wmrm_predictor_width", 384),
             wmrm_predictor_heads=getattr(args, "wmrm_predictor_heads", 12),
+            runtime_integrity_checks=args.runtime_integrity_checks,
+            slot_free_policy=args.slot_free_policy,
             **_mtvj_config_kwargs(args),
         )
         if args.single_task:
@@ -8048,6 +8328,7 @@ def main() -> None:
             dual_attention=args.dual_attention,
             flow_semantic=args.flow_semantic,
             wmrm=args.wmrm,
+            wmrm_full_language_tokens=args.wmrm_full_language_tokens,
             va_world_mode=args.va_world_mode,
             wmrm_inject=args.wmrm_inject,
             wmrm_target=getattr(args, "wmrm_target", "dino"),
@@ -8071,6 +8352,8 @@ def main() -> None:
             wmrm_predictor_depth=getattr(args, "wmrm_predictor_depth", 6),
             wmrm_predictor_width=getattr(args, "wmrm_predictor_width", 384),
             wmrm_predictor_heads=getattr(args, "wmrm_predictor_heads", 12),
+            runtime_integrity_checks=args.runtime_integrity_checks,
+            slot_free_policy=args.slot_free_policy,
             local_slots=(args.local_slots_data is not None) or args.live_vjepa,
             local_slots_direct288=args.local_slots_direct288,
             local_slots_fixed_query=args.local_slots_fixed_query,
@@ -8137,7 +8420,7 @@ def main() -> None:
                 if args.perturb_data is not None
                 else (c2_clean_n if args.c2_controller else args.batch_size)
             )
-            if args.task_sampling in {"weighted", "balanced"}:
+            if args.task_sampling in {"weighted", "balanced", "full"}:
                 tasks = list(dataset.payload.get("metadata", {}).get("tasks", []))
                 if not tasks:
                     raise ValueError(
@@ -8146,7 +8429,7 @@ def main() -> None:
                     )
                 raw_task_w = (
                     torch.ones(len(tasks), dtype=torch.float64)
-                    if args.task_sampling == "balanced"
+                    if args.task_sampling in {"balanced", "full"}
                     else torch.tensor(task_weights_for(tasks), dtype=torch.float64)
                 )
                 # Codex P1-2（2026-08-09）：曝光 = 窗口数 × 难度权重会引入轨迹
@@ -8162,9 +8445,13 @@ def main() -> None:
                     f"{sorted(set(raw_task_w.tolist()))}（active_tasks="
                     f"{int((task_rows > 0).sum())}, samples={len(per_sample)}；"
                     + (
-                        "每 epoch 严格均衡任务 batch）"
-                        if args.task_sampling == "balanced"
-                        else "按难度分层）"
+                        "每 epoch 每行无放回恰好一次）"
+                        if args.task_sampling == "full"
+                        else (
+                            "每 epoch 严格均衡任务 batch）"
+                            if args.task_sampling == "balanced"
+                            else "按难度分层）"
+                        )
                     ),
                     flush=True,
                 )
@@ -8216,6 +8503,12 @@ def main() -> None:
                         args.seed,
                         args.task_locality_block_batches,
                         args.task_sampling,
+                        task_order_seed=(
+                            args.seed
+                            if args.task_sampling == "full"
+                            and getattr(args, "peer_shared_full_data", False)
+                            else None
+                        ),
                         rank=topology.rank,
                         world_size=topology.world_size,
                     )
@@ -8240,7 +8533,7 @@ def main() -> None:
                         # generator has no data/augmentation semantics.
                         generator=torch.Generator().manual_seed(args.seed),
                     )
-                elif args.task_sampling == "balanced":
+                elif args.task_sampling in {"balanced", "full"}:
                     sampler = TaskLocalityWeightedSampler(
                         dataset.payload["instruction_id"],
                         dataset.payload["episode_id"],
@@ -8249,6 +8542,12 @@ def main() -> None:
                         args.seed,
                         args.task_locality_block_batches,
                         args.task_sampling,
+                        task_order_seed=(
+                            args.seed
+                            if args.task_sampling == "full"
+                            and getattr(args, "peer_shared_full_data", False)
+                            else None
+                        ),
                         rank=topology.rank,
                         world_size=topology.world_size,
                     )
@@ -8336,16 +8635,19 @@ def main() -> None:
                 va_world_mode=getattr(args, "va_world_mode", "legacy"),
                 planning_stride=int(getattr(args, "planning_stride", 6)),
             )
+            args.peer_data_isolation = validate_peer_data_isolation(
+                dataset.payload,
+                world_dataset.payload,
+                planning_stride=int(getattr(args, "planning_stride", 6)),
+                shared_full_data=bool(
+                    getattr(args, "peer_shared_full_data", False)
+                ),
+            )
             donor_identity = prepare_visual_world_action_ranking(
                 world_dataset.payload,
                 planning_stride=int(getattr(args, "planning_stride", 6)),
             )
             args.visual_world_split_identity.update(donor_identity)
-            args.peer_data_isolation = validate_peer_data_isolation(
-                dataset.payload,
-                world_dataset.payload,
-                planning_stride=int(getattr(args, "planning_stride", 6)),
-            )
             world_tasks = list(
                 world_dataset.payload.get("metadata", {}).get("tasks", [])
             )
@@ -8353,12 +8655,12 @@ def main() -> None:
                 raise ValueError("--world-data requires metadata.tasks")
             world_raw_task_w = (
                 torch.ones(len(world_tasks), dtype=torch.float64)
-                if args.task_sampling == "balanced"
+                if args.task_sampling in {"balanced", "full"}
                 else torch.tensor(
                     task_weights_for(world_tasks), dtype=torch.float64
                 )
             )
-            if args.task_sampling in {"weighted", "balanced"}:
+            if args.task_sampling in {"weighted", "balanced", "full"}:
                 world_sampler = TaskLocalityWeightedSampler(
                     world_dataset.payload["instruction_id"],
                     world_dataset.payload["episode_id"],
@@ -8367,6 +8669,12 @@ def main() -> None:
                     args.seed + 1,
                     args.task_locality_block_batches,
                     args.task_sampling,
+                    task_order_seed=(
+                        args.seed
+                        if args.task_sampling == "full"
+                        and getattr(args, "peer_shared_full_data", False)
+                        else None
+                    ),
                     rank=topology.rank,
                     world_size=topology.world_size,
                 )
@@ -8444,6 +8752,7 @@ def main() -> None:
             dual_attention=args.dual_attention,
             flow_semantic=args.flow_semantic,
             wmrm=args.wmrm,
+            wmrm_full_language_tokens=args.wmrm_full_language_tokens,
             va_world_mode=args.va_world_mode,
             wmrm_inject=args.wmrm_inject,
             wmrm_target=getattr(args, "wmrm_target", "dino"),
@@ -8467,6 +8776,8 @@ def main() -> None:
             wmrm_predictor_depth=getattr(args, "wmrm_predictor_depth", 6),
             wmrm_predictor_width=getattr(args, "wmrm_predictor_width", 384),
             wmrm_predictor_heads=getattr(args, "wmrm_predictor_heads", 12),
+            runtime_integrity_checks=args.runtime_integrity_checks,
+            slot_free_policy=args.slot_free_policy,
             **_mtvj_config_kwargs(args),
         )
         smoke_batch = synthetic_sequence(
@@ -8929,6 +9240,11 @@ def main() -> None:
                         if getattr(config, "dino_dense_metric", False)
                         else None
                     ),
+                    peer_data_isolation_contract=(
+                        PEER_SHARED_FULL_DATA_CONTRACT
+                        if getattr(args, "peer_shared_full_data", False)
+                        else PEER_DATA_ISOLATION_CONTRACT
+                    ),
                 )
             # Fail before restoring model/optimizer/sampler/RNG if any data,
             # objective, sampler, architecture or optimizer semantic changed.
@@ -8960,11 +9276,16 @@ def main() -> None:
                 getattr(args, "resume_weights_migration", None)
                 == PEER_H15_PREFIX_TAIL_FLOW_MIGRATION
             )
+            migrating_p2_to_p15 = (
+                getattr(args, "resume_weights_migration", None)
+                == PEER_H15_P2_TO_P15_TEMPORAL_MIGRATION
+            )
             migration_record = validate_peer_resume_weights_contract(
                 contract,
                 planning_stride=int(getattr(args, "planning_stride", 6)),
                 migrating_peer_world=migrating_peer_world,
                 migrating_prefix_tail_flow=migrating_prefix_tail_flow,
+                migrating_p2_to_p15=migrating_p2_to_p15,
                 action_horizon=int(config.action_horizon),
                 world_horizon=int(config.wmrm_cycle_steps),
                 deployment_execution_horizon=int(
@@ -8980,6 +9301,11 @@ def main() -> None:
                     ASSEMBLY_METRIC_ROLE_CONTRACT
                     if getattr(config, "dino_dense_metric", False)
                     else None
+                ),
+                peer_data_isolation_contract=(
+                    PEER_SHARED_FULL_DATA_CONTRACT
+                    if getattr(args, "peer_shared_full_data", False)
+                    else PEER_DATA_ISOLATION_CONTRACT
                 ),
             )
             if migration_record is not None:
@@ -9027,6 +9353,12 @@ def main() -> None:
                 getattr(args, "resume_weights_migration", None)
                 == PEER_H15_PREFIX_TAIL_FLOW_MIGRATION
                 and key == "deployment_execution_horizon"
+            ):
+                continue
+            if (
+                getattr(args, "resume_weights_migration", None)
+                == PEER_H15_P2_TO_P15_TEMPORAL_MIGRATION
+                and key == "planning_stride"
             ):
                 continue
             if key.startswith("wmrm_") and not getattr(config, "wmrm", False):
@@ -9302,24 +9634,34 @@ def main() -> None:
         """Encode one physically separate World batch without VA-label reuse."""
         if not dual_peer_data:
             raise RuntimeError("peer World batch preparation requires dual streams")
-        if main_vision_backbone is None or not config.dino_dense_metric:
-            raise ValueError(
-                "peer joint World stream requires DINO-main dense metric encoding"
-            )
+        if main_vision_backbone is None:
+            raise ValueError("peer joint World stream requires DINO-main encoding")
         frames = raw_batch.get("frames")
         if frames is None:
             raise ValueError("--world-data batch has no raw frames")
         if isinstance(frames, torch.Tensor):
             frames = frames.cpu().numpy()
-        vision_tokens, dense_evidence = _dino_main_online_encode(
-            frames,
-            main_vision_backbone,
-            device,
-            encode_batch=args.main_vision_encode_batch,
-            grid=config.main_vision_grid,
-            window=config.main_vision_frames,
-            return_dense=True,
-        )
+        dense_evidence = None
+        if config.dino_dense_metric:
+            vision_tokens, dense_evidence = _dino_main_online_encode(
+                frames,
+                main_vision_backbone,
+                device,
+                encode_batch=args.main_vision_encode_batch,
+                grid=config.main_vision_grid,
+                window=config.main_vision_frames,
+                return_dense=True,
+            )
+        else:
+            vision_tokens = _dino_main_online_encode(
+                frames,
+                main_vision_backbone,
+                device,
+                encode_batch=args.main_vision_encode_batch,
+                grid=config.main_vision_grid,
+                window=config.main_vision_frames,
+                return_dense=False,
+            )
         raw_batch["vision_tokens"] = vision_tokens
         target_frames = raw_batch.pop("world_target_frames", None)
         if target_frames is not None:
@@ -9343,20 +9685,23 @@ def main() -> None:
             raw_batch["world_target_map"] = target_tokens.reshape(
                 batch_size, sequence, grid, grid, dim
             ).permute(0, 1, 4, 2, 3)
-        metric_tokens, metric_g = _dino_metric_tokens(
-            metric_head,
-            relation_encoder,
-            dense_evidence,
-            raw_batch,
-            device,
-            train_metric_head=args.mtvj_train_metric_head,
-            roi_head=roi_head,
-            roi_backbone=main_vision_backbone,
-            roi_frames=raw_batch.get("frames"),
-            roi_alpha=(
-                float(args.dino_roi_alpha) if roi_head is not None else 0.0
-            ),
-        )
+        metric_tokens = None
+        metric_g = None
+        if config.dino_dense_metric:
+            metric_tokens, metric_g = _dino_metric_tokens(
+                metric_head,
+                relation_encoder,
+                dense_evidence,
+                raw_batch,
+                device,
+                train_metric_head=args.mtvj_train_metric_head,
+                roi_head=roi_head,
+                roi_backbone=main_vision_backbone,
+                roi_frames=raw_batch.get("frames"),
+                roi_alpha=(
+                    float(args.dino_roi_alpha) if roi_head is not None else 0.0
+                ),
+            )
         raw_batch.pop("frames", None)
         prepared = move_batch(raw_batch, device)
         prepared = ensure_sequence(prepared, args.min_sequence_length)
@@ -9391,6 +9736,20 @@ def main() -> None:
 
     last_saved_global_step: int | None = None
     visual_aux_pool = ThreadPoolExecutor(max_workers=1)
+    peer_batch_prefetcher = None
+    if getattr(args, "peer_batch_prefetch", False):
+        peer_batch_prefetcher = PeerJointBatchPrefetcher(
+            iterator,
+            loader,
+            world_iterator,
+            world_loader,
+            depth=int(args.peer_batch_prefetch_depth),
+        )
+        peer_batch_prefetcher.fill(
+            peer_prefetch_fill_limit(
+                args.steps, sampler, world_sampler
+            )
+        )
 
     def commit_successful_update(local_step: int, consumed_locality_batch: bool) -> None:
         """Advance all resumable state only after the optimizer update succeeds."""
@@ -9435,6 +9794,7 @@ def main() -> None:
         rec_batch = None
         world_raw_batch = None
         consumed_locality_batch = False
+        prefetch_after_commit = False
         is_fork_batch = fork_iter is not None and step % (args.fork_k + 1) == 0
         if args.c2_controller:
             # C² 3:1 混合：clean 部分（v5 + v6a 目标）+ recovery 部分（v6b）。
@@ -9444,17 +9804,39 @@ def main() -> None:
                 sampler, (TaskLocalityWeightedSampler, TaskWeightedSampler)
             )
         elif dual_peer_data:
-            (
-                batch,
-                world_raw_batch,
-                iterator,
-                world_iterator,
-            ) = next_peer_joint_batches(
-                iterator,
-                loader,
-                world_iterator,
-                world_loader,
-            )
+            if peer_batch_prefetcher is None:
+                (
+                    batch,
+                    world_raw_batch,
+                    iterator,
+                    world_iterator,
+                ) = next_peer_joint_batches(
+                    iterator,
+                    loader,
+                    world_iterator,
+                    world_loader,
+                )
+            else:
+                (
+                    batch,
+                    world_raw_batch,
+                    iterator,
+                    world_iterator,
+                ) = peer_batch_prefetcher.result()
+                if step < args.steps:
+                    fill_limit = peer_prefetch_fill_limit(
+                        args.steps - step,
+                        sampler,
+                        world_sampler,
+                        current_batch_consumed=True,
+                    )
+                    peer_batch_prefetcher.fill(fill_limit)
+                    prefetch_after_commit = (
+                        fill_limit == 0
+                        and peer_prefetch_must_wait_for_commit(
+                            sampler, world_sampler
+                        )
+                    )
             consumed_locality_batch = isinstance(
                 sampler, (TaskLocalityWeightedSampler, TaskWeightedSampler)
             )
@@ -9707,15 +10089,14 @@ def main() -> None:
                 named_trainable_parameters(("model", model))
             )
             validate_optimizer_update_state(optimizer, validate_values=False)
-            validate_update_gradients(
-                c2_named_parameters,
-                max_norm=args.max_gradient_norm,
-            )
             gradient_norm = clip_update_gradients(
                 c2_named_parameters, max_norm=1.0
             )
+            validate_preclip_gradient_norms(
+                gradient_norm, max_norm=args.max_gradient_norm
+            )
             optimizer.step()
-            validate_optimizer_update_state(optimizer)
+            validate_optimizer_update_state(optimizer, validate_values=False)
             commit_successful_update(step, consumed_locality_batch)
             print(
                 f"step={step} mode={args.mode} contract=single_c2 "
@@ -10343,26 +10724,6 @@ def main() -> None:
         )
         validate_optimizer_update_state(optimizer, validate_values=False)
         reduce_update_gradients(update_named_parameters, topology)
-        raw_gradient_norm = validate_update_gradients(
-            update_named_parameters, max_norm=args.max_gradient_norm
-        )
-        if raw_gradient_norm > 100.0:
-            largest_gradients = sorted(
-                (
-                    (float(parameter.grad.detach().double().norm().item()), name)
-                    for name, parameter in update_named_parameters
-                    if parameter.grad is not None
-                ),
-                reverse=True,
-            )[:12]
-            print(
-                "gradient_spike "
-                f"global_step={next_global_step} raw_norm={raw_gradient_norm:.6g} "
-                + " ".join(
-                    f"{name}={norm:.6g}" for norm, name in largest_gradients
-                ),
-                flush=True,
-            )
         main_parameter_ids = {id(parameter) for parameter in clip_params}
         main_named_parameters = [
             (name, parameter)
@@ -10384,6 +10745,31 @@ def main() -> None:
             if metric_named_parameters
             else None
         )
+        raw_gradient_norm = validate_preclip_gradient_norms(
+            gradient_norm,
+            predictor_clip_norm,
+            metric_clip_norm,
+            max_norm=args.max_gradient_norm,
+        )
+        if raw_gradient_norm > 100.0:
+            # The ordinary path has one device synchronization per clip group.
+            # Per-parameter norms are reserved for the exceptional spike path.
+            largest_gradients = sorted(
+                (
+                    (float(parameter.grad.detach().double().norm().item()), name)
+                    for name, parameter in update_named_parameters
+                    if parameter.grad is not None
+                ),
+                reverse=True,
+            )[:12]
+            print(
+                "gradient_spike "
+                f"global_step={next_global_step} raw_norm={raw_gradient_norm:.6g} "
+                + " ".join(
+                    f"{name}={norm:.6g}" for norm, name in largest_gradients
+                ),
+                flush=True,
+            )
         if args.sam_rho > 0:
             # SAM：先沿梯度方向扰动权重（worst-case 邻域），重算 loss 后走真实步。
             # η_act 对两次 backward 都按动作/语义拆分缩放（见 scale_semantic_lora_grads
@@ -10419,25 +10805,40 @@ def main() -> None:
                 ):
                     semantic_total2.backward()
                 validate_optimizer_update_state(optimizer, validate_values=False)
-                validate_update_gradients(
-                    update_named_parameters,
+                sam_gradient_norm, sam_predictor_clip_norm = (
+                    clip_main_and_optional_predictor_gradients(
+                        main_named_parameters,
+                        predictor_max_norm=getattr(
+                            args, "wmrm_predictor_grad_clip", None
+                        ),
+                        main_max_norm=1.0,
+                    )
+                )
+                sam_metric_clip_norm = (
+                    clip_update_gradients(metric_named_parameters, max_norm=1.0)
+                    if metric_named_parameters
+                    else None
+                )
+                validate_preclip_gradient_norms(
+                    sam_gradient_norm,
+                    sam_predictor_clip_norm,
+                    sam_metric_clip_norm,
                     max_norm=args.max_gradient_norm,
                 )
-                clip_main_and_optional_predictor_gradients(
-                    main_named_parameters,
-                    predictor_max_norm=getattr(args, "wmrm_predictor_grad_clip", None),
-                    main_max_norm=1.0,
-                )
-                if metric_named_parameters:
-                    clip_update_gradients(metric_named_parameters, max_norm=1.0)
             except Exception:
                 optimizer.restore_step(zero_grad=True)
                 raise
             optimizer.second_step(zero_grad=True)
         else:
             optimizer.step()
-        validate_optimizer_update_state(optimizer)
+        validate_optimizer_update_state(optimizer, validate_values=False)
         commit_successful_update(step, consumed_locality_batch)
+        if prefetch_after_commit:
+            peer_batch_prefetcher.fill(
+                peer_prefetch_fill_limit(
+                    args.steps - step, sampler, world_sampler
+                )
+            )
         gate_log = (
             f" evsm_gate={evsm_gate_mean:.3f}" if evsm_gate_mean is not None else ""
         )
@@ -10568,6 +10969,8 @@ def main() -> None:
                 f"{world_constraint_log}"
             )
 
+    if peer_batch_prefetcher is not None:
+        peer_batch_prefetcher.close()
     if topology.is_distributed:
         data_parallel_barrier(topology)
     if topology.is_primary and final_checkpoint_save_due(

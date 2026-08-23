@@ -47,13 +47,19 @@ LEGACY_PERTURB_SETTLE_STEPS = 12
 PEER_SYNC_H6_CONTRACT = "peer_sync_h6_world_windows_v1"
 PEER_SYNC_H6_P2_CONTRACT = "peer_sync_h6_p2_world_windows_v1"
 PEER_SYNC_H15_P2_CONTRACT = "peer_sync_h15_p2_world_windows_v1"
+PEER_SYNC_H15_P15_CONTRACT = "peer_sync_h15_p15_world_windows_v1"
 PEER_SYNC_H6_VERSION = 1
 PEER_SYNC_H6_P2_VERSION = 1
 PEER_SYNC_H6_P2_STRIDE = 2
+PEER_SYNC_H15_P15_STRIDE = 15
+PEER_SYNC_H15_CONTRACTS = frozenset({
+    PEER_SYNC_H15_P2_CONTRACT,
+    PEER_SYNC_H15_P15_CONTRACT,
+})
 PEER_SYNC_H6_CONTRACTS = frozenset({
     PEER_SYNC_H6_CONTRACT,
     PEER_SYNC_H6_P2_CONTRACT,
-    PEER_SYNC_H15_P2_CONTRACT,
+    *PEER_SYNC_H15_CONTRACTS,
 })
 
 
@@ -454,9 +460,7 @@ def phase1(horizon: int, *, task: str | None = None,
     """
     if data_contract not in {None, *PEER_SYNC_H6_CONTRACTS}:
         raise ValueError(f"unknown data_contract={data_contract!r}")
-    expected_peer_horizon = (
-        15 if data_contract == PEER_SYNC_H15_P2_CONTRACT else 6
-    )
+    expected_peer_horizon = 15 if data_contract in PEER_SYNC_H15_CONTRACTS else 6
     if data_contract in PEER_SYNC_H6_CONTRACTS and horizon != expected_peer_horizon:
         raise ValueError(
             f"{data_contract} requires exact action horizon H{expected_peer_horizon}, "
@@ -472,8 +476,14 @@ def phase1(horizon: int, *, task: str | None = None,
     if data_contract in {PEER_SYNC_H6_P2_CONTRACT, PEER_SYNC_H15_P2_CONTRACT}:
         if planning_stride != PEER_SYNC_H6_P2_STRIDE:
             raise ValueError(
-                f"{PEER_SYNC_H6_P2_CONTRACT} requires planning_stride="
+                f"{data_contract} requires planning_stride="
                 f"{PEER_SYNC_H6_P2_STRIDE}, got {planning_stride}"
+            )
+    elif data_contract == PEER_SYNC_H15_P15_CONTRACT:
+        if planning_stride != PEER_SYNC_H15_P15_STRIDE:
+            raise ValueError(
+                f"{PEER_SYNC_H15_P15_CONTRACT} requires planning_stride="
+                f"{PEER_SYNC_H15_P15_STRIDE}, got {planning_stride}"
             )
     elif planning_stride != CONTROL_STRIDE:
         raise ValueError(
@@ -565,7 +575,7 @@ def phase1(horizon: int, *, task: str | None = None,
                 legacy_perturb_events_inferred += int(
                     semantics["perturb_start"] is not None
                 )
-            explicit_world_target = data_contract == PEER_SYNC_H15_P2_CONTRACT
+            explicit_world_target = data_contract in PEER_SYNC_H15_CONTRACTS
             last_start = T - 1 - (
                 (SEQUENCE_LENGTH - 1) * planning_stride
                 + (horizon if explicit_world_target else horizon - 1)
@@ -727,7 +737,7 @@ def phase1(horizon: int, *, task: str | None = None,
             "legacy_perturb_events_inferred": legacy_perturb_events_inferred,
         },
     }
-    if data_contract == PEER_SYNC_H15_P2_CONTRACT:
+    if data_contract in PEER_SYNC_H15_CONTRACTS:
         payload["world_target_frame_refs"] = [
             (w["task_file"], w["ep_idx"], w["world_target_frame_idx"])
             for w in W
@@ -910,13 +920,13 @@ if __name__ == "__main__":
     ap.add_argument("--st-meta", type=Path, help="phase2 metadata 输出")
     ap.add_argument(
         "--data-contract", choices=tuple(sorted(PEER_SYNC_H6_CONTRACTS)),
-        help=("emit an explicit peer H6 protocol; the P2 contract additionally "
-              "requires --planning-stride 2"),
+        help=("emit an explicit peer protocol; cadence-specific contracts require "
+              "their matching --planning-stride"),
     )
     ap.add_argument(
         "--planning-stride", type=int, default=CONTROL_STRIDE,
         help=("decision/control cadence in source frames; default 6 preserves old "
-              f"datasets, while {PEER_SYNC_H6_P2_CONTRACT} requires 2"),
+              "datasets; P2/P15 contracts require stride 2/15 respectively"),
     )
     ap.add_argument(
         "--legacy-policy", choices=("warn", "error", "infer"), default="warn",

@@ -94,18 +94,21 @@ def test_hard2_eval_launcher_is_fixed_to_h15_p15() -> None:
     assert syntax.returncode == 0, syntax.stderr
     text = EVAL_RUNNER.read_text(encoding="utf-8")
     for token in (
-        "hard2_peer_h15_p2_eval_v2.pt",
+        "all49_peer_h15_p15_eval_v1.pt",
         "EXECUTION_HORIZON=${EXECUTION_HORIZON:-15}",
         "PEER_WORLD_OFF=${PEER_WORLD_OFF:-0}",
-        'data_contract = f"peer_sync_h{action_horizon}_p2_world_windows_v1"',
-        "action_horizon not in {6, 15}",
+        'data_contract = "peer_sync_h15_p15_world_windows_v1"',
+        "action_horizon != 15",
         '"fps": 80',
-        '"control_stride": 2',
-        '"planning_stride": 2',
+        '"control_stride": 15',
+        '"planning_stride": 15',
+        '"decision_offsets": [0, 15, 30, 45]',
+        'world_target_offsets=[15, 30, 45, 60]',
         "deployment_horizon != execution_horizon",
         '"action_horizon": action_horizon',
         '"wmrm_cycle_steps": world_horizon',
-        '"flow_prefix_steps": 2',
+        '"flow_prefix_steps": 15',
+        'previous_action[:, 1:], actions[:, :-1, 14]',
         '"peer_training_mode": "joint_dual_stream"',
         '"peer_flow_topology"',
         '"peer_va_data_identity"',
@@ -117,18 +120,19 @@ def test_hard2_eval_launcher_is_fixed_to_h15_p15() -> None:
     assert "--execute-steps" not in text
 
 
-def test_eval_preflight_rejects_p6_flow_prefix_checkpoint(tmp_path: Path) -> None:
+def test_eval_preflight_rejects_p2_flow_prefix_checkpoint(tmp_path: Path) -> None:
     checkpoint = tmp_path / "wrong-flow-prefix.pt"
-    features = tmp_path / "p2-eval.pt"
+    features = tmp_path / "p15-eval.pt"
     identity = {"full_file_sha256": "a" * 64}
     torch.save(
         {
             "config": {
                 "va_world_mode": "peer_sync_h6",
                 "wmrm": True,
-                "action_horizon": 6,
-                "planning_stride": 2,
-                "wmrm_cycle_steps": 2,
+                "action_horizon": 15,
+                "planning_stride": 15,
+                "deployment_execution_horizon": 15,
+                "wmrm_cycle_steps": 15,
             },
             "training_contract": {
                 "peer_training_mode": "joint_dual_stream",
@@ -143,10 +147,11 @@ def test_eval_preflight_rejects_p6_flow_prefix_checkpoint(tmp_path: Path) -> Non
             },
             "exact_run_contract": {
                 "arguments": {
-                    "control_stride": 2,
-                    "planning_stride": 2,
-                    "wmrm_cycle_steps": 2,
-                    "flow_prefix_steps": 6,
+                    "control_stride": 15,
+                    "planning_stride": 15,
+                    "wmrm_cycle_steps": 15,
+                    "deployment_execution_horizon": 15,
+                    "flow_prefix_steps": 2,
                 }
             },
         },
@@ -156,7 +161,7 @@ def test_eval_preflight_rejects_p6_flow_prefix_checkpoint(tmp_path: Path) -> Non
     launcher = EVAL_RUNNER.read_text(encoding="utf-8")
     preflight = launcher.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
     result = subprocess.run(
-        [sys.executable, "-c", preflight, str(checkpoint), str(features), "2"],
+        [sys.executable, "-c", preflight, str(checkpoint), str(features), "15"],
         cwd=ROOT,
         capture_output=True,
         text=True,

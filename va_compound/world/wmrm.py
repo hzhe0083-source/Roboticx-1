@@ -299,13 +299,21 @@ class WAMProposal:
 class ExecutableActionReadout(nn.Module):
     """Deterministic bounded action-chunk belief for the World peer."""
 
-    def __init__(self, hidden_dim: int, action_dim: int = 4, horizon: int = 6) -> None:
+    def __init__(
+        self,
+        hidden_dim: int,
+        action_dim: int = 4,
+        horizon: int = 6,
+        *,
+        runtime_integrity_checks: bool = True,
+    ) -> None:
         super().__init__()
         if hidden_dim < 1 or action_dim < 1 or horizon < 1:
             raise ValueError("hidden_dim, action_dim, and horizon must be positive")
         self.hidden_dim = hidden_dim
         self.action_dim = action_dim
         self.horizon = horizon
+        self.runtime_integrity_checks = bool(runtime_integrity_checks)
         self.proj = nn.Linear(hidden_dim, action_dim)
 
     def forward(self, action: Tensor) -> Tensor:
@@ -315,11 +323,20 @@ class ExecutableActionReadout(nn.Module):
                 f"action must be [B, {self.horizon}, {self.hidden_dim}], "
                 f"got {tuple(action.shape)}"
             )
-        _require_finite(action, "action", boundary="executable action readout input")
+        if self.runtime_integrity_checks:
+            _require_finite(
+                action, "action", boundary="executable action readout input"
+            )
         logits = self.proj(action)
-        _require_finite(logits, "readout", boundary="executable action readout output")
+        if self.runtime_integrity_checks:
+            _require_finite(
+                logits, "readout", boundary="executable action readout output"
+            )
         readout = torch.tanh(logits)
-        _require_finite(readout, "readout", boundary="executable action readout output")
+        if self.runtime_integrity_checks:
+            _require_finite(
+                readout, "readout", boundary="executable action readout output"
+            )
         return readout
 
 
@@ -336,14 +353,37 @@ class _CrossAttn(nn.Module):
         self.v = nn.Linear(dim, dim)
         self.o = nn.Linear(dim, dim)
 
-    def forward(self, query: Tensor, key_value: Tensor) -> Tensor:
+    def forward(
+        self,
+        query: Tensor,
+        key_value: Tensor,
+        key_mask: Tensor | None = None,
+        *,
+        validate_mask_content: bool = True,
+    ) -> Tensor:
         batch, n_q, dim = query.shape
+        if key_value.ndim != 3 or key_value.shape[0] != batch:
+            raise ValueError("key_value must be [B, N, D] with query batch size")
         n_k = key_value.shape[1]
         heads = self.num_heads
         q = self.q(query).view(batch, n_q, heads, self.head_dim).transpose(1, 2)
         k = self.k(key_value).view(batch, n_k, heads, self.head_dim).transpose(1, 2)
         v = self.v(key_value).view(batch, n_k, heads, self.head_dim).transpose(1, 2)
-        weights = torch.softmax(q @ k.transpose(-1, -2) * self.scale, dim=-1)
+        scores = q @ k.transpose(-1, -2) * self.scale
+        if key_mask is not None:
+            if key_mask.shape != (batch, n_k):
+                raise ValueError(
+                    f"key_mask must be [B, {n_k}], got {tuple(key_mask.shape)}"
+                )
+            if key_mask.dtype != torch.bool:
+                raise ValueError("key_mask must be bool")
+            if validate_mask_content and not bool(key_mask.any(dim=1).all()):
+                raise ValueError("every key_mask row must contain a valid token")
+            scores = scores.masked_fill(
+                ~key_mask[:, None, None, :].to(device=scores.device),
+                torch.finfo(scores.dtype).min,
+            )
+        weights = torch.softmax(scores, dim=-1)
         out = (weights @ v).transpose(1, 2).reshape(batch, n_q, dim)
         return self.o(out)
 
@@ -500,6 +540,7 @@ class WAM4VA(nn.Module):
         self,
         hidden_dim: int,
         *,
+        language_dim: int | None = None,
         world_dim: int = 8,
         proprio_dim: int = 9,
         num_heads: int = 4,
@@ -521,10 +562,13 @@ class WAM4VA(nn.Module):
         predictor_width: int = 384,
         predictor_heads: int = 12,
         max_stages: int = 8,
+        runtime_integrity_checks: bool = True,
     ) -> None:
         super().__init__()
         if hidden_dim < 1:
             raise ValueError("hidden_dim must be positive")
+        if language_dim is not None and language_dim < 1:
+            raise ValueError("language_dim must be positive when provided")
         if world_dim < 1:
             raise ValueError("world_dim must be positive")
         if proprio_dim < 1:
@@ -548,6 +592,8 @@ class WAM4VA(nn.Module):
         if max_stages < 1:
             raise ValueError("max_stages must be positive")
         self.hidden_dim = hidden_dim
+        self.language_dim = language_dim
+        self.full_language_tokens = language_dim is not None
         self.world_dim = world_dim
         self.proprio_dim = proprio_dim
         self.n_belief = n_belief
@@ -563,6 +609,7 @@ class WAM4VA(nn.Module):
         self.predictor_width = predictor_width
         self.predictor_heads = predictor_heads
         self.max_stages = max_stages
+        self.runtime_integrity_checks = bool(runtime_integrity_checks)
         self.stage_embed = nn.Embedding(max_stages, hidden_dim)
         nn.init.zeros_(self.stage_embed.weight)
 
@@ -589,9 +636,19 @@ class WAM4VA(nn.Module):
         self.world_from_env = nn.Linear(hidden_dim, hidden_dim)
         self.world_from_state = nn.Linear(proprio_dim, hidden_dim)
         self.world_from_belief = nn.Linear(hidden_dim, hidden_dim)
-        self.task_queries = nn.Parameter(torch.empty(n_task_queries, hidden_dim))
-        nn.init.normal_(self.task_queries, std=0.02)
-        self.task_attention = _CrossAttn(hidden_dim, num_heads)
+        if self.full_language_tokens:
+            self.task_queries = None
+            self.task_attention = None
+            self.language_norm = nn.LayerNorm(language_dim)
+            self.language_projection = nn.Linear(language_dim, hidden_dim)
+            self.language_read = _CrossAttn(hidden_dim, num_heads)
+        else:
+            self.task_queries = nn.Parameter(torch.empty(n_task_queries, hidden_dim))
+            nn.init.normal_(self.task_queries, std=0.02)
+            self.task_attention = _CrossAttn(hidden_dim, num_heads)
+            self.language_norm = None
+            self.language_projection = None
+            self.language_read = None
         self.world_from_task = nn.Linear(hidden_dim, hidden_dim)
         nn.init.zeros_(self.world_from_task.weight)
         nn.init.zeros_(self.world_from_task.bias)
@@ -1005,6 +1062,8 @@ class WAM4VA(nn.Module):
         belief: Tensor | None = None,
         prev_innovation: Tensor | None = None,
         language_keys: Tensor | None = None,
+        language_tokens: Tensor | None = None,
+        language_mask: Tensor | None = None,
         world_goal: Tensor | None = None,
         dino_tokens: Tensor | None = None,
         env_action: Tensor | None = None,
@@ -1072,8 +1131,51 @@ class WAM4VA(nn.Module):
             _gate_fuse(self.belief_gate, belief, belief_update)
         )
 
-        if language_keys is None:
-            task_summary = torch.zeros(batch, hidden, device=action.device, dtype=action.dtype)
+        language_context = None
+        if self.full_language_tokens:
+            if language_keys is not None:
+                raise ValueError(
+                    "full-language World accepts raw language_tokens, not VA language_keys"
+                )
+            if language_tokens is None:
+                raise ValueError(
+                    "full-language World requires the complete language_tokens sequence"
+                )
+            if (
+                language_tokens.ndim != 3
+                or language_tokens.shape[0] != batch
+                or language_tokens.shape[-1] != self.language_dim
+            ):
+                raise ValueError(
+                    "language_tokens must be "
+                    f"[B, L, {self.language_dim}], got {tuple(language_tokens.shape)}"
+                )
+            if language_mask is None or language_mask.shape != language_tokens.shape[:2]:
+                raise ValueError(
+                    "full-language World requires language_mask matching [B, L]"
+                )
+            raw_language = language_tokens.to(
+                device=action.device, dtype=self.language_norm.weight.dtype
+            )
+            projected_language = self.language_projection(
+                self.language_norm(raw_language)
+            )
+            world_queries = belief + stage_cond
+            language_context = self.language_read(
+                world_queries,
+                projected_language,
+                language_mask.to(device=action.device, dtype=torch.bool),
+                validate_mask_content=self.runtime_integrity_checks,
+            ).to(dtype=action.dtype)
+            task_summary = language_context.mean(dim=1)
+        elif language_keys is None:
+            if language_tokens is not None or language_mask is not None:
+                raise ValueError(
+                    "legacy World language path accepts language_keys only"
+                )
+            task_summary = torch.zeros(
+                batch, hidden, device=action.device, dtype=action.dtype
+            )
         else:
             if language_keys.ndim != 3 or language_keys.shape[0] != batch:
                 raise ValueError(
@@ -1090,6 +1192,8 @@ class WAM4VA(nn.Module):
             task_summary = task_tokens.mean(dim=1)
 
         conditioned = belief + stage_cond
+        if language_context is not None:
+            conditioned = conditioned + language_context
         predict_belief = conditioned.detach()
         z_hat, z_spans, progress, z_tokens = self.predict_world(
             action,
@@ -1153,6 +1257,8 @@ class WAM4VA(nn.Module):
         *,
         state: WAMState | None = None,
         language_keys: Tensor | None = None,
+        language_tokens: Tensor | None = None,
+        language_mask: Tensor | None = None,
         dino_tokens: Tensor | None = None,
         env_action: Tensor | None = None,
         reuse_aux: WMRMAux | None = None,
@@ -1176,6 +1282,8 @@ class WAM4VA(nn.Module):
             belief=snapshot.belief,
             prev_innovation=snapshot.innovation,
             language_keys=language_keys,
+            language_tokens=language_tokens,
+            language_mask=language_mask,
             dino_tokens=dino_tokens,
             env_action=env_action,
             reuse_aux=reuse_aux,
