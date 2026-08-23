@@ -94,6 +94,13 @@ PEER_HIGH_FREQUENCY_CONTRACT = {
     "action_prediction": "full_action_chunk_each_decision_v2",
     "world_transition": "logged_world_horizon_action_chunk_v2",
     "world_target": "explicit_endpoint_at_world_horizon_v2",
+    "readout_auxiliary": "all_world_stages_full_logged_action_chunk_mean_v3",
+}
+# The formal H15/P15 checkpoint predates all-stage readout supervision.  Keep
+# its exact source semantics named so weights-only initialization can accept
+# only this one known transition without weakening any action/World contract.
+PEER_READOUT_V2_HIGH_FREQUENCY_CONTRACT = {
+    **PEER_HIGH_FREQUENCY_CONTRACT,
     "readout_auxiliary": "full_logged_action_chunk_v2",
 }
 PEER_LEGACY_HIGH_FREQUENCY_CONTRACT = {
@@ -105,8 +112,21 @@ PEER_LEGACY_HIGH_FREQUENCY_CONTRACT = {
 PEER_WORLD_READOUT_CONTRACT = {
     "va_stream": "causal_deterministic_action_chunk_readout_v2",
     "world_stream": "explicit_logged_chunk_at_world_horizon_v2",
+    "loss": "all_stage_mean_logged_chunk_auxiliary_without_forward_label_injection_v3",
+}
+PEER_WORLD_READOUT_V2_CONTRACT = {
+    **PEER_WORLD_READOUT_CONTRACT,
     "loss": "logged_chunk_auxiliary_without_forward_label_injection_v2",
 }
+PEER_READOUT_V2_TO_V3_WEIGHTS_MIGRATION = (
+    "peer_readout_final_to_all_stage_mean_weights_only_v1"
+)
+ASSEMBLY_METRIC_ROLE_WEIGHTS_MIGRATION = (
+    "assembly_metric_duplicate_handle_to_reward_center_weights_only_v1"
+)
+PEER_WEIGHTS_SEMANTIC_MIGRATION_CONTRACT = (
+    "peer_resume_weights_semantic_migrations_v1"
+)
 FEATURE_AUTOCAST_CONTRACT = "bf16_nograd_decode_cache_isolated_v1"
 WORLD_NO_REGRESSION = {
     "all_ratio": 1.0,
@@ -304,11 +324,8 @@ def validate_visual_world_training_split(
         ):
             raise ValueError(f"{name} must be an integer [N] tensor")
     actual_tasks = sorted(int(value) for value in torch.unique(task_ids).tolist())
-    if actual_tasks != [0, 16]:
-        raise ValueError(
-            "visual World joint training requires task ids [0,16], got "
-            f"{actual_tasks}"
-        )
+    if not actual_tasks:
+        raise ValueError("visual World joint training requires at least one task")
 
     splits = manifest.get("splits") or {}
     train_contract = splits.get("train") or {}
@@ -334,15 +351,49 @@ def validate_visual_world_training_split(
     if set(actual_episodes) & eval_episodes:
         raise ValueError("World split train/eval episode leakage detected")
 
-    expected_names = {0: "assembly-v3", 16: "door-unlock-v3"}
+    frame_refs = payload.get("frame_refs")
+    if not isinstance(frame_refs, (list, tuple)) or len(frame_refs) != len(actions):
+        raise ValueError("visual World training requires one frame_ref per row")
+    if peer_mode and peer_horizon == 15:
+        target_refs = payload["world_target_frame_refs"]
+        for current_ref, target_ref in zip(frame_refs, target_refs, strict=True):
+            if (
+                not isinstance(current_ref, (list, tuple))
+                or len(current_ref) < 2
+                or not isinstance(target_ref, (list, tuple))
+                or len(target_ref) < 2
+                or target_ref[0] != current_ref[0]
+                or target_ref[1] != current_ref[1]
+            ):
+                raise ValueError(
+                    "H15 world_target_frame_ref task/episode mismatch"
+                )
+    names_by_task: dict[int, set[str]] = {}
+    for task_id, ref in zip(task_ids.tolist(), frame_refs, strict=True):
+        if not isinstance(ref, (list, tuple)) or not ref:
+            raise ValueError("visual World frame_ref must start with a task name")
+        names_by_task.setdefault(int(task_id), set()).add(str(ref[0]))
+    inconsistent_names = {
+        task_id: sorted(names)
+        for task_id, names in names_by_task.items()
+        if len(names) != 1
+    }
+    if inconsistent_names:
+        raise ValueError(
+            "visual World task ids map to inconsistent frame names: "
+            f"{inconsistent_names}"
+        )
+    expected_names = {
+        task_id: next(iter(names_by_task[task_id])) for task_id in actual_tasks
+    }
     manifest_tasks = {
         int(item["task_id"]): str(item.get("task_name"))
         for item in manifest.get("tasks", [])
     }
     if manifest_tasks != expected_names:
         raise ValueError(
-            "World split task contract must be assembly-v3 + door-unlock-v3, got "
-            f"{manifest_tasks}"
+            "World split task names differ from payload frame refs: "
+            f"{manifest_tasks} != {expected_names}"
         )
 
     transition_rule = manifest.get("transition_rule") or {}
@@ -374,7 +425,7 @@ def validate_visual_world_training_split(
     task_contracts = {
         int(item["task_id"]): item for item in train_contract.get("tasks", [])
     }
-    if sorted(task_contracts) != [0, 16]:
+    if sorted(task_contracts) != actual_tasks:
         raise ValueError("World split train task list mismatch")
     for task_id, item in task_contracts.items():
         selected = task_ids == task_id
@@ -485,6 +536,120 @@ def validate_peer_data_isolation(
     }
 
 
+def validate_peer_resume_weights_contract(
+    contract: dict,
+    *,
+    planning_stride: int,
+    migrating_peer_world: bool = False,
+    migrating_prefix_tail_flow: bool = False,
+    action_horizon: int | None = None,
+    world_horizon: int | None = None,
+    deployment_execution_horizon: int | None = None,
+    peer_flow_topology: str | None = None,
+    assembly_metric_role_contract: str | None = None,
+) -> dict[str, object] | None:
+    """Validate peer weights-only initialization and name known migrations.
+
+    Exact resume is intentionally handled by
+    :func:`validate_visual_world_resume_contract`, which requires the current
+    contracts verbatim.  This validator permits only the two shape-compatible
+    weights-only semantic transitions needed by the current run: final-only to
+    all-stage readout supervision, and the absent legacy assembly role contract
+    to the explicitly supplied reward-center contract.
+    """
+
+    expected = {
+        "peer_training_mode": "joint_dual_stream",
+        "peer_world_topology": (
+            PEER_LEGACY_TOPOLOGY_CONTRACT
+            if migrating_peer_world
+            else PEER_WORLD_TOPOLOGY_CONTRACT
+        ),
+        "peer_gradient_boundary": (
+            PEER_LEGACY_GRADIENT_BOUNDARY_CONTRACT
+            if migrating_peer_world
+            else PEER_GRADIENT_BOUNDARY_CONTRACT
+        ),
+        "peer_data_isolation": PEER_DATA_ISOLATION_CONTRACT,
+        "peer_dual_stream_optimizer": PEER_DUAL_STREAM_OPTIMIZER_CONTRACT,
+        "peer_world_action_source": PEER_WORLD_ACTION_SOURCE_CONTRACT,
+        "planning_stride": int(planning_stride),
+        "planning_hz": 80.0 / int(planning_stride),
+        "peer_high_frequency_contract": (
+            PEER_LEGACY_HIGH_FREQUENCY_CONTRACT
+            if migrating_peer_world
+            else PEER_HIGH_FREQUENCY_CONTRACT
+        ),
+    }
+    migrations: list[dict[str, object]] = []
+    if not migrating_peer_world:
+        expected["peer_world_readout"] = PEER_WORLD_READOUT_CONTRACT
+        expected["peer_flow_topology"] = (
+            None if migrating_prefix_tail_flow else peer_flow_topology
+        )
+        if action_horizon is not None and world_horizon is not None:
+            expected["world_action_source"] = (
+                f"logged_h{int(action_horizon)}_world_horizon_"
+                f"{int(world_horizon)}"
+            )
+        if deployment_execution_horizon is not None:
+            expected["deployment_execution_horizon"] = int(
+                planning_stride
+                if migrating_prefix_tail_flow
+                else deployment_execution_horizon
+            )
+        old_readout = (
+            contract.get("peer_high_frequency_contract")
+            == PEER_READOUT_V2_HIGH_FREQUENCY_CONTRACT
+            and contract.get("peer_world_readout")
+            == PEER_WORLD_READOUT_V2_CONTRACT
+        )
+        if old_readout:
+            expected["peer_high_frequency_contract"] = (
+                PEER_READOUT_V2_HIGH_FREQUENCY_CONTRACT
+            )
+            expected["peer_world_readout"] = PEER_WORLD_READOUT_V2_CONTRACT
+            migrations.append(
+                {
+                    "kind": PEER_READOUT_V2_TO_V3_WEIGHTS_MIGRATION,
+                    "source_high_frequency": PEER_READOUT_V2_HIGH_FREQUENCY_CONTRACT,
+                    "source_readout": PEER_WORLD_READOUT_V2_CONTRACT,
+                    "target_high_frequency": PEER_HIGH_FREQUENCY_CONTRACT,
+                    "target_readout": PEER_WORLD_READOUT_CONTRACT,
+                }
+            )
+
+    if assembly_metric_role_contract is not None:
+        saved_assembly_contract = contract.get("assembly_metric_role_contract")
+        if saved_assembly_contract is None:
+            migrations.append(
+                {
+                    "kind": ASSEMBLY_METRIC_ROLE_WEIGHTS_MIGRATION,
+                    "source": None,
+                    "target": assembly_metric_role_contract,
+                }
+            )
+        else:
+            expected["assembly_metric_role_contract"] = assembly_metric_role_contract
+
+    mismatches = {
+        key: (contract.get(key), value)
+        for key, value in expected.items()
+        if contract.get(key) != value
+    }
+    if mismatches:
+        raise ValueError(
+            "peer --resume-weights requires a joint dual-stream checkpoint "
+            f"with the same physical/message contract: {mismatches}"
+        )
+    if not migrations:
+        return None
+    return {
+        "contract": PEER_WEIGHTS_SEMANTIC_MIGRATION_CONTRACT,
+        "migrations": migrations,
+    }
+
+
 def validate_visual_world_resume_contract(
     checkpoint: dict,
     split_identity: dict[str, object],
@@ -496,6 +661,7 @@ def validate_visual_world_resume_contract(
     late_stage_anchor_weight: float = 0.0,
     stage_weight_overrides: dict[int, float] | None = None,
     world_horizon: int | None = None,
+    assembly_metric_role_contract: str | None = None,
 ) -> None:
     """Reject exact continuation from an old or differently split loss graph."""
 
@@ -569,6 +735,8 @@ def validate_visual_world_resume_contract(
                 "peer_high_frequency_contract": PEER_HIGH_FREQUENCY_CONTRACT,
             }
         )
+    if assembly_metric_role_contract is not None:
+        expected["assembly_metric_role_contract"] = assembly_metric_role_contract
     mismatches = {
         key: (contract.get(key), value)
         for key, value in expected.items()

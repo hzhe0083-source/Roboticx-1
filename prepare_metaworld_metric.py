@@ -23,6 +23,11 @@ Task35 ``peg-insert-side-v3`` 使用任务对齐覆盖：固定四槽仍保持
 ``pegHead - hole``，且目标锚点是画面中真实可见的 ``hole`` site，而不是位于
 方块内部、视觉不可观测的 ``_target_pos``。
 
+``assembly-v3`` 同样使用任务对齐覆盖：抓取角色仍为官方 observation 中的
+``RoundNut-8`` 抓柄，但装配进度角色使用奖励函数真正判定成功的 ``RoundNut``
+中心，即 ``[tcp, RoundNut-8, _target_pos, RoundNut]``。两点在该资产中相距
+13cm，不能把抓柄重复当作装配中心。
+
 投影（2026-08-09 实测验证，误差 <2px）：
     p_cam = R^T (p − cam_pos)，R = mju_quat2Mat(cam_quat) 列 = 相机轴
     x = W/2 + f·(x̂·v)/(−ẑ·v)，y = H/2 − f·(ŷ·v)/(−ẑ·v)，f = (H/2)/tan(fovy/2)
@@ -69,6 +74,7 @@ if _MUJOCO_GL == "egl":
     os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
 from scripts.build_longtraj_features import ENV_TO_TASK  # noqa: E402
+from va_compound.metric_roi import ASSEMBLY_METRIC_ROLE_CONTRACT  # noqa: E402
 
 ROLE_NAMES = ("tool", "object", "target", "interface")
 SUPPORTED_TASKS = tuple(ENV_TO_TASK)
@@ -78,6 +84,11 @@ DIRECT_TOOL_TARGET_TASKS = frozenset(("reach-v3", "reach-wall-v3"))
 # _get_pos_objects() 只给 pegGrasp，而 _target_pos 位于孔块内部、不可见。
 TASK_ALIGNED_ROLE_SOURCES = {
     "peg-insert-side-v3": ("tcp_center", "pegGrasp", "hole", "pegHead"),
+    "assembly-v3": ("tcp_center", "RoundNut-8", "_target_pos", "RoundNut"),
+}
+TASK_ALIGNED_ROLE_CONTRACT = {
+    "peg-insert-side-v3": "slots_tool_pegGrasp_hole_pegHead_v1",
+    "assembly-v3": ASSEMBLY_METRIC_ROLE_CONTRACT,
 }
 CAMERA_NAME = "corner2"
 CAM_POS_DEFAULT = np.array([0.75, 0.075, 0.7])  # lerobot 采集同款 corner2
@@ -103,10 +114,10 @@ PROJECTION_REFERENCE_TABLE: dict[str, dict[str, tuple]] = {
         "interface": ("site", "pegHead"),   # 精插接口：真正进入 hole 的杆尖
     },
     "assembly-v3": {
-        "object": ("body", "RoundNut"),     # 螺母（obs[4:7] 即 RoundNut-8 site，同体）
+        "object": ("site", "RoundNut-8"),  # 官方 observation / 抓取锚点
         "target": ("env", "_target_pos"),   # 螺母落点 = peg 顶（可见；pegTop site 因 metaworld
                                             #   把世界坐标写进 body 相对 site pos 而错位，不能用）
-        "interface": ("body", "peg"),       # 插杆（红柱，接触界面）
+        "interface": ("site", "RoundNut"),  # reward/success 使用的螺母中心
     },
     "hand-insert-v3": {
         "object": ("body", "obj"),          # 带孔方块（objGeom）
@@ -204,6 +215,19 @@ def _site_world_position(env, task: str, name: str) -> np.ndarray:
     return point.copy()
 
 
+def _aligned_role_position(env, task: str, source: str) -> np.ndarray:
+    """Resolve one task-aligned role without changing the fixed four-slot shape."""
+    if source == "tcp_center":
+        point = np.asarray(env.tcp_center, dtype=float).reshape(-1)
+    elif source == "_target_pos":
+        point = np.asarray(getattr(env, source, None), dtype=float).reshape(-1)
+    else:
+        return _site_world_position(env, task, source)
+    if point.shape != (3,):
+        raise ValueError(f"{task}: metric source {source!r} must have shape (3,), got {point.shape}")
+    return point.copy()
+
+
 def keypoint_world_positions(env, task: str) -> np.ndarray | None:
     """统一 MetaWorld 四角色世界坐标 ``[tool, object, target, interface]``。
 
@@ -216,6 +240,8 @@ def keypoint_world_positions(env, task: str) -> np.ndarray | None:
     ``[tcp, pegGrasp, _target_pos, pegGrasp]``，其中两个角色坍缩且内部 target
     在视觉上恒不可见。这里改为 ``[tcp, pegGrasp, hole, pegHead]``，保持固定
     slot 语义（target=hole，interface=pegHead），让第二关系直接表示插入误差。
+    ``assembly-v3`` 的 observation 锚点 ``RoundNut-8`` 是抓柄，而成功判定使用
+    相距 13cm 的 ``RoundNut`` 中心；因此其 progress/interface 槽显式使用后者。
     未知任务返回 ``None``，已声明支持的任务接口异常则立即报错。
     """
     if task not in SUPPORTED_TASKS:
@@ -226,12 +252,10 @@ def keypoint_world_positions(env, task: str) -> np.ndarray | None:
 
     if task in TASK_ALIGNED_ROLE_SOURCES:
         world = np.stack(
-            (
-                tool,
-                _site_world_position(env, task, "pegGrasp"),
-                _site_world_position(env, task, "hole"),
-                _site_world_position(env, task, "pegHead"),
-            )
+            [
+                _aligned_role_position(env, task, source)
+                for source in TASK_ALIGNED_ROLE_SOURCES[task]
+            ]
         )
     else:
         objects = np.asarray(env._get_pos_objects(), dtype=float).reshape(-1)
@@ -889,7 +913,8 @@ def make_metric_batch(
             "roles": list(ROLE_NAMES),
             "interface_semantics": (
                 "progress anchor: second achieved entity when present, else object; "
-                "task35 override uses pegHead while target uses visible hole"
+                "task35 override uses pegHead while target uses visible hole; "
+                "assembly override separates RoundNut-8 grasp handle from RoundNut reward center"
             ),
             "keypoints_order": "y,x normalized 0-1",
             "relation_units": "normalized image coords (p_tool-p_object, p_progress-p_target)",
@@ -906,6 +931,7 @@ def make_metric_batch(
             "render_size": RENDER_SIZE,
             "vision_stride": VISION_STRIDE,
             "task_role_source": {
+                "contracts": dict(TASK_ALIGNED_ROLE_CONTRACT),
                 "tool": "env.tcp_center",
                 "object_and_progress": "env._get_pos_objects()",
                 "target": "env._target_pos",

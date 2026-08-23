@@ -10,15 +10,20 @@ import torch
 import train as train_module
 from train import prepare_visual_world_action_ranking, rollout_policy
 from va_compound.model import VACompoundConfig, VACompoundPolicy
-from va_compound.world_supervision import ActionTop10GapLoss
+from va_compound.world_supervision import (
+    ActionTop10GapLoss,
+    _nearest_cross_episode_donors,
+)
 
 
-def _tiny_world_model(*, va_world_mode: str = "legacy") -> VACompoundPolicy:
+def _tiny_world_model(
+    *, va_world_mode: str = "legacy", num_layers: int = 2
+) -> VACompoundPolicy:
     config = VACompoundConfig(
         language_dim=12,
         vision_dim=8,
         hidden_dim=16,
-        num_layers=2,
+        num_layers=num_layers,
         num_heads=4,
         action_horizon=6,
         action_dim=4,
@@ -217,6 +222,50 @@ def test_action_ranking_donors_are_fixed_in_train_payload() -> None:
     assert identity == second
 
 
+def test_task_grouped_action_donors_match_global_scan_exactly() -> None:
+    generator = torch.Generator().manual_seed(20260823)
+    rows = 49 * 7
+    task_ids = torch.arange(49).repeat_interleave(7)
+    permutation = torch.randperm(rows, generator=generator)
+    task_ids = task_ids[permutation]
+    episode_ids = torch.randint(0, 3, (rows,), generator=generator)
+    proprio = torch.randn(rows, 5, generator=generator)
+    eligible = torch.rand(rows, generator=generator) > 0.15
+
+    # Force exact ties and tasks with no cross-episode donor to cover the
+    # original global-argmin tie break and -1 behavior.
+    for task_id in (3, 17):
+        task_rows = torch.nonzero(task_ids.eq(task_id), as_tuple=False).flatten()
+        eligible[task_rows[:4]] = True
+        proprio[task_rows[:2]] = 0.0
+        episode_ids[task_rows[:2]] = 0
+        episode_ids[task_rows[2:]] = 1
+        proprio[task_rows[2:4]] = 1.0
+    single_episode_rows = task_ids.eq(41)
+    episode_ids[single_episode_rows] = 9
+
+    expected = torch.full((rows,), -1, dtype=torch.int64)
+    state64 = proprio.to(dtype=torch.float64)
+    for row in range(rows):
+        if not bool(eligible[row]):
+            continue
+        candidate = (
+            eligible
+            & task_ids.eq(task_ids[row])
+            & ~episode_ids.eq(episode_ids[row])
+        )
+        if not bool(candidate.any()):
+            continue
+        distance = (state64 - state64[row]).square().sum(dim=-1)
+        distance.masked_fill_(~candidate, float("inf"))
+        expected[row] = distance.argmin()
+
+    actual = _nearest_cross_episode_donors(
+        proprio, task_ids, episode_ids, eligible
+    )
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+
 def test_logged_world_branch_uses_detached_pre_step_memory_without_extra_encode() -> None:
     model = _tiny_world_model()
     batch, noisy_actions, flow_time = _rollout_batch(transitions_valid=True)
@@ -271,17 +320,19 @@ def test_logged_world_branch_uses_detached_pre_step_memory_without_extra_encode(
 def test_peer_world_stream_uses_logged_actions_and_supervises_causal_readout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    model = _tiny_world_model(va_world_mode="peer_sync_h6")
+    model = _tiny_world_model(va_world_mode="peer_sync_h6", num_layers=4)
     batch, noisy_actions, flow_time = _rollout_batch(transitions_valid=True)
     batch["actions"].zero_()
     batch["action_valid_mask"].fill_(True)
     batch["action_valid_mask"][0, 1, 0] = False
     calls = 0
+    stages = model.config.wmrm_stage_count()
 
     def readout_probe(action: torch.Tensor) -> torch.Tensor:
         nonlocal calls
         calls += 1
-        return action.new_ones((action.shape[0], 6, 4))
+        stage_value = (calls - 1) % stages + 1
+        return action.new_full((action.shape[0], 6, 4), stage_value)
 
     monkeypatch.setattr(model.world_action_readout, "forward", readout_probe)
     rollout_policy(
@@ -293,12 +344,53 @@ def test_peer_world_stream_uses_logged_actions_and_supervises_causal_readout(
         flow_steps=2,
     )
 
-    # Logged H6 remains the World forward condition; the independently computed
-    # causal readout is supervised only in the loss and is never written back.
+    # Logged H6 remains the World forward condition; every independently computed
+    # stage readout is supervised only in the loss and is never written back.
     assert torch.count_nonzero(model.last_wmrm.env_action) == 0
-    assert calls == batch["actions"].shape[1] - 1
-    assert model.last_world_action_readout_loss.item() == pytest.approx(0.5)
-    assert model.last_world_action_readout_rmse.item() == pytest.approx(1.0)
+    assert calls == (batch["actions"].shape[1] - 1) * stages
+    stage_values = torch.arange(1, stages + 1, dtype=torch.float32)
+    expected_loss = torch.nn.functional.smooth_l1_loss(
+        stage_values, torch.zeros_like(stage_values), reduction="mean"
+    )
+    expected_rmse = stage_values.square().mean().sqrt()
+    assert model.last_world_action_readout_loss.item() == pytest.approx(
+        expected_loss.item()
+    )
+    assert model.last_world_action_readout_rmse.item() == pytest.approx(
+        expected_rmse.item()
+    )
+
+
+def test_peer_readout_auxiliary_reaches_every_stage_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _tiny_world_model(va_world_mode="peer_sync_h6", num_layers=4)
+    batch, noisy_actions, flow_time = _rollout_batch(transitions_valid=True)
+    captured: list[torch.Tensor] = []
+    original_readout = model.world_action_readout.forward
+
+    def capture_readout(action: torch.Tensor) -> torch.Tensor:
+        action.retain_grad()
+        captured.append(action)
+        return original_readout(action)
+
+    monkeypatch.setattr(model.world_action_readout, "forward", capture_readout)
+    rollout_policy(
+        model,
+        batch,
+        noisy_actions,
+        flow_time,
+        visual_world_supervision=True,
+        flow_steps=2,
+    )
+
+    expected = (batch["actions"].shape[1] - 1) * model.config.wmrm_stage_count()
+    assert len(captured) == expected
+    model.last_world_action_readout_loss.backward()
+    assert all(
+        snapshot.grad is not None and bool(torch.count_nonzero(snapshot.grad))
+        for snapshot in captured
+    )
 
 
 def test_va_only_rollout_keeps_world_messages_but_skips_world_targets() -> None:

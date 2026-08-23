@@ -67,6 +67,7 @@ from va_compound.flow import (
     semantic_pair_loss_legacy,
 )
 from va_compound.world_contract import (
+    ASSEMBLY_METRIC_ROLE_WEIGHTS_MIGRATION,
     FEATURE_AUTOCAST_CONTRACT,
     PEER_DATA_ISOLATION_CONTRACT,
     PEER_DUAL_STREAM_OPTIMIZER_CONTRACT,
@@ -74,13 +75,16 @@ from va_compound.world_contract import (
     PEER_H15_PREFIX_TAIL_FLOW_CONTRACT,
     PEER_H15_PREFIX_TAIL_FLOW_MIGRATION,
     PEER_HIGH_FREQUENCY_CONTRACT,
-    PEER_LEGACY_HIGH_FREQUENCY_CONTRACT,
     PEER_LEGACY_GRADIENT_BOUNDARY_CONTRACT,
     PEER_LEGACY_TOPOLOGY_CONTRACT,
     PEER_PLANNING_STRIDES,
+    PEER_READOUT_V2_HIGH_FREQUENCY_CONTRACT,
+    PEER_READOUT_V2_TO_V3_WEIGHTS_MIGRATION,
     PEER_WORLD_ACTION_SOURCE_CONTRACT,
     PEER_WORLD_READOUT_CONTRACT,
+    PEER_WORLD_READOUT_V2_CONTRACT,
     PEER_WORLD_TOPOLOGY_CONTRACT,
+    PEER_WEIGHTS_SEMANTIC_MIGRATION_CONTRACT,
     PEER_WORLD8_TO_WORLD7_REPAIR_MIGRATION,
     WORLD_ACTION_DONOR_CONTRACT,
     WORLD_ACTION_RANKING,
@@ -94,6 +98,7 @@ from va_compound.world_contract import (
     WORLD_SUPERVISION_CONTRACT,
     WORLD_TRANSITION_CONTRACT,
     validate_peer_data_isolation,
+    validate_peer_resume_weights_contract,
     validate_visual_world_resume_contract,
     validate_visual_world_training_split,
     world_action_ranking_contract,
@@ -273,6 +278,7 @@ def wmrm_next_feature_target(
     return raw.detach()
 from va_compound.backbones import pool_flat_tokens, pool_mtvj_coarse_tokens
 from va_compound.metric_roi import (
+    ASSEMBLY_METRIC_ROLE_CONTRACT,
     DINO_METRIC_ROI_CONTRACT,
     METRIC_ROI_CONTRACT_VERSION,
     TASK35_METRIC_ROLE_CONTRACT,
@@ -3443,20 +3449,46 @@ def rollout_policy(
                         raise RuntimeError(
                             "peer World stage did not expose its action snapshot"
                         )
-                    final_readout = model.world_action_readout(proposal_pres[-1])
-                    if final_readout is None:
+                    expected_stages = model.config.wmrm_stage_count()
+                    if not (
+                        len(proposal_pres) == len(proposal_auxes) == expected_stages
+                    ):
                         raise RuntimeError(
-                            "final peer World stage did not expose deterministic readout"
+                            "peer World stage trace is incomplete: "
+                            f"pre_actions={len(proposal_pres)}, "
+                            f"auxes={len(proposal_auxes)}, expected={expected_stages}"
                         )
-                    logged_readout = logged_chunk.to(dtype=final_readout.dtype)
-                    readout_error = F.smooth_l1_loss(
-                        final_readout,
-                        logged_readout,
-                        reduction="none",
-                    ).mean(dim=(-1, -2))
-                    readout_squared = (
-                        final_readout - logged_readout
-                    ).square().mean(dim=(-1, -2))
+                    stage_readouts = [
+                        model.world_action_readout(pre_action)
+                        for pre_action in proposal_pres
+                    ]
+                    if any(readout is None for readout in stage_readouts):
+                        raise RuntimeError(
+                            "peer World stage did not expose deterministic readout"
+                        )
+                    logged_readout = logged_chunk.to(dtype=stage_readouts[0].dtype)
+                    # Deployment conditions every World stage with its own readout.
+                    # Supervise every such action identity, then average over stages
+                    # so the auxiliary keeps the same total scale as the old final-only
+                    # objective and remains checkpoint-compatible.
+                    readout_error = torch.stack(
+                        [
+                            F.smooth_l1_loss(
+                                readout,
+                                logged_readout,
+                                reduction="none",
+                            ).mean(dim=(-1, -2))
+                            for readout in stage_readouts
+                        ],
+                        dim=0,
+                    ).mean(dim=0)
+                    readout_squared = torch.stack(
+                        [
+                            (readout - logged_readout).square().mean(dim=(-1, -2))
+                            for readout in stage_readouts
+                        ],
+                        dim=0,
+                    ).mean(dim=0)
                     peer_readout_loss_records.append((valid, readout_error))
                     peer_readout_squared_error_records.append(
                         (valid, readout_squared)
@@ -7221,6 +7253,11 @@ def save_checkpoint(
                     if getattr(config, "dino_dense_metric", False)
                     else None
                 ),
+                "assembly_metric_role_contract": (
+                    ASSEMBLY_METRIC_ROLE_CONTRACT
+                    if getattr(config, "dino_dense_metric", False)
+                    else None
+                ),
                 "dino_roi_enabled": roi_head is not None
                 and getattr(args, "dino_roi_checkpoint", None) is not None,
                 "dino_roi_alpha": (
@@ -7261,6 +7298,13 @@ def save_checkpoint(
             # Stage B：解冻后的 V-JEPA 权重必须随 checkpoint 保存（评估侧
             # eval_metaworld.py 已支持 vjepa_state_dict 恢复）。
             payload["vjepa_state_dict"] = vision_backbone.model.state_dict()
+    peer_migration_record = getattr(
+        args, "_peer_resume_weights_contract_migration", None
+    )
+    if isinstance(peer_migration_record, dict):
+        payload["peer_resume_weights_contract_migration"] = dict(
+            peer_migration_record
+        )
     if getattr(args, "visual_world_supervision", False):
         split_identity = getattr(args, "visual_world_split_identity", None)
         if not isinstance(split_identity, dict):
@@ -8857,6 +8901,13 @@ def main() -> None:
             if preloaded_resume_ckpt is not None
             else torch.load(resume_path, map_location="cpu", weights_only=True)
         )
+        prior_peer_migration = resume_ckpt.get(
+            "peer_resume_weights_contract_migration"
+        )
+        if isinstance(prior_peer_migration, dict):
+            args._peer_resume_weights_contract_migration = dict(
+                prior_peer_migration
+            )
         if exact_resume:
             if getattr(args, "visual_world_supervision", False):
                 validate_visual_world_resume_contract(
@@ -8873,6 +8924,11 @@ def main() -> None:
                     float(getattr(args, "wmrm_late_stage_anchor_weight", 0.0)),
                     visual_world_stage_weight_overrides(args),
                     world_horizon=int(config.wmrm_cycle_steps),
+                    assembly_metric_role_contract=(
+                        ASSEMBLY_METRIC_ROLE_CONTRACT
+                        if getattr(config, "dino_dense_metric", False)
+                        else None
+                    ),
                 )
             # Fail before restoring model/optimizer/sampler/RNG if any data,
             # objective, sampler, architecture or optimizer semantic changed.
@@ -8900,48 +8956,57 @@ def main() -> None:
                 getattr(args, "resume_weights_migration", None)
                 == PEER_WORLD8_TO_WORLD7_REPAIR_MIGRATION
             )
-            expected = {
-                "peer_training_mode": "joint_dual_stream",
-                "peer_world_topology": (
-                    PEER_LEGACY_TOPOLOGY_CONTRACT
-                    if migrating_peer_world
-                    else PEER_WORLD_TOPOLOGY_CONTRACT
+            migrating_prefix_tail_flow = (
+                getattr(args, "resume_weights_migration", None)
+                == PEER_H15_PREFIX_TAIL_FLOW_MIGRATION
+            )
+            migration_record = validate_peer_resume_weights_contract(
+                contract,
+                planning_stride=int(getattr(args, "planning_stride", 6)),
+                migrating_peer_world=migrating_peer_world,
+                migrating_prefix_tail_flow=migrating_prefix_tail_flow,
+                action_horizon=int(config.action_horizon),
+                world_horizon=int(config.wmrm_cycle_steps),
+                deployment_execution_horizon=int(
+                    getattr(config, "deployment_execution_horizon", 0)
+                    or getattr(config, "planning_stride", 6)
                 ),
-                "peer_gradient_boundary": (
-                    PEER_LEGACY_GRADIENT_BOUNDARY_CONTRACT
-                    if migrating_peer_world
-                    else PEER_GRADIENT_BOUNDARY_CONTRACT
+                peer_flow_topology=(
+                    PEER_H15_PREFIX_TAIL_FLOW_CONTRACT
+                    if getattr(model, "tail_flow_head", None) is not None
+                    else None
                 ),
-                "peer_data_isolation": PEER_DATA_ISOLATION_CONTRACT,
-                "peer_dual_stream_optimizer": PEER_DUAL_STREAM_OPTIMIZER_CONTRACT,
-                "planning_stride": int(getattr(args, "planning_stride", 6)),
-                "planning_hz": 80.0
-                / int(getattr(args, "planning_stride", 6)),
-                "peer_high_frequency_contract": (
-                    PEER_LEGACY_HIGH_FREQUENCY_CONTRACT
-                    if migrating_peer_world
-                    else PEER_HIGH_FREQUENCY_CONTRACT
+                assembly_metric_role_contract=(
+                    ASSEMBLY_METRIC_ROLE_CONTRACT
+                    if getattr(config, "dino_dense_metric", False)
+                    else None
                 ),
-            }
-            mismatches = {
-                key: (contract.get(key), value)
-                for key, value in expected.items()
-                if contract.get(key) != value
-            }
-            if mismatches:
-                raise ValueError(
-                    "peer --resume-weights requires a joint dual-stream "
-                    f"checkpoint with the same message contract: {mismatches}"
+            )
+            if migration_record is not None:
+                migration_record = {
+                    **migration_record,
+                    "source_global_step": int(resume_ckpt.get("global_step", 0)),
+                }
+                args._peer_resume_weights_contract_migration = migration_record
+                migration_names = ",".join(
+                    str(item["kind"])
+                    for item in migration_record["migrations"]
+                )
+                print(
+                    "resume-weights semantic migration: " + migration_names,
+                    flush=True,
                 )
         resume_config = resume_ckpt["config"]
         for key in (
             "num_layers",
             "hidden_dim",
+            "action_horizon",
             "action_dim",
             "proprio_dim",
             "mode",
             "va_world_mode",
             "planning_stride",
+            "deployment_execution_horizon",
             "wmrm_cycle_steps",
             "wmrm_predictor",
             "wmrm_predictor_depth",
@@ -8951,7 +9016,17 @@ def main() -> None:
             if (
                 getattr(args, "resume_weights_migration", None)
                 == PEER_WORLD8_TO_WORLD7_REPAIR_MIGRATION
-                and key == "wmrm_cycle_steps"
+                and key in {
+                    "action_horizon",
+                    "deployment_execution_horizon",
+                    "wmrm_cycle_steps",
+                }
+            ):
+                continue
+            if (
+                getattr(args, "resume_weights_migration", None)
+                == PEER_H15_PREFIX_TAIL_FLOW_MIGRATION
+                and key == "deployment_execution_horizon"
             ):
                 continue
             if key.startswith("wmrm_") and not getattr(config, "wmrm", False):
@@ -8961,6 +9036,8 @@ def main() -> None:
                 left = "legacy"
             if key == "planning_stride" and left is None:
                 left = 6
+            if key == "deployment_execution_horizon" and left is None:
+                left = resume_config.get("planning_stride") or 6
             right = getattr(config, key, None)
             if key.startswith("wmrm_") and left is None:
                 left = {

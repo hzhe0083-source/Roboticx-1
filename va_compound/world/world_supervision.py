@@ -819,15 +819,24 @@ def _nearest_cross_episode_donors(
     episode = episode_ids.detach().to(device="cpu", dtype=torch.int64)
     eligible = eligible.detach().to(device="cpu", dtype=torch.bool)
     donors = torch.full((batch,), -1, dtype=torch.int64)
-    for row in range(batch):
-        if not bool(eligible[row]):
-            continue
-        candidate = eligible & task.eq(task[row]) & ~episode.eq(episode[row])
-        if not bool(candidate.any()):
-            continue
-        distance = (state - state[row]).square().sum(dim=-1)
-        distance.masked_fill_(~candidate, float("inf"))
-        donors[row] = int(distance.argmin())
+    task_rows: dict[int, list[int]] = {}
+    for row in torch.nonzero(eligible, as_tuple=False).flatten().tolist():
+        task_rows.setdefault(int(task[row]), []).append(row)
+
+    # Rows are appended in global index order, so a distance tie still selects
+    # the same lowest global donor as the former batch-wide argmin.  Limiting
+    # each scan to one task changes the work from O(N^2) to sum_t O(N_t^2).
+    for rows in task_rows.values():
+        indices = torch.tensor(rows, dtype=torch.int64)
+        task_state = state.index_select(0, indices)
+        task_episode = episode.index_select(0, indices)
+        for local_row, row in enumerate(rows):
+            candidate = task_episode.ne(task_episode[local_row])
+            if not bool(candidate.any()):
+                continue
+            distance = (task_state - task_state[local_row]).square().sum(dim=-1)
+            distance.masked_fill_(~candidate, float("inf"))
+            donors[row] = indices[distance.argmin()]
     return donors
 
 

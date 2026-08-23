@@ -159,7 +159,7 @@ def test_p2_world_ranking_uses_transition_prefix_but_keeps_h6_labels() -> None:
     assert payload["world_rank_shuffle_action"].shape == (4, 3, 2, 4)
     source = inspect.getsource(rollout_policy)
     assert ": model.config.action_horizon" in source
-    assert "logged_chunk.to(dtype=final_readout.dtype)" in source
+    assert "logged_chunk.to(dtype=stage_readouts[0].dtype)" in source
 
 
 def test_h15_world_ranking_uses_full_endpoint_action_chunk(tmp_path: Path) -> None:

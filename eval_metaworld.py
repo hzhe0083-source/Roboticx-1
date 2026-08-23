@@ -760,6 +760,7 @@ def _mtvj_metric_tokens(
     roi_video: torch.Tensor | None = None,
     roi_alpha: float = 0.0,
     roi_dino: bool = False,
+    trace_out: dict[str, Any] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """单决策 metric_tokens（与 train.py ``_mtvj_online_encode`` 的 metric 分支同构）。
 
@@ -811,7 +812,18 @@ def _mtvj_metric_tokens(
             MTVJ_LEGACY_METRIC_STATE_SOURCE,
         ),
     ).detach()[0]
+    if trace_out is not None:
+        trace_out.update(
+            {
+                "role_order": ["tool", "object", "target", "interface"],
+                "predicted_yx": out.p[0].detach().float().cpu().tolist(),
+                "visibility": out.visibility[0].detach().float().cpu().tolist(),
+                "operative_metric_g": g.detach().float().cpu().tolist(),
+            }
+        )
     nu = torch.zeros_like(g) if g_prev is None else g - g_prev
+    if trace_out is not None:
+        trace_out["metric_nu"] = nu.detach().float().cpu().tolist()
     z_g, z_nu = relation_encoder(g[None], nu[None])
     metric_tokens = torch.stack((z_g, z_nu), dim=1)  # [1, 2, d_model]
     return metric_tokens, g.detach()
@@ -949,6 +961,271 @@ class SynchronousPlanQueue:
         if self._plan is None:
             raise RuntimeError("no active plan")
         return self._plan.action_at(step)
+
+
+def _action_trace_metrics(world_raw: np.ndarray, flow_raw: np.ndarray) -> dict[str, Any]:
+    """Compare peer readouts before and after the execution clip."""
+    world = np.asarray(world_raw, dtype=float)
+    flow = np.asarray(flow_raw, dtype=float)
+    if world.shape != flow.shape or world.ndim != 2 or world.shape[1] != 4:
+        raise ValueError("peer trace actions must share shape [horizon, 4]")
+    world_clipped = np.clip(world, -1.0, 1.0)
+    flow_clipped = np.clip(flow, -1.0, 1.0)
+    pre = world - flow
+    post = world_clipped - flow_clipped
+    world_sat = np.abs(world) > 1.0
+    flow_sat = np.abs(flow) > 1.0
+    return {
+        "world_raw": world.tolist(),
+        "flow_raw": flow.tolist(),
+        "world_clipped": world_clipped.tolist(),
+        "flow_clipped": flow_clipped.tolist(),
+        "distance": {
+            "xyz_preclip_l2": np.linalg.norm(pre[:, :3], axis=1).tolist(),
+            "xyz_postclip_l2": np.linalg.norm(post[:, :3], axis=1).tolist(),
+            "gripper_preclip_abs": np.abs(pre[:, 3]).tolist(),
+            "gripper_postclip_abs": np.abs(post[:, 3]).tolist(),
+        },
+        "saturation_disagreement": {
+            "xyz": np.any(world_sat[:, :3] != flow_sat[:, :3], axis=1).tolist(),
+            "gripper": (world_sat[:, 3] != flow_sat[:, 3]).tolist(),
+        },
+    }
+
+
+def _assembly_trace_state(env: Any, info: dict[str, Any]) -> dict[str, Any]:
+    """Read reward-authoritative assembly geometry and success."""
+    target = np.asarray(env._target_pos, dtype=float).reshape(3)
+    nut = np.asarray(env._get_site_pos("RoundNut"), dtype=float).reshape(3)
+    grasp_handle = np.asarray(
+        env._get_site_pos("RoundNut-8"), dtype=float
+    ).reshape(3)
+    metric_object = np.asarray(env._get_pos_objects(), dtype=float).reshape(-1, 3)[0]
+    tcp = np.asarray(env.tcp_center, dtype=float).reshape(3)
+    delta = target - nut
+    xy_radius = float(np.linalg.norm(delta[:2]))
+    delta_z = float(delta[2])
+    reward_z_condition = bool(delta_z > 0.0)
+
+    def optional_reward_term(name: str) -> float | None:
+        value = info.get(name)
+        return None if value is None else float(value)
+
+    return {
+        "target_pos": target.tolist(),
+        "round_nut": nut.tolist(),
+        "round_nut_reward_site_xyz": nut.tolist(),
+        "grasp_handle_roundnut8_xyz": grasp_handle.tolist(),
+        "metric_object": metric_object.tolist(),
+        "tcp": tcp.tolist(),
+        "xy_radius": xy_radius,
+        "z_gap": delta_z,
+        "aligned": bool(xy_radius < 0.02),
+        # Backward-compatible alias. This is only the reward's vertical sign
+        # test; it does not mean that the nut is grasped, in contact, or hooked.
+        "hooked": reward_z_condition,
+        "reward_z_condition": reward_z_condition,
+        "tcp_to_metric_object": float(np.linalg.norm(tcp - metric_object)),
+        "tcp_to_grasp_handle": float(np.linalg.norm(tcp - grasp_handle)),
+        "metric_object_to_target": float(np.linalg.norm(target - metric_object)),
+        "near_object": optional_reward_term("near_object"),
+        "grasp_success": optional_reward_term("grasp_success"),
+        "grasp_reward": optional_reward_term("grasp_reward"),
+        "in_place_reward": optional_reward_term("in_place_reward"),
+        "obj_to_target": optional_reward_term("obj_to_target"),
+        "success": bool(info.get("success", False)),
+    }
+
+
+def _validate_peer_eval_trace(
+    *, output_json: Path | None, va_world_mode: str, peer_world_off: bool
+) -> None:
+    if output_json is None:
+        raise ValueError("--peer-eval-trace requires --output-json")
+    if va_world_mode != "peer_sync_h6":
+        raise ValueError("--peer-eval-trace requires a peer_sync_h6 checkpoint")
+    if peer_world_off:
+        raise ValueError("--peer-eval-trace is incompatible with --peer-world-off")
+
+
+def _peer_world_trace_stages(model: Any) -> list[dict[str, Any]]:
+    """Return every peer stage's predicted and operative executable action.
+
+    ``readout`` is the deterministic action decoded from that stage's input VA
+    tokens. ``operative`` is copied from the WAM auxiliary and is therefore the
+    authoritative action that actually conditioned the World predictor.  They
+    are equal at deployment, but differ in the logged-action training branch.
+    """
+    stages = sorted(model._wmrm_inject_layers())
+    pre_actions = list(getattr(model, "last_wmrm_pre_actions", None) or ())
+    auxes = list(getattr(model, "last_wmrm_auxes", None) or ())
+    if not stages or len(pre_actions) != len(stages) or len(auxes) != len(stages):
+        raise RuntimeError("peer trace has no aligned World stage snapshots")
+    records: list[dict[str, Any]] = []
+    with torch.no_grad():
+        for stage, pre_action, aux in zip(stages, pre_actions, auxes, strict=True):
+            readout = model.world_action_readout(pre_action)
+            operative = getattr(aux, "env_action", None)
+            if operative is None or tuple(operative.shape) != tuple(readout.shape):
+                raise RuntimeError(
+                    f"peer trace stage {stage} has no full-horizon operative action"
+                )
+            records.append(
+                {
+                    "stage": int(stage),
+                    "readout": readout[0].detach().cpu().numpy().copy(),
+                    "operative": operative[0].detach().cpu().numpy().copy(),
+                }
+            )
+    return records
+
+
+def _peer_world_trace_readout(model: Any) -> tuple[int, np.ndarray]:
+    """Backward-compatible final-stage view used by existing trace analysis."""
+    final = _peer_world_trace_stages(model)[-1]
+    return int(final["stage"]), np.asarray(final["readout"]).copy()
+
+
+def _peer_trace_stage_metrics(
+    stages: list[dict[str, Any]], flow: np.ndarray
+) -> list[dict[str, Any]]:
+    """Serialize all stages, using the predictor's operative action as primary."""
+    result = []
+    stage_count = len(stages)
+    for ordinal, record in enumerate(stages):
+        readout = np.asarray(record["readout"], dtype=float)
+        operative = np.asarray(record["operative"], dtype=float)
+        operative_vs_flow = _action_trace_metrics(operative, flow)
+        readout_vs_operative = _action_trace_metrics(readout, operative)
+        result.append(
+            {
+                "stage_ordinal": int(ordinal),
+                "stage": int(record["stage"]),
+                "va_layer_index": int(record["stage"]),
+                "stage_count": int(stage_count),
+                "operative_matches_readout": bool(
+                    np.array_equal(operative, readout)
+                ),
+                "operative_raw": operative.tolist(),
+                "readout_raw": readout.tolist(),
+                "operative_vs_flow": operative_vs_flow,
+                "readout_vs_operative": readout_vs_operative,
+            }
+        )
+    return result
+
+
+def _peer_world_effect_metrics(
+    world_on_flow: np.ndarray, world_off_flow: np.ndarray
+) -> dict[str, Any]:
+    """Compare two Flow chunks generated from the same state and noise."""
+    metrics = _action_trace_metrics(world_on_flow, world_off_flow)
+    return {
+        "world_on_flow_raw": metrics["world_raw"],
+        "world_off_flow_raw": metrics["flow_raw"],
+        "world_on_flow_clipped": metrics["world_clipped"],
+        "world_off_flow_clipped": metrics["flow_clipped"],
+        "distance": metrics["distance"],
+        "saturation_disagreement": metrics["saturation_disagreement"],
+    }
+
+
+def _condition_trace_summary(condition: torch.Tensor, prefix_steps: int = 6) -> dict[str, Any]:
+    """Compact decision-level features for held-out representation probes."""
+    if condition.ndim != 3 or condition.shape[0] != 1:
+        raise ValueError("trace condition must have shape [1, horizon, hidden]")
+    horizon = condition.shape[1]
+    prefix = min(max(int(prefix_steps), 1), horizon)
+    value = condition[0].detach().float().cpu()
+    result = {
+        "horizon": int(horizon),
+        "hidden_dim": int(value.shape[-1]),
+        "token0": value[0].tolist(),
+        "all_mean": value.mean(dim=0).tolist(),
+        "prefix_mean": value[:prefix].mean(dim=0).tolist(),
+    }
+    if prefix < horizon:
+        result["tail_mean"] = value[prefix:].mean(dim=0).tolist()
+    return result
+
+
+def _assembly_metric_oracle(env: Any) -> dict[str, Any]:
+    """Project simulator-authoritative metric roles into the rendered camera."""
+    from prepare_metaworld_metric import (
+        RENDER_SIZE,
+        keypoint_world_positions,
+        project_points,
+    )
+
+    world = keypoint_world_positions(env, "assembly-v3")
+    if world is None or np.asarray(world).shape != (4, 3):
+        raise RuntimeError("assembly metric oracle did not expose four 3-D roles")
+    pixels_xy, depth = project_points(env, np.asarray(world, dtype=float))
+    normalized_yx = np.stack(
+        (pixels_xy[:, 1] / RENDER_SIZE, pixels_xy[:, 0] / RENDER_SIZE), axis=1
+    )
+    reward_center = np.asarray(env._get_site_pos("RoundNut"), dtype=float).reshape(3)
+    grasp_handle = np.asarray(env._get_site_pos("RoundNut-8"), dtype=float).reshape(3)
+    extra_world = np.stack((grasp_handle, reward_center))
+    extra_xy, extra_depth = project_points(env, extra_world)
+    extra_yx = np.stack(
+        (extra_xy[:, 1] / RENDER_SIZE, extra_xy[:, 0] / RENDER_SIZE), axis=1
+    )
+    return {
+        "role_order": ["tool", "object", "target", "interface"],
+        "world_xyz": np.asarray(world, dtype=float).tolist(),
+        "image_yx": normalized_yx.tolist(),
+        "camera_depth": np.asarray(depth, dtype=float).tolist(),
+        "assembly_extra": {
+            "role_order": ["grasp_handle_roundnut8", "reward_center_roundnut"],
+            "world_xyz": extra_world.tolist(),
+            "image_yx": extra_yx.tolist(),
+            "camera_depth": np.asarray(extra_depth, dtype=float).tolist(),
+            "separation_m": float(np.linalg.norm(grasp_handle - reward_center)),
+        },
+    }
+
+
+def _append_peer_trace_token(
+    decision: dict[str, Any],
+    *,
+    token: int,
+    env_step: int,
+    normalized_command: np.ndarray,
+    denormalized_command: np.ndarray,
+    pre_tcp: np.ndarray,
+    post_tcp: np.ndarray,
+    reward: float,
+    pre_assembly: dict[str, Any],
+    assembly: dict[str, Any],
+    terminated: bool,
+    truncated: bool,
+) -> None:
+    flow_raw = np.asarray(decision["flow_raw"], dtype=float)
+    if token != len(decision["tokens"]) or not 0 <= token < flow_raw.shape[0]:
+        raise RuntimeError(f"peer trace token {token} is not the next planned token")
+    normalized = np.asarray(normalized_command, dtype=float)
+    if not np.allclose(normalized, np.clip(flow_raw[token], -1.0, 1.0)):
+        raise RuntimeError("peer trace normalized command does not match planned Flow token")
+    decision["tokens"].append(
+        {
+            "decision": int(decision["decision"]),
+            "token": int(token),
+            "env_step": int(env_step),
+            "pre_tcp": np.asarray(pre_tcp, dtype=float).reshape(3).tolist(),
+            "post_tcp": np.asarray(post_tcp, dtype=float).reshape(3).tolist(),
+            "normalized_command": normalized.tolist(),
+            "denormalized_command": np.asarray(denormalized_command, dtype=float).tolist(),
+            "reward": float(reward),
+            "pre_step_assembly": pre_assembly,
+            "post_step_assembly": assembly,
+            **assembly,
+            "terminated": bool(terminated),
+            "truncated": bool(truncated),
+            "terminal": bool(assembly["success"] or terminated or truncated),
+        }
+    )
+    decision["executed_token_count"] = len(decision["tokens"])
 
 
 def resolve_execution_horizon(
@@ -1091,6 +1368,14 @@ def parse_args() -> argparse.Namespace:
         "--record-action-chunks",
         action="store_true",
         help="Include decoded normalized chunks in per-trial JSON for paired divergence analysis.",
+    )
+    parser.add_argument(
+        "--peer-eval-trace",
+        action="store_true",
+        help=(
+            "Opt-in per-decision/token JSON trace for peer World/Flow assembly "
+            "diagnostics; requires --output-json and a peer checkpoint."
+        ),
     )
     parser.add_argument("--trials-per-task", type=int, default=10)
     parser.add_argument(
@@ -2381,6 +2666,12 @@ def main() -> None:
     )
     if args.peer_world_off and config.va_world_mode != "peer_sync_h6":
         raise ValueError("--peer-world-off requires a peer_sync_h6 checkpoint")
+    if args.peer_eval_trace:
+        _validate_peer_eval_trace(
+            output_json=args.output_json,
+            va_world_mode=config.va_world_mode,
+            peer_world_off=args.peer_world_off,
+        )
     # Keep the old field available to existing validation/reporting callers.
     args.execute_steps = args.execution_horizon
     policy_contract = ckpt.get("training_contract", {}) or {}
@@ -3237,6 +3528,8 @@ def main() -> None:
         )
     for local_task_index, (global_task_index, task_text) in enumerate(selected_tasks):
         env_name = descriptions_to_env.get(task_text)
+        if args.peer_eval_trace and env_name != "assembly-v3":
+            raise ValueError("--peer-eval-trace currently supports assembly-v3 only")
         if env_name is None:
             message = f"task {task_text[:40]} has no env_name mapping"
             if args.task35_precision_contract:
@@ -3310,6 +3603,9 @@ def main() -> None:
             }
             decision_count = 0  # 2026-08-06：--memory-reset-every 的决策计数器
             recorded_chunks: list[list[list[float]]] = []
+            peer_eval_trace: list[dict[str, Any]] = []
+            active_peer_decision: dict[str, Any] | None = None
+            last_env_info: dict[str, Any] = {}
             plan_queue = SynchronousPlanQueue(args.execution_horizon)
             plan_step = None  # C²/伺服：上次规划的原始步
             c2_token = 0  # C²/伺服：自规划以来消费的 token 索引
@@ -3839,6 +4135,9 @@ def main() -> None:
                         )
                         dense_kwargs = {}
                         metric_g = None
+                        metric_trace: dict[str, Any] | None = (
+                            {} if args.peer_eval_trace else None
+                        )
                         if getattr(config, "dino_dense_metric", False):
                             # DINO-metric 在线解码：dense evidence（本决策窗口
                             # 已编码）+ metric tokens（g_t / ν_t，与训练
@@ -3892,6 +4191,7 @@ def main() -> None:
                                     else 0.0
                                 ),
                                 roi_dino=True,
+                                trace_out=metric_trace,
                             )
                             metric_g_prev = metric_g
                             metric_g_policy = task35_ablation_geometry(
@@ -4008,6 +4308,7 @@ def main() -> None:
                                         f"is shorter than WAM4VA cycle {cycle}"
                                     )
                                 world_action = decoded_proposal[:, :cycle].clamp(-1.0, 1.0)
+                        pre_decision_memory = memory
                         cond, memory = model.encode_condition(
                             vision_in,
                             proprio[0],
@@ -4018,6 +4319,11 @@ def main() -> None:
                             env_action=world_action,
                             skip_wmrm=args.peer_world_off,
                             **dense_kwargs,
+                        )
+                        peer_stage_records = (
+                            _peer_world_trace_stages(model)
+                            if args.peer_eval_trace
+                            else None
                         )
                         # 训练侧 flow_semantic 时槽输出（vision_in）作为 flow
                         # head 逐层 cross-attn 语义上下文；闭环必须传同一路径，
@@ -4030,6 +4336,17 @@ def main() -> None:
                             )
                             else None
                         )
+                        if args.peer_eval_trace and proposal_noise is None:
+                            # This is exactly the random draw sample_actions would
+                            # make. Making it explicit preserves the baseline while
+                            # allowing a same-state, same-noise World-off decode.
+                            proposal_noise = torch.randn(
+                                cond.shape[0],
+                                config.action_horizon,
+                                config.action_dim,
+                                device=cond.device,
+                                dtype=cond.dtype,
+                            )
                         if args.flow_samples == 1:
                             decoded = model.decode_actions(
                                 cond,
@@ -4049,6 +4366,115 @@ def main() -> None:
                                 ]
                             ).mean(dim=0)
                         chunk = decoded[0].cpu().numpy()
+                        if args.peer_eval_trace:
+                            if not all(
+                                np.array_equal(row["readout"], row["operative"])
+                                for row in peer_stage_records
+                            ):
+                                raise RuntimeError(
+                                    "deployment World stage did not consume its own readout"
+                                )
+                            world_stage = int(peer_stage_records[-1]["stage"])
+                            world_readout = np.asarray(
+                                peer_stage_records[-1]["readout"]
+                            )
+                            world_off_cond = model.encode_condition(
+                                vision_in,
+                                proprio[0],
+                                previous[0],
+                                language_cache=task_caches[local_task_index],
+                                visual_memory=pre_decision_memory,
+                                skip_wmrm=True,
+                                **dense_kwargs,
+                            )
+                            world_off_chunk = model.decode_actions(
+                                world_off_cond,
+                                steps=flow_steps,
+                                noise=proposal_noise,
+                                semantic_context=semantic_ctx,
+                            )[0].cpu().numpy()
+                            candidate_action = np.clip(
+                                world_off_chunk, -1.0, 1.0
+                            )
+                            candidate_tensor = torch.as_tensor(
+                                candidate_action,
+                                device=cond.device,
+                                dtype=cond.dtype,
+                            )[None]
+                            candidate_cond = model.encode_condition(
+                                vision_in,
+                                proprio[0],
+                                previous[0],
+                                language_cache=task_caches[local_task_index],
+                                visual_memory=pre_decision_memory,
+                                env_action=candidate_tensor,
+                                **dense_kwargs,
+                            )
+                            candidate_stage_records = _peer_world_trace_stages(model)
+                            candidate_chunk = model.decode_actions(
+                                candidate_cond,
+                                steps=flow_steps,
+                                noise=proposal_noise,
+                                semantic_context=semantic_ctx,
+                            )[0].cpu().numpy()
+                            active_peer_decision = {
+                                "decision": int(decision_count - 1),
+                                "env_step_start": int(step),
+                                "world_stage": world_stage,
+                                **_action_trace_metrics(world_readout, chunk),
+                                "world_stages": _peer_trace_stage_metrics(
+                                    peer_stage_records, chunk
+                                ),
+                                "same_noise_counterfactual": {
+                                    "history_note": (
+                                        "current-decision World bypass; pre-decision memory "
+                                        "still contains prior World influence"
+                                    ),
+                                    "flow_current_world_bypass_raw": world_off_chunk.tolist(),
+                                    "flow_candidate_conditioned_raw": candidate_chunk.tolist(),
+                                    "candidate_action_clipped": candidate_action.tolist(),
+                                    "world_on_vs_current_bypass": _peer_world_effect_metrics(
+                                        chunk, world_off_chunk
+                                    ),
+                                    "candidate_conditioned_vs_current_bypass": (
+                                        _peer_world_effect_metrics(
+                                            candidate_chunk, world_off_chunk
+                                        )
+                                    ),
+                                    "candidate_world_stages": _peer_trace_stage_metrics(
+                                        candidate_stage_records, candidate_chunk
+                                    ),
+                                },
+                                "condition_summary": {
+                                    "world_on": _condition_trace_summary(cond),
+                                    "current_world_bypass": _condition_trace_summary(
+                                        world_off_cond
+                                    ),
+                                    "candidate_conditioned": _condition_trace_summary(
+                                        candidate_cond
+                                    ),
+                                },
+                                "flow_noise": proposal_noise[0]
+                                .detach()
+                                .float()
+                                .cpu()
+                                .tolist(),
+                                "action_affine": {
+                                    "q01": np.asarray(aq01, dtype=float).tolist(),
+                                    "q99": np.asarray(aq99, dtype=float).tolist(),
+                                },
+                                "pre_decision_assembly": _assembly_trace_state(env, {}),
+                                "metric_perception": metric_trace,
+                                "metric_oracle": _assembly_metric_oracle(env),
+                                "denormalized_command": (
+                                    np.clip(chunk, -1.0, 1.0)
+                                    * (aq99 - aq01) / 2
+                                    + (aq99 + aq01) / 2
+                                ).astype(float).tolist(),
+                                "executed_token_count": 0,
+                                "tokens": [],
+                            }
+                            peer_eval_trace.append(active_peer_decision)
                         # Standard evaluation uses an absolute-time synchronous plan;
                         # execution_horizon controls the hard replacement prefix while
                         # peer WMRM consumes the same checkpoint planning prefix.
@@ -4080,7 +4506,40 @@ def main() -> None:
                     norm_action = np.clip(plan_queue.action_at(step), -1.0, 1.0)
 
                 action = norm_action * (aq99 - aq01) / 2 + (aq99 + aq01) / 2
+                pre_tcp = (
+                    np.asarray(env.tcp_center, dtype=float).reshape(3).copy()
+                    if args.peer_eval_trace
+                    else None
+                )
+                pre_assembly = (
+                    _assembly_trace_state(env, last_env_info)
+                    if args.peer_eval_trace
+                    else None
+                )
                 obs, reward, terminated, truncated, info = env.step(action)
+                if args.peer_eval_trace:
+                    if active_peer_decision is None or plan_queue.plan is None:
+                        raise RuntimeError("peer trace token has no active decision plan")
+                    token = int(step - plan_queue.plan.start_step)
+                    if not 0 <= token < args.execution_horizon:
+                        raise RuntimeError(
+                            f"peer trace token {token} is outside execution horizon"
+                        )
+                    _append_peer_trace_token(
+                        active_peer_decision,
+                        token=token,
+                        env_step=step,
+                        normalized_command=norm_action,
+                        denormalized_command=action,
+                        pre_tcp=pre_tcp,
+                        post_tcp=env.tcp_center,
+                        reward=reward,
+                        pre_assembly=pre_assembly,
+                        assembly=_assembly_trace_state(env, info),
+                        terminated=terminated,
+                        truncated=truncated,
+                    )
+                last_env_info = dict(info)
                 last_norm = norm_action
                 if args.debug_stage_metrics:
                     for metric_name in (
@@ -4122,6 +4581,8 @@ def main() -> None:
                 }
             if args.record_action_chunks:
                 record["action_chunks"] = recorded_chunks
+            if args.peer_eval_trace:
+                record["peer_eval_trace"] = peer_eval_trace
             trial_records.append(record)
             print(
                 f"trial task={global_task_index} trial={trial} seed={episode_seed} "

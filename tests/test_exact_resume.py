@@ -10,6 +10,8 @@ import torch
 from torch import nn
 
 from train import (
+    ASSEMBLY_METRIC_ROLE_CONTRACT,
+    ASSEMBLY_METRIC_ROLE_WEIGHTS_MIGRATION,
     SAM,
     TaskLocalityWeightedSampler,
     TaskWeightedSampler,
@@ -21,10 +23,15 @@ from train import (
     PEER_DATA_ISOLATION_CONTRACT,
     PEER_DUAL_STREAM_OPTIMIZER_CONTRACT,
     PEER_GRADIENT_BOUNDARY_CONTRACT,
+    PEER_H15_PREFIX_TAIL_FLOW_CONTRACT,
     PEER_HIGH_FREQUENCY_CONTRACT,
+    PEER_READOUT_V2_HIGH_FREQUENCY_CONTRACT,
+    PEER_READOUT_V2_TO_V3_WEIGHTS_MIGRATION,
     PEER_WORLD_ACTION_SOURCE_CONTRACT,
     PEER_WORLD_READOUT_CONTRACT,
+    PEER_WORLD_READOUT_V2_CONTRACT,
     PEER_WORLD_TOPOLOGY_CONTRACT,
+    PEER_WEIGHTS_SEMANTIC_MIGRATION_CONTRACT,
     WORLD_STAGE_AUXILIARY_DECAY,
     WORLD_STAGE_AUXILIARY_FLOOR,
     WORLD_STATIC_COPY_CONSTRAINT,
@@ -44,6 +51,7 @@ from train import (
     restore_exact_resume_state,
     save_checkpoint,
     validate_exact_run_contract,
+    validate_peer_resume_weights_contract,
     validate_visual_world_resume_contract,
     world_action_ranking_contract,
 )
@@ -254,7 +262,15 @@ def test_peer_checkpoint_contains_both_sampler_states_and_data_identities(
     world_sampler.bind_dataset_content_identity(world_identity)
     va_sampler.advance()
     world_sampler.advance(2)
-    config = SimpleNamespace(va_world_mode="peer_sync_h6")
+    migration_record = {
+        "contract": "peer_resume_weights_semantic_migrations_v1",
+        "migrations": [{"kind": PEER_READOUT_V2_TO_V3_WEIGHTS_MIGRATION}],
+    }
+    args._peer_resume_weights_contract_migration = migration_record
+    config = SimpleNamespace(
+        va_world_mode="peer_sync_h6",
+        dino_dense_metric=True,
+    )
     exact_contract = build_exact_run_contract(
         args,
         config,
@@ -281,6 +297,10 @@ def test_peer_checkpoint_contains_both_sampler_states_and_data_identities(
     peer = loaded["exact_run_contract"]["peer_world"]
     assert peer["va_data_identity"] == va_identity
     assert peer["world_data_identity"] == world_identity
+    assert loaded["training_contract"]["assembly_metric_role_contract"] == (
+        ASSEMBLY_METRIC_ROLE_CONTRACT
+    )
+    assert loaded["peer_resume_weights_contract_migration"] == migration_record
 
 
 def test_final_checkpoint_skips_same_step_periodic_save(tmp_path) -> None:
@@ -1200,6 +1220,41 @@ def test_visual_world_exact_resume_binds_fixed_action_donors() -> None:
             va_world_mode="peer_sync_h6",
         )
 
+    legacy_readout = copy.deepcopy(h15_peer_contract)
+    legacy_readout["peer_high_frequency_contract"] = (
+        PEER_READOUT_V2_HIGH_FREQUENCY_CONTRACT
+    )
+    legacy_readout["peer_world_readout"] = PEER_WORLD_READOUT_V2_CONTRACT
+    with pytest.raises(ValueError, match="peer_(world_readout|high_frequency_contract)"):
+        validate_visual_world_resume_contract(
+            {"training_contract": legacy_readout},
+            identity,
+            va_world_mode="peer_sync_h6",
+            planning_stride=2,
+            world_horizon=15,
+        )
+    with pytest.raises(ValueError, match="assembly_metric_role_contract"):
+        validate_visual_world_resume_contract(
+            {"training_contract": h15_peer_contract},
+            identity,
+            va_world_mode="peer_sync_h6",
+            planning_stride=2,
+            world_horizon=15,
+            assembly_metric_role_contract=ASSEMBLY_METRIC_ROLE_CONTRACT,
+        )
+    current_metric_roles = {
+        **h15_peer_contract,
+        "assembly_metric_role_contract": ASSEMBLY_METRIC_ROLE_CONTRACT,
+    }
+    validate_visual_world_resume_contract(
+        {"training_contract": current_metric_roles},
+        identity,
+        va_world_mode="peer_sync_h6",
+        planning_stride=2,
+        world_horizon=15,
+        assembly_metric_role_contract=ASSEMBLY_METRIC_ROLE_CONTRACT,
+    )
+
     cap_ranking = world_action_ranking_contract("cycle", 0.2)
     with pytest.raises(ValueError, match="world_action_ranking"):
         validate_visual_world_resume_contract(
@@ -1230,3 +1285,116 @@ def test_visual_world_exact_resume_binds_fixed_action_donors() -> None:
     changed["training_contract"]["world_action_donor_sha256"] = "x" * 64
     with pytest.raises(ValueError, match="world_action_donor_sha256"):
         validate_visual_world_resume_contract(changed, identity)
+
+
+def test_weights_only_allows_only_named_peer_semantic_migrations() -> None:
+    current = {
+        "peer_training_mode": "joint_dual_stream",
+        "peer_world_topology": PEER_WORLD_TOPOLOGY_CONTRACT,
+        "peer_world_action_source": PEER_WORLD_ACTION_SOURCE_CONTRACT,
+        "peer_world_readout": PEER_WORLD_READOUT_CONTRACT,
+        "peer_gradient_boundary": PEER_GRADIENT_BOUNDARY_CONTRACT,
+        "peer_data_isolation": PEER_DATA_ISOLATION_CONTRACT,
+        "peer_dual_stream_optimizer": PEER_DUAL_STREAM_OPTIMIZER_CONTRACT,
+        "planning_stride": 2,
+        "planning_hz": 40.0,
+        "peer_high_frequency_contract": PEER_HIGH_FREQUENCY_CONTRACT,
+        "peer_flow_topology": PEER_H15_PREFIX_TAIL_FLOW_CONTRACT,
+        "deployment_execution_horizon": 15,
+        "world_action_source": "logged_h15_world_horizon_15",
+        "assembly_metric_role_contract": ASSEMBLY_METRIC_ROLE_CONTRACT,
+    }
+    assert (
+        validate_peer_resume_weights_contract(
+            current,
+            planning_stride=2,
+            action_horizon=15,
+            world_horizon=15,
+            deployment_execution_horizon=15,
+            peer_flow_topology=PEER_H15_PREFIX_TAIL_FLOW_CONTRACT,
+            assembly_metric_role_contract=ASSEMBLY_METRIC_ROLE_CONTRACT,
+        )
+        is None
+    )
+
+    legacy = copy.deepcopy(current)
+    legacy["peer_high_frequency_contract"] = (
+        PEER_READOUT_V2_HIGH_FREQUENCY_CONTRACT
+    )
+    legacy["peer_world_readout"] = PEER_WORLD_READOUT_V2_CONTRACT
+    legacy.pop("assembly_metric_role_contract")
+    record = validate_peer_resume_weights_contract(
+        legacy,
+        planning_stride=2,
+        action_horizon=15,
+        world_horizon=15,
+        deployment_execution_horizon=15,
+        peer_flow_topology=PEER_H15_PREFIX_TAIL_FLOW_CONTRACT,
+        assembly_metric_role_contract=ASSEMBLY_METRIC_ROLE_CONTRACT,
+    )
+    assert record is not None
+    assert record["contract"] == PEER_WEIGHTS_SEMANTIC_MIGRATION_CONTRACT
+    assert [item["kind"] for item in record["migrations"]] == [
+        PEER_READOUT_V2_TO_V3_WEIGHTS_MIGRATION,
+        ASSEMBLY_METRIC_ROLE_WEIGHTS_MIGRATION,
+    ]
+
+    mixed = copy.deepcopy(legacy)
+    mixed["peer_world_readout"] = PEER_WORLD_READOUT_CONTRACT
+    with pytest.raises(ValueError, match="physical/message contract"):
+        validate_peer_resume_weights_contract(
+            mixed,
+            planning_stride=2,
+            action_horizon=15,
+            world_horizon=15,
+            deployment_execution_horizon=15,
+            peer_flow_topology=PEER_H15_PREFIX_TAIL_FLOW_CONTRACT,
+            assembly_metric_role_contract=ASSEMBLY_METRIC_ROLE_CONTRACT,
+        )
+    wrong_horizon_semantics = copy.deepcopy(legacy)
+    wrong_horizon_semantics["peer_high_frequency_contract"] = {
+        **PEER_READOUT_V2_HIGH_FREQUENCY_CONTRACT,
+        "world_target": "adjacent_decision_at_data_stride_v1",
+    }
+    with pytest.raises(ValueError, match="peer_high_frequency_contract"):
+        validate_peer_resume_weights_contract(
+            wrong_horizon_semantics,
+            planning_stride=2,
+            action_horizon=15,
+            world_horizon=15,
+            deployment_execution_horizon=15,
+            peer_flow_topology=PEER_H15_PREFIX_TAIL_FLOW_CONTRACT,
+            assembly_metric_role_contract=ASSEMBLY_METRIC_ROLE_CONTRACT,
+        )
+
+    wrong_flow = copy.deepcopy(legacy)
+    wrong_flow["peer_flow_topology"] = "shared_flow_tail_v0"
+    with pytest.raises(ValueError, match="peer_flow_topology"):
+        validate_peer_resume_weights_contract(
+            wrong_flow,
+            planning_stride=2,
+            action_horizon=15,
+            world_horizon=15,
+            deployment_execution_horizon=15,
+            peer_flow_topology=PEER_H15_PREFIX_TAIL_FLOW_CONTRACT,
+            assembly_metric_role_contract=ASSEMBLY_METRIC_ROLE_CONTRACT,
+        )
+
+    uniform_p2 = copy.deepcopy(legacy)
+    uniform_p2["peer_flow_topology"] = None
+    uniform_p2["deployment_execution_horizon"] = 2
+    prefix_tail_record = validate_peer_resume_weights_contract(
+        uniform_p2,
+        planning_stride=2,
+        migrating_prefix_tail_flow=True,
+        action_horizon=15,
+        world_horizon=15,
+        deployment_execution_horizon=15,
+        peer_flow_topology=PEER_H15_PREFIX_TAIL_FLOW_CONTRACT,
+        assembly_metric_role_contract=ASSEMBLY_METRIC_ROLE_CONTRACT,
+    )
+    assert prefix_tail_record is not None
+    assert [item["kind"] for item in prefix_tail_record["migrations"]] == [
+        PEER_READOUT_V2_TO_V3_WEIGHTS_MIGRATION,
+        ASSEMBLY_METRIC_ROLE_WEIGHTS_MIGRATION,
+    ]

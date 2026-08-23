@@ -29,6 +29,9 @@ METRIC_ROI_CONTRACT = "mt_vj_metric_roi_v1"
 METRIC_ROI_CONTRACT_VERSION = 1
 DINO_METRIC_ROI_CONTRACT = "dino_metric_roi_task35_v2"
 TASK35_METRIC_ROLE_CONTRACT = "slots_tool_pegGrasp_hole_pegHead_v1"
+ASSEMBLY_METRIC_ROLE_CONTRACT = (
+    "slots_tool_RoundNut-8_target_RoundNut_reward_center_v1"
+)
 METRIC_ROI_HEAD_CONFIG_KEYS = (
     "lang_dim",
     "h_dim",

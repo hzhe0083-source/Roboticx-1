@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 
@@ -16,6 +17,7 @@ from scripts.split_wam4va_episode_holdout import (
     build_split_plan,
     canonical_manifest_sha256,
 )
+from va_compound.world_contract import validate_visual_world_training_split
 
 
 def _payload(episodes_per_task: int = 10, windows_per_episode: int = 2) -> dict:
@@ -116,6 +118,50 @@ def _peer_h15_p2_payload() -> dict:
     return payload
 
 
+def _all49_peer_h15_p2_payload() -> dict:
+    task_ids: list[int] = []
+    episode_ids: list[int] = []
+    frame_refs = []
+    for task_id in range(49):
+        for local_episode in range(2):
+            task_ids.append(task_id)
+            episode_ids.append(task_id * 10_000 + local_episode)
+            task_name = f"contract-task-{task_id}-v3"
+            frame_refs.append((task_name, local_episode, [[0]] * 4))
+    n = len(task_ids)
+    return {
+        "actions": torch.zeros(n, 4, 15, 4),
+        "previous_action": torch.zeros(n, 4, 4),
+        "proprio": torch.zeros(n, 4, 4),
+        "instruction_id": torch.tensor(task_ids, dtype=torch.long),
+        "episode_id": torch.tensor(episode_ids, dtype=torch.long),
+        "pair_id": torch.arange(n),
+        "frame_refs": frame_refs,
+        "world_target_frame_refs": list(frame_refs),
+        "action_valid_mask": torch.ones(n, 4, 15, dtype=torch.bool),
+        "recovery_mask": torch.zeros(n, 4, 15, dtype=torch.bool),
+        "world_target_valid_mask": torch.ones(n, 4, dtype=torch.bool),
+        "metadata": {
+            "contract": PEER_SYNC_H15_P2_CONTRACT,
+            "contract_version": 1,
+            "logged_action_chunk": "full_h15",
+            "parent_identity": {"path": "/parent", "sha256": "p"},
+            "source_identities": [{"path": "/source", "sha256": "s"}],
+            "output_identity": {"path": "/windows", "shape": {"action_horizon": 15}},
+            "tasks": [f"Contract task {task_id}" for task_id in range(49)],
+            "fps": 80,
+            "planning_stride": 2,
+            "control_stride": 2,
+            "sequence_length": 4,
+            "decision_offsets": [0, 2, 4, 6],
+            "action_horizon": 15,
+            "action_label_offsets": list(range(15)),
+            "world_target_horizon": 15,
+            "world_target_offsets": [15, 17, 19, 21],
+        },
+    }
+
+
 def _direct_mask_stats(payload: dict) -> dict:
     valid = payload["action_valid_mask"]
     recovery = payload["recovery_mask"]
@@ -194,6 +240,75 @@ def test_builds_task_stratified_split_and_shared_manifest(tmp_path) -> None:
         "assembly-v3",
         "door-unlock-v3",
     ]
+
+
+def test_visual_world_split_validator_accepts_and_binds_all49_tasks(
+    tmp_path,
+) -> None:
+    source = tmp_path / "source.pt"
+    train_path = tmp_path / "train.pt"
+    eval_path = tmp_path / "eval.pt"
+    manifest_path = tmp_path / "split.json"
+    torch.save(_all49_peer_h15_p2_payload(), source)
+    build_split_artifacts(
+        source,
+        train_path,
+        eval_path,
+        manifest_path,
+        heldout_fraction=0.50,
+        seed=11,
+    )
+    train = torch.load(train_path, map_location="cpu", weights_only=True)
+
+    identity = validate_visual_world_training_split(
+        train,
+        train_path,
+        manifest_path,
+        va_world_mode="peer_sync_h6",
+        planning_stride=2,
+    )
+    assert identity["manifest_sha256"] == train["metadata"][
+        "split_manifest_sha256"
+    ]
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert identity["source_sha256"] == manifest["source"]["sha256"]
+    assert len(manifest["splits"]["train"]["tasks"]) == 49
+    assert sorted(torch.unique(train["instruction_id"]).tolist()) == list(
+        range(49)
+    )
+
+    broken = copy.deepcopy(train)
+    original = broken["frame_refs"][0]
+    broken["frame_refs"][0] = ("wrong-task-v3", *original[1:])
+    target = broken["world_target_frame_refs"][0]
+    broken["world_target_frame_refs"][0] = (
+        "wrong-task-v3",
+        *target[1:],
+    )
+    with pytest.raises(ValueError, match="task names differ"):
+        validate_visual_world_training_split(
+            broken,
+            train_path,
+            manifest_path,
+            va_world_mode="peer_sync_h6",
+            planning_stride=2,
+        )
+
+    broken_target = copy.deepcopy(train)
+    target_ref = broken_target["world_target_frame_refs"][0]
+    broken_target["world_target_frame_refs"][0] = (
+        target_ref[0],
+        int(target_ref[1]) + 1,
+        target_ref[2],
+    )
+    with pytest.raises(ValueError, match="world_target_frame_ref task/episode mismatch"):
+        validate_visual_world_training_split(
+            broken_target,
+            train_path,
+            manifest_path,
+            va_world_mode="peer_sync_h6",
+            planning_stride=2,
+        )
 
 
 def test_manifest_mask_stats_match_output_tensors_exactly(tmp_path) -> None:
