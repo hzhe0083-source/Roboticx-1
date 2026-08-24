@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import json
+import threading
+import time
 from unittest.mock import patch
 
 import numpy as np
@@ -145,6 +147,37 @@ def test_online_dataset_decodes_only_referenced_frames_and_reuses_cache(tmp_path
         assert decode.call_count == first_decode_count
 
 
+def test_online_dataset_prefetches_raw_task_without_blocking_or_reloading(tmp_path) -> None:
+    dataset = _dataset(tmp_path)
+    source = dataset._task_source("synthetic-online-v3")
+    key = longtraj_impl._raw_task_key(source)
+    with longtraj_impl._PROCESS_RAW_TASK_LOCK:
+        longtraj_impl._PROCESS_RAW_TASKS.pop(key, None)
+        longtraj_impl._PROCESS_RAW_TASK_FUTURES.pop(key, None)
+
+    started = threading.Event()
+    release = threading.Event()
+    original_load = torch.load
+
+    def slow_load(*args, **kwargs):
+        started.set()
+        assert release.wait(timeout=5)
+        return original_load(*args, **kwargs)
+
+    with patch.object(longtraj_impl.torch, "load", side_effect=slow_load) as load:
+        begin = time.monotonic()
+        dataset.prefetch_task_ids([0])
+        assert time.monotonic() - begin < 0.5
+        assert started.wait(timeout=2)
+        dataset.prefetch_task_ids([0])
+        assert load.call_count == 1
+        release.set()
+        data = longtraj_impl._load_process_raw_task(source)
+
+    assert data["task"] == "synthetic-online-v3"
+    assert load.call_count == 1
+
+
 def test_online_starts_change_by_epoch_and_are_not_p15_aligned(tmp_path) -> None:
     dataset = _dataset(tmp_path, seed=19)
     starts = []
@@ -177,3 +210,36 @@ def test_locality_sampler_sets_online_dataset_epoch(tmp_path) -> None:
     sampler.advance(len(sampler))
     list(sampler)
     assert dataset.epoch == 1
+
+
+def test_locality_sampler_starts_next_task_load_after_first_current_batch() -> None:
+    class RecordingDataset:
+        def __init__(self) -> None:
+            self.epoch = -1
+            self.prefetched: list[list[int]] = []
+
+        def set_epoch(self, epoch: int) -> None:
+            self.epoch = epoch
+
+        def prefetch_task_ids(self, task_ids: list[int]) -> None:
+            self.prefetched.append(list(task_ids))
+
+    dataset = RecordingDataset()
+    instruction_id = torch.tensor([0] * 8 + [1] * 8)
+    sampler = TaskLocalityWeightedSampler(
+        instruction_id,
+        torch.arange(16),
+        torch.ones(2),
+        batch_size=2,
+        seed=3,
+        sampling_mode="full",
+        epoch_dataset=dataset,
+    )
+    iterator = iter(sampler)
+    first = next(iterator)
+    first_task = int(instruction_id[first[0]])
+    assert dataset.prefetched == []
+
+    second = next(iterator)
+    assert int(instruction_id[second[0]]) == first_task
+    assert dataset.prefetched == [[1 - first_task]]

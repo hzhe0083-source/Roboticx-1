@@ -16,9 +16,10 @@ import hashlib
 import io
 import json
 import random
+import threading
 import time
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -51,6 +52,15 @@ _PROCESS_FRAME_CACHE: OrderedDict[tuple[str, int, int], np.ndarray] = OrderedDic
 _PROCESS_FRAME_CACHE_CAP = 2048
 _PROCESS_RAW_TASKS: OrderedDict[str, dict] = OrderedDict()
 _PROCESS_RAW_TASKS_CAP = 2
+_PROCESS_RAW_TASK_FUTURES: dict[str, Future] = {}
+_PROCESS_RAW_TASK_LOCK = threading.Lock()
+# Raw task files are large Python object graphs (often 1--2 GiB).  Loading the
+# next file on the batch-producing thread empties the batch queue and leaves
+# both GPUs idle.  One independent worker is enough because the full sampler
+# visits tasks sequentially and only needs one-task lookahead.
+_PROCESS_RAW_TASK_POOL = ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="raw-task-prefetch"
+)
 _PROCESS_JPEG_POOL = ThreadPoolExecutor(
     max_workers=8, thread_name_prefix="online-jpeg"
 )
@@ -98,19 +108,65 @@ def _decode_sparse_episode_frames(
     return result
 
 
-def _load_process_raw_task(source: Path) -> dict:
-    """Share compressed episode data between the VA and World datasets."""
+def _raw_task_key(source: Path) -> str:
+    return str(source.resolve(strict=False))
 
-    key = str(source.resolve(strict=False))
-    cached = _PROCESS_RAW_TASKS.get(key)
-    if cached is not None:
-        _PROCESS_RAW_TASKS.move_to_end(key)
-        return cached
-    data = torch.load(source, map_location="cpu", weights_only=False)
-    while len(_PROCESS_RAW_TASKS) >= _PROCESS_RAW_TASKS_CAP:
-        _PROCESS_RAW_TASKS.popitem(last=False)
-    _PROCESS_RAW_TASKS[key] = data
+
+def _submit_process_raw_task(source: Path) -> Future:
+    """Return the one process-wide load future for ``source``."""
+
+    key = _raw_task_key(source)
+    with _PROCESS_RAW_TASK_LOCK:
+        cached = _PROCESS_RAW_TASKS.get(key)
+        if cached is not None:
+            ready = Future()
+            ready.set_result(cached)
+            return ready
+        future = _PROCESS_RAW_TASK_FUTURES.get(key)
+        if future is None:
+            future = _PROCESS_RAW_TASK_POOL.submit(
+                torch.load, source, map_location="cpu", weights_only=False
+            )
+            _PROCESS_RAW_TASK_FUTURES[key] = future
+        return future
+
+
+def _prefetch_process_raw_task(source: Path) -> None:
+    """Start loading one future task without blocking the batch producer."""
+
+    _submit_process_raw_task(source)
+
+
+def _load_process_raw_task(source: Path) -> dict:
+    """Share compressed episode data and any in-flight load across VA/World."""
+
+    key = _raw_task_key(source)
+    with _PROCESS_RAW_TASK_LOCK:
+        cached = _PROCESS_RAW_TASKS.get(key)
+        if cached is not None:
+            _PROCESS_RAW_TASKS.move_to_end(key)
+            return cached
+    future = _submit_process_raw_task(source)
+    data = future.result()
+    with _PROCESS_RAW_TASK_LOCK:
+        cached = _PROCESS_RAW_TASKS.get(key)
+        if cached is not None:
+            _PROCESS_RAW_TASKS.move_to_end(key)
+            return cached
+        if _PROCESS_RAW_TASK_FUTURES.get(key) is future:
+            del _PROCESS_RAW_TASK_FUTURES[key]
+        while len(_PROCESS_RAW_TASKS) >= _PROCESS_RAW_TASKS_CAP:
+            _PROCESS_RAW_TASKS.popitem(last=False)
+        _PROCESS_RAW_TASKS[key] = data
     return data
+
+
+def _raw_task_is_resident(source: Path) -> bool:
+    """Whether a task is loaded or already loading in this process."""
+
+    key = _raw_task_key(source)
+    with _PROCESS_RAW_TASK_LOCK:
+        return key in _PROCESS_RAW_TASKS or key in _PROCESS_RAW_TASK_FUTURES
 
 
 def _decoded_cap(requested: int) -> int:
@@ -520,6 +576,9 @@ class OnlineLongTrajEpisodeDataset(LongTrajFramesDataset):
         self._source_by_task = {
             str(item["task"]): Path(str(item["source_path"])) for item in tasks
         }
+        self._task_by_id = {
+            int(item["task_id"]): str(item["task"]) for item in tasks
+        }
         self._episodes = episodes
         self._episodes_by_task: dict[int, list[dict]] = {}
         for entry in episodes:
@@ -593,6 +652,15 @@ class OnlineLongTrajEpisodeDataset(LongTrajFramesDataset):
         if data.get("task") != task_file:
             raise ValueError(f"{source}: expected task={task_file!r}")
         return data
+
+    def prefetch_task_ids(self, task_ids: list[int]) -> None:
+        """Load upcoming raw tasks independently of sparse JPEG batch work."""
+
+        for task_id in task_ids:
+            task = self._task_by_id[int(task_id)]
+            source = self._task_source(task)
+            if not _raw_task_is_resident(source):
+                _prefetch_process_raw_task(source)
 
     def _decode_episode_frames(
         self, task_file: str, episode_index: int, frame_indices: list[int]

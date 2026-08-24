@@ -1236,11 +1236,53 @@ class TaskLocalityWeightedSampler(Sampler[list[int]]):
                 raise TypeError("epoch_dataset must provide set_epoch(epoch)")
             set_epoch(self.epoch)
         schedule = self._build_epoch()
-        if self.world_size == 1:
-            yield from schedule[self.batch_cursor :]
-            return
-        for batch in schedule[self.batch_cursor :]:
-            yield batch[self.rank :: self.world_size]
+        prefetch_tasks = (
+            getattr(self.epoch_dataset, "prefetch_task_ids", None)
+            if self.epoch_dataset is not None
+            else None
+        )
+        run_task: int | None = None
+        run_batches = 0
+        for position, batch in enumerate(
+            schedule[self.batch_cursor :], start=self.batch_cursor
+        ):
+            batch_tasks = {self.task_ids[index] for index in batch}
+            if len(batch_tasks) == 1:
+                task = next(iter(batch_tasks))
+                if task == run_task:
+                    run_batches += 1
+                else:
+                    run_task = task
+                    run_batches = 1
+                # The first batch has now loaded the current task.  On the
+                # next batch, start loading the following task on an independent
+                # worker, leaving the remaining task-local batches to hide it.
+                if run_batches == 2 and callable(prefetch_tasks):
+                    following = next(
+                        (
+                            self.task_ids[index]
+                            for future_batch in schedule[position + 1 :]
+                            for index in future_batch
+                            if self.task_ids[index] != task
+                        ),
+                        None,
+                    )
+                    if following is None and self.sampling_mode == "full":
+                        next_order = list(self.tasks)
+                        random.Random(
+                            self.task_order_seed + self.epoch + 1
+                        ).shuffle(next_order)
+                        following = next_order[0]
+                    if following is not None:
+                        prefetch_tasks([following])
+            else:
+                run_task = None
+                run_batches = 0
+            yield (
+                batch
+                if self.world_size == 1
+                else batch[self.rank :: self.world_size]
+            )
 
     def advance(self, batches: int = 1) -> None:
         if batches < 0:
