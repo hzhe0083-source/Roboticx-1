@@ -73,7 +73,7 @@ def test_all49_runner_builds_and_trains_true_h15_p15() -> None:
     assert "--mtvj-train-relation" not in joint
 
 
-def test_mt50_60ep_runner_appends_task50_and_continues_for_20_epochs() -> None:
+def test_mt50_60ep_runner_appends_task50_and_continues_for_62_epochs() -> None:
     syntax = subprocess.run(
         ["bash", "-n", str(MT50_RUNNER)],
         cwd=ROOT,
@@ -100,3 +100,6 @@ def test_mt50_60ep_runner_appends_task50_and_continues_for_20_epochs() -> None:
     assert "--wmrm-full-language-tokens" in text
     assert "scratch_v5d16_s5152.pt" in text
     assert '--resume-weights "$BASE_CHECKPOINT"' in text
+    assert 'run_steps=$((STEPS - completed))' in text
+    assert 'resume_args=(--resume-exact "$save")' in text
+    assert "resume) run_joint exact" in text

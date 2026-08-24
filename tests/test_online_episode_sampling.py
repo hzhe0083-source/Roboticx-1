@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import io
 import json
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
 import torch
 
 from train import TaskLocalityWeightedSampler
+from va_compound.vision import longtraj_frames as longtraj_impl
 from va_compound.longtraj_frames import (
     ONLINE_EPISODE_CONTRACT,
     OnlineLongTrajEpisodeDataset,
@@ -109,8 +111,15 @@ def _dataset(tmp_path, *, seed: int = 7) -> OnlineLongTrajEpisodeDataset:
 def test_online_dataset_contains_no_offline_windows_and_preserves_continuity(tmp_path) -> None:
     dataset = _dataset(tmp_path)
     assert len(dataset) == 6
-    assert "actions" not in dataset.payload
+    assert "actions" not in dataset.index
+    assert dataset.payload["actions"].numel() == 0
     assert "frame_refs" not in dataset.payload
+    assert dataset.model_schema == {
+        "language_dim": 4,
+        "action_horizon": 15,
+        "action_dim": 4,
+        "proprio_dim": 4,
+    }
 
     item = dataset[0]
     assert item["actions"].shape == (4, 15, 4)
@@ -121,6 +130,19 @@ def test_online_dataset_contains_no_offline_windows_and_preserves_continuity(tmp
     )
     assert item["world_rank_shuffle_action"].shape == (4, 15, 4)
     assert bool(item["world_rank_shuffle_mask"].any())
+
+
+def test_online_dataset_decodes_only_referenced_frames_and_reuses_cache(tmp_path) -> None:
+    dataset = _dataset(tmp_path)
+    original = longtraj_impl._decode_jpeg_bytes
+    with patch.object(longtraj_impl, "_decode_jpeg_bytes", wraps=original) as decode:
+        first = dataset[0]
+        first_decode_count = decode.call_count
+        # One item references 4x4 current frames plus four World endpoints.
+        # The old eager path decoded all 160 frames from both episodes.
+        assert 0 < first_decode_count <= 20
+        np.testing.assert_array_equal(dataset[0]["frames"], first["frames"])
+        assert decode.call_count == first_decode_count
 
 
 def test_online_starts_change_by_epoch_and_are_not_p15_aligned(tmp_path) -> None:

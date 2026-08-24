@@ -8338,8 +8338,21 @@ def main() -> None:
                     "identity contract"
                 )
         dino_main_kwargs = _main_vision_config_kwargs(args)
+        online_model_schema = getattr(dataset, "model_schema", None)
+        if online_model_schema is None:
+            dataset_language_hidden = dataset.payload["language_hidden"]
+            dataset_language_mask = dataset.payload.get("language_mask")
+            dataset_action_horizon = int(dataset.payload["actions"].shape[-2])
+            dataset_action_dim = int(dataset.payload["actions"].shape[-1])
+            dataset_proprio_dim = int(dataset.payload["proprio"].shape[-1])
+        else:
+            dataset_language_hidden = dataset.task_language_hidden
+            dataset_language_mask = dataset.task_language_mask
+            dataset_action_horizon = int(online_model_schema["action_horizon"])
+            dataset_action_dim = int(online_model_schema["action_dim"])
+            dataset_proprio_dim = int(online_model_schema["proprio_dim"])
         config = VACompoundConfig(
-            language_dim=int(dataset.payload["language_hidden"].shape[-1]),
+            language_dim=int(dataset_language_hidden.shape[-1]),
             vision_dim=(
                 int(dino_main_kwargs["main_vision_dim"])
                 if dino_main_kwargs  # DINO-main：主视觉维 = DINO 特征维
@@ -8349,13 +8362,13 @@ def main() -> None:
                 else 768 if args.dense_readout_mtvj  # MT-VJ：在线 dense，H11 特征维 768
                 else int(dataset.payload[vision_key].shape[-1])
             ),
-            action_horizon=int(dataset.payload["actions"].shape[-2]),
+            action_horizon=dataset_action_horizon,
             planning_stride=args.planning_stride,
             deployment_execution_horizon=(
                 args.deployment_execution_horizon or args.planning_stride
             ),
-            action_dim=int(dataset.payload["actions"].shape[-1]),
-            proprio_dim=int(dataset.payload["proprio"].shape[-1]),
+            action_dim=dataset_action_dim,
+            proprio_dim=dataset_proprio_dim,
             mode=args.mode,
             num_layers=args.va_layers,
             qk_norm=args.qk_norm,
@@ -8517,14 +8530,14 @@ def main() -> None:
                 aux_tasks = []
                 aux_weights: list[float] = []
                 if args.mtvj_visual_aux_every > 0:
-                    hid_all = dataset.payload["language_hidden"]
-                    mask_all = dataset.payload["language_mask"]
+                    hid_all = dataset_language_hidden
+                    mask_all = dataset_language_mask
                     id_all = dataset.payload["instruction_id"]
                     for tid, text in enumerate(tasks):
                         hits = (id_all == tid).nonzero()
                         if hits.numel() == 0:
                             continue
-                        row = int(hits[0, 0])
+                        row = tid if online_model_schema is not None else int(hits[0, 0])
                         lang_aux_cache[text] = (
                             hid_all[row].float(),
                             mask_all[row],
@@ -9717,7 +9730,7 @@ def main() -> None:
         # 循环外预计算一次；完整模型 vs 固定语言基线的差距即语言条件的因果贡献。
         if args.live_vjepa:
             raise ValueError("--lang-fixed-vector 仅支持 feature 路径（非 live）")
-        lang_fixed_vec = dataset.payload["language_hidden"].mean(dim=(0, 1), keepdim=True)
+        lang_fixed_vec = dataset_language_hidden.mean(dim=(0, 1), keepdim=True)
         print(f"lang-fixed-vector: 语言通道替换为全局均值（shape={tuple(lang_fixed_vec.shape)}）")
 
     def prepare_peer_world_batch(raw_batch):

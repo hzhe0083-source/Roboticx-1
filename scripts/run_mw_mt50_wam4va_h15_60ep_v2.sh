@@ -28,7 +28,7 @@ PEER_BATCH_PREFETCH_DEPTH=${PEER_BATCH_PREFETCH_DEPTH:-16}
 LOCK=/tmp/ora0_mt50_full_episode_online_h15.lock
 
 fail(){ printf 'ERROR: %s\n' "$*" >&2; exit 1; }
-usage(){ printf 'usage: %s {prepare|preflight|joint}\n' "$0" >&2; exit 2; }
+usage(){ printf 'usage: %s {prepare|preflight|joint|resume}\n' "$0" >&2; exit 2; }
 
 prepare(){
   for path in "$BASE_RAW_MANIFEST" "$EXISTING_EVAL"; do
@@ -95,12 +95,36 @@ preflight(){
 }
 
 run_joint(){
+  local launch_mode=${1:-fresh}
   preflight
   read -r _ _ _ _ STEPS_PER_EPOCH STEPS < <(read_counts)
   local run_id=${RUN_ID:-mw_mt50_wam4va_h15_full_episode_online60_e62_s${STEPS}_lang_slotfree_resume_v1}
   local save=$CHECKPOINT_DIR/$run_id.pt
   local log=logs/$run_id.log
-  [[ ! -e "$save" && ! -e "$log" ]] || fail "refusing to overwrite run $run_id"
+  local run_steps=$STEPS
+  local resume_args=(--resume-weights "$BASE_CHECKPOINT")
+  local tee_args=()
+  if [[ "$launch_mode" == exact ]]; then
+    [[ -f "$save" ]] || fail "exact resume checkpoint is missing: $save"
+    local completed
+    completed=$("$PY" -B - "$save" <<'PY'
+import sys
+import torch
+
+checkpoint = torch.load(sys.argv[1], map_location="cpu", weights_only=True)
+print(int(checkpoint.get("global_step", -1)))
+PY
+)
+    (( completed > 0 && completed < STEPS )) || \
+      fail "checkpoint global_step=$completed is outside (0,$STEPS)"
+    run_steps=$((STEPS - completed))
+    resume_args=(--resume-exact "$save")
+    tee_args=(-a)
+    printf 'exact resume: global_step=%s remaining=%s target=%s\n' \
+      "$completed" "$run_steps" "$STEPS"
+  else
+    [[ ! -e "$save" && ! -e "$log" ]] || fail "refusing to overwrite run $run_id"
+  fi
   ! pgrep -af '[p]ython.*train.py' >/dev/null || fail 'another train.py is active'
   mkdir -p "$CHECKPOINT_DIR" logs
   local launcher=("$PY" -u -B)
@@ -135,10 +159,10 @@ run_joint(){
     --lr 0.0001 --seed 0 --device cuda --feature-autocast-bf16 \
     --va-layers 8 --va-attention-backend auto --flow-cond adaln \
     --flow-layers 6 --flow-steps 8 --flow-prefix-steps 15 \
-    --flow-prefix-weight 1.0 --flow-tail-weight 1.0 --steps "$STEPS" \
+    --flow-prefix-weight 1.0 --flow-tail-weight 1.0 --steps "$run_steps" \
     --save-every "$((3 * STEPS_PER_EPOCH))" --save-step-copies --save "$save" \
-    --longtraj-dir "$FRAMES_DIR" --resume-weights "$BASE_CHECKPOINT" \
-    2>&1 | tee "$log"
+    --longtraj-dir "$FRAMES_DIR" "${resume_args[@]}" \
+    2>&1 | tee "${tee_args[@]}" "$log"
 }
 
 command -v flock >/dev/null || fail 'flock is required'
@@ -148,5 +172,6 @@ case "$MODE" in
   prepare) prepare; preflight ;;
   preflight) preflight ;;
   joint) run_joint ;;
+  resume) run_joint exact ;;
   *) usage ;;
 esac
