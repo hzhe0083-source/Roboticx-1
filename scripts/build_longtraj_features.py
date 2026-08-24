@@ -423,6 +423,7 @@ ENV_TO_TASK = {
     "stick-push-v3": "Grasp a stick and push a box using the stick",
     "stick-pull-v3": "Grasp a stick and pull a box with the stick",
     "push-v3": "Push the puck to a goal",
+    "push-back-v3": "Pull a puck to a goal",
     "push-wall-v3": "Bypass a wall and push a puck to a goal",
     "reach-v3": "Reach a goal position",
     "reach-wall-v3": "Bypass a wall and reach a goal",

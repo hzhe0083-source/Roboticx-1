@@ -10,31 +10,42 @@ ALL49_DATA_DIR=${ALL49_DATA_DIR:-/root/ora0_all49_data}
 ALL49_FRAMES_DIR=${ALL49_FRAMES_DIR:-/root/ora0_all49_raw}
 HARD2_FRAMES_DIR=${HARD2_FRAMES_DIR:-data/frames_v2}
 ALLTASK_H48_REF=${ALLTASK_H48_REF:-data/metaworld_longtraj_windows_h48_all49_repaired_v2_clean.pt}
-RAW_IDENTITY_MANIFEST=$ALL49_DATA_DIR/all49_raw_canonical_identity_v1.json
+RAW_IDENTITY_MANIFEST=${RAW_IDENTITY_MANIFEST:-$ALL49_DATA_DIR/all49_raw_canonical_identity_v1.json}
 
-SOURCE=$ALL49_DATA_DIR/all49_peer_h15_p15_source_v1.pt
+SOURCE=${SOURCE:-$ALL49_DATA_DIR/all49_peer_h15_p15_source_v1.pt}
 WORLD_POOL=$ALL49_DATA_DIR/all49_peer_h15_p15_world_pool_v1.pt
 VA_DATA=$ALL49_DATA_DIR/all49_peer_h15_p15_va_train_v1.pt
 WORLD_DATA=$ALL49_DATA_DIR/all49_peer_h15_p15_world_train_v1.pt
-EVAL_DATA=$ALL49_DATA_DIR/all49_peer_h15_p15_eval_v1.pt
+EVAL_DATA=${EVAL_DATA:-$ALL49_DATA_DIR/all49_peer_h15_p15_eval_v1.pt}
 PARTITION_MANIFEST=$ALL49_DATA_DIR/all49_peer_h15_p15_va_world_partition_v1.json
 WORLD_MANIFEST=$ALL49_DATA_DIR/all49_peer_h15_p15_world_split_v1.json
-FULL_TRAIN=$ALL49_DATA_DIR/all49_peer_h15_p15_full_train_v1.pt
-FULL_MANIFEST=$ALL49_DATA_DIR/all49_peer_h15_p15_full_split_v1.json
+FULL_TRAIN=${FULL_TRAIN:-$ALL49_DATA_DIR/all49_peer_h15_p15_full_train_v1.pt}
+FULL_MANIFEST=${FULL_MANIFEST:-$ALL49_DATA_DIR/all49_peer_h15_p15_full_split_v1.json}
 
 MODE=${1:-}
 STEPS=${2:-}
 BATCH=${3:-48}
 EPOCHS=${EPOCHS:-23}
+EXPECTED_EPOCHS=${EXPECTED_EPOCHS:-23}
 NGPUS=${NGPUS:-2}
 RUN_ID=${RUN_ID:-mw_all49_wam4va_h15_p15_full10722_e23_lang_slotfree_scratch_v3}
 CHECKPOINT_DIR=${CHECKPOINT_DIR:-/root/ora0_ckpts}
 SAVE_EVERY=${SAVE_EVERY:-670}
 MAIN_VISION_ENCODE_BATCH=${MAIN_VISION_ENCODE_BATCH:-16}
+# Ordinary-task JPEG decode is 4-10s; assembly is 40-70s. One prefetch
+# thread plus 2-4 batches/task means depth 8 (~64s) still leaves a hole
+# when the slower DDP rank decodes. Depth 16 covers ~140s.
+PEER_BATCH_PREFETCH_DEPTH=${PEER_BATCH_PREFETCH_DEPTH:-16}
+EXPECTED_SOURCE_WINDOWS=${EXPECTED_SOURCE_WINDOWS:-11903}
+EXPECTED_TRAIN_WINDOWS=${EXPECTED_TRAIN_WINDOWS:-10722}
+EXPECTED_EVAL_WINDOWS=${EXPECTED_EVAL_WINDOWS:-1181}
+EXPECTED_TASKS=${EXPECTED_TASKS:-49}
+EXPECTED_RAW_CONTRACT=${EXPECTED_RAW_CONTRACT:-all49_canonical_raw_sources_v1}
+RESUME_WEIGHTS=${RESUME_WEIGHTS:-}
 LOCK=/tmp/ora0_all49_wam4va_h15_p15_v1.lock
 
 fail(){ printf 'ERROR: %s\n' "$*" >&2; exit 1; }
-usage(){ printf 'usage: %s {prepare|prepare-full} | %s {preflight|joint} STEPS [global-batch] (EPOCHS=23)\n' "$0" "$0" >&2; exit 2; }
+usage(){ printf 'usage: %s {prepare|prepare-full} | %s {preflight|joint} STEPS [global-batch]\n' "$0" "$0" >&2; exit 2; }
 
 prepare_raw_view(){
   mkdir -p "$ALL49_DATA_DIR" "$ALL49_FRAMES_DIR"
@@ -197,9 +208,14 @@ preflight(){
     "$RAW_IDENTITY_MANIFEST" "$DINO"; do
     [[ -f "$artifact" ]] || fail "missing required artifact: $artifact"
   done
+  [[ -z "$RESUME_WEIGHTS" || -f "$RESUME_WEIGHTS" ]] || \
+    fail "missing resume-weights checkpoint: $RESUME_WEIGHTS"
   "$VERIFY_PY" -B - "$SOURCE" "$FULL_TRAIN" "$EVAL_DATA" "$FULL_MANIFEST" \
     "$RAW_IDENTITY_MANIFEST" "$ALL49_FRAMES_DIR" "$BATCH" "$STEPS" \
-    "$EPOCHS" "$enforce_steps" <<'PY'
+    "$EPOCHS" "$enforce_steps" "$EXPECTED_SOURCE_WINDOWS" \
+    "$EXPECTED_TRAIN_WINDOWS" "$EXPECTED_EVAL_WINDOWS" \
+    "$RESUME_WEIGHTS" "$EXPECTED_TASKS" "$EXPECTED_RAW_CONTRACT" \
+    "$EXPECTED_EPOCHS" <<'PY'
 from pathlib import Path
 import hashlib
 import json
@@ -219,6 +235,17 @@ global_batch = int(sys.argv[7])
 requested_steps = sys.argv[8]
 epochs = int(sys.argv[9])
 enforce_steps = bool(int(sys.argv[10]))
+expected_counts = {
+    "source": int(sys.argv[11]),
+    "train": int(sys.argv[12]),
+    "eval": int(sys.argv[13]),
+}
+resume_weights = sys.argv[14]
+expected_task_count = int(sys.argv[15])
+expected_raw_contract = sys.argv[16]
+expected_epochs = int(sys.argv[17])
+if expected_task_count <= 0:
+    raise SystemExit("expected task count must be positive")
 
 
 def sha256_file(path: Path) -> str:
@@ -266,8 +293,11 @@ if sha256_file(eval_path) != selection.get("existing_eval_sha256"):
     raise SystemExit("full: elected eval SHA mismatch")
 
 raw_manifest = json.loads(raw_manifest_path.read_text(encoding="utf-8"))
-if raw_manifest.get("contract") != "all49_canonical_raw_sources_v1":
-    raise SystemExit("unknown all49 raw identity manifest contract")
+if raw_manifest.get("contract") != expected_raw_contract:
+    raise SystemExit(
+        f"raw identity contract mismatch: {raw_manifest.get('contract')!r} "
+        f"!= {expected_raw_contract!r}"
+    )
 reference = raw_manifest.get("reference") or {}
 reference_path = Path(str(reference.get("path", "")))
 if (
@@ -277,8 +307,13 @@ if (
 ):
     raise SystemExit("all49 H48 reference identity mismatch")
 raw_entries = list(raw_manifest.get("sources") or [])
-if len(raw_entries) != 49 or len({item.get("task") for item in raw_entries}) != 49:
-    raise SystemExit("raw identity manifest must contain 49 unique tasks")
+if (
+    len(raw_entries) != expected_task_count
+    or len({item.get("task") for item in raw_entries}) != expected_task_count
+):
+    raise SystemExit(
+        f"raw identity manifest must contain {expected_task_count} unique tasks"
+    )
 declared_raw = source_contract.get("payload_source_identities") or []
 manifest_raw = [
     {
@@ -317,11 +352,11 @@ payloads = {
     )
 }
 counts = {name: len(payload["actions"]) for name, payload in payloads.items()}
-if counts != {"source": 11903, "train": 10722, "eval": 1181}:
+if counts != expected_counts:
     raise SystemExit(f"formal full-data counts mismatch: {counts}")
 episode_sets = {}
 row_sets = {}
-expected_ids = list(range(49))
+expected_ids = list(range(expected_task_count))
 for name, payload in payloads.items():
     actions = payload.get("actions")
     metadata = payload.get("metadata") or {}
@@ -346,7 +381,10 @@ for name, payload in payloads.items():
         raise SystemExit(f"{name}: H15 cadence mismatch: {bad}")
     task_ids = sorted(int(value) for value in torch.unique(payload["instruction_id"]))
     if task_ids != expected_ids:
-        raise SystemExit(f"{name}: expected instruction ids 0..48, got {task_ids}")
+        raise SystemExit(
+            f"{name}: expected instruction ids 0..{expected_task_count - 1}, "
+            f"got {task_ids}"
+        )
     target_valid = payload.get("world_target_valid_mask")
     target_refs = payload.get("world_target_frame_refs")
     frame_refs = payload.get("frame_refs")
@@ -390,7 +428,10 @@ for name, payload in payloads.items():
             raise SystemExit("train: split output identity mismatch")
         if metadata.get("parent_identity") != source_contract:
             raise SystemExit("train: split parent identity mismatch")
-    if metadata.get("source_identities") != declared_raw:
+    # The elected eval artifact is intentionally frozen across dataset growth,
+    # so its historical raw identities differ. Its immutable SHA and exact row
+    # membership are verified above/below; source and train must bind new raw.
+    if name != "eval" and metadata.get("source_identities") != declared_raw:
         raise SystemExit(f"{name}: raw source identity binding mismatch")
     episode_sets[name] = set(zip(
         payload["instruction_id"].tolist(), payload["episode_id"].tolist(), strict=True
@@ -414,7 +455,10 @@ for name, payload in payloads.items():
     frame_tasks = {str(ref[0]) for ref in payload["frame_refs"]}
     target_tasks = {str(ref[0]) for ref in target_refs}
     if frame_tasks != expected_tasks or target_tasks != expected_tasks:
-        raise SystemExit(f"{name}: frame sources do not cover the canonical 49 tasks")
+        raise SystemExit(
+            f"{name}: frame sources do not cover the canonical "
+            f"{expected_task_count} tasks"
+        )
     for task_file in frame_tasks:
         raw = frames_dir / f"metaworld_longtraj_{task_file}.pt"
         if not raw.is_file():
@@ -442,25 +486,24 @@ if global_batch != 48:
 steps_per_epoch = (counts["train"] + global_batch - 1) // global_batch
 last_batch = counts["train"] % global_batch
 expected_steps = epochs * steps_per_epoch
-if epochs != 23:
-    raise SystemExit(f"formal all49 run requires EPOCHS=23, got {epochs}")
-if steps_per_epoch != 224 or last_batch != 18 or expected_steps != 5152:
+if epochs != expected_epochs:
     raise SystemExit(
-        "formal full schedule must be ceil(10722/48)=224 with final batch 18, "
-        f"23 epochs=5152; got {steps_per_epoch}/{last_batch}/{expected_steps}"
+        f"formal run requires EPOCHS={expected_epochs}, got {epochs}"
     )
 if enforce_steps and requested_steps != str(expected_steps):
     raise SystemExit(
-        f"formal all49 run requires STEPS={expected_steps} "
-        f"(23 * {steps_per_epoch}), got {requested_steps!r}"
+        f"formal run requires STEPS={expected_steps} "
+        f"({expected_epochs} * {steps_per_epoch}), got {requested_steps!r}"
     )
 
 
 print(
-    f"all49 H15 full preflight: PASS; shared VA+World train={counts['train']}, "
+    f"MT{expected_task_count} H15 full preflight: PASS; "
+    f"shared VA+World train={counts['train']}, "
     f"eval={counts['eval']}, steps/epoch={steps_per_epoch} (last={last_batch}), "
-    f"23 epochs={expected_steps} steps, "
-    "initialization=scratch, language=full-token VA+World, policy=slot-free"
+    f"{expected_epochs} epochs={expected_steps} steps, "
+    f"initialization={'weights:' + Path(resume_weights).name if resume_weights else 'scratch'}, "
+    "language=full-token VA+World, policy=slot-free"
 )
 PY
 }
@@ -471,7 +514,8 @@ require_idle(){
 
 run_joint(){
   [[ "$STEPS" =~ ^[1-9][0-9]*$ ]] || fail 'joint requires a positive step count'
-  [[ "$EPOCHS" == 23 ]] || fail 'formal all49 joint run requires EPOCHS=23'
+  [[ "$EPOCHS" == "$EXPECTED_EPOCHS" ]] || \
+    fail "formal joint run requires EPOCHS=$EXPECTED_EPOCHS"
   [[ "$BATCH" =~ ^[1-9][0-9]*$ ]] || fail 'global batch must be positive'
   [[ "$NGPUS" =~ ^[1-9][0-9]*$ ]] || fail 'NGPUS must be positive'
   (( BATCH % NGPUS == 0 )) || fail "global batch $BATCH must divide across $NGPUS GPUs"
@@ -481,6 +525,11 @@ run_joint(){
   mkdir -p "$CHECKPOINT_DIR" logs
   require_idle
   local launcher=("$PY" -u -B)
+  local resume_args=()
+  if [[ -n "$RESUME_WEIGHTS" ]]; then
+    [[ -f "$RESUME_WEIGHTS" ]] || fail "missing resume-weights checkpoint: $RESUME_WEIGHTS"
+    resume_args=(--resume-weights "$RESUME_WEIGHTS")
+  fi
   if (( NGPUS > 1 )); then
     launcher=("$PY" -m torch.distributed.run --standalone \
       --nproc_per_node="$NGPUS" --max_restarts=0)
@@ -505,14 +554,14 @@ run_joint(){
     --wmrm-predictor-heads 12 --single-task --task-sampling full \
     --task-locality-block-batches 64 --batch-size "$BATCH" --sequence-length 4 \
     --min-sequence-length 4 --num-workers 0 --peer-batch-prefetch \
-    --peer-batch-prefetch-depth 8 \
+    --peer-batch-prefetch-depth "$PEER_BATCH_PREFETCH_DEPTH" \
     --longtraj-decode-cache-tasks 2 --disable-runtime-integrity-checks \
     --lr 0.0001 --seed 0 --device cuda \
     --feature-autocast-bf16 --va-layers 8 --va-attention-backend auto \
     --flow-cond adaln --flow-layers 6 --flow-steps 8 --flow-prefix-steps 15 \
     --flow-prefix-weight 1.0 --flow-tail-weight 1.0 --steps "$STEPS" \
     --save-every "$SAVE_EVERY" --save-step-copies --save "$save" \
-    --longtraj-dir "$ALL49_FRAMES_DIR" \
+    --longtraj-dir "$ALL49_FRAMES_DIR" "${resume_args[@]}" \
     2>&1 | tee "$log"
 }
 

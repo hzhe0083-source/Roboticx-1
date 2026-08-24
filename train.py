@@ -1024,6 +1024,7 @@ class TaskLocalityWeightedSampler(Sampler[list[int]]):
         task_order_seed: int | None = None,
         rank: int = 0,
         world_size: int = 1,
+        epoch_dataset: Dataset | None = None,
     ) -> None:
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
@@ -1065,6 +1066,7 @@ class TaskLocalityWeightedSampler(Sampler[list[int]]):
         )
         self.rank = int(rank)
         self.world_size = int(world_size)
+        self.epoch_dataset = epoch_dataset
         self.epoch = 0
         self.batch_cursor = 0
         self.by_task_episode: dict[int, dict[int, list[int]]] = {}
@@ -1228,6 +1230,11 @@ class TaskLocalityWeightedSampler(Sampler[list[int]]):
         return batches
 
     def __iter__(self) -> Iterator[list[int]]:
+        if self.epoch_dataset is not None:
+            set_epoch = getattr(self.epoch_dataset, "set_epoch", None)
+            if not callable(set_epoch):
+                raise TypeError("epoch_dataset must provide set_epoch(epoch)")
+            set_epoch(self.epoch)
         schedule = self._build_epoch()
         if self.world_size == 1:
             yield from schedule[self.batch_cursor :]
@@ -5058,6 +5065,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "跟到同一目录，不会去 data/ 下认错旧文件。",
     )
     parser.add_argument(
+        "--online-episode-sampling",
+        action="store_true",
+        help=(
+            "treat --va-data/--world-data as a full-episode JSON index and "
+            "generate arbitrary overlapping H15 samples at batch time; no "
+            "offline action/frame windows are loaded"
+        ),
+    )
+    parser.add_argument(
+        "--online-episode-samples",
+        type=int,
+        default=6,
+        help="independent random starts drawn per full episode per epoch (default 6)",
+    )
+    parser.add_argument(
         "--longtraj-decode-cache-tasks",
         type=int,
         default=None,
@@ -5614,6 +5636,8 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"--{name.replace('_', '-')} must be finite")
     if args.steps <= 0 or args.flow_steps <= 0:
         raise ValueError("training steps and flow steps must be positive")
+    if int(getattr(args, "online_episode_samples", 6)) < 1:
+        raise ValueError("--online-episode-samples must be positive")
     if args.deployment_execution_horizon < 0:
         raise ValueError("--deployment-execution-horizon must be non-negative")
     if not math.isfinite(args.pair_loss_weight) or args.pair_loss_weight < 0.0:
@@ -5654,6 +5678,17 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--va-data and --world-data must be provided together")
     dual_peer_data = peer_world and va_data is not None and world_data is not None
     primary_data = va_data if dual_peer_data else args.data
+    if getattr(args, "online_episode_sampling", False):
+        if not dual_peer_data:
+            raise ValueError(
+                "--online-episode-sampling requires peer --va-data/--world-data"
+            )
+        if int(getattr(args, "planning_stride", 6)) != 15:
+            raise ValueError("online full-episode sampling currently requires P15")
+        if getattr(args, "dino_feature_cache", None) is not None:
+            raise ValueError(
+                "online random starts cannot use a fixed --dino-feature-cache"
+            )
     if int(getattr(args, "peer_batch_prefetch_depth", 1)) < 1:
         raise ValueError("--peer-batch-prefetch-depth must be positive")
     if getattr(args, "peer_batch_prefetch", False) and not dual_peer_data:
@@ -7621,7 +7656,9 @@ def save_checkpoint(
                     getattr(args, "world_action_rank_stage", "cycle"),
                     getattr(args, "wmrm_action_rank_per_sample_cap", None),
                 ),
-                "world_action_donor_contract": WORLD_ACTION_DONOR_CONTRACT,
+                "world_action_donor_contract": split_identity.get(
+                    "world_action_donor_contract", WORLD_ACTION_DONOR_CONTRACT
+                ),
                 "world_action_donor_sha256": split_identity[
                     "world_action_donor_sha256"
                 ],
@@ -8084,40 +8121,56 @@ def main() -> None:
             (args.dense_readout_mtvj or getattr(args, "dino_main_vision", False))
             and not args.live_vjepa
         ):
-            # MT-VJ / DINO-main 主数据路径：longtraj windows + JPEG 帧在线解码
-            # （2026-08-10）。DINO-main 复用同一帧数据源（V-JEPA 路径保留）。
-            from va_compound.longtraj_frames import LongTrajFramesDataset
-
-            dataset = LongTrajFramesDataset(
-                primary_data,
-                longtraj_dir=getattr(args, "longtraj_dir", None),
-                min_sequence_length=args.min_sequence_length,
-                decode_cache_tasks=(
-                    max(int(getattr(args, "longtraj_decode_cache_tasks", None) or 1), 2)
-                    if dual_peer_data
-                    else (
-                        getattr(args, "longtraj_decode_cache_tasks", None)
-                        or (
-                            2
-                            if getattr(args, "dino_main_vision", False)
-                            else 1
-                        )
-                    )
-                ),
-                feature_cache=(
-                    args.dino_feature_cache
-                    if getattr(args, "dino_main_vision", False)
-                    else None
-                ),
-                include_frames=(
-                    args.dino_feature_cache is None
-                    or getattr(args, "dino_roi_checkpoint", None) is not None
-                ),
-                include_world_target_frames=False,
+            # DINO-main consumes raw full episodes.  The legacy path still
+            # accepts old window payloads; the formal MT50 path samples an
+            # arbitrary overlapping start online and never loads such a file.
+            from va_compound.longtraj_frames import (
+                LongTrajFramesDataset,
+                OnlineLongTrajEpisodeDataset,
             )
+
+            if getattr(args, "online_episode_sampling", False):
+                dataset = OnlineLongTrajEpisodeDataset(
+                    primary_data,
+                    longtraj_dir=getattr(args, "longtraj_dir", None),
+                    samples_per_episode=args.online_episode_samples,
+                    sampling_seed=args.seed,
+                    decode_cache_tasks=max(
+                        int(getattr(args, "longtraj_decode_cache_tasks", None) or 1), 2
+                    ),
+                    include_world_target_frames=False,
+                )
+            else:
+                dataset = LongTrajFramesDataset(
+                    primary_data,
+                    longtraj_dir=getattr(args, "longtraj_dir", None),
+                    min_sequence_length=args.min_sequence_length,
+                    decode_cache_tasks=(
+                        max(int(getattr(args, "longtraj_decode_cache_tasks", None) or 1), 2)
+                        if dual_peer_data
+                        else (
+                            getattr(args, "longtraj_decode_cache_tasks", None)
+                            or (
+                                2
+                                if getattr(args, "dino_main_vision", False)
+                                else 1
+                            )
+                        )
+                    ),
+                    feature_cache=(
+                        args.dino_feature_cache
+                        if getattr(args, "dino_main_vision", False)
+                        else None
+                    ),
+                    include_frames=(
+                        args.dino_feature_cache is None
+                        or getattr(args, "dino_roi_checkpoint", None) is not None
+                    ),
+                    include_world_target_frames=False,
+                )
             print(
                 f"{'DINO-main' if args.dino_main_vision else 'MT-VJ'} data: "
-                f"LongTrajFramesDataset（{len(dataset)} 样本，"
+                f"{type(dataset).__name__}（{len(dataset)} 样本，"
                 f"帧从 longtraj JPEG 在线解码，"
                 f"decode_cache_tasks={dataset.decode_cache_tasks}）",
                 flush=True,
@@ -8511,6 +8564,11 @@ def main() -> None:
                         ),
                         rank=topology.rank,
                         world_size=topology.world_size,
+                        epoch_dataset=(
+                            dataset
+                            if getattr(args, "online_episode_sampling", False)
+                            else None
+                        ),
                     )
                     if args.save is not None or args.resume_exact is not None:
                         # Full payload hashing happens once here; periodic/final
@@ -8614,19 +8672,35 @@ def main() -> None:
                 flush=True,
             )
         if dual_peer_data:
-            from va_compound.longtraj_frames import LongTrajFramesDataset, mtvj_collate
-
-            world_dataset = LongTrajFramesDataset(
-                args.world_data,
-                longtraj_dir=getattr(args, "longtraj_dir", None),
-                min_sequence_length=args.min_sequence_length,
-                decode_cache_tasks=(
-                    max(int(getattr(args, "longtraj_decode_cache_tasks", None) or 1), 2)
-                ),
-                feature_cache=None,
-                include_frames=True,
-                include_world_target_frames=config.action_horizon == 15,
+            from va_compound.longtraj_frames import (
+                LongTrajFramesDataset,
+                OnlineLongTrajEpisodeDataset,
+                mtvj_collate,
             )
+
+            if getattr(args, "online_episode_sampling", False):
+                world_dataset = OnlineLongTrajEpisodeDataset(
+                    args.world_data,
+                    longtraj_dir=getattr(args, "longtraj_dir", None),
+                    samples_per_episode=args.online_episode_samples,
+                    sampling_seed=args.seed + 1,
+                    decode_cache_tasks=max(
+                        int(getattr(args, "longtraj_decode_cache_tasks", None) or 1), 2
+                    ),
+                    include_world_target_frames=config.action_horizon == 15,
+                )
+            else:
+                world_dataset = LongTrajFramesDataset(
+                    args.world_data,
+                    longtraj_dir=getattr(args, "longtraj_dir", None),
+                    min_sequence_length=args.min_sequence_length,
+                    decode_cache_tasks=(
+                        max(int(getattr(args, "longtraj_decode_cache_tasks", None) or 1), 2)
+                    ),
+                    feature_cache=None,
+                    include_frames=True,
+                    include_world_target_frames=config.action_horizon == 15,
+                )
             _enable_optional_action_masks(world_dataset)
             args.visual_world_split_identity = validate_visual_world_training_split(
                 world_dataset.payload,
@@ -8643,11 +8717,22 @@ def main() -> None:
                     getattr(args, "peer_shared_full_data", False)
                 ),
             )
-            donor_identity = prepare_visual_world_action_ranking(
-                world_dataset.payload,
-                planning_stride=int(getattr(args, "planning_stride", 6)),
-            )
-            args.visual_world_split_identity.update(donor_identity)
+            if getattr(args, "online_episode_sampling", False):
+                donor_identity = {
+                    key: args.visual_world_split_identity[key]
+                    for key in (
+                        "world_action_donor_contract",
+                        "world_action_donor_sha256",
+                        "world_action_donor_transitions",
+                        "world_action_rank_transitions",
+                    )
+                }
+            else:
+                donor_identity = prepare_visual_world_action_ranking(
+                    world_dataset.payload,
+                    planning_stride=int(getattr(args, "planning_stride", 6)),
+                )
+                args.visual_world_split_identity.update(donor_identity)
             world_tasks = list(
                 world_dataset.payload.get("metadata", {}).get("tasks", [])
             )
@@ -8677,6 +8762,11 @@ def main() -> None:
                     ),
                     rank=topology.rank,
                     world_size=topology.world_size,
+                    epoch_dataset=(
+                        world_dataset
+                        if getattr(args, "online_episode_sampling", False)
+                        else None
+                    ),
                 )
                 if args.save is not None or args.resume_exact is not None:
                     world_sampler.bind_dataset_content_identity(

@@ -88,11 +88,19 @@ if not isinstance(episodes, (list, tuple)) or len(episodes) != 10:
 if payload.get("n_episodes") != 10:
     raise SystemExit(f"{path}: n_episodes must equal 10")
 actual_seeds = [episode.get("episode_seed") for episode in episodes]
-if actual_seeds != expected_seeds:
+metadata = payload.get("metadata") or {}
+pinned = metadata.get("pinned_episode_seeds")
+if pinned is not None and actual_seeds != expected_seeds:
     raise SystemExit(
         f"{path}: episode seeds mismatch: actual={actual_seeds}, "
         f"expected={expected_seeds}"
     )
+if (
+    len(set(actual_seeds)) != 10
+    or any(not isinstance(seed, int) for seed in actual_seeds)
+    or any(35000 <= seed < 35050 for seed in actual_seeds)
+):
+    raise SystemExit(f"{path}: fallback seeds must be 10 unique non-eval seeds")
 bad_events = [
     index
     for index, episode in enumerate(episodes)

@@ -52,6 +52,7 @@ TASK_WEIGHTS: dict[str, float] = {
     "Pick and place a puck onto a shelf": 2.0,
     "Pick and place a puck to a goal": 2.0,
     "Pick up a puck from a hole": 2.0,
+    "Pull a puck to a goal": 2.0,
     "Unplug a peg sideways": 2.0,
     "Pick a nut out of a peg": 2.0,
     "Grasp a stick and push a box using the stick": 2.0,

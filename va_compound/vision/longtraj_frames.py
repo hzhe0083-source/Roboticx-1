@@ -12,7 +12,10 @@ LiveVJEPADataset 同契约：全部既有键 + ``frames [T, W, H, W, 3] uint8``
 from __future__ import annotations
 
 import gc
+import hashlib
 import io
+import json
+import random
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -31,6 +34,8 @@ PEER_SYNC_H15_CONTRACTS = {
     PEER_SYNC_H15_P2_CONTRACT,
     PEER_SYNC_H15_P15_CONTRACT,
 }
+ONLINE_EPISODE_CONTRACT = "full_episode_online_random_h15_v1"
+ONLINE_ACTION_DONOR_CONTRACT = "online_cross_episode_random_action_v1"
 # One decoded-task table per process. Peer training builds two
 # LongTrajFramesDataset objects (VA + World); a per-dataset LRU of size 1
 # still keeps two full 480px caches and re-decodes on every task switch.
@@ -332,3 +337,367 @@ class LongTrajFramesDataset:
                 ]
             )
         return item
+
+
+class OnlineLongTrajEpisodeDataset(LongTrajFramesDataset):
+    """Full episodes -> random overlapping H15 training samples at access time.
+
+    The JSON index contains episode membership and raw-file identities only.  It
+    deliberately contains no action chunks, frame windows, or crop starts.  A
+    sample start ``d`` is selected deterministically from ``(seed, epoch,
+    episode, sample_slot)`` so exact resume is stable while every epoch sees new
+    overlapping portions of the trajectory.
+    """
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        split: str = "train",
+        longtraj_dir: str | Path | None = None,
+        samples_per_episode: int = 6,
+        sampling_seed: int = 0,
+        decode_cache_tasks: int = 1,
+        include_world_target_frames: bool = False,
+    ) -> None:
+        if split != "train":
+            raise ValueError("online training dataset currently requires split='train'")
+        if samples_per_episode < 1:
+            raise ValueError("samples_per_episode must be positive")
+        self.path = Path(path).expanduser().resolve(strict=True)
+        index = json.loads(self.path.read_text(encoding="utf-8"))
+        if index.get("contract") != ONLINE_EPISODE_CONTRACT:
+            raise ValueError(
+                f"unexpected online episode contract: {index.get('contract')!r}"
+            )
+        protocol = index.get("sampling_protocol") or {}
+        required_protocol = {
+            "sequence_length": 4,
+            "action_horizon": 15,
+            "decision_stride": 15,
+            "crop_start_stride": 1,
+            "world_target_horizon": 15,
+        }
+        bad = {
+            key: (protocol.get(key), value)
+            for key, value in required_protocol.items()
+            if protocol.get(key) != value
+        }
+        if bad:
+            raise ValueError(f"online episode sampling protocol mismatch: {bad}")
+
+        tasks = list(index.get("tasks") or [])
+        episodes = [
+            dict(item) for item in index.get("episodes") or []
+            if item.get("split") == split
+        ]
+        if not tasks or not episodes:
+            raise ValueError("online episode index has no train episodes")
+        task_ids = [int(item["task_id"]) for item in tasks]
+        if task_ids != list(range(len(tasks))):
+            raise ValueError("online episode task ids must be contiguous from zero")
+        if any(int(item.get("valid_start_count", 0)) <= 0 for item in episodes):
+            raise ValueError("every indexed train episode must have a valid online start")
+
+        reference_path = Path(str(index["language_reference"]["path"]))
+        reference = torch.load(reference_path, map_location="cpu", weights_only=True)
+        descriptions = list((reference.get("metadata") or {}).get("tasks") or [])
+        if descriptions != [str(item["description"]) for item in tasks]:
+            raise ValueError("online index task descriptions differ from language cache")
+        language_hidden = reference.get("language_hidden")
+        language_mask = reference.get("language_mask")
+        normalization = reference.get("normalization") or {}
+        if (
+            not isinstance(language_hidden, torch.Tensor)
+            or not isinstance(language_mask, torch.Tensor)
+            or language_hidden.shape[0] != len(tasks)
+            or language_mask.shape[0] != len(tasks)
+        ):
+            raise ValueError("online language reference must contain one row per task")
+        for key in ("action_q01", "action_q99", "state_q01", "state_q99"):
+            if not isinstance(normalization.get(key), torch.Tensor):
+                raise ValueError(f"online language reference lacks normalization.{key}")
+
+        self.index = index
+        self.longtraj_dir = (
+            Path(longtraj_dir).expanduser().resolve(strict=False)
+            if longtraj_dir is not None else self.path.parent
+        )
+        self.samples_per_episode = int(samples_per_episode)
+        self.sampling_seed = int(sampling_seed)
+        self.epoch = 0
+        self.include_world_target_frames = bool(include_world_target_frames)
+        self.include_frames = True
+        self.feature_cache = None
+        self.cache_rows = None
+        self.cached_raw_frames = None
+        self.decode_cache_tasks = _decoded_cap(decode_cache_tasks)
+        self._task_cache: dict[str, dict] = {}
+        self._semantics_cache: dict[tuple[str, int], dict] = {}
+        self._valid_starts_cache: dict[tuple[str, int], list[int]] = {}
+        self._reference_hidden = language_hidden
+        self._reference_mask = language_mask
+        self._aq01 = normalization["action_q01"].cpu().numpy()
+        self._aq99 = normalization["action_q99"].cpu().numpy()
+        self._sq01 = normalization["state_q01"].cpu().numpy()
+        self._sq99 = normalization["state_q99"].cpu().numpy()
+        self._source_by_task = {
+            str(item["task"]): Path(str(item["source_path"])) for item in tasks
+        }
+        self._episodes = episodes
+        self._episodes_by_task: dict[int, list[dict]] = {}
+        for entry in episodes:
+            self._episodes_by_task.setdefault(int(entry["task_id"]), []).append(entry)
+        self._rows = [
+            (entry, slot)
+            for entry in self._episodes
+            for slot in range(self.samples_per_episode)
+        ]
+        self.length = len(self._rows)
+
+        instruction = torch.tensor(
+            [int(entry["task_id"]) for entry, _ in self._rows], dtype=torch.long
+        )
+        episode_id = torch.tensor(
+            [int(entry["episode_id"]) for entry, _ in self._rows], dtype=torch.long
+        )
+        raw_sources = [
+            {
+                "path": str(item["source_path"]),
+                "sha256": str(item["sha256"]),
+                "size_bytes": int(item["size_bytes"]),
+            }
+            for item in tasks
+        ]
+        self.payload = {
+            "instruction_id": instruction,
+            "episode_id": episode_id,
+            "pair_id": torch.arange(self.length, dtype=torch.long),
+            # Model construction only inspects these tensors for their schema.
+            # Actual language/state/action rows are still generated by
+            # ``__getitem__`` from the selected full-episode crop.
+            "language_hidden": self._reference_hidden,
+            "language_mask": self._reference_mask,
+            "actions": torch.empty((0, 4, 15, int(self._aq01.shape[0]))),
+            "proprio": torch.empty((0, 4, int(self._sq01.shape[0]))),
+            "metadata": {
+                "contract": ONLINE_EPISODE_CONTRACT,
+                "tasks": descriptions,
+                "split_name": split,
+                "sequence_length": 4,
+                "action_horizon": 15,
+                "control_stride": 15,
+                "planning_stride": 15,
+                "crop_start_stride": 1,
+                "world_target_horizon": 15,
+                "samples_per_episode": self.samples_per_episode,
+                "episode_count": len(self._episodes),
+                "index_path": str(self.path),
+                "index_sha256": _sha256_file(self.path),
+                "raw_sources": raw_sources,
+            },
+        }
+
+    def set_epoch(self, epoch: int) -> None:
+        if epoch < 0:
+            raise ValueError("online dataset epoch must be non-negative")
+        self.epoch = int(epoch)
+
+    def _load_task(self, task_file: str) -> dict:
+        data = self._task_cache.get(task_file)
+        if data is not None:
+            return data
+        declared = self._source_by_task[task_file]
+        canonical = self.longtraj_dir / f"metaworld_longtraj_{task_file}.pt"
+        # The episode index is the authority.  ``longtraj_dir`` is only a
+        # portability fallback; otherwise a repaired source could silently be
+        # shadowed by the older canonical 60ep file.
+        source = declared if declared.is_file() else canonical
+        data = torch.load(source, map_location="cpu", weights_only=False)
+        if data.get("task") != task_file:
+            raise ValueError(f"{source}: expected task={task_file!r}")
+        if len(self._task_cache) >= 2:
+            oldest = next(iter(self._task_cache))
+            del self._task_cache[oldest]
+            stale = [key for key in self._semantics_cache if key[0] == oldest]
+            for key in stale:
+                self._semantics_cache.pop(key, None)
+                self._valid_starts_cache.pop(key, None)
+        self._task_cache[task_file] = data
+        return data
+
+    @staticmethod
+    def _file_sha_seed(*parts: object) -> int:
+        encoded = ":".join(map(str, parts)).encode("utf-8")
+        return int.from_bytes(hashlib.sha256(encoded).digest()[:8], "little")
+
+    def _episode_semantics(self, task: str, episode_index: int) -> dict:
+        key = (task, int(episode_index))
+        cached = self._semantics_cache.get(key)
+        if cached is not None:
+            return cached
+        from scripts.build_longtraj_features import resolve_episode_semantics
+
+        episode = self._load_task(task)["episodes"][episode_index]
+        semantics = resolve_episode_semantics(
+            episode, f"{task}:episode[{episode_index}]", legacy_policy="infer"
+        )
+        self._semantics_cache[key] = semantics
+        return semantics
+
+    def _valid_starts(self, entry: dict) -> list[int]:
+        task = str(entry["task"])
+        episode_index = int(entry["episode_index"])
+        key = (task, episode_index)
+        cached = self._valid_starts_cache.get(key)
+        if cached is not None:
+            return cached
+        episode = self._load_task(task)["episodes"][episode_index]
+        semantics = self._episode_semantics(task, episode_index)
+        length = len(episode["actions"])
+        starts = []
+        for start in range(max(0, length - 60)):
+            decisions = start + np.arange(4) * 15
+            targets = decisions[:, None] + np.arange(15)[None, :]
+            valid = semantics["valid"][targets].copy()
+            perturb_start = semantics["perturb_start"]
+            if perturb_start is not None:
+                unseen = (
+                    semantics["recovery"][targets]
+                    & (decisions[:, None] < int(perturb_start))
+                )
+                valid &= ~unseen
+            if bool(valid.any()):
+                starts.append(start)
+        if len(starts) != int(entry["valid_start_count"]):
+            raise ValueError(
+                f"{task}:episode[{episode_index}] valid-start count changed: "
+                f"{len(starts)} != {entry['valid_start_count']}"
+            )
+        self._valid_starts_cache[key] = starts
+        return starts
+
+    def _select_start(self, entry: dict, slot: int, *, donor: bool = False) -> int:
+        starts = self._valid_starts(entry)
+        seed = self._file_sha_seed(
+            self.sampling_seed,
+            self.epoch,
+            int(entry["episode_id"]),
+            "donor" if donor else "main",
+        )
+        rng = random.Random(seed)
+        if len(starts) >= self.samples_per_episode:
+            return rng.sample(starts, self.samples_per_episode)[slot]
+        rng.shuffle(starts := list(starts))
+        return starts[slot % len(starts)]
+
+    @staticmethod
+    def _normalize(values: np.ndarray, lo: np.ndarray, hi: np.ndarray) -> np.ndarray:
+        return np.clip(2.0 * (values - lo) / (hi - lo) - 1.0, -1.0, 1.0)
+
+    def _crop(self, entry: dict, start: int) -> dict[str, np.ndarray | int | None]:
+        task = str(entry["task"])
+        episode_index = int(entry["episode_index"])
+        episode = self._load_task(task)["episodes"][episode_index]
+        semantics = self._episode_semantics(task, episode_index)
+        decisions = start + np.arange(4) * 15
+        targets = decisions[:, None] + np.arange(15)[None, :]
+        endpoints = decisions + 15
+        action_valid = semantics["valid"][targets].copy()
+        perturb_start = semantics["perturb_start"]
+        if perturb_start is not None:
+            action_valid &= ~(
+                semantics["recovery"][targets]
+                & (decisions[:, None] < int(perturb_start))
+            )
+        actions = np.asarray(episode["actions"], dtype=np.float32)
+        states = np.asarray(episode["states"], dtype=np.float32)
+        previous = np.stack([
+            np.zeros(4, dtype=np.float32) if decision == 0 else actions[decision - 1]
+            for decision in decisions
+        ])
+        return {
+            "actions": self._normalize(actions[targets], self._aq01, self._aq99).astype(np.float32),
+            "previous_action": self._normalize(previous, self._aq01, self._aq99).astype(np.float32),
+            "proprio": self._normalize(states[decisions], self._sq01, self._sq99).astype(np.float32),
+            "action_valid_mask": action_valid,
+            "recovery_mask": semantics["recovery"][targets],
+            "decision_recovery": semantics["recovery"][decisions],
+            "door_metric_state": semantics["metric_state"][decisions].astype(np.float32),
+            "door_metric_state_valid": semantics["metric_valid"][decisions],
+            "world_target_valid_mask": (
+                action_valid.all(axis=1) & semantics["frame_valid"][endpoints]
+            ),
+            "first_success": -1 if semantics["first_success"] is None else int(semantics["first_success"]),
+            "decisions": decisions,
+            "endpoints": endpoints,
+        }
+
+    def _donor_entry(self, entry: dict, slot: int) -> dict:
+        candidates = self._episodes_by_task[int(entry["task_id"])]
+        if len(candidates) < 2:
+            raise ValueError("online action ranking requires two train episodes per task")
+        current = int(entry["episode_id"])
+        others = [item for item in candidates if int(item["episode_id"]) != current]
+        seed = self._file_sha_seed(self.sampling_seed, self.epoch, current, slot, "episode")
+        return others[seed % len(others)]
+
+    def __len__(self) -> int:
+        return self.length
+
+    def __getitem__(self, index: int) -> dict:
+        entry, slot = self._rows[index]
+        start = self._select_start(entry, slot)
+        crop = self._crop(entry, start)
+        donor_entry = self._donor_entry(entry, slot)
+        donor = self._crop(
+            donor_entry, self._select_start(donor_entry, slot, donor=True)
+        )
+        donor_actions = np.asarray(donor["actions"])
+        own_actions = np.asarray(crop["actions"])
+        rank_mask = (
+            np.asarray(crop["world_target_valid_mask"], dtype=bool)
+            & np.asarray(donor["world_target_valid_mask"], dtype=bool)
+            & np.any(donor_actions != own_actions, axis=(1, 2))
+        )
+        task_id = int(entry["task_id"])
+        item = {
+            key: crop[key]
+            for key in (
+                "actions", "previous_action", "proprio", "action_valid_mask",
+                "recovery_mask", "decision_recovery", "door_metric_state",
+                "door_metric_state_valid", "world_target_valid_mask", "first_success",
+            )
+        }
+        item.update({
+            "language_hidden": self._reference_hidden[task_id],
+            "language_mask": self._reference_mask[task_id],
+            "instruction_id": torch.tensor(task_id, dtype=torch.long),
+            "episode_id": torch.tensor(int(entry["episode_id"]), dtype=torch.long),
+            "pair_id": torch.tensor(index, dtype=torch.long),
+            "world_rank_shuffle_action": donor_actions,
+            "world_rank_shuffle_mask": rank_mask,
+            "crop_start": torch.tensor(start, dtype=torch.long),
+        })
+        task = str(entry["task"])
+        episode_index = int(entry["episode_index"])
+        frames = self._decode_task(task)[episode_index]
+        from scripts.build_longtraj_features import clip_frame_indices
+
+        item["frames"] = np.stack([
+            np.stack([frames[int(frame)] for frame in clip_frame_indices(int(decision))])
+            for decision in crop["decisions"]
+        ])
+        if self.include_world_target_frames:
+            item["world_target_frames"] = np.stack([
+                np.stack([frames[int(endpoint)]]) for endpoint in crop["endpoints"]
+            ])
+        return item
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()

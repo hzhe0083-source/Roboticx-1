@@ -13,6 +13,7 @@ with no back-reference to this one, so there is no cycle.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -59,6 +60,7 @@ def world_late_stage_anchor_contract(weight: float = 0.0) -> dict[str, object]:
 WORLD_LATE_STAGE_ANCHOR = world_late_stage_anchor_contract(0.0)
 WORLD_LOGGED_BRANCH_CONTRACT = "matched_context_full_forward_v1"
 WORLD_ACTION_DONOR_CONTRACT = "train_split_task_cross_episode_proprio_nearest_v1"
+WORLD_ONLINE_ACTION_DONOR_CONTRACT = "online_cross_episode_random_action_v1"
 # VA has N layers; World proposes on layers 0..N-2. Each proposal predicts the
 # same next-decision endpoint from the current DINO anchor. The previous stage
 # map is detached refinement context, never an additive physical-state base.
@@ -184,6 +186,125 @@ def world_action_ranking_contract(
 WORLD_ACTION_RANKING = world_action_ranking_contract("cycle")
 
 
+def validate_online_episode_training_split(
+    payload: dict,
+    data_path: Path,
+    manifest_path: Path,
+    *,
+    planning_stride: int,
+) -> dict[str, object]:
+    """Validate a full-episode index without requiring offline window tensors."""
+
+    from va_compound.longtraj_frames import ONLINE_EPISODE_CONTRACT
+
+    resolved_data = data_path.expanduser().resolve(strict=True)
+    resolved_manifest = manifest_path.expanduser().resolve(strict=True)
+    if resolved_data != resolved_manifest:
+        raise ValueError(
+            "online episode training uses the same JSON as data and split manifest"
+        )
+    manifest = json.loads(resolved_manifest.read_text(encoding="utf-8"))
+    if manifest.get("contract") != ONLINE_EPISODE_CONTRACT:
+        raise ValueError("unexpected online full-episode split contract")
+    protocol = manifest.get("sampling_protocol") or {}
+    required_protocol = {
+        "storage": "full_episode_only",
+        "offline_windows": False,
+        "crop_start_stride": 1,
+        "sequence_length": 4,
+        "decision_stride": 15,
+        "action_horizon": 15,
+        "world_target_horizon": 15,
+    }
+    mismatches = {
+        key: (protocol.get(key), expected)
+        for key, expected in required_protocol.items()
+        if protocol.get(key) != expected
+    }
+    if planning_stride != 15 or mismatches:
+        raise ValueError(
+            f"online H15/P15 sampling contract mismatch: stride={planning_stride}, "
+            f"fields={mismatches}"
+        )
+    metadata = payload.get("metadata") or {}
+    if (
+        metadata.get("contract") != ONLINE_EPISODE_CONTRACT
+        or metadata.get("split_name") != "train"
+        or int(metadata.get("crop_start_stride", -1)) != 1
+        or int(metadata.get("samples_per_episode", 0)) <= 0
+    ):
+        raise ValueError("invalid runtime online-episode metadata")
+    digest = _sha256_file(resolved_manifest)
+    if metadata.get("index_sha256") != digest:
+        raise ValueError("runtime online payload is not bound to its JSON index")
+
+    instruction = payload.get("instruction_id")
+    episode_id = payload.get("episode_id")
+    pair_id = payload.get("pair_id")
+    if not all(
+        isinstance(value, Tensor)
+        and value.ndim == 1
+        and value.dtype != torch.bool
+        and not value.is_floating_point()
+        for value in (instruction, episode_id, pair_id)
+    ):
+        raise ValueError("online payload ids must be integer [N] tensors")
+    if not instruction.shape == episode_id.shape == pair_id.shape:
+        raise ValueError("online payload id lengths differ")
+    tasks = list(manifest.get("tasks") or [])
+    descriptions = [str(item["description"]) for item in tasks]
+    if metadata.get("tasks") != descriptions:
+        raise ValueError("online runtime task descriptions differ from the index")
+    actual_tasks = sorted(int(value) for value in torch.unique(instruction).tolist())
+    if actual_tasks != list(range(len(tasks))):
+        raise ValueError("online train split does not cover every indexed task")
+
+    train_entries = [
+        item for item in manifest.get("episodes") or [] if item.get("split") == "train"
+    ]
+    eval_ids = {
+        int(item["episode_id"])
+        for item in manifest.get("episodes") or []
+        if item.get("split") == "eval"
+    }
+    train_ids = {int(item["episode_id"]) for item in train_entries}
+    actual_ids = {int(value) for value in episode_id.tolist()}
+    if actual_ids != train_ids or actual_ids & eval_ids:
+        raise ValueError("online train/eval episode partition mismatch or leakage")
+    samples_per_episode = int(metadata["samples_per_episode"])
+    counts = torch.unique(episode_id, return_counts=True)[1]
+    if (
+        instruction.numel() != len(train_entries) * samples_per_episode
+        or not bool((counts == samples_per_episode).all())
+    ):
+        raise ValueError("online epoch exposure is not uniform per train episode")
+
+    raw_identity = manifest.get("raw_manifest") or {}
+    source_sha = str(raw_identity.get("sha256") or "")
+    if len(source_sha) != 64:
+        raise ValueError("online index lacks its raw-manifest SHA-256")
+    donor_digest = hashlib.sha256(
+        (
+            f"{digest}:{WORLD_ONLINE_ACTION_DONOR_CONTRACT}:"
+            f"samples={samples_per_episode}"
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "manifest_id": f"online-full-episode-{digest[:16]}",
+        "manifest_path": str(resolved_manifest),
+        "manifest_sha256": digest,
+        "source_sha256": source_sha,
+        "world_action_donor_contract": WORLD_ONLINE_ACTION_DONOR_CONTRACT,
+        "world_action_donor_sha256": donor_digest,
+        # The table is generated for each online sample, so there is no fixed
+        # split-wide transition count to archive.
+        "world_action_donor_transitions": -1,
+        "world_action_rank_transitions": -1,
+        "online_train_episodes": len(train_entries),
+        "online_samples_per_episode": samples_per_episode,
+    }
+
+
 def validate_visual_world_training_split(
     payload: dict,
     data_path: Path,
@@ -191,8 +312,16 @@ def validate_visual_world_training_split(
     *,
     va_world_mode: str = "legacy",
     planning_stride: int = 6,
-) -> dict[str, str]:
+) -> dict[str, object]:
     """Validate the immutable episode-level train split before model startup."""
+
+    metadata = payload.get("metadata") or {}
+    from va_compound.longtraj_frames import ONLINE_EPISODE_CONTRACT
+
+    if metadata.get("contract") == ONLINE_EPISODE_CONTRACT:
+        return validate_online_episode_training_split(
+            payload, data_path, manifest_path, planning_stride=planning_stride
+        )
 
     from scripts.split_wam4va_episode_holdout import (
         MANIFEST_CONTRACT,
@@ -214,7 +343,6 @@ def validate_visual_world_training_split(
     if Path(str(manifest.get("manifest_path", ""))).name != resolved_manifest.name:
         raise ValueError("World split manifest_path does not match the supplied file")
 
-    metadata = payload.get("metadata") or {}
     if metadata.get("split_name") != "train":
         raise ValueError("visual World training requires metadata.split_name='train'")
     if metadata.get("split_contract") != manifest:
@@ -567,16 +695,40 @@ def validate_peer_data_isolation(
             "peer VA/World datasets must cover the same task ids: "
             f"VA={va_tasks}, World={world_tasks}"
         )
-    for key in ("actions", "proprio", "language_hidden"):
-        va_value = va_payload.get(key)
-        world_value = world_payload.get(key)
-        if not isinstance(va_value, Tensor) or not isinstance(world_value, Tensor):
-            raise ValueError(f"peer VA/World datasets both require tensor {key}")
-        if tuple(va_value.shape[1:]) != tuple(world_value.shape[1:]):
-            raise ValueError(
-                f"peer VA/World {key} schema mismatch: "
-                f"{tuple(va_value.shape[1:])} vs {tuple(world_value.shape[1:])}"
-            )
+    from va_compound.longtraj_frames import ONLINE_EPISODE_CONTRACT
+
+    va_online = (va_payload.get("metadata") or {}).get("contract") == ONLINE_EPISODE_CONTRACT
+    world_online = (
+        (world_payload.get("metadata") or {}).get("contract")
+        == ONLINE_EPISODE_CONTRACT
+    )
+    if va_online != world_online:
+        raise ValueError("VA and World must both use online episodes or both use payload rows")
+    if va_online:
+        schema_keys = (
+            "sequence_length", "action_horizon", "control_stride",
+            "planning_stride", "crop_start_stride", "samples_per_episode",
+        )
+        va_meta = va_payload["metadata"]
+        world_meta = world_payload["metadata"]
+        different = {
+            key: (va_meta.get(key), world_meta.get(key))
+            for key in schema_keys
+            if va_meta.get(key) != world_meta.get(key)
+        }
+        if different:
+            raise ValueError(f"online VA/World sampling schema mismatch: {different}")
+    else:
+        for key in ("actions", "proprio", "language_hidden"):
+            va_value = va_payload.get(key)
+            world_value = world_payload.get(key)
+            if not isinstance(va_value, Tensor) or not isinstance(world_value, Tensor):
+                raise ValueError(f"peer VA/World datasets both require tensor {key}")
+            if tuple(va_value.shape[1:]) != tuple(world_value.shape[1:]):
+                raise ValueError(
+                    f"peer VA/World {key} schema mismatch: "
+                    f"{tuple(va_value.shape[1:])} vs {tuple(world_value.shape[1:])}"
+                )
     if planning_stride is not None:
         for stream, payload in (("VA", va_payload), ("World", world_payload)):
             metadata = payload.get("metadata") or {}
@@ -602,6 +754,7 @@ def validate_peer_data_isolation(
         "world_episode_count": len(world_episodes),
         "shared_full_data": bool(shared_full_data),
         "shared_windows": int(va_episode.numel()) if shared_full_data else 0,
+        "online_full_episodes": bool(va_online),
         "task_ids": va_tasks,
     }
 
@@ -805,7 +958,9 @@ def validate_visual_world_resume_contract(
         "world_action_ranking": (
             WORLD_ACTION_RANKING if action_ranking is None else action_ranking
         ),
-        "world_action_donor_contract": WORLD_ACTION_DONOR_CONTRACT,
+        "world_action_donor_contract": split_identity.get(
+            "world_action_donor_contract", WORLD_ACTION_DONOR_CONTRACT
+        ),
         "world_action_donor_sha256": split_identity[
             "world_action_donor_sha256"
         ],

@@ -208,6 +208,21 @@ def build_dataset_content_identity(
                         "missing": True,
                     }
                 )
+    else:
+        # Full-episode online sampling has no frame-ref rows by design.  Bind
+        # exact resume to the raw containers declared by its episode index.
+        raw_sources = (payload.get("metadata") or {}).get("raw_sources") or []
+        for item in raw_sources:
+            source = Path(str(item.get("path", ""))).expanduser()
+            if source.exists():
+                sampled = _sampled_file_identity(source)
+                sampled["declared_sha256"] = item.get("sha256")
+                sampled["declared_size_bytes"] = item.get("size_bytes")
+                sources.append(sampled)
+            else:
+                sources.append(
+                    {"path": str(source.resolve(strict=False)), "missing": True}
+                )
 
     return {
         "identity_algorithm": "full_payload_sha256+referenced_source_sample_v1",
