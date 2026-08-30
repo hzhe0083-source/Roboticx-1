@@ -228,3 +228,37 @@ def test_main_vision_vision_dim_override_via_kwargs() -> None:
         dino_main_vision = False
 
     assert _main_vision_config_kwargs(ArgsOff()) == {}
+
+
+def test_timm_dino_full_unfreeze_enables_gradients_and_checkpointing() -> None:
+    from va_compound.backbones import TimmActionVisionBackbone
+
+    class TinyTimm(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.projection = torch.nn.Linear(3, 4)
+            self.grad_checkpointing = False
+
+        def set_grad_checkpointing(self, enabled: bool) -> None:
+            self.grad_checkpointing = enabled
+
+        def get_intermediate_layers(self, images, **_kwargs):
+            tokens = self.projection(images.mean(dim=(-1, -2)))[:, None, :]
+            prefixes = tokens[:, :0]
+            return [(tokens, prefixes), (tokens + 1.0, prefixes)]
+
+    model = TinyTimm()
+    backbone = TimmActionVisionBackbone(
+        model,
+        model_id="tiny",
+        image_size=2,
+        feature_dim=4,
+        output_layers=(0, 1),
+    )
+    assert not any(parameter.requires_grad for parameter in backbone.parameters())
+    backbone.unfreeze_all()
+    assert model.grad_checkpointing
+    assert all(parameter.requires_grad for parameter in backbone.parameters())
+    output = backbone.forward_hierarchical_dense(torch.randn(2, 3, 2, 2))[11]
+    output.sum().backward()
+    assert model.projection.weight.grad is not None

@@ -5,7 +5,13 @@ from collections import Counter
 import pytest
 import torch
 
-from train import TaskLocalityWeightedSampler
+from train import (
+    TaskLocalityWeightedSampler,
+    backward_pcgrad,
+    merge_separate_pcgrad_gradients,
+    partition_separate_pcgrad_parameters,
+    pop_update_gradients,
+)
 
 
 def _sampler(seed: int = 7, block_batches: int = 2) -> TaskLocalityWeightedSampler:
@@ -361,3 +367,167 @@ def test_full_sampler_even_tail_preserves_manual_ddp_mean_gradient() -> None:
     # manual_post_backward_grad_allreduce_v1 averages the two local gradients.
     averaged = (rank0_parameter.grad + rank1_parameter.grad) / 2
     torch.testing.assert_close(averaged, global_parameter.grad)
+
+
+def test_mixed_sampler_has_four_tasks_and_fixed_25_percent_anchors() -> None:
+    instruction = torch.repeat_interleave(torch.arange(8), 20)
+    episode = torch.arange(160) // 2
+    kwargs = dict(
+        instruction_id=instruction,
+        episode_id=episode,
+        task_weights=torch.ones(8),
+        batch_size=16,
+        seed=43,
+        sampling_mode="mixed",
+        mixed_tasks_per_batch=4,
+        anchor_replay_fraction=0.25,
+        task_order_seed=5,
+        block_batches=2,
+    )
+    sampler = TaskLocalityWeightedSampler(**kwargs)
+    schedule = list(sampler)
+    assert len(schedule) == len(sampler) == 10
+    for batch in schedule:
+        real = [-index - 1 if index < 0 else index for index in batch]
+        counts = Counter(sampler.task_ids[index] for index in real)
+        assert len(counts) == 4
+        assert set(counts.values()) == {4}
+        assert sum(index < 0 for index in batch) == 4
+
+    task_sets = [
+        frozenset(sampler.task_ids[index] for index in real)
+        for batch in schedule
+        for real in [[-index - 1 if index < 0 else index for index in batch]]
+    ]
+    assert all(task_sets[start] == task_sets[start + 1] for start in range(0, 10, 2))
+    assert task_sets[0].isdisjoint(task_sets[2])
+
+    anchors0 = {
+        -index - 1 for batch in schedule for index in batch if index < 0
+    }
+    sampler.advance(len(sampler))
+    anchors1 = {
+        -index - 1 for batch in sampler for index in batch if index < 0
+    }
+    assert anchors1 == anchors0
+
+
+def test_mixed_sampler_keeps_dagger_rows_out_of_fixed_anchors() -> None:
+    instruction = torch.repeat_interleave(torch.arange(8), 20)
+    eligible = torch.ones(160, dtype=torch.bool)
+    for task in range(8):
+        eligible[task * 20 + 10 : task * 20 + 20] = False
+    sampler = TaskLocalityWeightedSampler(
+        instruction_id=instruction,
+        episode_id=torch.arange(160) // 2,
+        task_weights=torch.ones(8),
+        batch_size=16,
+        seed=43,
+        sampling_mode="mixed",
+        mixed_tasks_per_batch=4,
+        anchor_replay_fraction=0.25,
+        anchor_eligible=eligible,
+    )
+    schedule = list(sampler)
+    anchors = [-index - 1 for batch in schedule for index in batch if index < 0]
+    fresh = [index for batch in schedule for index in batch if index >= 0]
+    assert all(bool(eligible[index]) for index in anchors)
+    assert any(not bool(eligible[index]) for index in fresh)
+
+
+def test_mixed_sampler_keeps_all_tasks_on_both_data_parallel_ranks() -> None:
+    instruction = torch.repeat_interleave(torch.arange(8), 20)
+    episode = torch.arange(160) // 2
+    kwargs = dict(
+        instruction_id=instruction,
+        episode_id=episode,
+        task_weights=torch.ones(8),
+        batch_size=16,
+        seed=47,
+        sampling_mode="mixed",
+        mixed_tasks_per_batch=4,
+        anchor_replay_fraction=0.25,
+        world_size=2,
+    )
+    rank0 = TaskLocalityWeightedSampler(**kwargs, rank=0)
+    rank1 = TaskLocalityWeightedSampler(**kwargs, rank=1)
+    for left, right in zip(rank0, rank1, strict=True):
+        for batch in (left, right):
+            real = [-index - 1 if index < 0 else index for index in batch]
+            counts = Counter(rank0.task_ids[index] for index in real)
+            assert len(counts) == 4
+            assert set(counts.values()) == {2}
+
+
+def test_pcgrad_removes_opposite_gradients_and_keeps_aligned_gradients() -> None:
+    conflicting = torch.nn.Parameter(torch.tensor(1.0))
+    stats = backward_pcgrad(
+        [conflicting, -conflicting], [("conflicting", conflicting)], seed=3
+    )
+    torch.testing.assert_close(conflicting.grad, torch.tensor(0.0))
+    assert stats == {"conflicts": 2, "comparisons": 2}
+
+    aligned = torch.nn.Parameter(torch.tensor(1.0))
+    stats = backward_pcgrad(
+        [aligned, 2.0 * aligned], [("aligned", aligned)], seed=3
+    )
+    torch.testing.assert_close(aligned.grad, torch.tensor(1.5))
+    assert stats == {"conflicts": 0, "comparisons": 2}
+
+
+def test_world_gradient_cannot_oppose_pcgrad_action_direction() -> None:
+    shared = torch.nn.Parameter(torch.tensor([1.0, 1.0]))
+    action_only = torch.nn.Parameter(torch.tensor(1.0))
+    world_only = torch.nn.Parameter(torch.tensor(1.0))
+    stats, world_loss = backward_pcgrad(
+        [shared[0] + action_only, shared[1] + action_only],
+        [
+            ("shared", shared),
+            ("action_only", action_only),
+            ("world_only", world_only),
+        ],
+        seed=3,
+        auxiliary_loss_or_forward=lambda: (
+            -2.0 * shared[0] + 3.0 * shared[1] + 4.0 * world_only
+        ),
+    )
+    torch.testing.assert_close(shared.grad, torch.tensor([0.5, 3.5]))
+    torch.testing.assert_close(action_only.grad, torch.tensor(1.0))
+    torch.testing.assert_close(world_only.grad, torch.tensor(4.0))
+    torch.testing.assert_close(world_loss, torch.tensor(5.0))
+    assert stats["world_conflicts"] == 1
+    assert stats["world_comparisons"] == 2
+
+
+def test_separate_action_world_pcgrad_only_guards_shared_dino() -> None:
+    action = torch.nn.Parameter(torch.tensor(1.0))
+    world = torch.nn.Parameter(torch.tensor(1.0))
+    dino = torch.nn.Parameter(torch.tensor([1.0, 1.0]))
+    named = [
+        ("model.action", action),
+        ("model.wmrm.weight", world),
+        ("main_vision_backbone.model.weight", dino),
+    ]
+    action_private, world_private, shared = (
+        partition_separate_pcgrad_parameters(named)
+    )
+    backward_pcgrad(
+        [action + dino[0], 2.0 * action + dino[0]],
+        [*action_private, *shared],
+        seed=3,
+    )
+    action_gradients = pop_update_gradients([*action_private, *shared])
+    backward_pcgrad(
+        [world - dino[0] + dino[1], 2.0 * world - dino[0] + dino[1]],
+        [*world_private, *shared],
+        seed=3,
+    )
+    stats = merge_separate_pcgrad_gradients(
+        action_private, shared, action_gradients
+    )
+    torch.testing.assert_close(action.grad, torch.tensor(1.5))
+    torch.testing.assert_close(world.grad, torch.tensor(1.5))
+    torch.testing.assert_close(dino.grad, torch.tensor([1.0, 1.0]))
+    assert stats["dino_projected"] == 1
+    assert stats["dino_cosine"] < 0.0
+    assert stats["dino_post_cosine"] == pytest.approx(0.0, abs=1e-6)

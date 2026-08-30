@@ -19,11 +19,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import numpy as np
 
-ROOT = Path("/home/ryan/Documents/robot/benchmark_data/raw/metaworld/lerobot_metaworld_mt50")
+ROOT = Path(os.environ.get(
+    "METAWORLD_DATASET_ROOT",
+    "/home/ryan/Documents/robot/benchmark_data/raw/metaworld/lerobot_metaworld_mt50",
+))
 _CONFIG_CANDIDATES = (
     Path(__file__).resolve().parent / "metaworld_config.json",
     Path(

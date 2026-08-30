@@ -114,6 +114,11 @@ class VACompoundConfig:
     wmrm_predictor_depth: int = 6
     wmrm_predictor_width: int = 384
     wmrm_predictor_heads: int = 12
+    wmrm_predictor_copies: int = 1
+    # Optional warm-start gate for newly appended peer World stages. Stages
+    # before this index keep their checkpoint behavior; later proposals start
+    # as residual no-ops and learn to open during the depth experiment.
+    wmrm_stage_gate_start: int | None = None
     # Fail-fast tensor-content checks are valuable in tests/debug runs, but each
     # CUDA truth-value check synchronizes the host inside the recurrent hot path.
     runtime_integrity_checks: bool = True
@@ -127,6 +132,12 @@ class VACompoundConfig:
     # flow 头深度条件（2026-08-07 审阅落地④）：每层 AdaLN-Zero + cross-attn
     # 注入条件（"entry" 为旧行为：仅入口相加）。
     flow_cond: str = "entry"
+    # Capacity warm-up only: let the frozen H9 Flow teacher pass its loss
+    # through the action condition into newly appended VA layers.
+    tail_flow_condition_grad: bool = False
+    # Capacity phase 2 only: let policy loss train the new World stage gates
+    # without sending policy gradients into World-state predictions.
+    capacity_stage_gate_policy_grad: bool = False
     # EVSM：证据验证的暂存记忆（2026-08-07 Codex 主推，可选）：动作提议写入
     # 暂存 task_spec，下一决策用 FutureLatentPredictor 的预测与真实视觉比较，
     # q = sigma((kappa - stopgrad(delta)) / temp) 决定提交或回滚。零新增参数
@@ -377,15 +388,26 @@ class VACompoundConfig:
             raise ValueError("wmrm_predictor_width must be positive")
         if self.wmrm_predictor_heads < 1:
             raise ValueError("wmrm_predictor_heads must be positive")
+        if self.wmrm_predictor_copies < 1:
+            raise ValueError("wmrm_predictor_copies must be positive")
+        if self.wmrm_predictor != "st_blocks" and self.wmrm_predictor_copies != 1:
+            raise ValueError("wmrm_predictor_copies requires st_blocks")
         if self.wmrm_predictor_width % self.wmrm_predictor_heads != 0:
             raise ValueError("wmrm_predictor_width must be divisible by wmrm_predictor_heads")
         if self.va_world_mode not in {"legacy", "peer_sync_h6"}:
             raise ValueError("va_world_mode must be legacy|peer_sync_h6")
+        if self.wmrm_stage_gate_start is not None:
+            if self.va_world_mode != "peer_sync_h6":
+                raise ValueError("wmrm_stage_gate_start requires peer_sync_h6")
+            if not 0 < self.wmrm_stage_gate_start < self.num_layers - 1:
+                raise ValueError(
+                    "wmrm_stage_gate_start must be inside the peer World stage range"
+                )
         if self.va_world_mode == "peer_sync_h6":
             if not self.wmrm:
                 raise ValueError("peer_sync_h6 requires wmrm=true")
-            if self.action_horizon not in {6, 15}:
-                raise ValueError("peer mode requires action_horizon in {6, 15}")
+            if self.action_horizon not in {6, 15, 50}:
+                raise ValueError("peer mode requires action_horizon in {6, 15, 50}")
             if self.planning_stride not in {1, 2, 3, 6, 15}:
                 raise ValueError(
                     "peer_sync_h6 requires planning_stride in {1, 2, 3, 6, 15}"
@@ -1084,7 +1106,7 @@ class VACouplingLayer(nn.Module):
         dual_attention: bool = False,
         dense_readout_mtvj: bool = False,
         action_dense_readout: bool = False,
-        protected_action_prefix: int = 0,
+        protected_action_prefix: int | tuple[int, ...] = 0,
     ) -> None:
         super().__init__()
         self.sequential = sequential
@@ -1099,9 +1121,18 @@ class VACouplingLayer(nn.Module):
         if attention_backend not in ("manual", "auto"):
             raise ValueError(f"unsupported VA attention backend: {attention_backend}")
         self.attention_backend = attention_backend
-        if protected_action_prefix < 0:
-            raise ValueError("protected_action_prefix must be non-negative")
-        self.protected_action_prefix = protected_action_prefix
+        prefixes = (
+            (protected_action_prefix,)
+            if isinstance(protected_action_prefix, int) and protected_action_prefix
+            else ()
+            if isinstance(protected_action_prefix, int)
+            else tuple(protected_action_prefix)
+        )
+        if any(prefix <= 0 for prefix in prefixes) or tuple(sorted(set(prefixes))) != prefixes:
+            raise ValueError(
+                "protected_action_prefix must contain increasing positive boundaries"
+            )
+        self.protected_action_prefixes = prefixes
         # 双注意力（第二轮架构重构 2026-08-08）：仅非 sequential 层（policy
         # 构造时 sequential 层传 False）。动作 query 的 physical 更新不含语言列，
         # 语言列走独立 semantic 注意力；融合门 g_A = σ(G([A_mean, lang_mean]))。
@@ -1274,21 +1305,21 @@ class VACouplingLayer(nn.Module):
         if self.mode == "uni_a":
             allowed[:n_visual] = False
             allowed[:n_visual, :n_visual] = True
-        if self.protected_action_prefix:
-            if not self.protected_action_prefix < n_action:
+        for protected_prefix in self.protected_action_prefixes:
+            if not protected_prefix < n_action:
                 raise ValueError(
                     "protected_action_prefix must be shorter than the action horizon"
                 )
             action_key_start = n_visual + n_memory + n_task
             tail_keys = slice(
-                action_key_start + self.protected_action_prefix,
+                action_key_start + protected_prefix,
                 action_key_start + n_action,
             )
             # Base visual/prefix/task queries cannot read the H9 extension.
             # Tail queries remain free to read both the protected prefix and tail.
             allowed[:, tail_keys] = False
             tail_queries = slice(
-                n_visual + self.protected_action_prefix,
+                n_visual + protected_prefix,
                 n_visual + n_action,
             )
             allowed[tail_queries, tail_keys] = True
@@ -2108,6 +2139,7 @@ class VACompoundPolicy(nn.Module):
                     predictor_depth=config.wmrm_predictor_depth,
                     predictor_width=config.wmrm_predictor_width,
                     predictor_heads=config.wmrm_predictor_heads,
+                    predictor_copies=config.wmrm_predictor_copies,
                     max_stages=config.wmrm_stage_count(),
                     runtime_integrity_checks=config.runtime_integrity_checks,
                 )
@@ -2120,11 +2152,27 @@ class VACompoundPolicy(nn.Module):
                 self.world_action_readout = ExecutableActionReadout(
                     config.hidden_dim,
                     action_dim=config.action_dim,
-                    horizon=config.action_horizon,
+                    horizon=(
+                        config.wmrm_cycle_steps
+                        if config.action_horizon == 50
+                        else config.action_horizon
+                    ),
                     runtime_integrity_checks=config.runtime_integrity_checks,
                 )
         else:
             self.world_action_readout = None
+        if config.wmrm_stage_gate_start is None:
+            self.register_parameter("wmrm_stage_scale", None)
+            self.register_parameter("wmrm_belief_message_scale", None)
+        else:
+            self.wmrm_stage_scale = nn.Parameter(
+                torch.zeros(
+                    config.wmrm_stage_count() - config.wmrm_stage_gate_start
+                )
+            )
+            self.wmrm_belief_message_scale = nn.Parameter(
+                torch.zeros(config.wmrm_stage_count())
+            )
         self.last_wmrm = None
         self.action_queries = nn.Parameter(torch.empty(config.action_horizon, config.hidden_dim))
         nn.init.normal_(self.action_queries, std=0.02)
@@ -2221,7 +2269,12 @@ class VACompoundPolicy(nn.Module):
                 dense_readout_mtvj=config.dense_readout_mtvj,
                 action_dense_readout=(config.action_vision_backbone != "none"),
                 protected_action_prefix=(
-                    6
+                    (6, 15)
+                    if config.va_world_mode == "peer_sync_h6"
+                    and config.action_horizon == 50
+                    and (config.deployment_execution_horizon or config.planning_stride)
+                    == 15
+                    else 6
                     if config.va_world_mode == "peer_sync_h6"
                     and config.action_horizon == 15
                     and (config.deployment_execution_horizon or config.planning_stride)
@@ -2307,9 +2360,16 @@ class VACompoundPolicy(nn.Module):
         self.tail_flow_head = (
             FlowMatchingHead(**flow_head_kwargs)
             if config.va_world_mode == "peer_sync_h6"
-            and config.action_horizon == 15
+            and config.action_horizon in {15, 50}
             and (config.deployment_execution_horizon or config.planning_stride)
             == 15
+            else None
+        )
+        self.extension_flow_head = (
+            FlowMatchingHead(**flow_head_kwargs)
+            if config.va_world_mode == "peer_sync_h6"
+            and config.action_horizon == 50
+            and (config.deployment_execution_horizon or config.planning_stride) == 15
             else None
         )
         if config.direct_head:
@@ -2468,6 +2528,31 @@ class VACompoundPolicy(nn.Module):
         if mode == "all":
             return set(range(n_layers))
         return {index for index in range(n_layers) if index % 2 == 1 or index == n_layers - 1}
+
+    def _peer_world_message(
+        self,
+        world_state: object,
+        stage_index: int,
+        *,
+        detach_world_map: bool = True,
+    ) -> Tensor:
+        """Publish the spatial map plus a zero-gated residual belief bridge."""
+        world_map = world_state.world_map
+        if world_map is None:
+            raise ValueError("peer World message requires a predicted world map")
+        message = self.wmrm.encode_world_tokens(
+            world_map.detach() if detach_world_map else world_map
+        )
+        scale = self.wmrm_belief_message_scale
+        belief = world_state.belief
+        if scale is not None and belief is not None:
+            count = min(message.shape[1], belief.shape[1])
+            residual = belief[:, :count].to(dtype=message.dtype)
+            residual = residual * scale[stage_index].to(dtype=message.dtype)
+            message = torch.cat(
+                (message[:, :count] + residual, message[:, count:]), dim=1
+            )
+        return message
 
     def project_shared_eye(self, vision_tokens: Tensor) -> Tensor:
         """Pre-VA DINO/main tokens: optional frame embedding then vision_projection."""
@@ -2787,14 +2872,13 @@ class VACompoundPolicy(nn.Module):
             if skip_wmrm:
                 world_message = None
             elif world_state.world_map is not None:
-                published_map = (
-                    world_state.world_map.detach()
+                world_message = (
+                    self._peer_world_message(
+                        world_state, self.config.wmrm_stage_count() - 1
+                    )
                     if peer_mode
-                    else world_state.world_map
-                )
-                world_message = self.wmrm.encode_world_tokens(
-                    published_map.to(device=vision.device, dtype=target_dtype)
-                )
+                    else self.wmrm.encode_world_tokens(world_state.world_map)
+                ).to(device=vision.device, dtype=target_dtype)
             elif world_state.belief is not None:
                 world_message = world_state.belief.to(
                     device=vision.device, dtype=target_dtype
@@ -2873,18 +2957,24 @@ class VACompoundPolicy(nn.Module):
                 # consumes the final world map and does not open another stage.
                 if peer_mode:
                     full_env_action = (
-                        self.world_action_readout(snapshot_action)
+                        self.world_action_readout(
+                            snapshot_action[:, : self.wmrm.cycle_steps]
+                            if self.config.action_horizon == 50
+                            else snapshot_action
+                        )
                         if env_action is None
                         else env_action
                     )
                     expected_env_action = (
                         snapshot_action.shape[0],
-                        self.config.action_horizon,
+                        self.wmrm.cycle_steps
+                        if self.config.action_horizon == 50
+                        else self.config.action_horizon,
                         self.config.action_dim,
                     )
                     if tuple(full_env_action.shape) != expected_env_action:
                         raise ValueError(
-                            "peer_sync_h6 env_action must be a complete H6 tensor "
+                            "peer_sync_h6 env_action must be a complete action tensor "
                             f"with shape {expected_env_action}, got "
                             f"{tuple(full_env_action.shape)}"
                         )
@@ -2908,13 +2998,67 @@ class VACompoundPolicy(nn.Module):
                         boundary=f"World stage {index} transition"
                     )
                 aux = proposal.aux
-                world_state = proposal.next_world_state
+                next_world_state = proposal.next_world_state
+                gated_policy_state = None
+                if (
+                    self.wmrm_stage_scale is not None
+                    and index >= self.config.wmrm_stage_gate_start
+                ):
+                    if (
+                        world_state.belief is None
+                        or world_state.innovation is None
+                        or world_state.world_map is None
+                        or next_world_state.belief is None
+                        or next_world_state.innovation is None
+                        or next_world_state.world_map is None
+                    ):
+                        raise ValueError(
+                            "gated peer World stages require a complete prior and proposal state"
+                        )
+                    scale = self.wmrm_stage_scale[
+                        index - self.config.wmrm_stage_gate_start
+                    ]
+                    if self.config.capacity_stage_gate_policy_grad:
+                        # Policy/FM may decide how much of this stage to use, but
+                        # cannot turn the World predictor into a control scratchpad.
+                        gated_policy_state = WAMState(
+                            belief=world_state.belief.detach(),
+                            innovation=world_state.innovation.detach(),
+                            world_map=torch.lerp(
+                                world_state.world_map.detach(),
+                                next_world_state.world_map.detach(),
+                                scale,
+                            ),
+                        )
+                    world_state = WAMState(
+                        belief=torch.lerp(
+                            world_state.belief, next_world_state.belief, scale
+                        ),
+                        innovation=torch.lerp(
+                            world_state.innovation,
+                            next_world_state.innovation,
+                            scale,
+                        ),
+                        world_map=torch.lerp(
+                            world_state.world_map,
+                            next_world_state.world_map,
+                            scale,
+                        ),
+                    )
+                else:
+                    world_state = next_world_state
                 # Keep the predicted map semantically honest: Flow may train the
                 # map-to-policy projection and VA state readers, but not rewrite
                 # the future-DINO predictor into a control scratchpad. World loss
                 # and recurrent World state remain fully differentiable.
                 published_message = (
-                    self.wmrm.encode_world_tokens(world_state.world_map.detach())
+                    self._peer_world_message(
+                        gated_policy_state,
+                        index,
+                        detach_world_map=False,
+                    )
+                    if gated_policy_state is not None
+                    else self._peer_world_message(world_state, index)
                     if peer_mode and world_state.world_map is not None
                     else proposal.world_message
                 )
@@ -2972,11 +3116,36 @@ class VACompoundPolicy(nn.Module):
             flow_time,
             semantic_context,
         )
-        tail_semantic = (
-            semantic_context.detach() if semantic_context is not None else None
+        tail_condition = (
+            action_condition
+            if self.config.tail_flow_condition_grad
+            else action_condition.detach()
         )
+        tail_semantic = semantic_context
+        if tail_semantic is not None and not self.config.tail_flow_condition_grad:
+            tail_semantic = tail_semantic.detach()
+        if self.config.action_horizon == 50:
+            if self.extension_flow_head is None:
+                raise RuntimeError("H50 nested Flow requires extension_flow_head")
+            # Preserve the complete pretrained H15 decoder at migration time:
+            # neither the H35 noise nor its conditions enter the old outputs.
+            mid_velocity = self.tail_flow_head(
+                tail_condition[:, :15],
+                noisy_actions[:, :15],
+                flow_time,
+                tail_semantic,
+            )[:, prefix_horizon:15]
+            new_tail_velocity = self.extension_flow_head(
+                tail_condition,
+                noisy_actions,
+                flow_time,
+                tail_semantic,
+            )[:, 15:]
+            return torch.cat(
+                (prefix_velocity, mid_velocity, new_tail_velocity), dim=1
+            )
         tail_velocity = self.tail_flow_head(
-            action_condition.detach(),
+            tail_condition,
             noisy_actions,
             flow_time,
             tail_semantic,

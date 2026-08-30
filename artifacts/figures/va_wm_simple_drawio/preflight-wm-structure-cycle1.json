@@ -1,0 +1,335 @@
+{
+  "file": "artifacts/figures/va_wm_simple_drawio/wm_update_component.drawio",
+  "summary": {
+    "total_findings": 26,
+    "fail": 25,
+    "warn": 1,
+    "passed": false,
+    "clean": false
+  },
+  "fails": [
+    {
+      "rule": "arrow-box-collision",
+      "element_id": "e_visual_evidence",
+      "message": "Edge 'e_visual_evidence' passes through box 'wm_panel' (25,80 1350×540)",
+      "detail": {
+        "edge_id": "e_visual_evidence",
+        "box_id": "wm_panel",
+        "box_type": "shape",
+        "box_rect": "25,80 1350×540",
+        "segment": "(170,185)→(170,330)"
+      }
+    },
+    {
+      "rule": "arrow-box-collision",
+      "element_id": "e_state_innovation",
+      "message": "Edge 'e_state_innovation' passes through box 'wm_panel' (25,80 1350×540)",
+      "detail": {
+        "edge_id": "e_state_innovation",
+        "box_id": "wm_panel",
+        "box_type": "shape",
+        "box_rect": "25,80 1350×540",
+        "segment": "(530,185)→(430,330)"
+      }
+    },
+    {
+      "rule": "arrow-box-collision",
+      "element_id": "e_state_prebelief",
+      "message": "Edge 'e_state_prebelief' passes through box 'wm_panel' (25,80 1350×540)",
+      "detail": {
+        "edge_id": "e_state_prebelief",
+        "box_id": "wm_panel",
+        "box_type": "shape",
+        "box_rect": "25,80 1350×540",
+        "segment": "(530,185)→(575,260)"
+      }
+    },
+    {
+      "rule": "arrow-box-collision",
+      "element_id": "e_state_prebelief",
+      "message": "Edge 'e_state_prebelief' passes through box 'wm_panel' (25,80 1350×540)",
+      "detail": {
+        "edge_id": "e_state_prebelief",
+        "box_id": "wm_panel",
+        "box_type": "shape",
+        "box_rect": "25,80 1350×540",
+        "segment": "(575,260)→(640,260)"
+      }
+    },
+    {
+      "rule": "arrow-box-collision",
+      "element_id": "e_state_prebelief",
+      "message": "Edge 'e_state_prebelief' passes through box 'wm_panel' (25,80 1350×540)",
+      "detail": {
+        "edge_id": "e_state_prebelief",
+        "box_id": "wm_panel",
+        "box_type": "shape",
+        "box_rect": "25,80 1350×540",
+        "segment": "(640,260)→(695,330)"
+      }
+    },
+    {
+      "rule": "arrow-box-collision",
+      "element_id": "e_state_predictor",
+      "message": "Edge 'e_state_predictor' passes through box 'wm_panel' (25,80 1350×540)",
+      "detail": {
+        "edge_id": "e_state_predictor",
+        "box_id": "wm_panel",
+        "box_type": "shape",
+        "box_rect": "25,80 1350×540",
+        "segment": "(530,185)→(650,245)"
+      }
+    },
+    {
+      "rule": "arrow-box-collision",
+      "element_id": "e_state_predictor",
+      "message": "Edge 'e_state_predictor' passes through box 'wm_panel' (25,80 1350×540)",
+      "detail": {
+        "edge_id": "e_state_predictor",
+        "box_id": "wm_panel",
+        "box_type": "shape",
+        "box_rect": "25,80 1350×540",
+        "segment": "(650,245)→(910,245)"
+      }
+    },
+    {
+      "rule": "arrow-box-collision",
+      "element_id": "e_state_predictor",
+      "message": "Edge 'e_state_predictor' passes through box 'wm_panel' (25,80 1350×540)",
+      "detail": {
+        "edge_id": "e_state_predictor",
+        "box_id": "wm_panel",
+        "box_type": "shape",
+        "box_rect": "25,80 1350×540",
+        "segment": "(910,245)→(975,330)"
+      }
+    },
+    {
+      "rule": "arrow-box-collision",
+      "element_id": "e_context_predictor",
+      "message": "Edge 'e_context_predictor' passes through box 'wm_panel' (25,80 1350×540)",
+      "detail": {
+        "edge_id": "e_context_predictor",
+        "box_id": "wm_panel",
+        "box_type": "shape",
+        "box_rect": "25,80 1350×540",
+        "segment": "(1040,185)→(975,330)"
+      }
+    },
+    {
+      "rule": "arrow-box-collision",
+      "element_id": "e_evidence_innovation",
+      "message": "Edge 'e_evidence_innovation' passes through box 'wm_panel' (25,80 1350×540)",
+      "detail": {
+        "edge_id": "e_evidence_innovation",
+        "box_id": "wm_panel",
+        "box_type": "shape",
+        "box_rect": "25,80 1350×540",
+        "segment": "(170,330)→(430,330)"
+      }
+    },
+    {
+      "rule": "arrow-box-collision",
+      "element_id": "e_innovation_prebelief",
+      "message": "Edge 'e_innovation_prebelief' passes through box 'wm_panel' (25,80 1350×540)",
+      "detail": {
+        "edge_id": "e_innovation_prebelief",
+        "box_id": "wm_panel",
+        "box_type": "shape",
+        "box_rect": "25,80 1350×540",
+        "segment": "(430,330)→(695,330)"
+      }
+    },
+    {
+      "rule": "arrow-box-collision",
+      "element_id": "e_prebelief_predictor",
+      "message": "Edge 'e_prebelief_predictor' passes through box 'wm_panel' (25,80 1350×540)",
+      "detail": {
+        "edge_id": "e_prebelief_predictor",
+        "box_id": "wm_panel",
+        "box_type": "shape",
+        "box_rect": "25,80 1350×540",
+        "segment": "(695,330)→(975,330)"
+      }
+    },
+    {
+      "rule": "arrow-box-collision",
+      "element_id": "e_predictor_mapbelief",
+      "message": "Edge 'e_predictor_mapbelief' passes through box 'wm_panel' (25,80 1350×540)",
+      "detail": {
+        "edge_id": "e_predictor_mapbelief",
+        "box_id": "wm_panel",
+        "box_type": "shape",
+        "box_rect": "25,80 1350×540",
+        "segment": "(975,330)→(1250,330)"
+      }
+    },
+    {
+      "rule": "arrow-box-collision",
+      "element_id": "e_innovation_commit",
+      "message": "Edge 'e_innovation_commit' passes through box 'wm_panel' (25,80 1350×540)",
+      "detail": {
+        "edge_id": "e_innovation_commit",
+        "box_id": "wm_panel",
+        "box_type": "shape",
+        "box_rect": "25,80 1350×540",
+        "segment": "(430,330)→(835,535)"
+      }
+    },
+    {
+      "rule": "arrow-box-collision",
+      "element_id": "e_predictor_commit",
+      "message": "Edge 'e_predictor_commit' passes through box 'wm_panel' (25,80 1350×540)",
+      "detail": {
+        "edge_id": "e_predictor_commit",
+        "box_id": "wm_panel",
+        "box_type": "shape",
+        "box_rect": "25,80 1350×540",
+        "segment": "(975,330)→(835,535)"
+      }
+    },
+    {
+      "rule": "arrow-box-collision",
+      "element_id": "e_mapbelief_commit",
+      "message": "Edge 'e_mapbelief_commit' passes through box 'wm_panel' (25,80 1350×540)",
+      "detail": {
+        "edge_id": "e_mapbelief_commit",
+        "box_id": "wm_panel",
+        "box_type": "shape",
+        "box_rect": "25,80 1350×540",
+        "segment": "(1250,330)→(835,535)"
+      }
+    },
+    {
+      "rule": "element-overlap",
+      "element_id": "wm_panel",
+      "message": "Element 'wm_panel' (shape) overlaps 'input_visual' (shape): (25,80 1350×540) vs (65,150 210×70)",
+      "detail": {
+        "elem_a": "wm_panel",
+        "elem_b": "input_visual",
+        "a_type": "shape",
+        "b_type": "shape",
+        "rect_a": "25,80 1350×540",
+        "rect_b": "65,150 210×70"
+      }
+    },
+    {
+      "rule": "element-overlap",
+      "element_id": "wm_panel",
+      "message": "Element 'wm_panel' (shape) overlaps 'input_state' (shape): (25,80 1350×540) vs (380,150 300×70)",
+      "detail": {
+        "elem_a": "wm_panel",
+        "elem_b": "input_state",
+        "a_type": "shape",
+        "b_type": "shape",
+        "rect_a": "25,80 1350×540",
+        "rect_b": "380,150 300×70"
+      }
+    },
+    {
+      "rule": "element-overlap",
+      "element_id": "wm_panel",
+      "message": "Element 'wm_panel' (shape) overlaps 'input_context' (shape): (25,80 1350×540) vs (850,145 380×80)",
+      "detail": {
+        "elem_a": "wm_panel",
+        "elem_b": "input_context",
+        "a_type": "shape",
+        "b_type": "shape",
+        "rect_a": "25,80 1350×540",
+        "rect_b": "850,145 380×80"
+      }
+    },
+    {
+      "rule": "element-overlap",
+      "element_id": "wm_panel",
+      "message": "Element 'wm_panel' (shape) overlaps 'evidence' (shape): (25,80 1350×540) vs (65,290 210×80)",
+      "detail": {
+        "elem_a": "wm_panel",
+        "elem_b": "evidence",
+        "a_type": "shape",
+        "b_type": "shape",
+        "rect_a": "25,80 1350×540",
+        "rect_b": "65,290 210×80"
+      }
+    },
+    {
+      "rule": "element-overlap",
+      "element_id": "wm_panel",
+      "message": "Element 'wm_panel' (shape) overlaps 'innovation' (shape): (25,80 1350×540) vs (315,285 230×90)",
+      "detail": {
+        "elem_a": "wm_panel",
+        "elem_b": "innovation",
+        "a_type": "shape",
+        "b_type": "shape",
+        "rect_a": "25,80 1350×540",
+        "rect_b": "315,285 230×90"
+      }
+    },
+    {
+      "rule": "element-overlap",
+      "element_id": "wm_panel",
+      "message": "Element 'wm_panel' (shape) overlaps 'prebelief' (shape): (25,80 1350×540) vs (585,290 220×80)",
+      "detail": {
+        "elem_a": "wm_panel",
+        "elem_b": "prebelief",
+        "a_type": "shape",
+        "b_type": "shape",
+        "rect_a": "25,80 1350×540",
+        "rect_b": "585,290 220×80"
+      }
+    },
+    {
+      "rule": "element-overlap",
+      "element_id": "wm_panel",
+      "message": "Element 'wm_panel' (shape) overlaps 'predictor' (shape): (25,80 1350×540) vs (845,285 260×90)",
+      "detail": {
+        "elem_a": "wm_panel",
+        "elem_b": "predictor",
+        "a_type": "shape",
+        "b_type": "shape",
+        "rect_a": "25,80 1350×540",
+        "rect_b": "845,285 260×90"
+      }
+    },
+    {
+      "rule": "element-overlap",
+      "element_id": "wm_panel",
+      "message": "Element 'wm_panel' (shape) overlaps 'map_belief' (shape): (25,80 1350×540) vs (1145,285 210×90)",
+      "detail": {
+        "elem_a": "wm_panel",
+        "elem_b": "map_belief",
+        "a_type": "shape",
+        "b_type": "shape",
+        "rect_a": "25,80 1350×540",
+        "rect_b": "1145,285 210×90"
+      }
+    },
+    {
+      "rule": "element-overlap",
+      "element_id": "wm_panel",
+      "message": "Element 'wm_panel' (shape) overlaps 'output_state' (shape): (25,80 1350×540) vs (315,500 1040×70)",
+      "detail": {
+        "elem_a": "wm_panel",
+        "elem_b": "output_state",
+        "a_type": "shape",
+        "b_type": "shape",
+        "rect_a": "25,80 1350×540",
+        "rect_b": "315,500 1040×70"
+      }
+    }
+  ],
+  "warns": [
+    {
+      "rule": "orphan-empty-box",
+      "element_id": "wm_panel",
+      "message": "Box 'wm_panel' (1350×540) has no text label. Add content or reduce size.",
+      "detail": {
+        "box_id": "wm_panel",
+        "size": "1350×540"
+      }
+    }
+  ],
+  "vertex_count": 12,
+  "edge_count": 12,
+  "canvas": "1400x650"
+}

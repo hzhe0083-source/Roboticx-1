@@ -162,3 +162,280 @@ Within the returned records, **Jialei Chen** leads through LaWAM with 17 Semanti
 ## Recommendations for reading
 
 Read in this order: **DUST -> Faster-WAM -> ForeWAM -> EvoScene-VLA -> RB-VLA**. This sequence isolates the five parts most relevant to WAM4VA: dual streams, stage-wise K/V, hidden future cache, recurrent scene state, and predictive belief. Then use DINO-WM or V-JEPA 2-AC only to audit the dense DINO-world-predictor half.
+
+---
+
+# Meta-World 验收协议与 seed 核验
+
+检索日期：2026-08-27
+
+检索范围：2024–2026
+
+API 检索式：`EVO-1 FabriVLA SUREFlow Meta-World robot learning evaluation seeds`
+
+## 结论先行
+
+- Evo-1：每任务 10 次 episode；单次官方脚本用 reset seed `4042..4051`；论文结果再对 5 次独立运行取平均。
+- FabriVLA v3：每任务 10 次 episode；当前官方脚本用 reset seed `4048..4057`。未报告 5 次独立运行；旧 v1 文本曾写 base seed 4042，复现时必须固定版本。
+- SUREFlow：论文只明确每任务 50 rollouts，没有公开说明它们是否对应 50 个唯一 seed，也没有报告独立训练/评估 seed 数。
+- EvoMind 榜单口径是 50 个任务和四个难度桶；仅看总 episode 成功率不足以复现榜单分数。
+
+## 直接证据
+
+| 工作 | 任务数 | 每任务 rollout | 可核验的 episode seed | 独立运行 | episode horizon | 汇总口径 |
+|---|---:|---:|---|---:|---:|---|
+| Evo-1 | 50 | 10 | 官方脚本 `4042 + episode` | 论文写 5 次 | 400 | 四个难度桶等权平均 |
+| FabriVLA v3 | 50 | 10 | 当前脚本 `4048 + episode` | 未报告多次 | 400 | 四个难度桶等权平均 |
+| SUREFlow | 50 | 50 | 未报告 | 未报告 | 未找到明确值 | 表格采用四难度桶平均 |
+
+主要原始来源：[Evo-1 论文](https://arxiv.org/html/2511.04555v2)、[Evo-1 官方评估代码](https://github.com/MINT-SJTU/Evo-1/blob/evo1-flash/MetaWorld_evaluation/mt50_evo1_client_prompt.py)、[FabriVLA v3 论文](https://arxiv.org/html/2607.08575v3)、[FabriVLA 官方评估代码](https://github.com/Youi-FabriX/FabriVLA/blob/main/evaluations/metaworld/evaluate_mt50.py)、[SUREFlow 论文](https://arxiv.org/html/2607.10504v1)、[EvoMind Meta-World 榜单](https://studio.evomind-tech.com/benchmarks/metaworld?sources=paper%2Cstudio)。
+
+## Semantic Scholar
+
+本次精确检索返回 0 篇。
+
+## OpenAlex
+
+| # | Title | Authors | Year | Citations | Venue | URL |
+|---:|---|---|---:|---:|---|---|
+| 1 | A Tutorial on Meta-Reinforcement Learning | Jacob Beck; Risto Vuorio; Evan Zheran Liu; et al. | 2025 | 42 | Foundations and Trends in Machine Learning | [DOI](https://doi.org/10.1561/2200000080) |
+| 2 | Autonomous Landing of the Quadrotor on the Mobile Platform via Meta Reinforcement Learning | Qianqian Cao; Ziyi Liu; Hai Yu; et al. | 2024 | 21 | IEEE T-ASE | [DOI](https://doi.org/10.1109/tase.2024.3377810) |
+| 3 | Grow Your Limits: Continuous Improvement with Real-World RL for Robotic Locomotion | Laura Smith; Yun-Hao Cao; Sergey Levine | 2024 | 12 | ICRA | [DOI](https://doi.org/10.1109/icra57147.2024.10610485) |
+| 4 | MAGIC VFM: Meta-Learning Adaptation for Ground Interaction Control With Visual Foundation Models | Elena Sorina Lupu; Fengze Xie; James A. Preiss; et al. | 2024 | 11 | IEEE Transactions on Robotics | [DOI](https://doi.org/10.1109/tro.2024.3475212) |
+| 5 | CRiSE 1-3-7: Compilations of Real-World inspired Robotic Task Simulation Environments for Meta-RL | Johannes Ivancsics | 2024 | 0 | TU Wien repository | [DOI](https://doi.org/10.34726/hss.2024.79588) |
+| 6 | METAVerse: Meta-Learning Traversability Cost Map for Off-Road Navigation | Junwon Seo; Taekyung Kim; Seongyong Ahn; et al. | 2024 | 7 | IROS | [DOI](https://doi.org/10.1109/iros58592.2024.10802444) |
+| 7 | RoboVerse: A Unified Platform, Benchmark and Dataset for Scalable and Generalizable Robot Learning | Haoran Geng; Feishi Wang; Songlin Wei; et al. | 2025 | 7 | RSS | [DOI](https://doi.org/10.15607/rss.2025.xxi.022) |
+| 8 | TEAM: Task-Clustering and Enhanced Adaptability for Meta-Reinforcement Learning on Robotics Through Multi-Task Diffusion and Optimization | Joshua W. K. Ho; Chien-Min Wang; Chung-Ta King; et al. | 2024 | 0 | IRC | [DOI](https://doi.org/10.1109/irc63610.2024.00024) |
+| 9 | TaCoD: Tasks-Commonality-Aware World in Meta Reinforcement Learning | Xuantang Xiong; Shuang Xu; Bo Xu | 2024 | 2 | IJCNN | [DOI](https://doi.org/10.1109/ijcnn60899.2024.10649914) |
+| 10 | Meta-Learning for Robotic Vision Applications | Ning Gao | 2025 | 0 | KITopen | [DOI](https://doi.org/10.5445/ir/1000180168) |
+
+## arXiv
+
+| # | Title | Authors | Year | Citations | Venue | URL |
+|---:|---|---|---:|---:|---|---|
+| 1 | Evo-1: Lightweight Vision-Language-Action Model with Preserved Semantic Alignment | Tao Lin; Yilei Zhong; Yuxin Du; et al. | 2025 | 0 | arXiv | [2511.04555v2](https://arxiv.org/abs/2511.04555v2) |
+| 2 | Meta-DT: Offline Meta-RL as Conditional Sequence Modeling with World Model Disentanglement | Zhi Wang; Li Zhang; Wenhao Wu; et al. | 2024 | 0 | arXiv | [2410.11448v2](https://arxiv.org/abs/2410.11448v2) |
+| 3 | Robot Learning: A Tutorial | Francesco Capuano; Caroline Pascal; Adil Zouitine; et al. | 2025 | 0 | arXiv | [2510.12403v1](https://arxiv.org/abs/2510.12403v1) |
+| 4 | State-of-the-art in Robot Learning for Multi-Robot Collaboration: A Comprehensive Survey | Bin Wu; C. Steve Suh | 2024 | 0 | arXiv | [2408.11822v1](https://arxiv.org/abs/2408.11822v1) |
+| 5 | Robot Policy Evaluation for Sim-to-Real Transfer: A Benchmarking Perspective | Xuning Yang; Clemens Eppner; Jonathan Tremblay; et al. | 2025 | 0 | arXiv | [2508.11117v1](https://arxiv.org/abs/2508.11117v1) |
+| 6 | Robot Trains Robot: Automatic Real-World Policy Adaptation and Learning for Humanoids | Kaizhe Hu; Haochen Shi; Yao He; et al. | 2025 | 0 | arXiv | [2508.12252v2](https://arxiv.org/abs/2508.12252v2) |
+| 7 | SUREFlow: State-space Uncertainty-aware REsidual Flow Matching for Robust Robot Manipulation | Md Tanvir Islam; Sai Navaneet Peddapalli; Sangmoon Lee; et al. | 2026 | 0 | arXiv | [2607.10504v1](https://arxiv.org/abs/2607.10504v1) |
+| 8 | Robot Learning from Human Videos: A Survey | Junyi Ma; Erhang Zhang; Haoran Yang; et al. | 2026 | 0 | arXiv | [2604.27621v1](https://arxiv.org/abs/2604.27621v1) |
+| 9 | The Sound of Simulation: Learning Multimodal Sim-to-Real Robot Policies with Generative Audio | Renhao Wang; Haoran Geng; Tingle Li; et al. | 2025 | 0 | arXiv | [2507.02864v2](https://arxiv.org/abs/2507.02864v2) |
+| 10 | ClutterGen: A Cluttered Scene Generator for Robot Learning | Yinsen Jia; Boyuan Chen | 2024 | 0 | arXiv | [2407.05425v2](https://arxiv.org/abs/2407.05425v2) |
+
+## OpenReview
+
+本次返回 0 篇；请求失败，见 Source errors。
+
+## Crossref
+
+| # | Title | Authors | Year | Citations | Venue | URL |
+|---:|---|---|---:|---:|---|---|
+| 1 | The Human-Robot Interactive Reinforcement Learning for Robot Navigation of The Factory Transportation System in Grid World Environment | Xumin Gao | — | 0 | — | [DOI](https://doi.org/10.36227/techrxiv.176186638.80043394/v1) |
+| 2 | Development and Evaluation of a Deep Q-Network-Based Robot Learning Paradigm in Real-World Human-Robot Collaborative Tasks | Garrett Modery; Weitian Wang; Rui Li; et al. | 2025 | 0 | CASE | [DOI](https://doi.org/10.1109/case58245.2025.11164081) |
+| 3 | RoboMorph: In-Context Meta-Learning for Robot Dynamics Modeling | Manuel Bazzi; Asad Shahid; Christopher Agia; et al. | 2024 | 2 | ICINCO | [DOI](https://doi.org/10.5220/0012945500003822) |
+| 4 | Meta-Learning for Dynamic Multi-Robot Task Scheduling | Peng Song; Huaiyu Chen; Kaixin Cui; et al. | — | 1 | SSRN | [DOI](https://doi.org/10.2139/ssrn.5044505) |
+| 5 | Learning in World Bank Lending: An Independent Evaluation | — | 2025 | 0 | — | [DOI](https://doi.org/10.1596/ieg197067) |
+| 6 | Cosmos-Surg-DVRK: World Foundation Model-Based Automated Online Evaluation of Surgical Robot Policy Learning | Lukas Zbinden; Nigel Nelson; Juo-Tung Chen; et al. | 2026 | 1 | IEEE RA-L | [DOI](https://doi.org/10.1109/lra.2026.3675962) |
+| 7 | Coordinated World Model Learning for Deep Space Robot Teams | Andrzej M.J. Skulimowski | 2026 | 1 | IEEE Aerospace Conference | [DOI](https://doi.org/10.1109/aero66936.2026.11519895) |
+| 8 | Transperitoneal versus retroperitoneal robot-assisted partial nephrectomy: a systematic review and meta-analysis | Nikita Shrivastava; Priyank Bhargava; Gopal Sharma; et al. | 2024 | 24 | World Journal of Urology | [DOI](https://doi.org/10.1007/s00345-024-04796-7) |
+| 9 | Gaining Python Skills Through Interactive Education Robot Ozobot EVO | Maya Staikova | 2025 | 0 | TechSys 2025 | [DOI](https://doi.org/10.3390/engproc2025100015) |
+| 10 | Editorial: Reinforcement learning for real-world robot navigation | Pengqin Wang; Xiaocong Li; Meixin Zhu; et al. | 2026 | 0 | Frontiers in Robotics and AI | [DOI](https://doi.org/10.3389/frobt.2026.1861947) |
+
+## DBLP
+
+本次精确检索返回 0 篇。
+
+## Model Knowledge（经论文页与官方仓库复核的补充）
+
+| # | Title | Authors | Year | Citations | Venue | URL |
+|---:|---|---|---:|---:|---|---|
+| 1 | FabriVLA: Learning Efficient Vision-Language-Action Model with Fine-Grained Cross-Modal Fabric | FabriX team | 2026 | — | arXiv | [2607.08575v3](https://arxiv.org/abs/2607.08575v3) |
+
+## Source errors
+
+```text
+[openreview] Error: {'name': 'IncompleteRegistrationError', 'message': 'Your profile could not be activated and more information is required, please click on "Didn\'t receive email confirmation?" to receive a new confirmation link to edit your profile. (2026-08-26-7016065)', 'status': 400, 'details': {'reqId': '2026-08-26-7016065'}}
+```
+
+API search returned 30 records from the six configured sources. Only Evo-1 and SUREFlow directly matched the target protocol question; FabriVLA was added from its verified primary paper and repository.
+
+## Overview
+
+The protocol evidence is unusually uneven. Evo-1 reports both ten episodes per task and five independent runs. FabriVLA reports ten episodes per task and exposes the episode reset sequence in code, but no multi-run average. SUREFlow reports fifty rollouts per task without disclosing a seed schedule. Therefore rollout count, episode-reset seed count, and independent model/run count must remain separate fields.
+
+## Trends
+
+Recent Meta-World VLA work is converging on all 50 tasks, a 400-step cap, and four difficulty buckets, but statistical reporting is not standardized: papers mix single-checkpoint rollouts, repeated evaluation runs, and independently trained runs.
+
+## Key themes
+
+The relevant themes are deterministic reset schedules, independent-run averaging, task-balanced versus tier-balanced metrics, fixed episode horizon, and raw per-trial trace retention.
+
+## Keywords frequency (top 5)
+
+Approximate title-level counts over the 30 API records, merging singular/plural, hyphenation, and common morphology:
+
+| Keyword family | Count |
+|---|---:|
+| robot / robotic / robotics | 26 |
+| learning / RL | 23 |
+| meta | 14 |
+| world / real-world | 12 |
+| evaluation | 4 |
+
+## Most cited accepted paper
+
+Among the API-returned formal publications, **A Tutorial on Meta-Reinforcement Learning** has the highest reported snapshot citation count (42).
+
+## Most cited first author
+
+Within this result set, **Jacob Beck** leads via the same paper with 42 citations. This is a returned-paper count, not a complete author-level citation profile.
+
+## Recommendations for reading
+
+Read only the three primary protocol artifacts needed for acceptance: Evo-1 paper plus evaluator, FabriVLA v3 paper plus evaluator, and SUREFlow section 4.1. The other exact-query records are background or false-positive matches and should not influence the ORA0 acceptance threshold.
+
+---
+
+# DAgger、纠错干预与恢复轨迹论文检索报告
+
+检索日期：2026-08-27
+
+检索范围：2010–2026
+检索式：`robot imitation learning DAgger corrective interventions recovery demonstrations`
+
+## Semantic Scholar（10 篇）
+
+| # | Title | Date | Venue | Citations |
+|---:|---|---:|---|---:|
+| [1](https://www.semanticscholar.org/paper/ca275d9ef374dbbf81a6f6175cac2311526308c3) | IntervenGen: Interventional Data Generation for Robust and Data-Efficient Robot Imitation Learning | 2024 | IROS | 38 |
+| [2](https://www.semanticscholar.org/paper/d42f55af51fc631f3a0637af966b52c698693626) | Robot-Gated Interactive Imitation Learning with Adaptive Intervention Mechanism | 2025 | ICML | 6 |
+| [3](https://www.semanticscholar.org/paper/22c099753403e7b56739aee366bf5b46d553c144) | RaC: Robot Learning for Long-Horizon Tasks by Scaling Recovery and Correction | 2025 | IEEE Transactions on Robotics | 38 |
+| [4](https://www.semanticscholar.org/paper/94fb66d93292570425efad07878cf25a4a80bfbf) | WM-DAgger: Enabling Efficient Data Aggregation for Imitation Learning with World Models | 2026 | arXiv | 5 |
+| [5](https://www.semanticscholar.org/paper/7746cdc32f3d7e37b631c139b786b79b3c75d6d1) | Beyond Monotonic Progress: Retry-Supervised Value Learning for Robot Imitation | 2026 | arXiv | 0 |
+| [6](https://www.semanticscholar.org/paper/443d4d2bb17a39cc535cd205c7cc47f754f1cd48) | Human-Robot Copilot for Data-Efficient Imitation Learning | 2026 | arXiv | 0 |
+| [7](https://www.semanticscholar.org/paper/b7c107fa7b2ab017439858a9cc2d7a5ca15c320b) | Efficient Active Imitation Learning with Random Network Distillation | 2024 | ICLR | 9 |
+| [8](https://www.semanticscholar.org/paper/d0d57bd76e5e9f3038d34798fdf4198f2aafc7cf) | AutoIntervene: Calibrated Intervention for Action-Chunking Imitation Learning Policies | 2026 | — | 1 |
+| [9](https://www.semanticscholar.org/paper/e8952ebc3ba4678d8c6192eb8c3c51ee032258d0) | HACTS: a Human-As-Copilot Teleoperation System for Robot Learning | 2025 | IROS | 10 |
+| [10](https://www.semanticscholar.org/paper/0aa7ed66a12f55f96d114210d7219c1cae0325f6) | Online Imitation Learning for Manipulation via Decaying Relative Correction through Teleoperation | 2025 | IROS | 4 |
+
+## OpenAlex（10 篇）
+
+| # | Title | Date | Venue | Citations |
+|---:|---|---:|---|---:|
+| [1](https://openalex.org/W2989897153) | Causal Confusion in Imitation Learning | 2019 | UvA-DARE | 63 |
+| [2](https://doi.org/10.1109/cvpr52729.2023.01717) | NeRF in the Palm of Your Hand: Corrective Augmentation for Robotics via Novel-View Synthesis | 2023 | CVPR | 42 |
+| [3](https://doi.org/10.1177/0278364919871998) | Reinforcement learning of motor skills using Policy Search and human corrective advice | 2019 | IJRR | 23 |
+| [4](https://openalex.org/W3031773556) | On-Policy Robot Imitation Learning from a Converging Supervisor | 2019 | CoRL | 14 |
+| [5](https://doi.org/10.48550/arxiv.2012.06733) | Human-in-the-Loop Imitation Learning using Remote Teleoperation | 2020 | arXiv | 10 |
+| [6](https://doi.org/10.1109/icra.2011.5979792) | Physical human robot interaction in imitation learning | 2011 | ICRA | 10 |
+| [7](https://doi.org/10.48550/arxiv.2509.07953) | RaC: Robot Learning for Long-Horizon Tasks by Scaling Recovery and Correction | 2025 | arXiv | 1 |
+| [8](https://doi.org/10.1007/s10846-021-01312-6) | Endowing Robots with Longer-term Autonomy by Recovering from External Disturbances in Manipulation Through Grounded Anomaly Classification and Recovery Policies | 2021 | Journal of Intelligent & Robotic Systems | 9 |
+| [9](https://openalex.org/W3079699067) | Residual Learning from Demonstration | 2020 | arXiv | 5 |
+| [10](https://doi.org/10.48550/arxiv.2503.15368) | Online Imitation Learning for Manipulation via Decaying Relative Correction through Teleoperation | 2025 | arXiv | 2 |
+
+## arXiv（10 篇）
+
+| # | Title | Date | Venue | Citations |
+|---:|---|---:|---|---:|
+| [1](http://arxiv.org/abs/1907.03423v7) | On-Policy Robot Imitation Learning from a Converging Supervisor | 2019 | arXiv | 0 |
+| [2](http://arxiv.org/abs/2310.14196v1) | Learning to Discern: Imitating Heterogeneous Human Demonstrations with Preference and Representation Learning | 2023 | arXiv | 0 |
+| [3](http://arxiv.org/abs/1907.03976v3) | Better-than-Demonstrator Imitation Learning via Automatically-Ranked Demonstrations | 2019 | arXiv | 0 |
+| [4](http://arxiv.org/abs/2105.06411v2) | Coarse-to-Fine Imitation Learning: Robot Manipulation from a Single Demonstration | 2021 | arXiv | 0 |
+| [5](http://arxiv.org/abs/1711.10137v2) | One-Shot Reinforcement Learning for Robot Navigation with Interactive Replay | 2017 | arXiv | 0 |
+| [6](http://arxiv.org/abs/2402.17768v2) | Diffusion Meets DAgger: Supercharging Eye-in-hand Imitation Learning | 2024 | arXiv | 0 |
+| [7](http://arxiv.org/abs/1709.04905v1) | One-Shot Visual Imitation Learning via Meta-Learning | 2017 | arXiv | 0 |
+| [8](http://arxiv.org/abs/2310.17596v1) | MimicGen: A Data Generation System for Scalable Robot Learning using Human Demonstrations | 2023 | arXiv | 0 |
+| [9](http://arxiv.org/abs/2008.00524v2) | Interactive Imitation Learning in State-Space | 2020 | arXiv | 0 |
+| [10](http://arxiv.org/abs/2303.01497v1) | Teach a Robot to FISH: Versatile Imitation from One Minute of Demonstrations | 2023 | arXiv | 0 |
+
+## OpenReview（0 篇）
+
+检索错误（原样保留）：`IncompleteRegistrationError: Your profile could not be activated and more information is required, please click on "Didn't receive email confirmation?" to receive a new confirmation link to edit your profile. (2026-08-27-5100674)`
+
+## Crossref（10 篇）
+
+| # | Title | Date | Venue | Citations |
+|---:|---|---:|---|---:|
+| [1](https://doi.org/10.1109/lra.2025.3536297) | Greedy-DAgger - A Student Rollout Efficient Imitation Learning Algorithm | 2025 | IEEE RA-L | 6 |
+| [2](https://doi.org/10.1109/hri.2019.8673287) | Learning from Corrective Demonstrations | 2019 | HRI | 5 |
+| [3](https://doi.org/10.1109/lra.2022.3196122) | Learning Category-Level Generalizable Object Manipulation Policy Via Generative Adversarial Self-Imitation Learning From Demonstrations | 2022 | IEEE RA-L | 29 |
+| [4](https://doi.org/10.1109/icra40945.2020.9196602) | Zero-shot Imitation Learning from Demonstrations for Legged Robot Visual Navigation | 2020 | ICRA | 15 |
+| [5](https://doi.org/10.15607/rss.2024.xx.048) | Diffusion Meets DAgger: Supercharging Eye-in-hand Imitation Learning | 2024 | RSS | 11 |
+| [6](https://doi.org/10.1109/access.2023.3325194) | Imitation Learning for Agnostic Battery Charging: A DAGGER-Based Approach | 2023 | IEEE Access | 14 |
+| [7](https://doi.org/10.2139/ssrn.5719301) | Imitation Learning from Diverse Suboptimal Demonstrations | — | SSRN | 0 |
+| [8](https://doi.org/10.15607/rss.2023.xix.009) | Teach a Robot to FISH: Versatile Imitation from One Minute of Demonstrations | 2023 | RSS | 32 |
+| [9](https://doi.org/10.1016/j.ins.2022.04.015) | Best-in-class imitation: Non-negative positive-unlabeled imitation learning from imperfect demonstrations | 2022 | Information Sciences | 6 |
+| [10](https://doi.org/10.1109/icra.2019.8793698) | HG-DAgger: Interactive Imitation Learning with Human Experts | 2019 | ICRA | 137 |
+
+## DBLP（0 篇）
+
+检索错误（原样保留）：`503 Server Error: Service Unavailable for url: https://dblp.org/search/publ/api?q=robot+imitation+learning+DAgger+corrective+interventions+recovery+demonstrations&format=json&h=10&f=0`
+
+## Model Knowledge（1 篇，经原始论文页核验）
+
+| # | Title | Date | Venue | Notes |
+|---:|---|---:|---|---|
+| [1](https://proceedings.mlr.press/v15/ross11a.html) | A Reduction of Imitation Learning and Structured Prediction to No-Regret Online Learning | 2011 | AISTATS | DAgger 原始论文；API 精确查询漏掉的奠基工作 |
+
+## Overview
+
+本次以 2010–2026 为窗口，从六个 API 源取得 40 条记录；OpenReview 因账户注册错误、DBLP 因 503 未返回结果。记录中存在跨源重复，核心谱系从 2011 年 DAgger 的 learner-induced state aggregation，发展到 DART/HG-DAgger 的扰动与人工接管，再到 2024–2026 年面向 action chunk、生成式数据和显式 recovery/correction 的方法。
+
+## Trends
+
+2011–2020 年的工作主要解决行为克隆的 covariate shift 与人工在线标注负担；2023 年后研究重点转向更低成本地合成或扩增干预数据；2024–2026 年则明显聚焦长时程操作、动作块策略、自动干预门控、world model 辅助聚合，以及明确的 retry/recovery 行为。主要正式发表 venue 包括 AISTATS、CoRL、ICRA、IROS、RSS、ICLR 与 ICML。
+
+## Key themes
+
+1. **On-policy aggregation**：执行当前策略，在它诱导的状态上请求专家动作；代表作 DAgger、SHIV。
+2. **Corrective intervention**：只在风险或失败将要发生时接管，减少专家负担；代表作 HG-DAgger、IntervenGen。
+3. **Perturb-and-recover**：给专家轨迹注入扰动并学习恢复；代表作 DART。
+4. **Generated recovery data**：用扩散或场景生成覆盖 OOD 状态；代表作 Diffusion Meets DAgger、IntervenGen。
+5. **Explicit retry/recovery**：将恢复与纠正片段作为后训练阶段；代表作 RaC、RACER、AutoIntervene。
+
+## Keywords frequency
+
+对标题与摘要做词形合并后的近似计数：
+
+| Keyword | Count |
+|---|---:|
+| imitation learning | 29 |
+| robot / robotics | 24 |
+| demonstration | 16 |
+| correction / intervention / recovery | 15 |
+| DAgger / data aggregation | 9 |
+
+## Most cited by accepted paper
+
+跨源同名论文去重并取最高引用快照：
+
+| Rank | Title | Year | Citations |
+|---:|---|---:|---:|
+| 1 | HG-DAgger: Interactive Imitation Learning with Human Experts | 2019 | 137 |
+| 2 | Causal Confusion in Imitation Learning | 2019 | 63 |
+| 3 | NeRF in the Palm of Your Hand | 2023 | 42 |
+| 4 | IntervenGen | 2024 | 38 |
+| 5 | RaC | 2025 | 38 |
+
+## Most cited by first author
+
+按本次去重结果中的最高引用快照统计：
+
+| Rank | Author | Papers in set | Total citations |
+|---:|---|---:|---:|
+| 1 | Michael Kelly | 1 | 137 |
+| 2 | Pim de Haan | 1 | 63 |
+| 3 | Allan Zhou | 1 | 42 |
+| 4 | Ryan Hoque | 1 | 38 |
+| 5 | Zheyuan Hu | 1 | 38 |
+
+## Recommendations for reading
+
+1. [DAgger（AISTATS 2011）](https://proceedings.mlr.press/v15/ross11a.html)：理解为什么必须在学习器自己诱导的状态分布上训练。
+2. [DART（CoRL 2017）](https://proceedings.mlr.press/v78/laskey17a.html)：不完整跑 DAgger，而用扰动迫使专家演示恢复；与 MetaWorld scripted expert 很匹配。
+3. [HG-DAgger（ICRA 2019）](https://arxiv.org/abs/1810.02890)：仅在高风险状态由专家接管。
+4. [Diffusion Meets DAgger（RSS 2024）](https://www.roboticsproceedings.org/rss20/p048.html)：以生成方式扩充跑偏状态，直接针对视觉操作的误差累积。
+5. [RaC（2025）](https://arxiv.org/abs/2509.07953)：与 ORA0 当前问题最接近；预训练后增加 recovery/correction 后训练阶段。

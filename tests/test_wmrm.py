@@ -400,6 +400,7 @@ def test_world_transition_updates_belief_and_dedups_innovation() -> None:
     innov2 = second.next_world_state.innovation
     assert aux1.z_spans.shape == (2, 3, 8)
     assert aux1.progress.shape == (2, 4)
+    torch.testing.assert_close(aux1.progress, aux2.progress)
     assert belief1.shape == (2, 8, 32)
     assert not torch.equal(innov1, innov2)
     assert aux2.belief.shape == belief2.shape
@@ -1086,6 +1087,156 @@ def test_peer_joint_optimizer_keeps_va_world_and_flow_trainable() -> None:
     assert any(name.startswith("world_action_readout.") for name in trainable)
     grouped = {id(parameter) for group in groups for parameter in group["params"]}
     assert grouped == {id(parameter) for parameter in model.parameters()}
+
+
+def test_capacity_new_only_optimizer_freezes_small_model_base() -> None:
+    from argparse import Namespace
+
+    from train import _feature_optimizer_groups
+
+    model = VACompoundPolicy(
+        _tiny_config(
+            vision_dim=8,
+            main_vision_dim=8,
+            num_layers=16,
+            action_horizon=15,
+            action_dim=4,
+            planning_stride=15,
+            deployment_execution_horizon=15,
+            wmrm=True,
+            wmrm_cycle_steps=15,
+            wmrm_inject="all",
+            va_world_mode="peer_sync_h6",
+            wmrm_predictor="st_blocks",
+            wmrm_predictor_depth=7,
+            wmrm_predictor_width=16,
+            wmrm_predictor_heads=4,
+            wmrm_predictor_copies=11,
+            wmrm_stage_gate_start=7,
+            wmrm_map_size=4,
+            wmrm_map_channels=8,
+            wmrm_world_grid=4,
+            main_vision_grid=4,
+            main_vision_frames=2,
+            main_vision_tokens=32,
+            tail_flow_condition_grad=True,
+        )
+    )
+    groups = _feature_optimizer_groups(
+        Namespace(
+            capacity_new_only=True,
+            lr=5e-5,
+            action_vision_only=False,
+            wmrm_only=False,
+            va_only=False,
+            head_only=False,
+            servo_only=False,
+        ),
+        model,
+        None,
+    )
+    trainable = {
+        name for name, parameter in model.named_parameters() if parameter.requires_grad
+    }
+    assert "wmrm_stage_scale" in trainable
+    assert any(name.startswith("layers.8.") for name in trainable)
+    assert not any(name.startswith("layers.7.") for name in trainable)
+    assert any(name.startswith("wmrm.st_predictor_extra.4.") for name in trainable)
+    assert not any(name.startswith("wmrm.st_predictor_extra.3.") for name in trainable)
+    assert not any(name.startswith("flow_head.") for name in trainable)
+    assert not any(name.startswith("tail_flow_head.") for name in trainable)
+    assert "wmrm_belief_message_scale" not in trainable
+    grouped = {id(parameter) for group in groups for parameter in group["params"]}
+    assert grouped == {
+        id(parameter) for parameter in model.parameters() if parameter.requires_grad
+    }
+    assert groups[0]["lr"] == 5e-5
+
+
+def test_capacity_phase2_gate_group_and_projection_are_isolated() -> None:
+    from argparse import Namespace
+
+    from train import (
+        _feature_optimizer_groups,
+        project_capacity_stage_gates,
+    )
+
+    model = VACompoundPolicy(
+        _tiny_config(
+            vision_dim=8,
+            main_vision_dim=8,
+            num_layers=16,
+            action_horizon=15,
+            action_dim=4,
+            planning_stride=15,
+            deployment_execution_horizon=15,
+            wmrm=True,
+            wmrm_cycle_steps=15,
+            wmrm_inject="all",
+            va_world_mode="peer_sync_h6",
+            wmrm_predictor="st_blocks",
+            wmrm_predictor_depth=7,
+            wmrm_predictor_width=16,
+            wmrm_predictor_heads=4,
+            wmrm_predictor_copies=11,
+            wmrm_stage_gate_start=7,
+            wmrm_map_size=4,
+            wmrm_map_channels=8,
+            wmrm_world_grid=4,
+            main_vision_grid=4,
+            main_vision_frames=2,
+            main_vision_tokens=32,
+            capacity_stage_gate_policy_grad=True,
+        )
+    )
+    groups = _feature_optimizer_groups(
+        Namespace(
+            capacity_new_only=False,
+            capacity_phase2_gates=True,
+            lr=1e-5,
+            lr_wmrm_predictor=None,
+            action_vision_only=False,
+            wmrm_only=False,
+            va_only=False,
+            head_only=False,
+            servo_only=False,
+        ),
+        model,
+        None,
+    )
+    assert all(parameter.requires_grad for parameter in model.parameters())
+    assert {
+        id(parameter) for group in groups for parameter in group["params"]
+    } == {id(parameter) for parameter in model.parameters()}
+    gate_groups = [
+        group
+        for group in groups
+        if any(p is model.wmrm_stage_scale for p in group["params"])
+    ]
+    assert len(gate_groups) == 1
+    assert gate_groups[0]["lr"] == 1e-5
+
+    with torch.no_grad():
+        model.wmrm_stage_scale.copy_(
+            torch.tensor([-0.2, -1e-4, 0.0, 0.2, 0.8, 1.0, 1.1, 3.0])
+        )
+    project_capacity_stage_gates(model, enabled=True)
+    torch.testing.assert_close(
+        model.wmrm_stage_scale,
+        torch.tensor([0.0, 0.0, 0.0, 0.2, 0.8, 1.0, 1.0, 1.0]),
+    )
+    project_capacity_stage_gates(model, enabled=True, reset=True)
+    torch.testing.assert_close(model.wmrm_stage_scale, torch.ones(8))
+
+
+def test_capacity_phase2_projection_disabled_leaves_gate_unchanged() -> None:
+    from train import project_capacity_stage_gates
+
+    model = torch.nn.Module()
+    model.wmrm_stage_scale = torch.nn.Parameter(torch.linspace(-0.5, 1.5, 8))
+    before = model.wmrm_stage_scale.detach().clone()
+    assert project_capacity_stage_gates(model, enabled=False, reset=True) is None
+    torch.testing.assert_close(model.wmrm_stage_scale, before)
 
 
 def test_wmrm_only_freezes_va_and_flow() -> None:

@@ -113,6 +113,30 @@ def test_all_static_map_is_finite_and_uses_uniform_motion_weights() -> None:
         torch.testing.assert_close(value, torch.zeros(1))
 
 
+def test_cosine_world_loss_is_scale_invariant_and_stops_target_gradient() -> None:
+    torch.manual_seed(12)
+    prediction = torch.randn(2, 4, 2, 2, requires_grad=True)
+    target = torch.randn(2, 4, 2, 2, requires_grad=True)
+    current = torch.randn(2, 4, 2, 2)
+
+    base = visual_world_loss(
+        prediction,
+        target,
+        current,
+        feature_metric="cosine",
+    )
+    scaled = visual_world_loss(
+        prediction * 7.0,
+        target * 7.0,
+        current * 7.0,
+        feature_metric="cosine",
+    )
+    torch.testing.assert_close(base.loss_per_sample, scaled.loss_per_sample)
+    base.loss_per_sample.sum().backward()
+    assert prediction.grad is not None
+    assert target.grad is None
+
+
 def test_empty_transition_reduction_returns_graph_connected_zero() -> None:
     values = torch.tensor([2.0, 5.0], requires_grad=True)
     empty = torch.zeros(2, dtype=torch.bool)

@@ -1110,7 +1110,7 @@ class VJEPA21Backbone(nn.Module):
 
 
 class TimmActionVisionBackbone(nn.Module):
-    """Frozen timm ViT tower returning patch-only two-level evidence."""
+    """Timm ViT tower returning patch-only two-level evidence."""
 
     def __init__(
         self,
@@ -1179,15 +1179,25 @@ class TimmActionVisionBackbone(nn.Module):
         )
 
     def freeze_all(self) -> None:
+        self._trainable = False
         self.model.requires_grad_(False)
+        set_checkpointing = getattr(self.model, "set_grad_checkpointing", None)
+        if callable(set_checkpointing):
+            set_checkpointing(False)
         super().train(False)
+
+    def unfreeze_all(self) -> None:
+        self._trainable = True
+        self.model.requires_grad_(True)
+        set_checkpointing = getattr(self.model, "set_grad_checkpointing", None)
+        if callable(set_checkpointing):
+            set_checkpointing(True)
+        super().train(True)
 
     def train(self, mode: bool = True) -> "TimmActionVisionBackbone":
-        super().train(False)
-        self.model.eval()
+        super().train(bool(mode) and self._trainable)
         return self
 
-    @torch.no_grad()
     def forward_hierarchical_dense(self, images: Tensor) -> dict[int, Tensor]:
         if images.ndim != 4 or images.shape[1] != 3:
             raise ValueError("action-vision images must have shape [batch, 3, H, W]")

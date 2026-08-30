@@ -1,0 +1,15 @@
+{
+  "file": "artifacts/figures/va_wm_simple_drawio/va_internal_simple_landscape.drawio",
+  "summary": {
+    "total_findings": 0,
+    "fail": 0,
+    "warn": 0,
+    "passed": true,
+    "clean": true
+  },
+  "fails": [],
+  "warns": [],
+  "vertex_count": 7,
+  "edge_count": 8,
+  "canvas": "1600x620"
+}

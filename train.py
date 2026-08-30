@@ -70,11 +70,15 @@ from va_compound.world_contract import (
     ASSEMBLY_METRIC_ROLE_WEIGHTS_MIGRATION,
     FEATURE_AUTOCAST_CONTRACT,
     PEER_DATA_ISOLATION_CONTRACT,
+    PEER_ACTION_ONLY_DATA_CONTRACT,
     PEER_DUAL_STREAM_OPTIMIZER_CONTRACT,
     PEER_GRADIENT_BOUNDARY_CONTRACT,
     PEER_H15_P2_TO_P15_TEMPORAL_MIGRATION,
     PEER_H15_PREFIX_TAIL_FLOW_CONTRACT,
     PEER_H15_PREFIX_TAIL_FLOW_MIGRATION,
+    PEER_H15_TO_H50_ACTION_MIGRATION,
+    PEER_H50_ACTION_ONLY_TO_JOINT_MIGRATION,
+    PEER_H50_NESTED_FLOW_CONTRACT,
     PEER_HIGH_FREQUENCY_CONTRACT,
     PEER_LEGACY_GRADIENT_BOUNDARY_CONTRACT,
     PEER_LEGACY_TOPOLOGY_CONTRACT,
@@ -82,6 +86,7 @@ from va_compound.world_contract import (
     PEER_READOUT_V2_HIGH_FREQUENCY_CONTRACT,
     PEER_READOUT_V2_TO_V3_WEIGHTS_MIGRATION,
     PEER_SHARED_FULL_DATA_CONTRACT,
+    PEER_VA8_TO_VA16_CAPACITY_MIGRATION,
     PEER_WORLD_ACTION_SOURCE_CONTRACT,
     PEER_WORLD_READOUT_CONTRACT,
     PEER_WORLD_READOUT_V2_CONTRACT,
@@ -134,6 +139,179 @@ def visual_world_stage_weight_overrides(args: argparse.Namespace) -> dict[int, f
     if s6 is not None:
         overrides[6] = float(s6)
     return canonical_stage_weight_overrides(overrides)
+
+
+def cross_trajectory_progress_potential_loss(
+    score_progress,
+    progress_logits: Tensor,
+    progress_states: Tensor,
+    progress_languages: Tensor,
+    descriptors: Tensor,
+    valid: Tensor,
+    recovery: Tensor,
+    task_ids: Tensor,
+    episode_ids: Tensor,
+) -> tuple[Tensor, dict[str, int]]:
+    """Cycle-aligned ordinal value from same-task, cross-episode clips."""
+    if progress_logits.ndim != 3 or progress_logits.shape[-1] != 4:
+        raise ValueError("progress_logits must be [B, T, 4]")
+    batch, sequence = progress_logits.shape[:2]
+    expected_bt = (batch, sequence)
+    if (
+        progress_states.shape[:2] != expected_bt
+        or progress_languages.shape != progress_states.shape
+        or descriptors.ndim != 3
+        or descriptors.shape[:2] != expected_bt
+        or valid.shape != expected_bt
+        or recovery.shape != expected_bt
+        or task_ids.shape != (batch,)
+        or episode_ids.shape != (batch,)
+    ):
+        raise ValueError("progress inputs do not share [B, T] batch/time axes")
+
+    valid = valid.bool() & ~recovery.bool()
+    descriptors = F.normalize(descriptors.detach().float(), dim=-1)
+    anchors = torch.tensor(
+        (0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0),
+        device=progress_logits.device,
+        dtype=torch.float32,
+    )
+
+    def value(logits: Tensor) -> Tensor:
+        return (logits.float().softmax(dim=-1) * anchors).sum(dim=-1)
+
+    potential = value(progress_logits)
+    ordinal_terms: list[Tensor] = []
+    high_state_keys: list[Tensor] = []
+    violations: list[Tensor] = []
+    counts = {"cross_ordinal": 0, "within_ordinal": 0, "language": 0}
+    supervised_rows = torch.zeros(
+        batch, dtype=torch.bool, device=progress_logits.device
+    )
+
+    # DINO only aligns stages.  Direction is accepted when two reciprocal
+    # matches occur in the same order in both successful trajectories.
+    same_episode_task = (
+        (task_ids[:, None] == task_ids[None, :])
+        & (episode_ids[:, None] != episode_ids[None, :])
+    )
+    trajectory_pairs = torch.triu(same_episode_task, diagonal=1).nonzero()
+    if trajectory_pairs.numel() > 0:
+        left, right = trajectory_pairs.unbind(dim=1)
+        pair_valid = (
+            valid[left, :, None]
+            & valid[right, None, :]
+        )
+        similarity = torch.einsum(
+            "ptd,pud->ptu", descriptors[left], descriptors[right]
+        ).masked_fill(~pair_valid, -torch.inf)
+        row_has = pair_valid.any(dim=2)
+        col_has = pair_valid.any(dim=1)
+        row_best = similarity.argmax(dim=2)
+        col_best = similarity.argmax(dim=1)
+        slots = torch.arange(sequence, device=progress_logits.device)[None, :]
+        mutual = (
+            row_has
+            & col_has.gather(1, row_best)
+            & (col_best.gather(1, row_best) == slots)
+        )
+        for pair_index in range(int(trajectory_pairs.shape[0])):
+            matched_left = mutual[pair_index].nonzero().flatten()
+            if matched_left.numel() < 2:
+                continue
+            matched_right = row_best[pair_index, matched_left]
+            ordered = (
+                (matched_left[:, None] < matched_left[None, :])
+                & (matched_right[:, None] < matched_right[None, :])
+            ).nonzero()
+            if ordered.numel() == 0:
+                continue
+            early, late = ordered.unbind(dim=1)
+            left_early, left_late = matched_left[early], matched_left[late]
+            right_early, right_late = matched_right[early], matched_right[late]
+            left_row = left[pair_index]
+            right_row = right[pair_index]
+            supervised_rows[left_row] = True
+            supervised_rows[right_row] = True
+            ordinal_terms.extend(
+                (
+                    potential[left_row, left_early]
+                    - potential[left_row, left_late],
+                    potential[right_row, right_early]
+                    - potential[right_row, right_late],
+                )
+            )
+            high_state_keys.extend(
+                (
+                    left_row * sequence + left_late,
+                    right_row * sequence + right_late,
+                )
+            )
+            counts["cross_ordinal"] += 2 * int(early.numel())
+
+    # ponytail: a four-decision crop can lack two reciprocal matches.  Fall
+    # back to clean order inside that successful trajectory instead of adding
+    # an offline graph/cache; add one only if this fallback dominates logs.
+    for row in (~supervised_rows).nonzero().flatten():
+        clean_slots = valid[row].nonzero().flatten()
+        if clean_slots.numel() < 2:
+            continue
+        pairs = torch.triu(
+            torch.ones(
+                clean_slots.numel(),
+                clean_slots.numel(),
+                dtype=torch.bool,
+                device=progress_logits.device,
+            ),
+            diagonal=1,
+        ).nonzero()
+        early, late = pairs.unbind(dim=1)
+        early_slots, late_slots = clean_slots[early], clean_slots[late]
+        ordinal_terms.append(
+            potential[row, early_slots] - potential[row, late_slots]
+        )
+        high_state_keys.append(row * sequence + late_slots)
+        counts["within_ordinal"] += int(early.numel())
+
+    if ordinal_terms:
+        ordinal = torch.cat(ordinal_terms)
+        violations.append(ordinal)
+
+    if high_state_keys:
+        high_keys = torch.unique(torch.cat(high_state_keys))
+        high_rows = torch.div(high_keys, sequence, rounding_mode="floor")
+        high_slots = high_keys.remainder(sequence)
+        high_tasks = task_ids[high_rows]
+        cross_task = torch.triu(
+            high_tasks[:, None] != high_tasks[None, :], diagonal=1
+        ).nonzero()
+        if cross_task.numel() > 0:
+            first, second = cross_task.unbind(dim=1)
+            row_a, slot_a = high_rows[first], high_slots[first]
+            row_b, slot_b = high_rows[second], high_slots[second]
+            correct_a = potential[row_a, slot_a]
+            correct_b = potential[row_b, slot_b]
+            wrong_a = value(
+                score_progress(
+                    progress_states[row_a, slot_a],
+                    progress_languages[row_b, slot_b],
+                )
+            )
+            wrong_b = value(
+                score_progress(
+                    progress_states[row_b, slot_b],
+                    progress_languages[row_a, slot_a],
+                )
+            )
+            language = torch.cat(
+                (wrong_a - correct_a, wrong_b - correct_b)
+            )
+            violations.append(language)
+            counts["language"] = int(language.numel())
+
+    if not violations:
+        return progress_logits.sum() * 0.0, counts
+    return F.softplus(torch.cat(violations)).mean(), counts
 
 
 def migrate_peer_world8_to_world7_state(
@@ -241,6 +419,172 @@ def migrate_peer_h15_prefix_tail_flow_state(
         if source not in saved:
             raise ValueError(f"source checkpoint lacks {source}")
         state[key] = saved[source].clone()
+    return state
+
+
+def migrate_peer_h15_to_h50_state(
+    model: VACompoundPolicy,
+    checkpoint: dict,
+) -> dict[str, Tensor]:
+    """Expand only action-token state while loading every shared tensor strictly."""
+
+    saved_config = checkpoint.get("config") or {}
+    if (
+        saved_config.get("action_horizon") != 15
+        or saved_config.get("planning_stride") != 15
+        or saved_config.get("deployment_execution_horizon") != 15
+        or saved_config.get("wmrm_cycle_steps") != 15
+        or saved_config.get("action_query_cond", False)
+        or model.config.action_horizon != 50
+        or model.config.planning_stride != 15
+        or model.config.deployment_execution_horizon != 15
+        or model.config.wmrm_cycle_steps != 15
+        or model.config.action_query_cond
+        or model.tail_flow_head is None
+        or model.extension_flow_head is None
+    ):
+        raise ValueError(
+            f"{PEER_H15_TO_H50_ACTION_MIGRATION} requires the H15/P15 s3224 "
+            "topology and an H50/P15 target without action_query_cond"
+        )
+    saved = checkpoint["model"]
+    own = model.state_dict()
+    extension_keys = {
+        key for key in own if key.startswith("extension_flow_head.")
+    }
+    expected_source_keys = set(own) - extension_keys
+    if set(saved) != expected_source_keys:
+        raise ValueError(
+            "H15->H50 migration key mismatch: "
+            f"missing={sorted(expected_source_keys - set(saved))[:8]}, "
+            f"unexpected={sorted(set(saved) - expected_source_keys)[:8]}"
+        )
+    mismatched = {
+        key: (tuple(saved[key].shape), tuple(own[key].shape))
+        for key in expected_source_keys
+        if tuple(saved[key].shape) != tuple(own[key].shape)
+        and key != "action_queries"
+    }
+    if mismatched:
+        raise ValueError(f"H15->H50 changed shared tensor shapes: {mismatched}")
+    if tuple(saved["action_queries"].shape) != (15, model.config.hidden_dim):
+        raise ValueError("H15 source action_queries must have shape [15, hidden_dim]")
+
+    state = dict(saved)
+    queries = own["action_queries"].clone()
+    queries[:15].copy_(saved["action_queries"])
+    state["action_queries"] = queries
+    for key in extension_keys:
+        source = "tail_flow_head." + key.removeprefix("extension_flow_head.")
+        if source not in saved:
+            raise ValueError(f"H15 source lacks {source}")
+        state[key] = saved[source].clone()
+    return state
+
+
+def migrate_peer_va8_to_va16_state(
+    model: VACompoundPolicy,
+    checkpoint: dict,
+) -> dict[str, Tensor]:
+    """Expand VA depth and unshare eleven function-preserving World predictors."""
+    saved_config = checkpoint.get("config") or {}
+    if (
+        saved_config.get("num_layers") != 8
+        or saved_config.get("va_world_mode") != "peer_sync_h6"
+        or saved_config.get("action_horizon") != 15
+        or saved_config.get("wmrm_cycle_steps") != 15
+        or saved_config.get("wmrm_stage_gate_start") is not None
+        or saved_config.get("wmrm_predictor_depth", 6) != 6
+        or saved_config.get("wmrm_predictor_copies", 1) != 1
+    ):
+        raise ValueError(
+            f"{PEER_VA8_TO_VA16_CAPACITY_MIGRATION} requires an ungated "
+            "8-VA/7-World H15 peer checkpoint"
+        )
+    if (
+        model.config.num_layers != 16
+        or model.config.wmrm_stage_count() != 15
+        or model.config.wmrm_stage_gate_start != 7
+        or model.config.wmrm_predictor_depth != 7
+        or model.config.wmrm_predictor_copies != 11
+        or model.wmrm_stage_scale is None
+        or model.wmrm_belief_message_scale is None
+    ):
+        raise ValueError(
+            f"{PEER_VA8_TO_VA16_CAPACITY_MIGRATION} requires runtime "
+            "16-VA/15-World with gate start 7"
+        )
+
+    saved = checkpoint["model"]
+    state = {key: value.clone() for key, value in model.state_dict().items()}
+    unexpected = set(saved) - set(state)
+    if unexpected:
+        raise ValueError(
+            "VA depth migration found unexpected source tensors: "
+            f"{sorted(unexpected)}"
+        )
+    stage_key = "wmrm.stage_embed.weight"
+    for key, value in saved.items():
+        if key == stage_key:
+            continue
+        if state[key].shape != value.shape:
+            raise ValueError(
+                f"VA depth migration shape mismatch on {key}: "
+                f"{tuple(value.shape)} vs {tuple(state[key].shape)}"
+            )
+        state[key] = value
+
+    source_stage = saved.get(stage_key)
+    target_stage = state.get(stage_key)
+    if (
+        source_stage is None
+        or target_stage is None
+        or tuple(source_stage.shape) != (7, target_stage.shape[1])
+        or tuple(target_stage.shape) != (15, source_stage.shape[1])
+    ):
+        raise ValueError("VA depth migration requires stage_embed [7,H] -> [15,H]")
+    target_stage[:7].copy_(source_stage)
+    target_stage[7:].zero_()
+
+    predictor_prefix = "wmrm.st_predictor."
+    predictor_items = {
+        key.removeprefix(predictor_prefix): value
+        for key, value in saved.items()
+        if key.startswith(predictor_prefix)
+    }
+    if not predictor_items:
+        raise ValueError("VA depth migration requires the trained st_blocks predictor")
+    for copy_index in range(10):
+        target_prefix = f"wmrm.st_predictor_extra.{copy_index}."
+        for suffix, value in predictor_items.items():
+            target_key = target_prefix + suffix
+            if target_key not in state or state[target_key].shape != value.shape:
+                raise ValueError(
+                    f"World predictor copy mismatch on {target_key}: "
+                    f"{tuple(value.shape)}"
+                )
+            state[target_key] = value
+
+    residual_outputs = (
+        "out_v.weight", "out_v.bias", "out_a.weight", "out_a.bias",
+        "out_t.weight", "out_t.bias", "ffn_v.3.weight", "ffn_v.3.bias",
+        "ffn_a.3.weight", "ffn_a.3.bias", "ffn_t.3.weight", "ffn_t.3.bias",
+    )
+    for index in range(8, 16):
+        for suffix in residual_outputs:
+            state[f"layers.{index}.{suffix}"].zero_()
+    predictor_residual_outputs = (
+        "sa_o.weight", "sa_o.bias", "ca_o.weight", "ca_o.bias",
+        "ff.2.weight", "ff.2.bias",
+    )
+    for prefix in (
+        "wmrm.st_predictor.",
+        *(f"wmrm.st_predictor_extra.{index}." for index in range(10)),
+    ):
+        for suffix in predictor_residual_outputs:
+            state[f"{prefix}blocks.6.{suffix}"].zero_()
+    state["wmrm_stage_scale"].zero_()
+    state["wmrm_belief_message_scale"].zero_()
     return state
 
 
@@ -1005,7 +1349,8 @@ class TaskLocalityWeightedSampler(Sampler[list[int]]):
     恰好出现一次。weighted/balanced 抽样块含至多 ``block_batches`` 个同任务
     batch，在 JPEG 解码局部性与跨任务曝光之间取折中。``full`` 不拆任务块：
     随机任务顺序后把一个任务的全部行连续铺平，再按 global batch 切分，
-    因此任务边界批可能混合相邻任务。
+    因此任务边界批可能混合相邻任务。``mixed`` 每批均匀选择多个不同任务，
+    每个任务固定保留一部分 epoch-0 行作为 replay anchor。
     块内轮询 episode，不再让长轨迹因滑窗更多而被额外过采样。
     ``__iter__`` 不自行推进 cursor；只有优化器更新成功后由主循环调用
     :meth:`advance`，使 checkpoint 能精确指向“已完成更新”的下一批。
@@ -1022,9 +1367,12 @@ class TaskLocalityWeightedSampler(Sampler[list[int]]):
         sampling_mode: str = "weighted",
         *,
         task_order_seed: int | None = None,
+        mixed_tasks_per_batch: int = 4,
+        anchor_replay_fraction: float = 0.25,
         rank: int = 0,
         world_size: int = 1,
         epoch_dataset: Dataset | None = None,
+        anchor_eligible: Tensor | None = None,
     ) -> None:
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
@@ -1050,9 +1398,9 @@ class TaskLocalityWeightedSampler(Sampler[list[int]]):
             raise ValueError("instruction_id/episode_id must have the same non-zero length")
         if task_weights.ndim != 1:
             raise ValueError("task_weights must be 1-D")
-        if sampling_mode not in {"weighted", "balanced", "full"}:
+        if sampling_mode not in {"weighted", "balanced", "full", "mixed"}:
             raise ValueError(
-                "sampling_mode must be 'weighted', 'balanced', or 'full'"
+                "sampling_mode must be 'weighted', 'balanced', 'full', or 'mixed'"
             )
         self.task_ids = [int(value) for value in instruction_id.tolist()]
         self.episode_ids = [int(value) for value in episode_id.tolist()]
@@ -1064,9 +1412,16 @@ class TaskLocalityWeightedSampler(Sampler[list[int]]):
         self.task_order_seed = (
             self.seed if task_order_seed is None else int(task_order_seed)
         )
+        self.mixed_tasks_per_batch = int(mixed_tasks_per_batch)
+        self.anchor_replay_fraction = float(anchor_replay_fraction)
         self.rank = int(rank)
         self.world_size = int(world_size)
         self.epoch_dataset = epoch_dataset
+        if anchor_eligible is None:
+            anchor_eligible = torch.ones_like(instruction_id, dtype=torch.bool)
+        if anchor_eligible.shape != instruction_id.shape or anchor_eligible.dtype != torch.bool:
+            raise ValueError("anchor_eligible must be a bool tensor aligned with rows")
+        self.anchor_eligible = [bool(value) for value in anchor_eligible.tolist()]
         self.epoch = 0
         self.batch_cursor = 0
         self.by_task_episode: dict[int, dict[int, list[int]]] = {}
@@ -1075,10 +1430,55 @@ class TaskLocalityWeightedSampler(Sampler[list[int]]):
         self.tasks = sorted(self.by_task_episode)
         if self.tasks[-1] >= len(self.task_w) or bool((self.task_w[self.tasks] <= 0).any()):
             raise ValueError("task_weights must contain a positive entry for every task id")
-        if self.sampling_mode == "balanced":
+        if self.sampling_mode in {"balanced", "mixed"}:
             active_weights = self.task_w[self.tasks]
             if not bool(torch.all(active_weights == active_weights[0])):
-                raise ValueError("balanced sampling requires equal active task weights")
+                raise ValueError(
+                    f"{self.sampling_mode} sampling requires equal active task weights"
+                )
+        if self.sampling_mode == "mixed":
+            if not 2 <= self.mixed_tasks_per_batch <= len(self.tasks):
+                raise ValueError(
+                    "mixed_tasks_per_batch must be in [2, number of active tasks]"
+                )
+            if self.batch_size % self.mixed_tasks_per_batch:
+                raise ValueError(
+                    "mixed batch size must divide across mixed_tasks_per_batch"
+                )
+            per_task = self.batch_size // self.mixed_tasks_per_batch
+            if per_task % self.world_size:
+                raise ValueError(
+                    "mixed per-task rows must divide evenly across world_size"
+                )
+            anchors = round(per_task * self.anchor_replay_fraction)
+            if not 0 < self.anchor_replay_fraction < 1 or not 0 < anchors < per_task:
+                raise ValueError(
+                    "anchor_replay_fraction must produce at least one anchor and one "
+                    "fresh row per task"
+                )
+            self.mixed_rows_per_task = per_task
+            self.anchor_rows_per_task = anchors
+            anchor_rng = random.Random(self.task_order_seed + 0xA11CE)
+            self.anchor_rows: dict[int, list[int]] = {}
+            for task in self.tasks:
+                episodes = list(self.by_task_episode[task].values())
+                anchor_rng.shuffle(episodes)
+                candidates = [
+                    next(index for index in rows if self.anchor_eligible[index])
+                    for rows in episodes
+                    if any(self.anchor_eligible[index] for index in rows)
+                ]
+                if len(candidates) < anchors:
+                    candidates = [
+                        index
+                        for rows in self.by_task_episode[task].values()
+                        for index in rows
+                        if self.anchor_eligible[index]
+                    ]
+                    anchor_rng.shuffle(candidates)
+                if len(candidates) < anchors:
+                    raise ValueError(f"task {task} has too few anchor-eligible rows")
+                self.anchor_rows[task] = candidates[:anchors]
         self.task_probs = torch.stack([self.task_w[t] for t in self.tasks])
         self.task_probs = self.task_probs / self.task_probs.sum().clamp_min(1e-12)
         self._n = len(self.task_ids)
@@ -1103,7 +1503,7 @@ class TaskLocalityWeightedSampler(Sampler[list[int]]):
         self.dataset_fingerprint = hashlib.sha256(encoded).hexdigest()
 
     def __len__(self) -> int:
-        if self.sampling_mode == "full":
+        if self.sampling_mode in {"full", "mixed"}:
             return math.ceil(self._n / self.batch_size)
         return max(1, self._n // self.batch_size)
 
@@ -1159,6 +1559,72 @@ class TaskLocalityWeightedSampler(Sampler[list[int]]):
             ]
             if len(batches) != len(self) or sum(map(len, batches)) != self._n:
                 raise RuntimeError("full sampler built an invalid epoch schedule")
+            return batches
+
+        if self.sampling_mode == "mixed":
+            queues: dict[tuple[int, int], list[int]] = {}
+            offsets: dict[tuple[int, int], int] = {}
+            for task, episodes in self.by_task_episode.items():
+                for episode, rows in episodes.items():
+                    anchors = set(self.anchor_rows[task])
+                    queue = [row for row in rows if row not in anchors]
+                    if not queue:
+                        continue
+                    rng.shuffle(queue)
+                    queues[(task, episode)] = queue
+                    offsets[(task, episode)] = 0
+
+            def take_rows(task: int, count: int) -> list[int]:
+                episodes = [
+                    episode
+                    for episode in self.by_task_episode[task]
+                    if (task, episode) in queues
+                ]
+                selected: list[int] = []
+                while len(selected) < count:
+                    rng.shuffle(episodes)
+                    for episode in episodes:
+                        key = (task, episode)
+                        queue = queues[key]
+                        offset = offsets[key]
+                        if offset >= len(queue):
+                            rng.shuffle(queue)
+                            offset = 0
+                        selected.append(queue[offset])
+                        offsets[key] = offset + 1
+                        if len(selected) == count:
+                            break
+                return selected
+
+            task_rng = random.Random(self.task_order_seed + self.epoch)
+            task_pool: list[int] = []
+
+            def choose_tasks() -> list[int]:
+                chosen: list[int] = []
+                while len(chosen) < self.mixed_tasks_per_batch:
+                    if not task_pool:
+                        task_pool.extend(self.tasks)
+                        task_rng.shuffle(task_pool)
+                    task = task_pool.pop()
+                    if task in chosen:
+                        task_pool.insert(0, task)
+                        continue
+                    chosen.append(task)
+                return chosen
+
+            fresh = self.mixed_rows_per_task - self.anchor_rows_per_task
+            batches: list[list[int]] = []
+            while len(batches) < len(self):
+                block_tasks = choose_tasks()
+                for _ in range(min(self.block_batches, len(self) - len(batches))):
+                    batch: list[int] = []
+                    for task in block_tasks:
+                        batch.extend(take_rows(task, fresh))
+                        # Negative indices address fixed rows at dataset epoch 0.
+                        batch.extend(-(index + 1) for index in self.anchor_rows[task])
+                    if len(batch) != self.batch_size:
+                        raise RuntimeError("mixed sampler built an invalid batch")
+                    batches.append(batch)
             return batches
 
         # 每个 (task, episode) 维护独立无放回队列；耗尽才重洗。
@@ -1246,7 +1712,12 @@ class TaskLocalityWeightedSampler(Sampler[list[int]]):
         for position, batch in enumerate(
             schedule[self.batch_cursor :], start=self.batch_cursor
         ):
-            batch_tasks = {self.task_ids[index] for index in batch}
+            batch_tasks = {
+                self.task_ids[-index - 1 if index < 0 else index]
+                for index in batch
+            }
+            if self.sampling_mode == "mixed" and callable(prefetch_tasks):
+                prefetch_tasks(sorted(batch_tasks))
             if len(batch_tasks) == 1:
                 task = next(iter(batch_tasks))
                 if task == run_task:
@@ -1260,10 +1731,11 @@ class TaskLocalityWeightedSampler(Sampler[list[int]]):
                 if run_batches == 2 and callable(prefetch_tasks):
                     following = next(
                         (
-                            self.task_ids[index]
+                            self.task_ids[-index - 1 if index < 0 else index]
                             for future_batch in schedule[position + 1 :]
                             for index in future_batch
-                            if self.task_ids[index] != task
+                            if self.task_ids[-index - 1 if index < 0 else index]
+                            != task
                         ),
                         None,
                     )
@@ -1312,6 +1784,16 @@ class TaskLocalityWeightedSampler(Sampler[list[int]]):
                     "task_order_seed": self.task_order_seed,
                 }
             )
+        if self.sampling_mode == "mixed":
+            state.update(
+                {
+                    "mixed_schedule_contract": "balanced_multitask_anchor_v1",
+                    "task_order_seed": self.task_order_seed,
+                    "mixed_tasks_per_batch": self.mixed_tasks_per_batch,
+                    "anchor_replay_fraction": self.anchor_replay_fraction,
+                    "anchor_epoch": 0,
+                }
+            )
         return state
 
     def load_state_dict(self, state: dict) -> None:
@@ -1330,6 +1812,16 @@ class TaskLocalityWeightedSampler(Sampler[list[int]]):
                 {
                     "full_schedule_contract": "task_contiguous_stream_v1",
                     "task_order_seed": self.task_order_seed,
+                }
+            )
+        if self.sampling_mode == "mixed":
+            expected.update(
+                {
+                    "mixed_schedule_contract": "balanced_multitask_anchor_v1",
+                    "task_order_seed": self.task_order_seed,
+                    "mixed_tasks_per_batch": self.mixed_tasks_per_batch,
+                    "anchor_replay_fraction": self.anchor_replay_fraction,
+                    "anchor_epoch": 0,
                 }
             )
         # Absent ``world_size`` is a single-process checkpoint (the field was
@@ -1474,7 +1966,9 @@ def build_exact_run_contract(
             "readout": PEER_WORLD_READOUT_CONTRACT,
             "gradient_boundary": PEER_GRADIENT_BOUNDARY_CONTRACT,
             "flow_topology": (
-                PEER_H15_PREFIX_TAIL_FLOW_CONTRACT
+                PEER_H50_NESTED_FLOW_CONTRACT
+                if int(getattr(config, "action_horizon", 0)) == 50
+                else PEER_H15_PREFIX_TAIL_FLOW_CONTRACT
                 if getattr(config, "deployment_execution_horizon", 0) == 15
                 else None
             ),
@@ -1483,11 +1977,17 @@ def build_exact_run_contract(
                 or planning_stride
             ),
             "data_isolation": (
-                PEER_SHARED_FULL_DATA_CONTRACT
+                PEER_ACTION_ONLY_DATA_CONTRACT
+                if getattr(args, "va_only", False)
+                else PEER_SHARED_FULL_DATA_CONTRACT
                 if getattr(args, "peer_shared_full_data", False)
                 else PEER_DATA_ISOLATION_CONTRACT
             ),
-            "optimizer": PEER_DUAL_STREAM_OPTIMIZER_CONTRACT,
+            "optimizer": (
+                None
+                if getattr(args, "va_only", False)
+                else PEER_DUAL_STREAM_OPTIMIZER_CONTRACT
+            ),
             "planning_stride": planning_stride,
             "planning_hz": 80.0 / planning_stride,
             "high_frequency": PEER_HIGH_FREQUENCY_CONTRACT,
@@ -1956,7 +2456,7 @@ def _build_dino_main_backbone(
     config: VACompoundConfig,
     device: torch.device,
 ):
-    """Frozen DINOv2 tower as the REPLACEMENT main vision backbone.
+    """DINOv2 tower as the replacement main vision backbone.
 
     V-JEPA stays available in the repository for the legacy path; this tower
     is only built under ``--dino-main-vision``.
@@ -1968,7 +2468,9 @@ def _build_dino_main_backbone(
 
     backbone = TimmActionVisionBackbone.from_pretrained(
         device=device,
-        dtype="float16",
+        dtype=(
+            "float32" if getattr(args, "vision_unfreeze_all", False) else "float16"
+        ),
         model_id=config.main_vision_model_id,
         image_size=config.main_vision_image_size,
         feature_dim=config.main_vision_dim,
@@ -1976,10 +2478,14 @@ def _build_dino_main_backbone(
         checkpoint_path=checkpoint,
         local_files_only=True,
     )
-    backbone.freeze_all()
+    if getattr(args, "vision_unfreeze_all", False):
+        backbone.unfreeze_all()
+    else:
+        backbone.freeze_all()
     args.main_vision_checkpoint_sha256 = _sha256_file(checkpoint)
+    mode = "fully trainable FP32-master/BF16-forward" if backbone._trainable else "frozen"
     print(
-        f"dino-main: frozen {config.main_vision_backbone} REPLACES V-JEPA as the "
+        f"dino-main: {mode} {config.main_vision_backbone} REPLACES V-JEPA as the "
         f"VA main vision ({config.main_vision_image_size}px, "
         f"dim={config.main_vision_dim}, {config.main_vision_tokens} tokens/decision, "
         f"params={sum(p.numel() for p in backbone.parameters()):,})",
@@ -2036,7 +2542,13 @@ def _dino_main_online_encode(
         encode_batch=encode_batch,
         image_size=backbone.image_size,
     ):
-        hierarchical = backbone.forward_hierarchical_dense(chunk)
+        with torch.autocast(
+            device_type=device.type,
+            dtype=torch.bfloat16,
+            enabled=device.type == "cuda"
+            and bool(getattr(backbone, "_trainable", False)),
+        ):
+            hierarchical = backbone.forward_hierarchical_dense(chunk)
         tokens = hierarchical[11]
         if tokens.shape[-2] != 256 or tokens.shape[-1] != backbone.feature_dim:
             raise RuntimeError(
@@ -3288,6 +3800,9 @@ def rollout_policy(
     wmrm_static_constraint_weight: float = 4.0,
     wmrm_late_stage_anchor_weight: float = 0.0,
     wmrm_stage_weight_overrides: dict[int, float] | None = None,
+    wmrm_feature_metric: str = "mse",
+    wmrm_progress_ordinal_weight: float = 0.0,
+    summarize_visual_world_metrics: bool = True,
     feature_autocast_bf16: bool = False,
     train_world_model: bool = True,
     compute_action_output: bool = True,
@@ -3296,6 +3811,14 @@ def rollout_policy(
         raise ValueError("world_action_rank_step must be non-negative")
     if world_action_rank_stage not in {"final", "cycle"}:
         raise ValueError("world_action_rank_stage must be 'final' or 'cycle'")
+    if wmrm_progress_ordinal_weight < 0.0 or not math.isfinite(
+        wmrm_progress_ordinal_weight
+    ):
+        raise ValueError("wmrm_progress_ordinal_weight must be finite and non-negative")
+    if wmrm_progress_ordinal_weight > 0.0 and not visual_world_supervision:
+        raise ValueError("ordinal progress requires visual World supervision")
+    if wmrm_progress_ordinal_weight > 0.0 and not model.config.wmrm_full_language_tokens:
+        raise ValueError("ordinal progress requires full-language World")
     peer_world_mode = getattr(model.config, "va_world_mode", "legacy") == "peer_sync_h6"
     logged_peer_world_forward = peer_world_mode and visual_world_supervision
     if visual_world_supervision and not train_world_model:
@@ -3357,8 +3880,9 @@ def rollout_policy(
         list[tuple[Tensor, Tensor, Tensor]]
     ] = []
     visual_world_action_shuffle_records: list[tuple[Tensor, Tensor, Tensor]] = []
-    peer_readout_loss_records: list[tuple[Tensor, Tensor]] = []
-    peer_readout_squared_error_records: list[tuple[Tensor, Tensor]] = []
+    peer_readout_loss_records: list[tuple[Tensor, Tensor, Tensor]] = []
+    progress_records: list[tuple[Tensor, Tensor, Tensor]] = []
+    peer_readout_squared_error_records: list[tuple[Tensor, Tensor, Tensor]] = []
     visual_world_final_records: list[dict[str, Tensor]] = []
     wmrm_adep_terms: list[Tensor] = []
     memories: list[VisualMemory] | None = [] if model.config.future_predict else None
@@ -3472,12 +3996,12 @@ def rollout_policy(
             if peer_world_mode:
                 planning_stride = int(getattr(model.config, "planning_stride", 6))
                 if (
-                    model.config.action_horizon not in {6, 15}
+                    model.config.action_horizon not in {6, 15, 50}
                     or planning_stride not in PEER_PLANNING_STRIDES
                     or cycle not in {planning_stride, model.config.action_horizon}
                 ):
                     raise ValueError(
-                        "peer rollout requires H6/H15 prediction with World "
+                        "peer rollout requires H6/H15/H50 prediction with World "
                         "horizon equal to the execution prefix or full chunk"
                     )
                 if logged_peer_world_forward:
@@ -3485,7 +4009,7 @@ def rollout_policy(
                     # the complete logged chunk to the model; the World horizon
                     # selects either its P-step prefix or the full candidate.
                     world_action = batch["actions"][
-                        :, time_index, : model.config.action_horizon
+                        :, time_index, :cycle
                     ].clamp(-1.0, 1.0)
                 elif getattr(model, "world_action_readout", None) is None:
                     raise ValueError("peer_sync_h6 requires world_action_readout")
@@ -3494,7 +4018,7 @@ def rollout_policy(
                 world_action = batch["actions"][:, time_index, :cycle].clamp(-1.0, 1.0)
         peer_stage_snapshots: list[tuple[tuple, dict]] = []
         original_peer_propose = None
-        if peer_world_mode and not logged_peer_world_forward:
+        if peer_world_mode and visual_world_supervision:
             original_peer_propose = model.wmrm.propose
 
             def record_peer_snapshot(*proposal_args, **proposal_kwargs):
@@ -3524,6 +4048,26 @@ def rollout_policy(
             proposal_auxes = [model.last_wmrm]
         proposal_pres = list(getattr(model, "last_wmrm_pre_actions", None) or ())
         proposal_last = getattr(model, "last_wmrm", None)
+        if wmrm_progress_ordinal_weight > 0.0:
+            if not proposal_auxes:
+                raise RuntimeError("ordinal progress requires a World proposal")
+            # Stage 0 sees project_shared_eye output before any VA layer,
+            # visual memory, or World message.  Its progress input contains
+            # only that fixed visual window, current proprio, and language;
+            # it excludes action, WAM belief, history, and stage embedding.
+            progress_aux = proposal_auxes[0]
+            if (
+                progress_aux.progress_state is None
+                or progress_aux.progress_task_summary is None
+            ):
+                raise RuntimeError("World proposal lacks stateless progress inputs")
+            progress_records.append(
+                (
+                    progress_aux.progress,
+                    progress_aux.progress_state,
+                    progress_aux.progress_task_summary,
+                )
+            )
         if (
             train_world_model
             and model.wmrm is not None
@@ -3559,7 +4103,7 @@ def rollout_policy(
                     :, time_index, : model.wmrm.cycle_steps
                 ]
                 logged_chunk = batch["actions"][
-                    :, time_index, : model.config.action_horizon
+                    :, time_index, : model.wmrm.cycle_steps
                 ]
                 if peer_world_mode:
                     logged_auxes = list(proposal_auxes)
@@ -3580,7 +4124,11 @@ def rollout_policy(
                             f"auxes={len(proposal_auxes)}, expected={expected_stages}"
                         )
                     stage_readouts = [
-                        model.world_action_readout(pre_action)
+                        model.world_action_readout(
+                            pre_action[:, : model.wmrm.cycle_steps]
+                            if model.config.action_horizon == 50
+                            else pre_action
+                        )
                         for pre_action in proposal_pres
                     ]
                     if any(readout is None for readout in stage_readouts):
@@ -3610,9 +4158,11 @@ def rollout_policy(
                         ],
                         dim=0,
                     ).mean(dim=0)
-                    peer_readout_loss_records.append((valid, readout_error))
+                    peer_readout_loss_records.append(
+                        (task_ids, valid, readout_error)
+                    )
                     peer_readout_squared_error_records.append(
-                        (valid, readout_squared)
+                        (task_ids, valid, readout_squared)
                     )
                 else:
                     logged_visual_memory = (
@@ -3677,7 +4227,12 @@ def rollout_policy(
                             f"{None if logged_map is None else tuple(logged_map.shape)} "
                             f"vs {tuple(target.shape)}"
                         )
-                    visual = visual_world_loss(logged_map, target, current)
+                    visual = visual_world_loss(
+                        logged_map,
+                        target,
+                        current,
+                        feature_metric=wmrm_feature_metric,
+                    )
                     logged_visuals.append(visual)
                     guard = visual_no_regression_loss(
                         visual,
@@ -3758,23 +4313,12 @@ def rollout_policy(
                         and logged_auxes[rank_stage - 1].z_tokens is not None
                         else None
                     )
-                    if peer_world_mode and not logged_peer_world_forward:
+                    if peer_world_mode:
                         snapshot_args, snapshot_kwargs = peer_stage_snapshots[rank_stage]
                         snapshot_kwargs["env_action"] = rank_shuffle_actions[:, time_index]
                         shuffled_map = model.wmrm.propose(
                             *snapshot_args, **snapshot_kwargs
                         ).aux.z_tokens
-                        # Zero is diagnostic-only in the v7 ranking objective, but
-                        # peer mode still evaluates it as an explicit env-action
-                        # override on the exact same immutable stage snapshot.
-                        snapshot_kwargs["env_action"] = torch.zeros_like(logged_action)
-                        zero_map = model.wmrm.propose(
-                            *snapshot_args, **snapshot_kwargs
-                        ).aux.z_tokens
-                        if zero_map is None or zero_map.shape != target.shape:
-                            raise ValueError(
-                                "zero-action World prediction must be the full DINO map"
-                            )
                     else:
                         _, _, _, shuffled_map = model.wmrm.predict_world(
                             logged_pres[rank_stage],
@@ -3791,7 +4335,10 @@ def rollout_policy(
                         )
                     real_visual = logged_visuals[rank_stage]
                     shuffled_visual = visual_world_loss(
-                        shuffled_map, target, current
+                        shuffled_map,
+                        target,
+                        current,
+                        feature_metric=wmrm_feature_metric,
                     )
                     for name in (
                         "motion_weights",
@@ -3974,6 +4521,36 @@ def rollout_policy(
             servo_stats[key] = torch.stack(servo_stats[key], dim=1)  # [B, T, ...]
     if c2_references is not None:
         return out + (torch.stack(c2_references, dim=1),)
+    if wmrm_progress_ordinal_weight > 0.0:
+        if len(progress_records) != batch["vision_tokens"].shape[1]:
+            raise RuntimeError("ordinal progress did not cover every decision state")
+        progress_logits = torch.stack([item[0] for item in progress_records], dim=1)
+        progress_states = torch.stack([item[1] for item in progress_records], dim=1)
+        progress_languages = torch.stack([item[2] for item in progress_records], dim=1)
+        progress_valid = batch["action_valid_mask"][:, :, 0].bool()
+        first_success = batch.get("first_success")
+        if first_success is None:
+            raise RuntimeError("ordinal progress requires successful-episode metadata")
+        progress_valid = progress_valid & first_success[:, None].ge(0)
+        progress_recovery = batch.get("decision_recovery")
+        if progress_recovery is None:
+            progress_recovery = torch.zeros_like(progress_valid)
+        progress_loss, progress_counts = cross_trajectory_progress_potential_loss(
+            model.wmrm.score_progress,
+            progress_logits,
+            progress_states,
+            progress_languages,
+            batch["vision_tokens"].mean(dim=2),
+            progress_valid,
+            progress_recovery.bool(),
+            batch["instruction_id"],
+            batch["episode_id"],
+        )
+        model.last_wmrm_progress_loss = progress_loss
+        model.last_wmrm_progress_counts = progress_counts
+    else:
+        model.last_wmrm_progress_loss = None
+        model.last_wmrm_progress_counts = {}
     if visual_world_stage_records:
         stage_weights = stage_supervision_weights(
             len(visual_world_stage_records),
@@ -3984,6 +4561,7 @@ def rollout_policy(
 
         def reduce_stage_records(
             records_by_stage: list[list[tuple[Tensor, Tensor, Tensor]]],
+            task_id: int | None = None,
         ) -> Tensor:
             values: list[Tensor] = []
             masks: list[Tensor] = []
@@ -3991,9 +4569,13 @@ def rollout_policy(
             for stage_weight, records in zip(
                 stage_weights, records_by_stage, strict=True
             ):
-                for _, valid, value in records:
+                for record_task_ids, valid, value in records:
                     values.append(value)
-                    masks.append(valid)
+                    masks.append(
+                        valid
+                        if task_id is None
+                        else valid & record_task_ids.eq(task_id)
+                    )
                     weights.append(stage_weight)
             return masked_world_reduction(values, masks, weights)
 
@@ -4011,12 +4593,34 @@ def rollout_policy(
 
         def reduce_action_records(
             records: list[tuple[Tensor, Tensor, Tensor]],
+            task_id: int | None = None,
         ) -> Tensor:
             if not records:
                 return objective_world_loss * 0.0
             return masked_world_reduction(
                 [value for _, _, value in records],
-                [valid for _, valid, _ in records],
+                [
+                    valid
+                    if task_id is None
+                    else valid & record_task_ids.eq(task_id)
+                    for record_task_ids, valid, _ in records
+                ],
+            )
+
+        def reduce_readout_records(
+            records: list[tuple[Tensor, Tensor, Tensor]],
+            task_id: int | None = None,
+        ) -> Tensor:
+            if not records:
+                return objective_world_loss * 0.0
+            return masked_world_reduction(
+                [value for _, _, value in records],
+                [
+                    valid
+                    if task_id is None
+                    else valid & record_task_ids.eq(task_id)
+                    for record_task_ids, valid, _ in records
+                ],
             )
 
         action_shuffle_loss = reduce_action_records(
@@ -4026,13 +4630,9 @@ def rollout_policy(
         action_strong_loss = objective_world_loss * 0.0
         action_rank_loss = action_shuffle_loss
         if peer_readout_loss_records:
-            readout_loss = masked_world_reduction(
-                [value for _, value in peer_readout_loss_records],
-                [mask for mask, _ in peer_readout_loss_records],
-            )
-            readout_mse = masked_world_reduction(
-                [value for _, value in peer_readout_squared_error_records],
-                [mask for mask, _ in peer_readout_squared_error_records],
+            readout_loss = reduce_readout_records(peer_readout_loss_records)
+            readout_mse = reduce_readout_records(
+                peer_readout_squared_error_records
             )
             readout_rmse = readout_mse.clamp_min(0.0).sqrt()
         else:
@@ -4047,17 +4647,23 @@ def rollout_policy(
         model.last_world_action_strong_loss = action_strong_loss
         model.last_world_action_readout_loss = readout_loss
         model.last_world_action_readout_rmse = readout_rmse
-        if float(wmrm_late_stage_anchor_weight) > 0.0:
-            def reduce_single_stage(
-                records: list[tuple[Tensor, Tensor, Tensor]],
-            ) -> Tensor:
-                if not records:
-                    return objective_world_loss * 0.0
-                return masked_world_reduction(
-                    [value for _, _, value in records],
-                    [valid for _, valid, _ in records],
-                )
+        def reduce_single_stage(
+            records: list[tuple[Tensor, Tensor, Tensor]],
+            task_id: int | None = None,
+        ) -> Tensor:
+            if not records:
+                return objective_world_loss * 0.0
+            return masked_world_reduction(
+                [value for _, _, value in records],
+                [
+                    valid
+                    if task_id is None
+                    else valid & record_task_ids.eq(task_id)
+                    for record_task_ids, valid, _ in records
+                ],
+            )
 
+        if float(wmrm_late_stage_anchor_weight) > 0.0:
             late_stage_anchor = late_stage_anchor_loss(
                 [
                     reduce_single_stage(records)
@@ -4076,9 +4682,48 @@ def rollout_policy(
             + readout_loss
             + late_stage_anchor
         )
-        model.last_visual_world_metrics = _summarize_visual_world_metrics(
-            visual_world_final_records,
-            visual_world_stage_records,
+        model.last_wmrm_task_losses = {}
+        for task_id in sorted(
+            int(value)
+            for value in torch.unique(batch["instruction_id"]).detach().cpu().tolist()
+        ):
+            task_objective = reduce_stage_records(
+                visual_world_objective_stage_records, task_id
+            )
+            task_static = reduce_stage_records(
+                visual_world_static_constraint_stage_records, task_id
+            )
+            task_rank = reduce_action_records(
+                visual_world_action_shuffle_records, task_id
+            )
+            task_readout = reduce_readout_records(
+                peer_readout_loss_records, task_id
+            )
+            task_late = (
+                late_stage_anchor_loss(
+                    [
+                        reduce_single_stage(records, task_id)
+                        for records in visual_world_objective_stage_records
+                    ],
+                    weight=float(wmrm_late_stage_anchor_weight),
+                )
+                if float(wmrm_late_stage_anchor_weight) > 0.0
+                else task_objective * 0.0
+            )
+            model.last_wmrm_task_losses[task_id] = (
+                task_objective
+                + float(wmrm_static_constraint_weight) * task_static
+                + float(WORLD_ACTION_RANKING["weight"]) * task_rank
+                + task_readout
+                + task_late
+            )
+        model.last_visual_world_metrics = (
+            _summarize_visual_world_metrics(
+                visual_world_final_records,
+                visual_world_stage_records,
+            )
+            if summarize_visual_world_metrics
+            else {}
         )
     elif wmrm_world_terms:
         model.last_wmrm_loss = torch.stack(wmrm_world_terms).mean()
@@ -4092,7 +4737,10 @@ def rollout_policy(
         model.last_world_action_readout_loss = model.last_wmrm_loss * 0.0
         model.last_world_action_readout_rmse = model.last_wmrm_loss.detach() * 0.0
         model.last_world_late_stage_anchor_loss = model.last_wmrm_loss * 0.0
+        model.last_wmrm_progress_loss = model.last_wmrm_loss * 0.0
+        model.last_wmrm_progress_counts = {}
         model.last_visual_world_metrics = {}
+        model.last_wmrm_task_losses = {}
     else:
         model.last_wmrm_loss = None
         model.last_wmrm_base_loss = None
@@ -4105,7 +4753,10 @@ def rollout_policy(
         model.last_world_action_readout_loss = None
         model.last_world_action_readout_rmse = None
         model.last_world_late_stage_anchor_loss = None
+        model.last_wmrm_progress_loss = None
+        model.last_wmrm_progress_counts = {}
         model.last_visual_world_metrics = {}
+        model.last_wmrm_task_losses = {}
     if wmrm_adep_terms:
         model.last_wmrm_adep_loss = torch.stack(wmrm_adep_terms).mean()
     else:
@@ -4258,6 +4909,262 @@ def backward_peer_joint_losses(va_loss: Tensor, world_loss_or_forward):
         raise ValueError("peer joint World loss must be a scalar tensor")
     world_loss.backward()
     return result
+
+
+def backward_pcgrad(
+    task_losses: list[Tensor],
+    named_parameters: list[tuple[str, Tensor]],
+    *,
+    seed: int = 0,
+    topology=None,
+    auxiliary_loss_or_forward=None,
+):
+    """PCGrad task losses; optionally project only an auxiliary gradient."""
+    if len(task_losses) < 2:
+        raise ValueError("PCGrad requires at least two task losses")
+    trainable_named = [
+        (name, parameter)
+        for name, parameter in named_parameters
+        if parameter.requires_grad
+    ]
+    trainable = [parameter for _, parameter in trainable_named]
+    if not trainable:
+        raise ValueError("PCGrad received no trainable parameters")
+    task_gradients: list[list[Tensor | None]] = []
+    for index, loss in enumerate(task_losses):
+        if not isinstance(loss, Tensor) or loss.ndim != 0:
+            raise ValueError("PCGrad task losses must be scalar tensors")
+        gradients = torch.autograd.grad(
+            loss,
+            trainable,
+            retain_graph=index + 1 < len(task_losses),
+            allow_unused=True,
+        )
+        for parameter, gradient in zip(trainable, gradients, strict=True):
+            parameter.grad = gradient
+        if topology is not None:
+            # PCGrad is nonlinear: reduce each task gradient first, then project.
+            reduce_update_gradients(trainable_named, topology)
+        task_gradients.append(
+            [
+                None if parameter.grad is None else parameter.grad.detach().clone()
+                for parameter in trainable
+            ]
+        )
+        for parameter in trainable:
+            parameter.grad = None
+
+    merged_gradients: list[Tensor | None] = [None] * len(trainable)
+    merged_counts = [0] * len(trainable)
+    conflicts = 0
+    comparisons = 0
+    rng = random.Random(int(seed))
+    for left, gradients in enumerate(task_gradients):
+        left_gradients = [
+            None if gradient is None else gradient.clone() for gradient in gradients
+        ]
+        order = [right for right in range(len(task_losses)) if right != left]
+        rng.shuffle(order)
+        for right in order:
+            reference = task_gradients[right]
+            overlap = [
+                (current, other)
+                for current, other in zip(left_gradients, reference, strict=True)
+                if current is not None and other is not None
+            ]
+            if not overlap:
+                continue
+            comparisons += 1
+            dot = sum((current * other).sum() for current, other in overlap)
+            if float(dot.detach()) >= 0.0:
+                continue
+            norm_sq = sum(other.square().sum() for _, other in overlap)
+            coefficient = dot / norm_sq.clamp_min(torch.finfo(dot.dtype).eps)
+            for parameter_index, (current, other) in enumerate(
+                zip(left_gradients, reference, strict=True)
+            ):
+                if current is not None and other is not None:
+                    left_gradients[parameter_index] = current - coefficient * other
+            conflicts += 1
+        for parameter_index, gradient in enumerate(left_gradients):
+            if gradient is None:
+                continue
+            if merged_gradients[parameter_index] is None:
+                merged_gradients[parameter_index] = gradient
+            else:
+                merged_gradients[parameter_index].add_(gradient)
+            merged_counts[parameter_index] += 1
+    for index, count in enumerate(merged_counts):
+        if count:
+            merged_gradients[index].div_(count)
+
+    stats: dict[str, int] = {
+        "conflicts": conflicts,
+        "comparisons": comparisons,
+    }
+    if auxiliary_loss_or_forward is None:
+        for parameter, gradient in zip(trainable, merged_gradients, strict=True):
+            parameter.grad = gradient
+        return stats
+
+    auxiliary_result = (
+        auxiliary_loss_or_forward()
+        if callable(auxiliary_loss_or_forward)
+        else auxiliary_loss_or_forward
+    )
+    auxiliary_loss = (
+        auxiliary_result[0]
+        if isinstance(auxiliary_result, tuple)
+        else auxiliary_result
+    )
+    if not isinstance(auxiliary_loss, Tensor) or auxiliary_loss.ndim != 0:
+        raise ValueError("PCGrad auxiliary loss must be a scalar tensor")
+    for parameter in trainable:
+        parameter.grad = None
+    auxiliary_loss.backward()
+    if topology is not None:
+        # Projection is nonlinear, so reduce World gradients before surgery.
+        reduce_update_gradients(trainable_named, topology)
+
+    world_conflicts = 0
+    world_comparisons = 0
+    world_order = list(range(len(task_gradients)))
+    rng.shuffle(world_order)
+    for task_index in world_order:
+        reference = task_gradients[task_index]
+        overlap = [
+            (parameter.grad, task_gradient)
+            for parameter, task_gradient in zip(trainable, reference, strict=True)
+            if parameter.grad is not None and task_gradient is not None
+        ]
+        if not overlap:
+            continue
+        world_comparisons += 1
+        dot = sum((world * task).sum() for world, task in overlap)
+        if float(dot.detach()) >= 0.0:
+            continue
+        norm_sq = sum(task.square().sum() for _, task in overlap)
+        coefficient = dot / norm_sq.clamp_min(torch.finfo(dot.dtype).eps)
+        for parameter, task_gradient in zip(trainable, reference, strict=True):
+            if parameter.grad is not None and task_gradient is not None:
+                parameter.grad.sub_(coefficient * task_gradient)
+        world_conflicts += 1
+
+    for parameter, action_gradient in zip(
+        trainable, merged_gradients, strict=True
+    ):
+        if action_gradient is None:
+            continue
+        if parameter.grad is None:
+            parameter.grad = action_gradient
+        else:
+            parameter.grad.add_(action_gradient)
+    stats.update(
+        world_conflicts=world_conflicts,
+        world_comparisons=world_comparisons,
+    )
+    return stats, auxiliary_result
+
+
+def partition_separate_pcgrad_parameters(
+    named_parameters: list[tuple[str, Tensor]],
+) -> tuple[
+    list[tuple[str, Tensor]],
+    list[tuple[str, Tensor]],
+    list[tuple[str, Tensor]],
+]:
+    """Split optimizer parameters into Action-private, World-private and DINO."""
+    action: list[tuple[str, Tensor]] = []
+    world: list[tuple[str, Tensor]] = []
+    shared_dino: list[tuple[str, Tensor]] = []
+    for name, parameter in named_parameters:
+        if name.startswith("main_vision_backbone."):
+            shared_dino.append((name, parameter))
+        elif name.startswith(("model.wmrm.", "model.world_action_readout.")) or name in {
+            "model.wmrm_stage_scale",
+            "model.wmrm_belief_message_scale",
+        }:
+            world.append((name, parameter))
+        else:
+            action.append((name, parameter))
+    partitioned = [*action, *world, *shared_dino]
+    if {id(parameter) for _, parameter in partitioned} != {
+        id(parameter) for _, parameter in named_parameters
+    } or len(partitioned) != len(named_parameters):
+        raise RuntimeError("separate PCGrad parameter partition is incomplete")
+    return action, world, shared_dino
+
+
+def pop_update_gradients(
+    named_parameters: list[tuple[str, Tensor]],
+) -> dict[int, Tensor | None]:
+    """Clone the current merged gradient and clear it for the next branch."""
+    gradients: dict[int, Tensor | None] = {}
+    for _, parameter in named_parameters:
+        gradients[id(parameter)] = (
+            None if parameter.grad is None else parameter.grad.detach().clone()
+        )
+        parameter.grad = None
+    return gradients
+
+
+def merge_separate_pcgrad_gradients(
+    action_private: list[tuple[str, Tensor]],
+    shared_dino: list[tuple[str, Tensor]],
+    action_gradients: dict[int, Tensor | None],
+) -> dict[str, float | int]:
+    """Restore Action grads and guard only the shared DINO against WM conflict."""
+    for _, parameter in action_private:
+        parameter.grad = action_gradients[id(parameter)]
+
+    overlap = [
+        (parameter, action_gradients[id(parameter)], parameter.grad)
+        for _, parameter in shared_dino
+        if action_gradients[id(parameter)] is not None and parameter.grad is not None
+    ]
+    if overlap:
+        dot = sum((action * world).sum() for _, action, world in overlap)
+        action_norm_sq = sum(action.square().sum() for _, action, _ in overlap)
+        world_norm_sq = sum(world.square().sum() for _, _, world in overlap)
+        denominator = (action_norm_sq * world_norm_sq).clamp_min(
+            torch.finfo(dot.dtype).eps
+        ).sqrt()
+        cosine = dot / denominator
+        projected = int(float(dot.detach()) < 0.0 and float(action_norm_sq.detach()) > 0.0)
+        if projected:
+            coefficient = dot / action_norm_sq.clamp_min(
+                torch.finfo(dot.dtype).eps
+            )
+            for parameter, action, world in overlap:
+                parameter.grad = world - coefficient * action
+        post_dot = sum(
+            (action * parameter.grad).sum()
+            for parameter, action, _ in overlap
+        )
+        post_world_norm_sq = sum(
+            parameter.grad.square().sum() for parameter, _, _ in overlap
+        )
+        post_denominator = (action_norm_sq * post_world_norm_sq).clamp_min(
+            torch.finfo(dot.dtype).eps
+        ).sqrt()
+        post_cosine = post_dot / post_denominator
+    else:
+        cosine = post_cosine = torch.tensor(0.0)
+        projected = 0
+
+    for _, parameter in shared_dino:
+        action = action_gradients[id(parameter)]
+        if action is None:
+            continue
+        if parameter.grad is None:
+            parameter.grad = action
+        else:
+            parameter.grad.add_(action)
+    return {
+        "dino_projected": projected,
+        "dino_cosine": float(cosine.detach()),
+        "dino_post_cosine": float(post_cosine.detach()),
+    }
 
 
 def compute_c2_loss(
@@ -4524,7 +5431,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--lr-vision",
         type=float,
         default=3e-6,
-        help="V-JEPA 解冻参数的学习率（--live-vjepa 用；默认 3e-6 低 LR 防坍塌）",
+        help="解冻主视觉骨干的学习率（V-JEPA 或 DINO-main）",
     )
     parser.add_argument(
         "--vision-unfreeze-last",
@@ -4542,8 +5449,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--vision-unfreeze-all",
         action="store_true",
-        help="truly full V-JEPA unfreezing (stem + all blocks + norms) for e2e "
-        "training (2026-08-06 user instruction + Codex design)",
+        help="全量解冻主视觉骨干（V-JEPA 或 DINO-main 的 stem/blocks/norm）",
     )
     parser.add_argument(
         "--unfreeze-blocks",
@@ -4774,9 +5680,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--wmrm-lang-align-weight",
+        "--wmrm-progress-ordinal-weight",
+        dest="wmrm_lang_align_weight",
         type=float,
         default=0.0,
-        help="可选：belief 与语言摘要对齐（默认 0）",
+        help="当前 batch 的语言条件跨轨迹循环序数损失权重（默认 0）",
     )
     parser.add_argument(
         "--wmrm-adep-weight",
@@ -4803,6 +5711,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "在相邻 World stage 状态间 stop-grad；"
             "前向值不变，默认关闭以保留跨层梯度"
+        ),
+    )
+    parser.add_argument(
+        "--wmrm-stage-gate-start",
+        type=int,
+        default=None,
+        help=(
+            "first newly appended peer World stage; later stage transitions "
+            "start as learnable residual no-ops"
         ),
     )
     parser.add_argument(
@@ -4850,6 +5767,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=12,
         dest="wmrm_predictor_heads",
+    )
+    parser.add_argument(
+        "--wmrm-predictor-copies",
+        type=int,
+        default=1,
+        dest="wmrm_predictor_copies",
+    )
+    parser.add_argument(
+        "--wmrm-feature-metric",
+        choices=("mse", "cosine"),
+        default="mse",
+        help="DINO-map error; cosine L2-normalizes channel directions",
     )
     parser.add_argument(
         "--wmrm-only",
@@ -5058,9 +5987,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--dino-main-vision",
         action="store_true",
-        help="DINO-main replacement（2026-08-14 用户决策）：冻结 DINOv2 替换 "
-        "V-JEPA 作为 VA 主视觉骨干，VA/FM/投影从零可训练。V-JEPA/dense/metric "
-        "代码保留在仓库中但被禁用（不删除）；要求 LongTrajFramesDataset 原始帧数据。",
+        help="DINO-main replacement：DINOv2 替换 V-JEPA 作为 VA 主视觉骨干；"
+        "默认冻结，--vision-unfreeze-all 可全量训练。",
     )
     parser.add_argument(
         "--main-vision-checkpoint",
@@ -5072,7 +6000,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--main-vision-encode-batch",
         type=int,
         default=16,
-        help="DINO-main 冻结塔图像 microbatch（ViT-L 16-GiB GPU 安全默认 16）。",
+        help="DINO-main 图像编码 microbatch。",
     )
     parser.add_argument(
         "--main-vision-grid",
@@ -5110,8 +6038,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--online-episode-sampling",
         action="store_true",
         help=(
-            "treat --va-data/--world-data as a full-episode JSON index and "
-            "generate arbitrary overlapping H15 samples at batch time; no "
+            "treat peer --va-data/--world-data (or --va-only --data) as a "
+            "full-episode JSON index and "
+            "generate arbitrary overlapping H15/H50 samples at batch time; no "
             "offline action/frame windows are loaded"
         ),
     )
@@ -5120,6 +6049,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=6,
         help="independent random starts drawn per full episode per epoch (default 6)",
+    )
+    parser.add_argument(
+        "--online-action-horizon",
+        type=int,
+        choices=(15, 50),
+        default=15,
+        help="runtime action labels sampled from full episodes; World remains +15",
+    )
+    parser.add_argument(
+        "--online-recovery-samples-per-episode",
+        type=int,
+        default=0,
+        help=(
+            "for perturbed episodes, reserve this many online starts for visible "
+            "expert recovery; remaining starts prefer clean trajectory regions"
+        ),
     )
     parser.add_argument(
         "--longtraj-decode-cache-tasks",
@@ -5450,13 +6395,39 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--task-sampling",
-        choices=("uniform", "balanced", "weighted", "full"),
+        choices=("uniform", "balanced", "weighted", "full", "mixed"),
         default="uniform",
         help="难度分层采样（E7 用 weighted，2026-08-09）：按 instruction_id → "
         "MT50 难度权重（easy 0.5/med 1.0/hard 2.0/vh 3.0，scripts/mt50_difficulty.py）"
         "多项式抽样，困难任务过采样、简单任务降采样；balanced = 每个 epoch "
         "严格均衡所有活跃任务；full = 每 epoch 无放回完整遍历所有行；"
+        "mixed = 每个 batch 均匀混合多个任务并加入固定 replay anchor；"
         "uniform = 按数据行均匀采样（会继承窗口数偏置）",
+    )
+    parser.add_argument(
+        "--mixed-tasks-per-batch",
+        type=int,
+        default=4,
+        help="--task-sampling mixed 时每个 global batch 的不同任务数",
+    )
+    parser.add_argument(
+        "--anchor-replay-fraction",
+        type=float,
+        default=0.25,
+        help="mixed batch 内固定 epoch-0 replay anchor 比例",
+    )
+    parser.add_argument(
+        "--pcgrad",
+        action="store_true",
+        help="对 mixed batch 内各任务的动作梯度执行冲突投影后再加入 World 梯度",
+    )
+    parser.add_argument(
+        "--pcgrad-separate-world",
+        action="store_true",
+        help=(
+            "Action 与 World 分别按任务执行 PCGrad；仅在共享 DINO 梯度冲突时"
+            "投影 World 梯度，VA/World 私有表征不做跨分支投影"
+        ),
     )
     parser.add_argument(
         "--task-locality-block-batches",
@@ -5579,6 +6550,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "Stage 2 再去掉本开关全量微调。",
     )
     parser.add_argument(
+        "--capacity-new-only",
+        action="store_true",
+        help=(
+            "VA16/World15 容量吸收阶段：冻结旧 VA/Flow/World 基座，"
+            "只训练 VA 8-15、late World predictors 和新 stage gates。"
+        ),
+    )
+    parser.add_argument(
+        "--capacity-phase2-gates",
+        action="store_true",
+        help=(
+            "VA16/World15 joint phase only: initialize the eight new World gates "
+            "to one, train them jointly at the main learning rate, and clamp "
+            "them to [0, 1] after every update."
+        ),
+    )
+    parser.add_argument(
         "--prev-dropout",
         type=float,
         default=0.0,
@@ -5642,10 +6630,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             PEER_WORLD8_TO_WORLD7_REPAIR_MIGRATION,
             PEER_H15_PREFIX_TAIL_FLOW_MIGRATION,
             PEER_H15_P2_TO_P15_TEMPORAL_MIGRATION,
+            PEER_H15_TO_H50_ACTION_MIGRATION,
+            PEER_H50_ACTION_ONLY_TO_JOINT_MIGRATION,
+            PEER_VA8_TO_VA16_CAPACITY_MIGRATION,
         ],
         help=(
             "one named peer weights migration: legacy H6-to-H15 World repair, "
-            "s1752 H15-to-isolated-prefix/tail Flow, or H15 P2-to-P15 cadence"
+            "s1752 H15-to-isolated-prefix/tail Flow, H15 P2-to-P15 cadence, "
+            "H15-to-H50 nested action expansion, H50 action-only-to-joint, "
+            "or gated 8-to-16 VA capacity expansion"
         ),
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -5667,9 +6660,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def validate_args(args: argparse.Namespace) -> None:
     """Arg 级契约校验（main 入口调用；纯参数检查，不加载数据/模型）。"""
-    finite_positive = {
-        "--lr": args.lr,
-    }
+    finite_positive = {"--lr": args.lr}
     for flag, value in finite_positive.items():
         if not math.isfinite(value) or value <= 0.0:
             raise ValueError(f"{flag} must be a positive finite value")
@@ -5680,6 +6671,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("training steps and flow steps must be positive")
     if int(getattr(args, "online_episode_samples", 6)) < 1:
         raise ValueError("--online-episode-samples must be positive")
+    recovery_samples = int(
+        getattr(args, "online_recovery_samples_per_episode", 0)
+    )
+    if not 0 <= recovery_samples <= int(args.online_episode_samples):
+        raise ValueError(
+            "--online-recovery-samples-per-episode must be in "
+            "[0, --online-episode-samples]"
+        )
     if args.deployment_execution_horizon < 0:
         raise ValueError("--deployment-execution-horizon must be non-negative")
     if not math.isfinite(args.pair_loss_weight) or args.pair_loss_weight < 0.0:
@@ -5709,9 +6708,74 @@ def validate_args(args: argparse.Namespace) -> None:
             "--resume-weights-migration requires --resume-weights"
         )
     peer_world = getattr(args, "va_world_mode", "legacy") == "peer_sync_h6"
+    peer_va_only = peer_world and bool(getattr(args, "va_only", False))
+    stage_gate_start = getattr(args, "wmrm_stage_gate_start", None)
+    if stage_gate_start is not None and (
+        not peer_world or not 0 < int(stage_gate_start) < int(args.va_layers) - 1
+    ):
+        raise ValueError(
+            "--wmrm-stage-gate-start must be inside the peer World stage range"
+        )
     if args.resume_weights_migration is not None and not peer_world:
         raise ValueError(
             "--resume-weights-migration requires --va-world-mode peer_sync_h6"
+        )
+    if getattr(args, "capacity_new_only", False) and any(
+        (
+            getattr(args, "head_only", False),
+            getattr(args, "servo_only", False),
+            getattr(args, "wmrm_only", False),
+            getattr(args, "va_only", False),
+            getattr(args, "action_vision_only", False),
+        )
+    ):
+        raise ValueError(
+            "--capacity-new-only is incompatible with other parameter-freeze modes"
+        )
+    if getattr(args, "capacity_phase2_gates", False):
+        phase2_resume = args.resume_weights is not None or args.resume_exact is not None
+        freeze_mode = any(
+            getattr(args, name, False)
+            for name in (
+                "capacity_new_only",
+                "head_only",
+                "servo_only",
+                "wmrm_only",
+                "va_only",
+                "action_vision_only",
+            )
+        )
+        if (
+            freeze_mode
+            or not phase2_resume
+            or args.resume_weights_migration is not None
+            or int(args.va_layers) != 16
+            or int(stage_gate_start or -1) != 7
+            or int(getattr(args, "wmrm_predictor_depth", 0)) != 7
+            or int(getattr(args, "wmrm_predictor_copies", 0)) != 11
+            or getattr(args, "wmrm_feature_metric", "mse") != "cosine"
+        ):
+            raise ValueError(
+                "--capacity-phase2-gates requires an expanded VA16/World15 "
+                "--resume-weights/--resume-exact run with gate_start=7, "
+                "depth7/copies11, cosine World loss, no migration, and no "
+                "--capacity-new-only"
+            )
+    if (
+        args.resume_weights_migration == PEER_VA8_TO_VA16_CAPACITY_MIGRATION
+        and (
+            int(args.va_layers) != 16
+            or int(getattr(args, "wmrm_stage_gate_start", -1) or -1) != 7
+            or int(getattr(args, "wmrm_predictor_depth", 0)) != 7
+            or int(getattr(args, "wmrm_predictor_copies", 0)) != 11
+            or getattr(args, "wmrm_feature_metric", "mse") != "cosine"
+        )
+    ):
+        raise ValueError(
+            f"{PEER_VA8_TO_VA16_CAPACITY_MIGRATION} requires "
+            "--va-layers 16 --wmrm-stage-gate-start 7 "
+            "--wmrm-predictor-depth 7 --wmrm-predictor-copies 11 "
+            "--wmrm-feature-metric cosine"
         )
     va_data = getattr(args, "va_data", None)
     world_data = getattr(args, "world_data", None)
@@ -5721,15 +6785,43 @@ def validate_args(args: argparse.Namespace) -> None:
     dual_peer_data = peer_world and va_data is not None and world_data is not None
     primary_data = va_data if dual_peer_data else args.data
     if getattr(args, "online_episode_sampling", False):
-        if not dual_peer_data:
+        if not dual_peer_data and not (peer_va_only and args.data is not None):
             raise ValueError(
-                "--online-episode-sampling requires peer --va-data/--world-data"
+                "--online-episode-sampling requires peer --va-data/--world-data "
+                "or peer --va-only with --data"
             )
         if int(getattr(args, "planning_stride", 6)) != 15:
             raise ValueError("online full-episode sampling currently requires P15")
         if getattr(args, "dino_feature_cache", None) is not None:
             raise ValueError(
                 "online random starts cannot use a fixed --dino-feature-cache"
+            )
+    elif int(getattr(args, "online_action_horizon", 15)) != 15:
+        raise ValueError("--online-action-horizon requires --online-episode-sampling")
+    if int(getattr(args, "online_action_horizon", 15)) == 50:
+        stage1_entry = peer_va_only and (
+            args.resume_weights_migration == PEER_H15_TO_H50_ACTION_MIGRATION
+            or args.resume_exact is not None
+        )
+        joint_entry = dual_peer_data and not peer_va_only and (
+            args.resume_weights_migration
+            == PEER_H50_ACTION_ONLY_TO_JOINT_MIGRATION
+            or args.resume_exact is not None
+        )
+        required_h50 = {
+            "H50 Stage1 or joint resume contract": stage1_entry or joint_entry,
+            "--planning-stride 15": int(args.planning_stride) == 15,
+            "--deployment-execution-horizon 15": int(
+                args.deployment_execution_horizon
+            ) == 15,
+            "--wmrm-cycle-steps 15": int(args.wmrm_cycle_steps) == 15,
+            "--flow-prefix-steps 15": int(args.flow_prefix_steps) == 15,
+        }
+        missing_h50 = [name for name, enabled in required_h50.items() if not enabled]
+        if missing_h50:
+            raise ValueError(
+                "H50/P15 training missing required settings: "
+                + ", ".join(missing_h50)
             )
     if int(getattr(args, "peer_batch_prefetch_depth", 1)) < 1:
         raise ValueError("--peer-batch-prefetch-depth must be positive")
@@ -5747,30 +6839,34 @@ def validate_args(args: argparse.Namespace) -> None:
             getattr(args, "deployment_execution_horizon", 0)
             or planning_stride
         )
-        if not dual_peer_data:
+        if not dual_peer_data and not (peer_va_only and args.data is not None):
             raise ValueError(
-                "peer_sync_h6 joint training requires both --va-data and --world-data"
+                "peer_sync_h6 requires joint --va-data/--world-data or "
+                "Stage1 --va-only with --data"
             )
-        if args.data is not None:
+        if args.data is not None and not peer_va_only:
             raise ValueError(
                 "peer_sync_h6 dual-stream training uses --va-data/--world-data, "
                 "not --data"
             )
+        if peer_va_only and dual_peer_data:
+            raise ValueError("peer --va-only uses one --data stream, not VA/World streams")
         if (
-            not shared_full_data
+            dual_peer_data
+            and not shared_full_data
             and va_data.expanduser().resolve(strict=False)
             == world_data.expanduser().resolve(strict=False)
         ):
             raise ValueError("--va-data and --world-data must be different files")
-        if getattr(args, "wmrm_only", False) or getattr(args, "va_only", False):
+        if getattr(args, "wmrm_only", False):
             raise ValueError(
-                "peer_sync_h6 is jointly optimized; do not use --world-only/--va-only"
+                "peer_sync_h6 does not support --world-only"
             )
         required = {
             "--wam4va": bool(getattr(args, "wmrm", False)),
             "--visual-world-supervision": bool(
                 getattr(args, "visual_world_supervision", False)
-            ),
+            ) or peer_va_only,
             "--planning-stride 1/2/3/6/15": planning_stride
             in PEER_PLANNING_STRIDES,
             "--control-stride == --planning-stride": int(
@@ -5808,8 +6904,8 @@ def validate_args(args: argparse.Namespace) -> None:
             == "none",
             "no --perturb-data/--fork-data": args.perturb_data is None
             and args.fork_data is None,
-            "--task-sampling balanced/weighted/full": args.task_sampling
-            in {"balanced", "weighted", "full"},
+            "--task-sampling balanced/weighted/full/mixed": args.task_sampling
+            in {"balanced", "weighted", "full", "mixed"},
         }
         missing = [name for name, enabled in required.items() if not enabled]
         if missing:
@@ -5857,13 +6953,24 @@ def validate_args(args: argparse.Namespace) -> None:
                 )
             ),
             "--wmrm-inject all": getattr(args, "wmrm_inject", None) == "all",
-            "--va-layers 8": int(getattr(args, "va_layers", 0)) == 8,
+            "VA/World depth contract": (
+                int(getattr(args, "va_layers", 0)) == 8
+                and stage_gate_start is None
+            ) or (
+                int(getattr(args, "va_layers", 0)) == 16
+                and int(stage_gate_start or -1) == 7
+            ),
             "--wmrm-predictor st_blocks": getattr(args, "wmrm_predictor", None)
             == "st_blocks",
-            "--wmrm-predictor-depth 6": int(
-                getattr(args, "wmrm_predictor_depth", 0)
-            )
-            == 6,
+            "WM predictor capacity contract": (
+                int(getattr(args, "wmrm_predictor_depth", 0)) == 6
+                and int(getattr(args, "wmrm_predictor_copies", 0)) == 1
+                and int(getattr(args, "va_layers", 0)) == 8
+            ) or (
+                int(getattr(args, "wmrm_predictor_depth", 0)) == 7
+                and int(getattr(args, "wmrm_predictor_copies", 0)) == 11
+                and int(getattr(args, "va_layers", 0)) == 16
+            ),
             "--wmrm-predictor-width 384": int(
                 getattr(args, "wmrm_predictor_width", 0)
             )
@@ -6012,6 +7119,15 @@ def validate_args(args: argparse.Namespace) -> None:
             )
         if args.main_vision_encode_batch < 1:
             raise ValueError("--main-vision-encode-batch must be positive")
+        if args.vision_unfreeze_last:
+            raise ValueError(
+                "DINO-main currently supports full unfreezing only; use "
+                "--vision-unfreeze-all"
+            )
+        if args.vision_unfreeze_all and (
+            not math.isfinite(float(args.lr_vision)) or args.lr_vision <= 0.0
+        ):
+            raise ValueError("trainable DINO-main requires positive --lr-vision")
         # DINO 视觉辅助 loss（2026-08-16 已移植）：--mtvj-visual-aux-every 在
         # --dino-dense-metric 下走 _dino_visual_aux_loss（仿真真值 → DINO dense
         # evidence → grid-16 metric head），不再报错。
@@ -6024,6 +7140,10 @@ def validate_args(args: argparse.Namespace) -> None:
                     "--mtvj-train-metric-head（辅助 loss 反传目标是 metric head）"
                 )
         if args.dino_feature_cache is not None:
+            if args.vision_unfreeze_all:
+                raise ValueError(
+                    "trainable DINO-main cannot use a frozen --dino-feature-cache"
+                )
             cache_dir = args.dino_feature_cache.expanduser()
             if not cache_dir.is_dir():
                 raise ValueError(
@@ -6146,13 +7266,61 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("batch size must be positive")
     if getattr(args, "task_locality_block_batches", 16) <= 0:
         raise ValueError("--task-locality-block-batches must be positive")
+    if args.task_sampling == "mixed":
+        if not getattr(args, "online_episode_sampling", False):
+            raise ValueError("--task-sampling mixed requires --online-episode-sampling")
+        if not args.single_task:
+            raise ValueError("--task-sampling mixed requires --single-task")
+        if args.mixed_tasks_per_batch < 2:
+            raise ValueError("--mixed-tasks-per-batch must be at least 2")
+        if not 0.0 < args.anchor_replay_fraction < 1.0:
+            raise ValueError("--anchor-replay-fraction must be in (0,1)")
+    if args.pcgrad:
+        forbidden = {
+            "--task-sampling mixed": args.task_sampling != "mixed",
+            "peer data stream": not (
+                (args.va_data is not None and args.world_data is not None)
+                or (peer_va_only and args.data is not None)
+            ),
+            "no --direct-head": bool(args.direct_head),
+            "no --sam-rho": float(args.sam_rho) != 0.0,
+            "no semantic adapter": bool(args.semantic_adapter),
+            "no future predictor": bool(args.future_predict)
+            or float(args.future_predict_weight) != 0.0,
+            "no visual auxiliary": int(args.mtvj_visual_aux_every) != 0,
+            "no fork/perturb/C2": args.fork_data is not None
+            or args.perturb_data is not None
+            or bool(args.c2_controller),
+        }
+        active = [name for name, invalid in forbidden.items() if invalid]
+        if active:
+            raise ValueError("--pcgrad incompatible settings: " + ", ".join(active))
+    if getattr(args, "pcgrad_separate_world", False):
+        if not args.pcgrad:
+            raise ValueError("--pcgrad-separate-world requires --pcgrad")
+        if not dual_peer_data or not getattr(args, "visual_world_supervision", False):
+            raise ValueError(
+                "--pcgrad-separate-world requires joint VA/World streams with "
+                "--visual-world-supervision"
+            )
+        if not (
+            getattr(args, "dino_main_vision", False)
+            and getattr(args, "vision_unfreeze_all", False)
+        ):
+            raise ValueError(
+                "--pcgrad-separate-world requires fully trainable DINO-main"
+            )
+        if float(getattr(args, "wmrm_lang_align_weight", 0.0)) != 0.0:
+            raise ValueError(
+                "--pcgrad-separate-world currently requires zero World progress weight"
+            )
     if getattr(args, "resume_exact", None) is not None:
         if args.num_workers != 0:
             raise ValueError("--resume-exact requires --num-workers 0 (worker RNG is not checkpointed)")
         if not (
             primary_data is not None
             and args.single_task
-            and args.task_sampling in {"weighted", "balanced", "full"}
+            and args.task_sampling in {"weighted", "balanced", "full", "mixed"}
             and (
                 args.dense_readout_mtvj
                 or getattr(args, "dino_main_vision", False)
@@ -6160,7 +7328,7 @@ def validate_args(args: argparse.Namespace) -> None:
         ):
             raise ValueError(
                 "--resume-exact currently requires the single-task "
-                "weighted/balanced/full "
+                "weighted/balanced/full/mixed "
                 "MT-VJ or DINO-main data path (TaskLocalityWeightedSampler or "
                 "TaskWeightedSampler)"
             )
@@ -6176,6 +7344,26 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--evsm-temp must be positive")
     if getattr(args, "wmrm", False) and args.memory_split:
         raise ValueError("--wmrm is mutually exclusive with --memory-split")
+    progress_weight = float(getattr(args, "wmrm_lang_align_weight", 0.0))
+    if progress_weight < 0.0:
+        raise ValueError("--wmrm-progress-ordinal-weight must be non-negative")
+    if progress_weight > 0.0 and not all(
+        (
+            getattr(args, "wmrm", False),
+            getattr(args, "visual_world_supervision", False),
+            getattr(args, "wmrm_full_language_tokens", False),
+            getattr(args, "online_episode_sampling", False),
+            getattr(args, "task_sampling", None) == "mixed",
+            int(getattr(args, "mixed_tasks_per_batch", 1)) > 1,
+        )
+    ):
+        raise ValueError(
+            "ordinal progress requires WAM4VA visual World online mixed-task batches"
+        )
+    if progress_weight > 0.0 and getattr(args, "capacity_new_only", False):
+        raise ValueError(
+            "ordinal progress requires full joint training, not --capacity-new-only"
+        )
     if getattr(args, "wmrm_full_language_tokens", False) and not getattr(
         args, "wmrm", False
     ):
@@ -6993,6 +8181,21 @@ def _split_wmrm_predictor_optimizer_groups(groups, model, args):
     return rewritten
 
 
+@torch.no_grad()
+def project_capacity_stage_gates(model, *, enabled: bool, reset: bool = False):
+    """Initialize/project phase-2 stage gates; leave every default path untouched."""
+    if not enabled:
+        return None
+    gate = getattr(model, "wmrm_stage_scale", None)
+    if gate is None or gate.numel() != 8:
+        raise ValueError("capacity phase 2 requires exactly eight World stage gates")
+    if reset:
+        gate.fill_(1.0)
+    else:
+        gate.clamp_(0.0, 1.0)
+    return gate
+
+
 def _feature_optimizer_groups(args, model, vision_backbone):
     """Stage A/B 参数分组：槽模块高 LR / VA 低 LR / V-JEPA 最低 LR。
 
@@ -7002,6 +8205,48 @@ def _feature_optimizer_groups(args, model, vision_backbone):
     """
     def is_action_vision_parameter(name: str) -> bool:
         return name.startswith("action_dense_evidence_proj.") or ".action_dense_" in name
+
+    if getattr(args, "capacity_new_only", False):
+        config = model.config
+        if not (
+            config.num_layers == 16
+            and config.va_world_mode == "peer_sync_h6"
+            and config.wmrm_stage_count() == 15
+            and config.wmrm_stage_gate_start == 7
+            and config.wmrm_predictor_depth == 7
+            and config.wmrm_predictor_copies == 11
+            and config.tail_flow_condition_grad
+        ):
+            raise ValueError(
+                "--capacity-new-only requires VA16/World15, gate_start=7, "
+                "depth7/copies11 and tail Flow condition gradients"
+            )
+
+        def selected(name: str) -> bool:
+            if name == "wmrm_stage_scale":
+                return True
+            if name.startswith("layers."):
+                return int(name.split(".", 2)[1]) >= 8
+            prefix = "wmrm.st_predictor_extra."
+            if name.startswith(prefix):
+                return int(name.removeprefix(prefix).split(".", 1)[0]) >= 4
+            return False
+
+        trainable = []
+        for name, parameter in model.named_parameters():
+            keep = selected(name)
+            parameter.requires_grad_(keep)
+            if keep:
+                trainable.append(parameter)
+        if not trainable:
+            raise RuntimeError("--capacity-new-only selected no parameters")
+        print(
+            "capacity-new-only: frozen small-model base; train new VA8-15, "
+            "late World predictors4-9 and stage gates "
+            f"({sum(parameter.numel() for parameter in trainable):,} params)",
+            flush=True,
+        )
+        return [{"params": trainable, "lr": args.lr}]
 
     if getattr(args, "action_vision_only", False):
         action_params = []
@@ -7300,6 +8545,7 @@ def save_checkpoint(
     sampler: TaskLocalityWeightedSampler | TaskWeightedSampler | None = None,
     world_sampler: TaskLocalityWeightedSampler | TaskWeightedSampler | None = None,
     exact_run_contract: dict | None = None,
+    main_vision_backbone=None,
 ) -> None:
     """原子保存 checkpoint（tmp 文件 + rename），供周期/最终保存复用。"""
     if not args.save:
@@ -7389,8 +8635,24 @@ def save_checkpoint(
                 "min_pair_action_delta": args.min_pair_action_delta,
                 "task_sampling": args.task_sampling,
                 "task_locality_block_batches": args.task_locality_block_batches,
+                "mixed_tasks_per_batch": args.mixed_tasks_per_batch,
+                "anchor_replay_fraction": args.anchor_replay_fraction,
+                "pcgrad": bool(args.pcgrad),
+                "pcgrad_scope": (
+                    (
+                        "per_task_va_and_world_separate_dino_guard_v1"
+                        if getattr(args, "pcgrad_separate_world", False)
+                        else "per_task_va_action_v1"
+                        if getattr(args, "va_only", False)
+                        else "per_task_va_action_then_project_world_v2"
+                    )
+                    if args.pcgrad
+                    else None
+                ),
                 "peer_training_mode": (
-                    "joint_dual_stream"
+                    "va_only"
+                    if getattr(args, "va_only", False)
+                    else "joint_dual_stream"
                     if getattr(config, "va_world_mode", "legacy")
                     == "peer_sync_h6"
                     else (
@@ -7427,7 +8689,9 @@ def save_checkpoint(
                     else None
                 ),
                 "peer_flow_topology": (
-                    PEER_H15_PREFIX_TAIL_FLOW_CONTRACT
+                    PEER_H50_NESTED_FLOW_CONTRACT
+                    if int(config.action_horizon) == 50
+                    else PEER_H15_PREFIX_TAIL_FLOW_CONTRACT
                     if getattr(model, "tail_flow_head", None) is not None
                     else None
                 ),
@@ -7437,7 +8701,9 @@ def save_checkpoint(
                 ),
                 "peer_data_isolation": (
                     (
-                        PEER_SHARED_FULL_DATA_CONTRACT
+                        PEER_ACTION_ONLY_DATA_CONTRACT
+                        if getattr(args, "va_only", False)
+                        else PEER_SHARED_FULL_DATA_CONTRACT
                         if getattr(args, "peer_shared_full_data", False)
                         else PEER_DATA_ISOLATION_CONTRACT
                     )
@@ -7449,6 +8715,7 @@ def save_checkpoint(
                     PEER_DUAL_STREAM_OPTIMIZER_CONTRACT
                     if getattr(config, "va_world_mode", "legacy")
                     == "peer_sync_h6"
+                    and not getattr(args, "va_only", False)
                     else None
                 ),
                 "planning_stride": int(getattr(args, "planning_stride", 6)),
@@ -7639,6 +8906,22 @@ def save_checkpoint(
                 "main_vision_checkpoint_sha256": getattr(
                     args, "main_vision_checkpoint_sha256", None
                 ),
+                "main_vision_joint_trained": bool(
+                    main_vision_backbone is not None
+                    and any(
+                        parameter.requires_grad
+                        for parameter in main_vision_backbone.parameters()
+                    )
+                ),
+                "main_vision_lr": (
+                    float(args.lr_vision)
+                    if main_vision_backbone is not None
+                    and any(
+                        parameter.requires_grad
+                        for parameter in main_vision_backbone.parameters()
+                    )
+                    else None
+                ),
                 "flow_prefix_steps": args.flow_prefix_steps,
                 "flow_prefix_weight": args.flow_prefix_weight,
                 "flow_tail_weight": args.flow_tail_weight,
@@ -7652,6 +8935,13 @@ def save_checkpoint(
             # Stage B：解冻后的 V-JEPA 权重必须随 checkpoint 保存（评估侧
             # eval_metaworld.py 已支持 vjepa_state_dict 恢复）。
             payload["vjepa_state_dict"] = vision_backbone.model.state_dict()
+        if (
+            main_vision_backbone is not None
+            and payload["training_contract"]["main_vision_joint_trained"]
+        ):
+            payload["main_vision_state_dict"] = (
+                main_vision_backbone.model.state_dict()
+            )
     peer_migration_record = getattr(
         args, "_peer_resume_weights_contract_migration", None
     )
@@ -7679,6 +8969,7 @@ def save_checkpoint(
                     "_and_next_first_v1"
                 ),
                 "world_loss_weights": dict(WORLD_LOSS_COMPONENT_WEIGHTS),
+                "world_feature_metric": getattr(args, "wmrm_feature_metric", "mse"),
                 "world_stage_auxiliary_decay": WORLD_STAGE_AUXILIARY_DECAY,
                 "world_stage_auxiliary_floor": WORLD_STAGE_AUXILIARY_FLOOR,
                 "world_stage_weight_overrides": visual_world_stage_weight_overrides(
@@ -8102,6 +9393,16 @@ def main() -> None:
             wmrm_predictor_depth=getattr(args, "wmrm_predictor_depth", 6),
             wmrm_predictor_width=getattr(args, "wmrm_predictor_width", 384),
             wmrm_predictor_heads=getattr(args, "wmrm_predictor_heads", 12),
+            wmrm_predictor_copies=getattr(args, "wmrm_predictor_copies", 1),
+            wmrm_stage_gate_start=getattr(args, "wmrm_stage_gate_start", None),
+            tail_flow_condition_grad=(
+                getattr(args, "capacity_new_only", False)
+                or getattr(args, "capacity_phase2_gates", False)
+                or int(getattr(args, "online_action_horizon", 15)) == 50
+            ),
+            capacity_stage_gate_policy_grad=getattr(
+                args, "capacity_phase2_gates", False
+            ),
             runtime_integrity_checks=args.runtime_integrity_checks,
             slot_free_policy=args.slot_free_policy,
             **_mtvj_config_kwargs(args),
@@ -8176,11 +9477,15 @@ def main() -> None:
                     primary_data,
                     longtraj_dir=getattr(args, "longtraj_dir", None),
                     samples_per_episode=args.online_episode_samples,
+                    recovery_samples_per_episode=(
+                        args.online_recovery_samples_per_episode
+                    ),
                     sampling_seed=args.seed,
                     decode_cache_tasks=max(
                         int(getattr(args, "longtraj_decode_cache_tasks", None) or 1), 2
                     ),
                     include_world_target_frames=False,
+                    action_horizon=args.online_action_horizon,
                 )
             else:
                 dataset = LongTrajFramesDataset(
@@ -8460,6 +9765,16 @@ def main() -> None:
             wmrm_predictor_depth=getattr(args, "wmrm_predictor_depth", 6),
             wmrm_predictor_width=getattr(args, "wmrm_predictor_width", 384),
             wmrm_predictor_heads=getattr(args, "wmrm_predictor_heads", 12),
+            wmrm_predictor_copies=getattr(args, "wmrm_predictor_copies", 1),
+            wmrm_stage_gate_start=getattr(args, "wmrm_stage_gate_start", None),
+            tail_flow_condition_grad=(
+                getattr(args, "capacity_new_only", False)
+                or getattr(args, "capacity_phase2_gates", False)
+                or int(getattr(args, "online_action_horizon", 15)) == 50
+            ),
+            capacity_stage_gate_policy_grad=getattr(
+                args, "capacity_phase2_gates", False
+            ),
             runtime_integrity_checks=args.runtime_integrity_checks,
             slot_free_policy=args.slot_free_policy,
             local_slots=(args.local_slots_data is not None) or args.live_vjepa,
@@ -8528,7 +9843,7 @@ def main() -> None:
                 if args.perturb_data is not None
                 else (c2_clean_n if args.c2_controller else args.batch_size)
             )
-            if args.task_sampling in {"weighted", "balanced", "full"}:
+            if args.task_sampling in {"weighted", "balanced", "full", "mixed"}:
                 tasks = list(dataset.payload.get("metadata", {}).get("tasks", []))
                 if not tasks:
                     raise ValueError(
@@ -8537,7 +9852,7 @@ def main() -> None:
                     )
                 raw_task_w = (
                     torch.ones(len(tasks), dtype=torch.float64)
-                    if args.task_sampling in {"balanced", "full"}
+                    if args.task_sampling in {"balanced", "full", "mixed"}
                     else torch.tensor(task_weights_for(tasks), dtype=torch.float64)
                 )
                 # Codex P1-2（2026-08-09）：曝光 = 窗口数 × 难度权重会引入轨迹
@@ -8556,9 +9871,13 @@ def main() -> None:
                         "每 epoch 每行无放回恰好一次）"
                         if args.task_sampling == "full"
                         else (
+                            "每 batch 多任务均衡 + 固定 anchor replay）"
+                            if args.task_sampling == "mixed"
+                            else (
                             "每 epoch 严格均衡任务 batch）"
                             if args.task_sampling == "balanced"
                             else "按难度分层）"
+                            )
                         )
                     ),
                     flush=True,
@@ -8613,10 +9932,12 @@ def main() -> None:
                         args.task_sampling,
                         task_order_seed=(
                             args.seed
-                            if args.task_sampling == "full"
+                            if args.task_sampling in {"full", "mixed"}
                             and getattr(args, "peer_shared_full_data", False)
                             else None
                         ),
+                        mixed_tasks_per_batch=args.mixed_tasks_per_batch,
+                        anchor_replay_fraction=args.anchor_replay_fraction,
                         rank=topology.rank,
                         world_size=topology.world_size,
                         epoch_dataset=(
@@ -8624,6 +9945,7 @@ def main() -> None:
                             if getattr(args, "online_episode_sampling", False)
                             else None
                         ),
+                        anchor_eligible=dataset.payload.get("anchor_eligible"),
                     )
                     if args.save is not None or args.resume_exact is not None:
                         # Full payload hashing happens once here; periodic/final
@@ -8646,7 +9968,7 @@ def main() -> None:
                         # generator has no data/augmentation semantics.
                         generator=torch.Generator().manual_seed(args.seed),
                     )
-                elif args.task_sampling in {"balanced", "full"}:
+                elif args.task_sampling in {"balanced", "full", "mixed"}:
                     sampler = TaskLocalityWeightedSampler(
                         dataset.payload["instruction_id"],
                         dataset.payload["episode_id"],
@@ -8657,12 +9979,15 @@ def main() -> None:
                         args.task_sampling,
                         task_order_seed=(
                             args.seed
-                            if args.task_sampling == "full"
+                            if args.task_sampling in {"full", "mixed"}
                             and getattr(args, "peer_shared_full_data", False)
                             else None
                         ),
+                        mixed_tasks_per_batch=args.mixed_tasks_per_batch,
+                        anchor_replay_fraction=args.anchor_replay_fraction,
                         rank=topology.rank,
                         world_size=topology.world_size,
+                        anchor_eligible=dataset.payload.get("anchor_eligible"),
                     )
                     loader = DataLoader(
                         dataset,
@@ -8738,11 +10063,15 @@ def main() -> None:
                     args.world_data,
                     longtraj_dir=getattr(args, "longtraj_dir", None),
                     samples_per_episode=args.online_episode_samples,
+                    recovery_samples_per_episode=(
+                        args.online_recovery_samples_per_episode
+                    ),
                     sampling_seed=args.seed + 1,
                     decode_cache_tasks=max(
                         int(getattr(args, "longtraj_decode_cache_tasks", None) or 1), 2
                     ),
                     include_world_target_frames=config.action_horizon == 15,
+                    action_horizon=args.online_action_horizon,
                 )
             else:
                 world_dataset = LongTrajFramesDataset(
@@ -8795,12 +10124,12 @@ def main() -> None:
                 raise ValueError("--world-data requires metadata.tasks")
             world_raw_task_w = (
                 torch.ones(len(world_tasks), dtype=torch.float64)
-                if args.task_sampling in {"balanced", "full"}
+                if args.task_sampling in {"balanced", "full", "mixed"}
                 else torch.tensor(
                     task_weights_for(world_tasks), dtype=torch.float64
                 )
             )
-            if args.task_sampling in {"weighted", "balanced", "full"}:
+            if args.task_sampling in {"weighted", "balanced", "full", "mixed"}:
                 world_sampler = TaskLocalityWeightedSampler(
                     world_dataset.payload["instruction_id"],
                     world_dataset.payload["episode_id"],
@@ -8811,10 +10140,12 @@ def main() -> None:
                     args.task_sampling,
                     task_order_seed=(
                         args.seed
-                        if args.task_sampling == "full"
+                        if args.task_sampling in {"full", "mixed"}
                         and getattr(args, "peer_shared_full_data", False)
                         else None
                     ),
+                    mixed_tasks_per_batch=args.mixed_tasks_per_batch,
+                    anchor_replay_fraction=args.anchor_replay_fraction,
                     rank=topology.rank,
                     world_size=topology.world_size,
                     epoch_dataset=(
@@ -8822,6 +10153,7 @@ def main() -> None:
                         if getattr(args, "online_episode_sampling", False)
                         else None
                     ),
+                    anchor_eligible=world_dataset.payload.get("anchor_eligible"),
                 )
                 if args.save is not None or args.resume_exact is not None:
                     world_sampler.bind_dataset_content_identity(
@@ -8921,6 +10253,16 @@ def main() -> None:
             wmrm_predictor_depth=getattr(args, "wmrm_predictor_depth", 6),
             wmrm_predictor_width=getattr(args, "wmrm_predictor_width", 384),
             wmrm_predictor_heads=getattr(args, "wmrm_predictor_heads", 12),
+            wmrm_predictor_copies=getattr(args, "wmrm_predictor_copies", 1),
+            wmrm_stage_gate_start=getattr(args, "wmrm_stage_gate_start", None),
+            tail_flow_condition_grad=(
+                getattr(args, "capacity_new_only", False)
+                or getattr(args, "capacity_phase2_gates", False)
+                or int(getattr(args, "online_action_horizon", 15)) == 50
+            ),
+            capacity_stage_gate_policy_grad=getattr(
+                args, "capacity_phase2_gates", False
+            ),
             runtime_integrity_checks=args.runtime_integrity_checks,
             slot_free_policy=args.slot_free_policy,
             **_mtvj_config_kwargs(args),
@@ -9260,6 +10602,23 @@ def main() -> None:
             groups.append({"params": list(servo.parameters()), "lr": servo_lr})
         optimizer = torch.optim.AdamW(groups, weight_decay=1e-4)
 
+    if main_vision_backbone is not None:
+        main_vision_params = [
+            parameter
+            for parameter in main_vision_backbone.parameters()
+            if parameter.requires_grad
+        ]
+        if main_vision_params:
+            optimizer.add_param_group(
+                {"params": main_vision_params, "lr": args.lr_vision}
+            )
+            print(
+                "dino-main: optimizer added "
+                f"{sum(parameter.numel() for parameter in main_vision_params):,} "
+                f"params @ lr={args.lr_vision}",
+                flush=True,
+            )
+
     # Plan-Cache 方案 A：加载冻结 Qwen（local files only，fp16/bf16）+ 可训练
     # SceneTeacher（projector + readout tokens 进 optimizer）。指令文本从
     # dataset payload 的 metadata.tasks 按 instruction_id 重建（与数据 prep
@@ -9348,6 +10707,8 @@ def main() -> None:
         e2e_model.train()
     else:
         model.train()
+    if main_vision_backbone is not None:
+        main_vision_backbone.train()
     global_step = 0
     resume_rng_state = None
     exact_resume = args.resume_exact is not None
@@ -9425,12 +10786,29 @@ def main() -> None:
                 getattr(args, "resume_weights_migration", None)
                 == PEER_H15_P2_TO_P15_TEMPORAL_MIGRATION
             )
+            migrating_h15_to_h50 = (
+                getattr(args, "resume_weights_migration", None)
+                == PEER_H15_TO_H50_ACTION_MIGRATION
+            )
+            migrating_action_only_to_joint = (
+                getattr(args, "resume_weights_migration", None)
+                == PEER_H50_ACTION_ONLY_TO_JOINT_MIGRATION
+            )
+            migrating_va_depth = (
+                getattr(args, "resume_weights_migration", None)
+                == PEER_VA8_TO_VA16_CAPACITY_MIGRATION
+            )
             migration_record = validate_peer_resume_weights_contract(
                 contract,
                 planning_stride=int(getattr(args, "planning_stride", 6)),
                 migrating_peer_world=migrating_peer_world,
                 migrating_prefix_tail_flow=migrating_prefix_tail_flow,
                 migrating_p2_to_p15=migrating_p2_to_p15,
+                migrating_h15_to_h50=migrating_h15_to_h50,
+                migrating_action_only_to_joint=(
+                    migrating_action_only_to_joint
+                ),
+                migrating_va_depth=migrating_va_depth,
                 action_horizon=int(config.action_horizon),
                 world_horizon=int(config.wmrm_cycle_steps),
                 deployment_execution_horizon=int(
@@ -9438,7 +10816,9 @@ def main() -> None:
                     or getattr(config, "planning_stride", 6)
                 ),
                 peer_flow_topology=(
-                    PEER_H15_PREFIX_TAIL_FLOW_CONTRACT
+                    PEER_H50_NESTED_FLOW_CONTRACT
+                    if int(config.action_horizon) == 50
+                    else PEER_H15_PREFIX_TAIL_FLOW_CONTRACT
                     if getattr(model, "tail_flow_head", None) is not None
                     else None
                 ),
@@ -9483,6 +10863,7 @@ def main() -> None:
             "wmrm_predictor_depth",
             "wmrm_predictor_width",
             "wmrm_predictor_heads",
+            "wmrm_predictor_copies",
         ):
             if (
                 getattr(args, "resume_weights_migration", None)
@@ -9506,6 +10887,18 @@ def main() -> None:
                 and key == "planning_stride"
             ):
                 continue
+            if (
+                getattr(args, "resume_weights_migration", None)
+                == PEER_H15_TO_H50_ACTION_MIGRATION
+                and key == "action_horizon"
+            ):
+                continue
+            if (
+                getattr(args, "resume_weights_migration", None)
+                == PEER_VA8_TO_VA16_CAPACITY_MIGRATION
+                and key in {"num_layers", "wmrm_predictor_depth", "wmrm_predictor_copies"}
+            ):
+                continue
             if key.startswith("wmrm_") and not getattr(config, "wmrm", False):
                 continue
             left = resume_config.get(key)
@@ -9523,6 +10916,7 @@ def main() -> None:
                     "wmrm_predictor_depth": 6,
                     "wmrm_predictor_width": 384,
                     "wmrm_predictor_heads": 12,
+                    "wmrm_predictor_copies": 1,
                 }[key]
             if left != right:
                 raise ValueError(
@@ -9591,6 +10985,29 @@ def main() -> None:
                     print(
                         "resume-weights migration: kept s1752 VA/World/H15; "
                         "cloned Flow into isolated H6-prefix and H9-tail paths",
+                        flush=True,
+                    )
+                elif (
+                    getattr(args, "resume_weights_migration", None)
+                    == PEER_VA8_TO_VA16_CAPACITY_MIGRATION
+                ):
+                    state = migrate_peer_va8_to_va16_state(model, resume_ckpt)
+                    model.load_state_dict(state, strict=True)
+                    print(
+                        "resume-weights migration: kept 8 VA/7 World stages; "
+                        "appended 8 zero-residual VA layers, 8 gated World stages, "
+                        "and eleven depth-7 World predictors",
+                        flush=True,
+                    )
+                elif (
+                    getattr(args, "resume_weights_migration", None)
+                    == PEER_H15_TO_H50_ACTION_MIGRATION
+                ):
+                    state = migrate_peer_h15_to_h50_state(model, resume_ckpt)
+                    model.load_state_dict(state, strict=True)
+                    print(
+                        "resume-weights migration: preserved the complete H15 policy; "
+                        "initialized H35 action queries and extension Flow explicitly",
                         flush=True,
                     )
                 else:
@@ -9724,6 +11141,22 @@ def main() -> None:
                 ),
             )
             print(f"resumed from {resume_path}")
+        saved_main_vision = resume_ckpt.get("main_vision_state_dict")
+        saved_main_trained = bool(
+            (resume_ckpt.get("training_contract") or {}).get(
+                "main_vision_joint_trained", False
+            )
+        )
+        if main_vision_backbone is not None and saved_main_vision is not None:
+            main_vision_backbone.model.load_state_dict(
+                saved_main_vision, strict=True
+            )
+            print("dino-main: trained weights restored from checkpoint", flush=True)
+        elif saved_main_trained:
+            raise ValueError(
+                "checkpoint declares trained DINO-main but lacks "
+                "main_vision_state_dict"
+            )
         if exact_resume:
             global_step = restore_exact_resume_state(
                 resume_ckpt,
@@ -9747,6 +11180,18 @@ def main() -> None:
                 )
             else:
                 global_step = int(resume_ckpt.get("global_step", 0))
+    phase2_gate = project_capacity_stage_gates(
+        model,
+        enabled=getattr(args, "capacity_phase2_gates", False),
+        reset=getattr(args, "capacity_phase2_gates", False) and not exact_resume,
+    )
+    if phase2_gate is not None and topology.is_primary:
+        print(
+            "capacity-phase2-gates initialized: "
+            f"mean={float(phase2_gate.mean()):.6f} "
+            f"max={float(phase2_gate.max()):.6f}",
+            flush=True,
+        )
     if args.c2_controller and recovery_loader is not None:
         # resume 之后再次注入 PCA：P 的权重恒取自当前 v6b 文件（冻结），
         # 与 ckpt 是否携带旧 P 权重无关。
@@ -9812,15 +11257,16 @@ def main() -> None:
         if target_frames is not None:
             if isinstance(target_frames, torch.Tensor):
                 target_frames = target_frames.cpu().numpy()
-            target_tokens = _dino_main_online_encode(
-                target_frames,
-                main_vision_backbone,
-                device,
-                encode_batch=args.main_vision_encode_batch,
-                grid=config.main_vision_grid,
-                window=1,
-                return_dense=False,
-            )
+            with torch.no_grad():
+                target_tokens = _dino_main_online_encode(
+                    target_frames,
+                    main_vision_backbone,
+                    device,
+                    encode_batch=args.main_vision_encode_batch,
+                    grid=config.main_vision_grid,
+                    window=1,
+                    return_dense=False,
+                )
             batch_size, sequence, patches, dim = target_tokens.shape
             grid = config.main_vision_grid
             if patches != grid * grid:
@@ -9829,7 +11275,7 @@ def main() -> None:
                 )
             raw_batch["world_target_map"] = target_tokens.reshape(
                 batch_size, sequence, grid, grid, dim
-            ).permute(0, 1, 4, 2, 3)
+            ).permute(0, 1, 4, 2, 3).detach()
         metric_tokens = None
         metric_g = None
         if config.dino_dense_metric:
@@ -9926,6 +11372,7 @@ def main() -> None:
                 sampler=sampler,
                 world_sampler=world_sampler,
                 exact_run_contract=runtime_exact_run_contract,
+                main_vision_backbone=main_vision_backbone,
             )
             last_saved_global_step = global_step
             if topology.is_primary:
@@ -10383,6 +11830,13 @@ def main() -> None:
                     wmrm_stage_weight_overrides=visual_world_stage_weight_overrides(
                         args
                     ),
+                    wmrm_feature_metric=getattr(args, "wmrm_feature_metric", "mse"),
+                    wmrm_progress_ordinal_weight=(
+                        float(getattr(args, "wmrm_lang_align_weight", 0.0))
+                        if objective != "va"
+                        else 0.0
+                    ),
+                    summarize_visual_world_metrics=next_global_step % 10 == 0,
                     feature_autocast_bf16=bool(args.feature_autocast_bf16),
                     train_world_model=(
                         objective != "va"
@@ -10627,22 +12081,48 @@ def main() -> None:
             wmrm_loss = getattr(model, "last_wmrm_loss", None)
             if wmrm_loss is None:
                 wmrm_loss = flow_loss.new_zeros(())
-            lang_align = flow_loss.new_zeros(())
-            last_aux = getattr(model, "last_wmrm", None)
-            if last_aux is not None and getattr(last_aux, "task_summary", None) is not None:
-                lang_align = 1.0 - F.cosine_similarity(
-                    last_aux.belief.mean(dim=1),
-                    last_aux.task_summary.detach(),
-                    dim=-1,
-                ).mean()
+            task_action_losses: list[Tensor] = []
+            if args.pcgrad and objective != "world":
+                instruction_ids = batch["instruction_id"]
+                batch_size = int(instruction_ids.shape[0])
+                for task_id in torch.unique(instruction_ids, sorted=True):
+                    task_mask = instruction_ids == task_id
+                    task_batch = {
+                        key: (
+                            value[task_mask]
+                            if isinstance(value, Tensor)
+                            and value.ndim > 0
+                            and int(value.shape[0]) == batch_size
+                            else value
+                        )
+                        for key, value in batch.items()
+                    }
+                    task_flow, _, _ = masked_flow_matching_loss(
+                        predicted_velocity[task_mask],
+                        target_velocity[task_mask],
+                        task_batch,
+                        prefix_steps=args.flow_prefix_steps,
+                        prefix_weight=args.flow_prefix_weight,
+                        tail_weight=args.flow_tail_weight,
+                    )
+                    task_action_losses.append(task_flow)
+                if len(task_action_losses) != int(args.mixed_tasks_per_batch):
+                    raise RuntimeError(
+                        "PCGrad batch task count mismatch: "
+                        f"{len(task_action_losses)} != {args.mixed_tasks_per_batch}"
+                    )
             adep = getattr(model, "last_wmrm_adep_loss", None)
             if adep is None:
                 adep = flow_loss.new_zeros(())
+            progress_loss = getattr(model, "last_wmrm_progress_loss", None)
+            if progress_loss is None:
+                progress_loss = flow_loss.new_zeros(())
+            progress_weight = float(getattr(args, "wmrm_lang_align_weight", 0.0))
             if objective == "world" or getattr(args, "wmrm_only", False):
                 action_total = (
                     float(getattr(args, "wmrm_world_weight", 1.0)) * wmrm_loss
-                    + float(getattr(args, "wmrm_lang_align_weight", 0.0)) * lang_align
                     + float(getattr(args, "wmrm_adep_weight", 0.0)) * adep
+                    + progress_weight * progress_loss
                 )
             elif objective == "va" or getattr(args, "va_only", False):
                 action_total = (
@@ -10656,8 +12136,8 @@ def main() -> None:
                     + args.pair_loss_weight * pair_loss
                     + args.future_predict_weight * future_loss
                     + float(getattr(args, "wmrm_world_weight", 1.0)) * wmrm_loss
-                    + float(getattr(args, "wmrm_lang_align_weight", 0.0)) * lang_align
                     + float(getattr(args, "wmrm_adep_weight", 0.0)) * adep
+                    + progress_weight * progress_loss
                 )
             semantic_total = (
                 flow_loss.new_zeros(())
@@ -10678,6 +12158,7 @@ def main() -> None:
                 evsm_gate_mean,
                 semantic_anchor_loss,
                 semantic_geom_loss,
+                task_action_losses,
             )
 
         # Clear the previous update once. Peer joint mode then accumulates one
@@ -10699,6 +12180,7 @@ def main() -> None:
                 evsm_gate_mean,
                 semantic_anchor_loss,
                 semantic_geom_loss,
+                task_action_losses,
             ) = compute_loss(
                 batch,
                 noisy_actions,
@@ -10722,9 +12204,31 @@ def main() -> None:
                 ("future", future_loss),
                 ("semantic_anchor", semantic_anchor_loss),
                 ("semantic_geometry", semantic_geom_loss),
+                *(
+                    (f"pcgrad.task_{index}", task_loss)
+                    for index, task_loss in enumerate(task_action_losses)
+                ),
             ]
         )
         world_action_total = action_total.new_zeros(())
+        pcgrad_stats: dict[str, float | int] | None = None
+        pcgrad_named_parameters = (
+            list(
+                named_optimizer_parameters(
+                    optimizer,
+                    ("e2e_model", e2e_model),
+                    ("model", model),
+                    ("scene_teacher", scene_teacher),
+                    ("vision_backbone", vision_backbone),
+                    ("main_vision_backbone", main_vision_backbone),
+                    ("servo", servo),
+                    ("relation_encoder", relation_encoder),
+                    ("metric_head", metric_head),
+                )
+            )
+            if args.pcgrad
+            else []
+        )
         if dual_peer_data:
             if world_raw_batch is None:
                 raise RuntimeError("peer joint step did not fetch a World batch")
@@ -10761,17 +12265,90 @@ def main() -> None:
                         ("world.flow_excluded", losses[2]),
                     ]
                 )
+                if getattr(args, "pcgrad_separate_world", False):
+                    task_losses = getattr(model, "last_wmrm_task_losses", {})
+                    if len(task_losses) != int(args.mixed_tasks_per_batch):
+                        raise RuntimeError(
+                            "World PCGrad task count mismatch: "
+                            f"{len(task_losses)} != {args.mixed_tasks_per_batch}"
+                        )
+                    weighted = {
+                        task_id: float(args.wmrm_world_weight) * loss
+                        for task_id, loss in task_losses.items()
+                    }
+                    validate_finite_update_scalars(
+                        [
+                            (f"world.pcgrad.task_{task_id}", loss)
+                            for task_id, loss in weighted.items()
+                        ]
+                    )
+                    return losses, weighted
                 return losses
 
-            world_losses = backward_peer_joint_losses(
-                action_total, world_forward
-            )
+            if args.pcgrad and getattr(args, "pcgrad_separate_world", False):
+                action_private, world_private, shared_dino = (
+                    partition_separate_pcgrad_parameters(
+                        pcgrad_named_parameters
+                    )
+                )
+                if not shared_dino:
+                    raise RuntimeError(
+                        "separate World PCGrad requires a trainable DINO backbone"
+                    )
+                action_stats = backward_pcgrad(
+                    task_action_losses,
+                    [*action_private, *shared_dino],
+                    seed=args.seed + next_global_step,
+                    topology=topology,
+                )
+                action_gradients = pop_update_gradients(
+                    [*action_private, *shared_dino]
+                )
+                world_losses, world_task_losses = world_forward()
+                world_stats = backward_pcgrad(
+                    list(world_task_losses.values()),
+                    [*world_private, *shared_dino],
+                    seed=args.seed + next_global_step,
+                    topology=topology,
+                )
+                dino_stats = merge_separate_pcgrad_gradients(
+                    action_private,
+                    shared_dino,
+                    action_gradients,
+                )
+                pcgrad_stats = {
+                    "conflicts": action_stats["conflicts"],
+                    "comparisons": action_stats["comparisons"],
+                    "world_conflicts": world_stats["conflicts"],
+                    "world_comparisons": world_stats["comparisons"],
+                    **dino_stats,
+                }
+            elif args.pcgrad:
+                pcgrad_stats, world_losses = backward_pcgrad(
+                    task_action_losses,
+                    pcgrad_named_parameters,
+                    seed=args.seed + next_global_step,
+                    topology=topology,
+                    auxiliary_loss_or_forward=world_forward,
+                )
+            else:
+                world_losses = backward_peer_joint_losses(
+                    action_total, world_forward
+                )
             world_action_total = world_losses[0]
             total_loss = total_loss.detach() + world_losses[1].detach()
         else:
             # P0-5：动作损失与语义损失分开 backward——LoRA 参数只缩放
             # 动作侧梯度，anchor/geometry 梯度完整。
-            action_total.backward()
+            if args.pcgrad:
+                pcgrad_stats = backward_pcgrad(
+                    task_action_losses,
+                    pcgrad_named_parameters,
+                    seed=args.seed + next_global_step,
+                    topology=topology,
+                )
+            else:
+                action_total.backward()
         # 双数据流视觉辅助批次（阶段 C）：每 N 步一个在线仿真批次，辅助 loss
         # 累积到同一优化器 step；辅助分支只反传 metric head，且视觉头与
         # VA/relation 分别 clip，避免大辅助梯度压小动作学习信号。
@@ -10832,6 +12409,15 @@ def main() -> None:
                 )
             )
         )
+        if main_vision_backbone is not None:
+            clip_params = [
+                *clip_params,
+                *(
+                    parameter
+                    for parameter in main_vision_backbone.parameters()
+                    if parameter.requires_grad
+                ),
+            ]
         if servo is not None:
             clip_params = [*clip_params, *servo.parameters()]
         relation_gradient_norm = None
@@ -10862,13 +12448,15 @@ def main() -> None:
                 ("model", model),
                 ("scene_teacher", scene_teacher),
                 ("vision_backbone", vision_backbone),
+                ("main_vision_backbone", main_vision_backbone),
                 ("servo", servo),
                 ("relation_encoder", relation_encoder),
                 ("metric_head", metric_head),
             )
         )
         validate_optimizer_update_state(optimizer, validate_values=False)
-        reduce_update_gradients(update_named_parameters, topology)
+        if not args.pcgrad:
+            reduce_update_gradients(update_named_parameters, topology)
         main_parameter_ids = {id(parameter) for parameter in clip_params}
         main_named_parameters = [
             (name, parameter)
@@ -10976,6 +12564,10 @@ def main() -> None:
             optimizer.second_step(zero_grad=True)
         else:
             optimizer.step()
+        project_capacity_stage_gates(
+            model,
+            enabled=getattr(args, "capacity_phase2_gates", False),
+        )
         validate_optimizer_update_state(optimizer, validate_values=False)
         commit_successful_update(step, consumed_locality_batch)
         if prefetch_after_commit:
@@ -10987,6 +12579,12 @@ def main() -> None:
         gate_log = (
             f" evsm_gate={evsm_gate_mean:.3f}" if evsm_gate_mean is not None else ""
         )
+        if getattr(args, "capacity_phase2_gates", False) and global_step % 10 == 0:
+            stage_gate = model.wmrm_stage_scale.detach()
+            gate_log += (
+                f" world_gate_mean={float(stage_gate.mean()):.6f}"
+                f" world_gate_max={float(stage_gate.max()):.6f}"
+            )
         semantic_log = ""
         if args.semantic_adapter:
             semantic_log = (
@@ -11008,6 +12606,42 @@ def main() -> None:
             if metric_head_gradient_norm is not None
             else ""
         )
+        pcgrad_log = ""
+        if pcgrad_stats is not None:
+            pcgrad_log = (
+                f" pcgrad={pcgrad_stats['conflicts']}/"
+                f"{pcgrad_stats['comparisons']} "
+                f"anchor={args.anchor_replay_fraction:.3f}"
+            )
+            if "world_conflicts" in pcgrad_stats:
+                label = (
+                    "wm_pcgrad"
+                    if getattr(args, "pcgrad_separate_world", False)
+                    else "wm_guard"
+                )
+                pcgrad_log += (
+                    f" {label}={pcgrad_stats['world_conflicts']}/"
+                    f"{pcgrad_stats['world_comparisons']}"
+                )
+            if "dino_cosine" in pcgrad_stats:
+                pcgrad_log += (
+                    f" dino_cos={pcgrad_stats['dino_cosine']:.5f}->"
+                    f"{pcgrad_stats['dino_post_cosine']:.5f}"
+                    f" dino_projected={pcgrad_stats['dino_projected']}"
+                )
+        progress_log = ""
+        progress_value = getattr(model, "last_wmrm_progress_loss", None)
+        if progress_value is not None and float(
+            getattr(args, "wmrm_lang_align_weight", 0.0)
+        ) > 0.0:
+            progress_counts = getattr(model, "last_wmrm_progress_counts", {}) or {}
+            progress_log = (
+                f" progress={float(progress_value):.6f}"
+                " progress_pairs="
+                f"{int(progress_counts.get('cross_ordinal', 0))}/"
+                f"{int(progress_counts.get('within_ordinal', 0))}/"
+                f"{int(progress_counts.get('language', 0))}"
+            )
         aux_log = ""
         if aux_parts:
             aux_log = (
@@ -11053,6 +12687,16 @@ def main() -> None:
         valid_fraction = effective_action_valid_fraction(
             batch, batch["actions"]
         ).detach()
+        recovery_mask = batch.get("recovery_mask")
+        action_valid_mask = batch.get("action_valid_mask")
+        recovery_rows = 0.0
+        if isinstance(recovery_mask, torch.Tensor):
+            recovery_valid = recovery_mask.bool()
+            if isinstance(action_valid_mask, torch.Tensor):
+                recovery_valid &= action_valid_mask.bool()
+            recovery_rows = float(
+                recovery_valid.flatten(1).any(dim=1).float().mean()
+            )
         world_task_log = ""
         visual_metrics = getattr(model, "last_visual_world_metrics", {}) or {}
         if visual_metrics:
@@ -11075,7 +12719,10 @@ def main() -> None:
                 )
             world_task_log = " world_task[" + " | ".join(task_parts) + "]"
         world_constraint_log = ""
-        if getattr(model, "last_world_no_regression_loss", None) is not None:
+        if (
+            next_global_step % 10 == 0
+            and getattr(model, "last_world_no_regression_loss", None) is not None
+        ):
             late_anchor = getattr(model, "last_world_late_stage_anchor_loss", None)
             world_constraint_log = (
                 f" world_base={float(model.last_wmrm_base_loss):.6f}"
@@ -11098,6 +12745,7 @@ def main() -> None:
                 f"step={global_step} mode={args.mode} contract="
                 f"{'e2e_single' if e2e_model is not None else ('single' if args.single_task else 'paired')} "
                 f"task={task_log} action_valid={float(valid_fraction):.4f} "
+                f"recovery_rows={recovery_rows:.4f} "
                 f"sequence={noisy_actions.shape[1]} "
                 f"loss={total_loss.item():.6f} flow={flow_loss.item():.6f} "
                 f"flow_first{min(args.flow_prefix_steps, noisy_actions.shape[-2])}="
@@ -11109,7 +12757,8 @@ def main() -> None:
                 f"world={float((getattr(model, 'last_wmrm_loss', None) if model is not None else None) or 0.0):.6f} "
                 f"goal_delta={predicted_delta.item():.6f}/"
                 f"{target_delta.item():.6f} grad={float(gradient_norm):.6f}"
-                f"{relation_log}{metric_head_log}{aux_log}{gate_log}{semantic_log}"
+                f"{relation_log}{metric_head_log}{pcgrad_log}{progress_log}"
+                f"{aux_log}{gate_log}{semantic_log}"
                 f"{compile_step_log}{servo_log}{world_task_log}{resource_log}"
                 f"{world_constraint_log}"
             )
@@ -11137,6 +12786,7 @@ def main() -> None:
             sampler=sampler,
             world_sampler=world_sampler,
             exact_run_contract=runtime_exact_run_contract,
+            main_vision_backbone=main_vision_backbone,
         )
     shutdown_data_parallel(topology)
 

@@ -27,10 +27,13 @@ from collections import defaultdict
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_DINO = (
-    "/root/.cache/huggingface/hub/models--timm--vit_large_patch14_reg4_dinov2."
-    "lvd142m/snapshots/f3c408e77602bb412aa65fb03dfa0d5f95cb3832/model.safetensors"
-)
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.mt50_difficulty import summarize_mt50_benchmark_trials
+from va_compound.statistics import binomial_wilson_ci, macro_bootstrap_ci
+
+DEFAULT_DINO = "/root/private_data/newhost_env/models/dinov2_vitl14_reg4.safetensors"
 # 实测最优：1 线程 188ms / 8 线程 80ms / 32 线程 120ms（超订反而变慢）。
 LLVMPIPE_THREADS = 8
 
@@ -53,11 +56,22 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint")
     parser.add_argument("features")
+    parser.add_argument("--language-features", default=None)
     parser.add_argument("--shards", type=int, default=5)
+    parser.add_argument("--shard-axis", choices=("trials", "tasks"), default="trials")
     parser.add_argument("--trials-per-task", type=int, default=10)
-    parser.add_argument("--task-ids", default="0,16")
-    parser.add_argument("--execution-horizon", type=int, default=2)
-    parser.add_argument("--horizon", type=int, default=500)
+    parser.add_argument("--task-ids", default=None)
+    parser.add_argument("--episode-seed-base", type=int, default=4042)
+    parser.add_argument("--execution-horizon", type=int, default=15)
+    parser.add_argument("--allow-execution-horizon-ablation", action="store_true")
+    parser.add_argument("--horizon", type=int, default=400)
+    parser.add_argument("--mt50-benchmark", action="store_true")
+    parser.add_argument("--align-init", action="store_true")
+    parser.add_argument("--dagger-output-dir", default=None)
+    parser.add_argument("--dagger-takeover-min", type=int, default=45)
+    parser.add_argument("--dagger-takeover-max", type=int, default=120)
+    parser.add_argument("--dagger-prefix-keep", type=int, default=45)
+    parser.add_argument("--gpus", default=os.environ.get("EVAL_GPUS", "0,1"))
     parser.add_argument("--dino", default=os.environ.get("DINO", DEFAULT_DINO))
     parser.add_argument("--python", default=os.environ.get("PY", "/opt/conda/bin/python"))
     parser.add_argument(
@@ -73,7 +87,28 @@ def main() -> int:
     name = Path(args.checkpoint).stem
     out_dir = ROOT / "logs"
     out_dir.mkdir(exist_ok=True)
-    bounds = shard_bounds(args.trials_per_task, args.shards)
+    if args.shard_axis == "tasks":
+        task_ids = (
+            [int(token) for token in args.task_ids.split(",")]
+            if args.task_ids is not None
+            else list(range(50))
+        )
+        bounds = shard_bounds(len(task_ids), args.shards)
+        jobs = [
+            (0, args.trials_per_task, task_ids[start:stop], f"k{start}-{stop}")
+            for start, stop in bounds
+        ]
+    else:
+        bounds = shard_bounds(args.trials_per_task, args.shards)
+        selected = (
+            None
+            if args.task_ids is None
+            else [int(token) for token in args.task_ids.split(",")]
+        )
+        jobs = [(start, stop, selected, f"t{start}-{stop}") for start, stop in bounds]
+    gpus = [token.strip() for token in args.gpus.split(",") if token.strip()]
+    if not gpus:
+        raise ValueError("--gpus must contain at least one CUDA device index")
 
     env = dict(os.environ)
     env.update(
@@ -87,18 +122,18 @@ def main() -> int:
         PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True",
     )
 
-    procs: list[tuple[subprocess.Popen, Path, Path, tuple[int, int]]] = []
+    procs: list[tuple[subprocess.Popen, Path, Path, dict]] = []
     started = time.time()
-    for start, stop in bounds:
-        json_path = out_dir / f"{name}_{args.tag}_t{start}-{stop}.json"
-        log_path = out_dir / f"{name}_{args.tag}_t{start}-{stop}.log"
+    for shard_index, (start, stop, selected, suffix) in enumerate(jobs):
+        json_path = out_dir / f"{name}_{args.tag}_{suffix}.json"
+        log_path = out_dir / f"{name}_{args.tag}_{suffix}.log"
         command = [
             args.python, "-u", "-B", "eval_metaworld.py",
             "--checkpoint", args.checkpoint,
             "--features", args.features,
             "--main-vision-checkpoint", args.dino,
-            "--task-ids", args.task_ids,
             "--trials-per-task", str(args.trials_per_task),
+            "--episode-seed-base", str(args.episode_seed_base),
             "--trial-range", f"{start}:{stop}",
             "--execution-horizon", str(args.execution_horizon),
             "--horizon", str(args.horizon),
@@ -107,20 +142,47 @@ def main() -> int:
             "--device", "cuda",
             "--output-json", str(json_path),
         ]
+        if args.language_features is not None:
+            command.extend(("--language-features", args.language_features))
+        if args.allow_execution_horizon_ablation:
+            command.append("--allow-execution-horizon-ablation")
+        if selected is not None:
+            command.extend(("--task-ids", ",".join(map(str, selected))))
+        if args.mt50_benchmark and args.shard_axis == "trials":
+            command.append("--mt50-benchmark")
+        if args.align_init:
+            command.append("--align-init")
+        if args.dagger_output_dir is not None:
+            command.extend(
+                (
+                    "--dagger-output-dir", args.dagger_output_dir,
+                    "--dagger-takeover-min", str(args.dagger_takeover_min),
+                    "--dagger-takeover-max", str(args.dagger_takeover_max),
+                    "--dagger-prefix-keep", str(args.dagger_prefix_keep),
+                )
+            )
+        shard_env = dict(env)
+        shard_env["CUDA_VISIBLE_DEVICES"] = gpus[shard_index % len(gpus)]
         handle = log_path.open("w", encoding="utf-8")
         proc = subprocess.Popen(
-            command, cwd=ROOT, env=env, stdout=handle, stderr=subprocess.STDOUT
+            command,
+            cwd=ROOT,
+            env=shard_env,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
         )
-        procs.append((proc, json_path, log_path, (start, stop)))
-        print(f"launched shard trials [{start},{stop}) pid={proc.pid} -> {log_path.name}",
-              flush=True)
+        shard = {"trial_range": f"{start}:{stop}"}
+        if selected is not None:
+            shard["task_ids"] = selected
+        procs.append((proc, json_path, log_path, shard))
+        print(f"launched shard {shard} pid={proc.pid} -> {log_path.name}", flush=True)
 
-    failed: list[tuple[int, int]] = []
-    for proc, _, log_path, span in procs:
+    failed: list[dict] = []
+    for proc, _, log_path, shard in procs:
         code = proc.wait()
         if code != 0:
-            failed.append(span)
-            print(f"FAIL shard {span} exit={code}; see {log_path}", file=sys.stderr)
+            failed.append(shard)
+            print(f"FAIL shard {shard} exit={code}; see {log_path}", file=sys.stderr)
     elapsed = time.time() - started
     if failed:
         print(f"aborting merge: {len(failed)} shard(s) failed: {failed}", file=sys.stderr)
@@ -137,18 +199,55 @@ def main() -> int:
     if len(seen) != len(records):
         print("FAIL: duplicate (task_id, trial) across shards", file=sys.stderr)
         return 1
+    expected_task_ids = {
+        int(task_id) for template in templates for task_id in template["task_ids"]
+    }
+    expected = {
+        (int(task_id), trial)
+        for task_id in expected_task_ids
+        for trial in range(args.trials_per_task)
+    }
+    if seen != expected:
+        print(
+            f"FAIL: incomplete trial grid missing={len(expected - seen)} "
+            f"extra={len(seen - expected)}",
+            file=sys.stderr,
+        )
+        return 1
 
     per_task: dict[int, list[dict]] = defaultdict(list)
     for record in records:
         per_task[record["task_id"]].append(record)
 
     merged = dict(templates[0])
+    merged["task_ids"] = sorted(expected_task_ids)
     merged["trials"] = sorted(records, key=lambda r: (r["task_id"], r["trial"]))
     merged["completed_trials"] = len(records)
     merged["successes"] = sum(1 for r in records if r["success"])
     merged["success_rate"] = merged["successes"] / max(len(records), 1)
-    merged["shards"] = [{"trial_range": f"{a}:{b}"} for _, _, _, (a, b) in procs]
-    merged.pop("ci", None)  # 合并后不重算 bootstrap CI，避免伪造未计算的统计量
+    merged["shards"] = [shard for _, _, _, shard in procs]
+    successes = [float(bool(row["success"])) for row in records]
+    task_ids = [int(row["task_id"]) for row in records]
+    if len(per_task) == 1:
+        estimate, low, high = binomial_wilson_ci(
+            merged["successes"], len(records)
+        )
+        ci_kind = "wilson"
+    else:
+        estimate, low, high = macro_bootstrap_ci(
+            successes, task_ids, n_boot=2000, seed=0
+        )
+        ci_kind = "task_bootstrap"
+    merged["ci"] = {
+        "kind": ci_kind,
+        "estimate": estimate,
+        "low_95": low,
+        "high_95": high,
+    }
+    merged["mt50_benchmark"] = summarize_mt50_benchmark_trials(records)
+    if args.mt50_benchmark and not merged["mt50_benchmark"]["complete_mt50"]:
+        print("FAIL: merged result is not complete MT50", file=sys.stderr)
+        return 1
 
     merged_path = out_dir / f"{name}_{args.tag}_merged.json"
     merged_path.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
@@ -164,6 +263,11 @@ def main() -> int:
     ) / max(len(per_task), 1)
     print(f"CLOSED-LOOP SUCCESS: {merged['successes']}/{len(records)} = {rate:.1f}%")
     print(f"macro (per-task avg): {macro:.1f}% (n_tasks={len(per_task)})")
+    benchmark = merged["mt50_benchmark"]
+    if benchmark["complete_mt50"]:
+        for group, values in benchmark["groups"].items():
+            print(f"{group}: {100.0 * values['success_rate']:.1f}%")
+        print(f"EVOMIND FOUR-TIER AVERAGE: {100.0 * benchmark['bucket_average']:.1f}%")
     print(f"merged results: {merged_path}")
     print(f"wall clock: {elapsed / 60.0:.1f} min across {args.shards} shards")
     return 0

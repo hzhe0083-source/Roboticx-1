@@ -7,6 +7,8 @@ import subprocess
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "scripts" / "run_mw_all49_wam4va_h15_v1.sh"
 MT50_RUNNER = ROOT / "scripts" / "run_mw_mt50_wam4va_h15_60ep_v2.sh"
+MT50_ACCEPTANCE = ROOT / "scripts" / "run_mw_mt50_acceptance_v1.sh"
+RLT_RUNNER = ROOT / "scripts" / "run_mw_rlt_h15_v1.sh"
 
 
 def test_all49_runner_builds_and_trains_true_h15_p15() -> None:
@@ -89,7 +91,24 @@ def test_mt50_60ep_runner_appends_task50_and_continues_for_62_epochs() -> None:
     assert "mt50_raw_canonical_identity_60ep_v2.json" in text
     assert "EPOCHS=${EPOCHS:-62}" in text
     assert "ONLINE_SAMPLES_PER_EPISODE=${ONLINE_SAMPLES_PER_EPISODE:-6}" in text
-    assert "(3420, 3222, 198)" in text
+    assert "PEER_BATCH_PREFETCH_DEPTH=${PEER_BATCH_PREFETCH_DEPTH:-4}" in text
+    assert "EPOCHS=10" in text
+    assert "EPOCHS=50" in text
+    assert "EPOCHS=3" not in text
+    assert "antiforget-resume) run_joint antiforget-exact" in text
+    assert "recovery) run_joint recovery" in text
+    assert 'capacity16) fail "capacity16 is retired' in text
+    assert "BATCH=${CAPACITY_BATCH:-20}" in text
+    assert "CAPACITY_MIXED_TASKS_PER_BATCH:-5" in text
+    assert '[[ "$BATCH" == 20 ]]' in text
+    assert '--task-sampling mixed --mixed-tasks-per-batch "$MIXED_TASKS_PER_BATCH"' in text
+    assert "--task-locality-block-batches 1 --longtraj-decode-cache-tasks 50" in text
+    assert "--online-recovery-samples-per-episode 3" in text
+    assert "mw_mt50_recovery25_mixed4_anchor25_pcgrad_lr1e5_from_s2015_e1_v1" in text
+    assert "EXPECTED_SOURCE_EPISODES=${EXPECTED_SOURCE_EPISODES:-3420}" in text
+    assert "EXPECTED_TRAIN_EPISODES=${EXPECTED_TRAIN_EPISODES:-3222}" in text
+    assert "EXPECTED_EVAL_EPISODES=${EXPECTED_EVAL_EPISODES:-198}" in text
+    assert "triple != expected" in text
     assert "offline_windows=0" in text
     assert "--online-episode-sampling" in text
     assert '--online-episode-samples "$ONLINE_SAMPLES_PER_EPISODE"' in text
@@ -100,6 +119,52 @@ def test_mt50_60ep_runner_appends_task50_and_continues_for_62_epochs() -> None:
     assert "--wmrm-full-language-tokens" in text
     assert "scratch_v5d16_s5152.pt" in text
     assert '--resume-weights "$BASE_CHECKPOINT"' in text
+    assert "--wmrm-stage-gate-start 7" in text
+    assert "wmrm_predictor_depth=7" in text
+    assert "wmrm_predictor_copies=11" in text
+    assert "--wmrm-predictor-copies" in text
+    assert "wmrm_feature_metric=cosine" in text
+    assert "peer_va8_world7_to_va16_world15_gated_capacity_v1" in text
+    assert '"${CAPACITY_PHASE2_GATES:-0}" == 1' in text
+    assert "CAPACITY_PHASE2_GATES requires CAPACITY_RESUME_EXPANDED=1" in text
+    assert "--capacity-phase2-gates" in text
+    assert 'va_layers=16' in text
+    assert "from_s3224_e50_v1" in text
     assert 'run_steps=$((STEPS - completed))' in text
     assert 'resume_args=(--resume-exact "$save")' in text
     assert "resume) run_joint exact" in text
+
+
+def test_mt50_acceptance_is_50_task_evomind_h15_protocol() -> None:
+    syntax = subprocess.run(
+        ["bash", "-n", str(MT50_ACCEPTANCE)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert syntax.returncode == 0, syntax.stderr
+
+    text = MT50_ACCEPTANCE.read_text(encoding="utf-8")
+    assert "/root/private_data/ORA0/checkpoints/mw_mt50_antiforget" in text
+    assert "/root/private_data/ORA0/features/all49_peer_h15_p15_eval_v1.pt" in text
+    assert "/root/private_data/ORA0/runtime_libs/osmesa_jammy" in text
+    assert "mt50_language_normalization_ref_v2.pt" in text
+    assert "--trials-per-task 10 --episode-seed-base 4042" in text
+    assert "--execution-horizon 15 --horizon 400 --mt50-benchmark" in text
+    assert "--task-ids" not in text
+
+
+def test_rlt_runner_uses_native_dense_h15_contract() -> None:
+    syntax = subprocess.run(
+        ["bash", "-n", str(RLT_RUNNER)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert syntax.returncode == 0, syntax.stderr
+    text = RLT_RUNNER.read_text(encoding="utf-8")
+    assert "CHUNK_LENGTH=${CHUNK_LENGTH:-15}" in text
+    assert "REPLAY_STRIDE=${REPLAY_STRIDE:-15}" in text
+    assert "PREFILL_EPISODES_PER_TASK=${PREFILL_EPISODES_PER_TASK:-0}" in text
+    assert "REWARD_MODE=${REWARD_MODE:-dense}" in text
+    assert '--reward-mode "$REWARD_MODE"' in text

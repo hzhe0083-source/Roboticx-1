@@ -13,11 +13,12 @@ import math
 
 import torch
 from torch import Tensor
+from torch.nn import functional as F
 
 
 @dataclass(frozen=True)
 class VisualWorldLoss:
-    """Per-sample visual losses and masks, all on the same MSE scale."""
+    """Per-sample visual losses and masks on one feature-error scale."""
 
     loss_per_sample: Tensor
     all_per_sample: Tensor
@@ -683,6 +684,7 @@ def visual_world_loss(
     topk_weight: float = 0.50,
     motion_clip: float = 4.0,
     eps: float = 1e-8,
+    feature_metric: str = "mse",
 ) -> VisualWorldLoss:
     """Compute action-relevant DINO-map supervision and matched diagnostics.
 
@@ -708,17 +710,36 @@ def visual_world_loss(
         raise ValueError("visual loss weights must sum to 1")
     if motion_clip <= 0.0 or eps <= 0.0:
         raise ValueError("motion_clip and eps must be positive")
+    if feature_metric not in {"mse", "cosine"}:
+        raise ValueError("feature_metric must be mse|cosine")
 
-    # Keep the error in float32 for stable reduction while preserving the
-    # original DINO feature scale.  These casts do not normalize features.
+    # Keep feature reductions in float32. Capacity runs use channel-normalized
+    # cosine error plus a small bounded norm term so direction dominates without
+    # allowing the predicted feature magnitude to drift freely.
+    prediction_float = prediction.float()
     target_detached = target.detach().float()
     current_detached = current.detach().float()
-    error = (prediction.float() - target_detached).square().mean(dim=1).flatten(1)
-    copy_error = (current_detached - target_detached).square().mean(dim=1).flatten(1)
+
+    def feature_error(left: Tensor, right: Tensor) -> Tensor:
+        if feature_metric == "mse":
+            return (left - right).square().mean(dim=1)
+        left_norm = torch.linalg.vector_norm(left, dim=1, keepdim=True)
+        right_norm = torch.linalg.vector_norm(right, dim=1, keepdim=True)
+        direction = 1.0 - (
+            F.normalize(left, dim=1, eps=eps)
+            * F.normalize(right, dim=1, eps=eps)
+        ).sum(dim=1).clamp(-1.0, 1.0)
+        relative_norm = (
+            (left_norm - right_norm)
+            / (left_norm + right_norm).clamp_min(eps)
+        ).square().squeeze(1)
+        return 0.95 * direction + 0.05 * relative_norm
+
+    error = feature_error(prediction_float, target_detached).flatten(1)
+    copy_error = feature_error(current_detached, target_detached).flatten(1)
 
     with torch.no_grad():
-        # Oracle motion energy is exactly mean_c((target-current)^2), not RMSE.
-        energy = (target_detached - current_detached).square().mean(dim=1)
+        energy = feature_error(target_detached, current_detached)
         flat_energy = energy.flatten(1)
         mean_energy = flat_energy.mean(dim=1, keepdim=True)
         motion_weights = flat_energy / mean_energy.clamp_min(eps)

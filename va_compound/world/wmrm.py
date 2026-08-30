@@ -216,6 +216,10 @@ class WMRMAux:
     # post-prediction state and is therefore not valid for an
     # action-counterfactual re-evaluation of the final World stage.
     predict_belief: Tensor | None = None
+    # Current visual/language inputs used by the offline ordinal potential.
+    # They deliberately exclude WAM belief, action, stage, and crop metadata.
+    progress_state: Tensor | None = None
+    progress_task_summary: Tensor | None = None
 
     def _map_tensors(self, transform) -> "WMRMAux":
         return WMRMAux(
@@ -561,6 +565,7 @@ class WAM4VA(nn.Module):
         predictor_depth: int = 6,
         predictor_width: int = 384,
         predictor_heads: int = 12,
+        predictor_copies: int = 1,
         max_stages: int = 8,
         runtime_integrity_checks: bool = True,
     ) -> None:
@@ -589,6 +594,10 @@ class WAM4VA(nn.Module):
             raise ValueError("predictor_width must be positive")
         if predictor_heads < 1:
             raise ValueError("predictor_heads must be positive")
+        if predictor_copies < 1:
+            raise ValueError("predictor_copies must be positive")
+        if predictor != "st_blocks" and predictor_copies != 1:
+            raise ValueError("predictor_copies requires st_blocks")
         if max_stages < 1:
             raise ValueError("max_stages must be positive")
         self.hidden_dim = hidden_dim
@@ -608,6 +617,7 @@ class WAM4VA(nn.Module):
         self.predictor_depth = predictor_depth
         self.predictor_width = predictor_width
         self.predictor_heads = predictor_heads
+        self.predictor_copies = predictor_copies
         self.max_stages = max_stages
         self.runtime_integrity_checks = bool(runtime_integrity_checks)
         self.stage_embed = nn.Embedding(max_stages, hidden_dim)
@@ -733,6 +743,17 @@ class WAM4VA(nn.Module):
                 if predictor == "st_blocks"
                 else None
             )
+            self.st_predictor_extra = nn.ModuleList(
+                _DeepWorldPredictor(
+                    dino_dim,
+                    width=predictor_width,
+                    depth=predictor_depth,
+                    num_heads=predictor_heads,
+                    map_frames=map_frames,
+                    map_size=map_size,
+                )
+                for _ in range(predictor_copies - 1)
+            )
         else:
             self.cond_to_dino = None
             self.dino_pred = None
@@ -756,6 +777,7 @@ class WAM4VA(nn.Module):
             self.belief_to_pred = None
             self.fused_to_pred = None
             self.st_predictor = None
+            self.st_predictor_extra = nn.ModuleList()
         self.innov_overlap = 0.5
 
     def has_action_shaped_head(self, action_dim: int) -> bool:
@@ -867,6 +889,9 @@ class WAM4VA(nn.Module):
         task_summary: Tensor,
         env_tokens: Tensor | None,
         env_flat: Tensor,
+        *,
+        progress_state: Tensor | None = None,
+        progress_task_summary: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         state = proprio.to(dtype=env_flat.dtype)
         belief_pool = belief.mean(dim=1)
@@ -896,8 +921,22 @@ class WAM4VA(nn.Module):
             span_latents.append(head(fused))
             fused_sum = fused_sum + fused
         z_spans = torch.stack(span_latents, dim=1)
-        progress = self.progress_head(torch.cat((belief_pool, task_summary), dim=-1))
+        progress = self.score_progress(
+            belief_pool if progress_state is None else progress_state,
+            task_summary if progress_task_summary is None else progress_task_summary,
+        )
         return fused_sum / max(self.n_spans, 1), z_spans, progress, belief_pool
+
+    def score_progress(self, state: Tensor, task_summary: Tensor) -> Tensor:
+        """Score a current state under a language goal with the existing 4-D head."""
+        if state.shape != task_summary.shape or state.shape[-1] != self.hidden_dim:
+            raise ValueError(
+                "progress state/task must share shape [B, hidden], got "
+                f"{tuple(state.shape)} and {tuple(task_summary.shape)}"
+            )
+        return self.progress_head(
+            torch.cat((state, state * torch.tanh(task_summary)), dim=-1)
+        )
 
     def encode_dino_clip(self, dino_tokens: Tensor) -> Tensor | None:
         """All T frames as [B, T, D, map_size, map_size]. Untrained reshape/pool."""
@@ -952,6 +991,9 @@ class WAM4VA(nn.Module):
         dino_tokens: Tensor | None = None,
         env_action: Tensor | None = None,
         previous_map: Tensor | None = None,
+        stage_index: int = 0,
+        progress_state: Tensor | None = None,
+        progress_task_summary: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
         """Predict the P-step-later DINO map from exactly P executable actions."""
         if env_action is None:
@@ -964,7 +1006,13 @@ class WAM4VA(nn.Module):
                 device=action.device,
             )
         fused, z_spans, progress, _ = self._world_condition(
-            proprio, belief, task_summary, env_tokens, env_flat
+            proprio,
+            belief,
+            task_summary,
+            env_tokens,
+            env_flat,
+            progress_state=progress_state,
+            progress_task_summary=progress_task_summary,
         )
         if dino_tokens is None or (
             self.st_predictor is None and self.map_dw1 is None and self.dino_pred is None
@@ -980,6 +1028,15 @@ class WAM4VA(nn.Module):
             )
         clip = self.encode_dino_clip(dino_tokens)
         if clip is not None and self.st_predictor is not None:
+            predictor_index = min(
+                int(stage_index) * self.predictor_copies // self.max_stages,
+                self.predictor_copies - 1,
+            )
+            stage_predictor = (
+                self.st_predictor
+                if predictor_index == 0
+                else self.st_predictor_extra[predictor_index - 1]
+            )
             cond_parts = [
                 self.belief_to_pred(belief),
                 self.fused_to_pred(fused)[:, None, :],
@@ -989,14 +1046,14 @@ class WAM4VA(nn.Module):
             cond = torch.cat(cond_parts, dim=1)
             if self.training:
                 z_map = torch.utils.checkpoint.checkpoint(
-                    self.st_predictor,
+                    stage_predictor,
                     clip,
                     cond,
                     previous_map,
                     use_reentrant=False,
                 )
             else:
-                z_map = self.st_predictor(clip, cond, previous_map)
+                z_map = stage_predictor(clip, cond, previous_map)
             world_tokens = self.encode_world_tokens(z_map)
             kv = self.map_readout(world_tokens)
             query = self.z_query[None].expand(action.shape[0], -1, -1)
@@ -1132,6 +1189,7 @@ class WAM4VA(nn.Module):
         )
 
         language_context = None
+        progress_task_summary = None
         if self.full_language_tokens:
             if language_keys is not None:
                 raise ValueError(
@@ -1160,6 +1218,12 @@ class WAM4VA(nn.Module):
             projected_language = self.language_projection(
                 self.language_norm(raw_language)
             )
+            progress_mask = language_mask.to(
+                device=action.device, dtype=projected_language.dtype
+            )
+            progress_task_summary = (
+                projected_language * progress_mask[:, :, None]
+            ).sum(dim=1) / progress_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
             world_queries = belief + stage_cond
             language_context = self.language_read(
                 world_queries,
@@ -1190,6 +1254,13 @@ class WAM4VA(nn.Module):
                 language_keys.to(dtype=action.dtype),
             )
             task_summary = task_tokens.mean(dim=1)
+            progress_task_summary = task_summary
+
+        if progress_task_summary is None:
+            progress_task_summary = task_summary
+        progress_state = evidence.mean(dim=1) + self.world_from_state(
+            proprio.to(dtype=evidence.dtype)
+        )
 
         conditioned = belief + stage_cond
         if language_context is not None:
@@ -1203,6 +1274,9 @@ class WAM4VA(nn.Module):
             dino_tokens=dino_tokens,
             env_action=env_action,
             previous_map=previous_map,
+            stage_index=stage,
+            progress_state=progress_state,
+            progress_task_summary=progress_task_summary,
         )
         world_tokens = None
         if (
@@ -1246,6 +1320,8 @@ class WAM4VA(nn.Module):
             ),
             world_tokens=world_tokens,
             predict_belief=predict_belief,
+            progress_state=progress_state,
+            progress_task_summary=progress_task_summary,
         )
         return aux, belief, innovation
 

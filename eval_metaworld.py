@@ -67,6 +67,11 @@ from va_compound.metric_roi import (
     refine_metric_roi_positions,
     refine_metric_roi_positions_dino,
 )
+from scripts.mt50_difficulty import (
+    MT50_BENCHMARK_TASK_TO_GROUP,
+    canonical_mt50_benchmark_env,
+    summarize_mt50_benchmark_trials,
+)
 
 IMAGE_MEAN = torch.tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1)
 IMAGE_STD = torch.tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1)
@@ -142,6 +147,59 @@ def select_eval_tasks(
     return [(index, all_tasks[index]) for index in indices]
 
 
+def validate_language_features(
+    features: dict[str, Any], language_features: dict[str, Any]
+) -> None:
+    """Require the compact language cache to share the evaluation normalization."""
+    normal = features.get("normalization") or {}
+    language_normal = language_features.get("normalization") or {}
+    if not normal or normal.keys() != language_normal.keys() or any(
+        not isinstance(normal[key], torch.Tensor)
+        or not isinstance(language_normal[key], torch.Tensor)
+        or not torch.equal(normal[key], language_normal[key])
+        for key in normal
+    ):
+        raise ValueError("--language-features normalization differs from --features")
+    tasks = list((language_features.get("metadata") or {}).get("tasks") or [])
+    if not tasks or len(set(tasks)) != len(tasks):
+        raise ValueError("--language-features must contain unique metadata.tasks")
+    raw_instruction_id = language_features.get("instruction_id")
+    if not isinstance(raw_instruction_id, torch.Tensor):
+        raise ValueError("--language-features is missing tensor instruction_id")
+    instruction_id = raw_instruction_id.to(dtype=torch.long).reshape(-1)
+    if set(instruction_id.tolist()) != set(range(len(tasks))):
+        raise ValueError("--language-features must cover every metadata task id")
+
+
+def validate_mt50_benchmark_protocol(
+    args: argparse.Namespace,
+    selected_tasks: list[tuple[int, str]],
+    descriptions_to_env: dict[str, str],
+) -> None:
+    """Fail fast before rollout when the formal EvoMind-compatible contract drifts."""
+    if not args.mt50_benchmark:
+        return
+    selected_envs = {
+        canonical_mt50_benchmark_env(str(descriptions_to_env.get(text, "")))
+        for _, text in selected_tasks
+    }
+    requirements = {
+        "50 canonical tasks": selected_envs == set(MT50_BENCHMARK_TASK_TO_GROUP),
+        "10 trials per task": args.trials_per_task == 10,
+        "400-step horizon": args.horizon == 400,
+        "H15 execution": (
+            args.execution_horizon == 15
+            and not args.allow_execution_horizon_ablation
+        ),
+        "shared reset seeds 4042-4051": args.episode_seed_base == 4042,
+        "structured output": args.output_json is not None,
+        "unaligned environment resets": not args.align_init,
+    }
+    failed = [name for name, ok in requirements.items() if not ok]
+    if failed:
+        raise ValueError("MT50 benchmark protocol failed: " + ", ".join(failed))
+
+
 METAWORLD_TASK_CONFIG = (
     Path(__file__).resolve().parent / "metaworld_config.json"
     if (Path(__file__).resolve().parent / "metaworld_config.json").is_file()
@@ -161,7 +219,15 @@ def load_metaworld_description_to_env(path: Path = METAWORLD_TASK_CONFIG) -> dic
     descriptions = config.get("TASK_DESCRIPTIONS")
     if not isinstance(descriptions, dict) or not descriptions:
         raise ValueError(f"{resolved} has no TASK_DESCRIPTIONS")
-    return {str(value): str(key) for key, value in descriptions.items()}
+    mapping = {str(value): str(key) for key, value in descriptions.items()}
+    # Native MetaWorld gives push-v3 and push-back-v3 the same description.
+    # The recovered MT50 source deliberately names push-back "Pull..." so the
+    # two task ids remain unambiguous.
+    if "push-v3" in descriptions:
+        mapping[str(descriptions["push-v3"])] = "push-v3"
+    if "push-back-v3" in descriptions:
+        mapping["Pull a puck to a goal"] = "push-back-v3"
+    return mapping
 
 
 def require_task35_peg_insert_side(
@@ -181,8 +247,12 @@ def require_task35_peg_insert_side(
     return env_name
 
 
-def evaluation_episode_seed(global_task_id: int, trial: int) -> int:
-    """Stable seed independent of task subset/order."""
+def evaluation_episode_seed(
+    global_task_id: int, trial: int, *, base_seed: int | None = None
+) -> int:
+    """Use a shared benchmark reset sequence or the legacy task-specific sequence."""
+    if base_seed is not None:
+        return int(base_seed) + int(trial)
     return 1000 * int(global_task_id) + int(trial)
 
 
@@ -209,6 +279,135 @@ def parse_trial_range(spec: str | None, trials_per_task: int) -> tuple[int, int]
 
 
 TASK35_EVAL50_SEEDS = tuple(range(35000, 35050))
+MT50_FORMAL_SEEDS = tuple(range(4042, 4052))
+DAGGER_POST_SUCCESS_STEPS = 60
+
+
+def dagger_takeover_step(
+    task_id: int,
+    episode_seed: int,
+    minimum: int,
+    maximum: int,
+    *,
+    stride: int = 15,
+) -> int:
+    """Choose a reproducible plan-boundary takeover without touching global RNG."""
+    if stride < 1 or minimum < 0 or maximum < minimum:
+        raise ValueError("invalid DAgger takeover range/stride")
+    first = ((int(minimum) + stride - 1) // stride) * stride
+    last = (int(maximum) // stride) * stride
+    if first > last:
+        raise ValueError("DAgger takeover range contains no plan boundary")
+    choices = range(first, last + 1, stride)
+    digest = hashlib.sha256(f"{task_id}:{episode_seed}:dagger".encode()).digest()
+    return choices[int.from_bytes(digest[:8], "little") % len(choices)]
+
+
+def build_dagger_episode(
+    *,
+    episode_seed: int,
+    takeover_step: int,
+    prefix_keep: int,
+    frames: list[np.ndarray],
+    actions: list[np.ndarray],
+    states: list[np.ndarray],
+    action_success: list[bool],
+    action_source: list[str],
+    metric_state: list[np.ndarray] | None = None,
+    metric_state_valid: list[bool] | None = None,
+) -> dict[str, Any] | None:
+    """Trim one model-prefix/expert-suffix rollout into the raw v2 contract."""
+    lengths = {
+        len(frames), len(actions), len(states), len(action_success), len(action_source)
+    }
+    if len(lengths) != 1:
+        raise ValueError(f"DAgger rollout timeline mismatch: {sorted(lengths)}")
+    if prefix_keep < 0 or takeover_step < 0:
+        raise ValueError("invalid DAgger prefix/takeover")
+    if takeover_step >= len(actions):
+        return None
+    succeeded = np.flatnonzero(np.asarray(action_success, dtype=bool))
+    if not len(succeeded) or int(succeeded[0]) < takeover_step:
+        return None
+
+    first_success_abs = int(succeeded[0])
+    trim = max(0, int(takeover_step) - int(prefix_keep))
+    first_success = first_success_abs - trim
+    takeover = int(takeover_step) - trim
+    n = len(actions) - trim
+    frame_valid = np.ones(n, dtype=bool)
+    action_executed = np.ones(n, dtype=bool)
+    supervision = np.zeros(n, dtype=bool)
+    supervision[takeover:first_success + 1] = True
+    recovery = supervision.copy()
+    settle = np.zeros(n, dtype=bool)
+    event = {
+        "start": takeover,
+        "end": takeover,
+        "kind": "current_policy_takeover",
+        "magnitude_m": 0.0,
+        "magnitude_mm": 0.0,
+        "applied": True,
+    }
+    episode: dict[str, Any] = {
+        "episode_seed": int(episode_seed),
+        "frames": np.stack(frames[trim:]),
+        "actions": np.asarray(actions[trim:], dtype=np.float32),
+        "states": np.asarray(states[trim:], dtype=np.float32),
+        "first_success": first_success,
+        "success_frame": first_success,
+        "action_success": np.asarray(action_success[trim:], dtype=bool),
+        "frame_valid": frame_valid,
+        "action_executed": action_executed,
+        "action_source": action_source[trim:],
+        "settle_mask": settle,
+        "action_valid": supervision,
+        "action_supervision_valid": supervision,
+        "recovery_mask": recovery,
+        "perturbed": True,
+        "n_perturb_events": 1,
+        "perturb_start": takeover,
+        "perturb_end": takeover,
+        "perturb_kind": "current_policy_takeover",
+        "perturb_magnitude": 0.0,
+        "perturb_magnitude_mm": 0.0,
+        "perturb_event": event,
+        "dagger_model_prefix_steps": takeover,
+        "dagger_takeover_step": int(takeover_step),
+    }
+    if metric_state is not None:
+        if metric_state_valid is None or len(metric_state) != len(actions):
+            raise ValueError("DAgger metric timeline mismatch")
+        episode["metric_state"] = np.asarray(metric_state[trim:], dtype=np.float32)
+        episode["metric_state_valid"] = np.asarray(
+            metric_state_valid[trim:], dtype=bool
+        )
+    return episode
+
+
+def validate_dagger_args(args: argparse.Namespace) -> None:
+    if args.dagger_output_dir is None:
+        return
+    if args.episode_seed_base is None:
+        raise ValueError("--dagger-output-dir requires --episode-seed-base")
+    if args.peer_eval_trace:
+        raise ValueError("DAgger collection is incompatible with --peer-eval-trace")
+    if args.dagger_prefix_keep < 0:
+        raise ValueError("--dagger-prefix-keep must be non-negative")
+    # Never train on either formal acceptance split.
+    requested = set(
+        range(args.episode_seed_base, args.episode_seed_base + args.trials_per_task)
+    )
+    protected = set(MT50_FORMAL_SEEDS) | set(TASK35_EVAL50_SEEDS)
+    overlap = sorted(requested & protected)
+    if overlap:
+        raise ValueError(f"DAgger seeds overlap protected evaluation seeds: {overlap}")
+    dagger_takeover_step(
+        0,
+        args.episode_seed_base,
+        args.dagger_takeover_min,
+        args.dagger_takeover_max,
+    )
 
 
 def cached_task_language(
@@ -1064,7 +1263,11 @@ def _peer_world_trace_stages(model: Any) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     with torch.no_grad():
         for stage, pre_action, aux in zip(stages, pre_actions, auxes, strict=True):
-            readout = model.world_action_readout(pre_action)
+            readout = model.world_action_readout(
+                pre_action[:, : model.wmrm.cycle_steps]
+                if model.config.action_horizon == 50
+                else pre_action
+            )
             operative = getattr(aux, "env_action", None)
             if operative is None or tuple(operative.shape) != tuple(readout.shape):
                 raise RuntimeError(
@@ -1095,7 +1298,9 @@ def _peer_trace_stage_metrics(
     for ordinal, record in enumerate(stages):
         readout = np.asarray(record["readout"], dtype=float)
         operative = np.asarray(record["operative"], dtype=float)
-        operative_vs_flow = _action_trace_metrics(operative, flow)
+        operative_vs_flow = _action_trace_metrics(
+            operative, np.asarray(flow)[: operative.shape[0]]
+        )
         readout_vs_operative = _action_trace_metrics(readout, operative)
         result.append(
             {
@@ -1281,6 +1486,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Closed-loop MetaWorld MT50 eval")
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--features", type=Path, required=True, help="metaworld_features.pt for normalization")
+    parser.add_argument(
+        "--language-features",
+        type=Path,
+        default=None,
+        help="Optional compact task/language cache. Use the MT50 cache to append "
+        "push-back while --features keeps the frozen normalization/cadence.",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--vision-pooling",
@@ -1379,6 +1591,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--trials-per-task", type=int, default=10)
     parser.add_argument(
+        "--episode-seed-base",
+        type=int,
+        default=None,
+        help="Use the shared reset sequence BASE..BASE+trials-1 for every task. "
+        "Formal MT50 acceptance uses 4042; omitted preserves legacy task-specific seeds.",
+    )
+    parser.add_argument(
         "--trial-range",
         type=str,
         default=None,
@@ -1399,7 +1618,21 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Atomically write per-trial success/stage telemetry and aggregate CI.",
     )
-    parser.add_argument("--max-tasks", type=int, default=49)
+    parser.add_argument(
+        "--dagger-output-dir",
+        type=Path,
+        default=None,
+        help="Collect current-policy states followed by scripted-expert takeover.",
+    )
+    parser.add_argument("--dagger-takeover-min", type=int, default=45)
+    parser.add_argument("--dagger-takeover-max", type=int, default=120)
+    parser.add_argument(
+        "--dagger-prefix-keep",
+        type=int,
+        default=45,
+        help="Model-controlled steps retained before expert takeover.",
+    )
+    parser.add_argument("--max-tasks", type=int, default=50)
     parser.add_argument(
         "--task-ids",
         type=str,
@@ -1418,9 +1651,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--horizon",
         type=int,
-        default=500,
-        help="每 episode 最大步数。数据/环境上限 500 步（10/49 任务专家轨迹达 500 步），"
-        "400 会截断这些任务低估成功率",
+        default=400,
+        help="每 episode 最大步数；400 与 Evo-1/FabriVLA MT50 报告口径一致。"
+        "旧诊断若需要环境上限须显式传 500。",
+    )
+    parser.add_argument(
+        "--mt50-benchmark",
+        action="store_true",
+        help="严格要求 50 tasks × 10 trials、400 steps、共享 seeds 4042..4051，"
+        "并输出 EvoMind 四难度桶等权平均。",
     )
     parser.add_argument(
         "--align-init",
@@ -2655,9 +2894,11 @@ def main() -> None:
     args = parse_args()
     if args.flow_samples < 1:
         raise ValueError("--flow-samples must be >= 1")
+    validate_dagger_args(args)
     torch.manual_seed(0)  # 固定 flow 采样噪声（口径要求：重跑可复现，2026-08-05 审查补充）
     device = torch.device(args.device)
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+    ckpt.pop("optimizer_state", None)
     config = VACompoundConfig(**ckpt["config"])
     args.execution_horizon = resolve_execution_horizon(args, config)
     checkpoint_deployment_horizon = int(
@@ -3139,6 +3380,17 @@ def main() -> None:
     )
 
     features = torch.load(args.features, map_location="cpu", weights_only=True)
+    language_features = features
+    if args.language_features is not None:
+        language_features = torch.load(
+            args.language_features, map_location="cpu", weights_only=True
+        )
+        validate_language_features(features, language_features)
+        print(
+            f"eval: task/language cache = {args.language_features} "
+            f"({len(language_features['metadata']['tasks'])} tasks)",
+            flush=True,
+        )
     feature_metadata = features.get("metadata") or {}
     try:
         training_control_stride = int(feature_metadata["control_stride"])
@@ -3157,7 +3409,14 @@ def main() -> None:
         )
     except (TypeError, ValueError) as exc:
         raise ValueError("feature metadata planning_stride must be an integer") from exc
-    if training_prediction_horizon != config.action_horizon:
+    h50_p15 = (
+        int(config.action_horizon) == 50
+        and training_prediction_horizon == 15
+        and int(getattr(config, "planning_stride", 0)) == 15
+        and int(getattr(config, "deployment_execution_horizon", 0)) == 15
+        and int(getattr(config, "wmrm_cycle_steps", 0)) == 15
+    )
+    if training_prediction_horizon != config.action_horizon and not h50_p15:
         raise ValueError(
             "feature/checkpoint action horizon mismatch: "
             f"{training_prediction_horizon} != {config.action_horizon}"
@@ -3196,7 +3455,7 @@ def main() -> None:
                 training_prediction_horizon,
             ),
             "action_horizon": (
-                training_prediction_horizon,
+                int(getattr(config, "action_horizon", 0)),
                 int(getattr(config, "action_horizon", 0)),
             ),
         }
@@ -3216,19 +3475,24 @@ def main() -> None:
         f"fps={control_hz}, training_stride={checkpoint_planning_stride}, "
         f"training_hz={training_planning_hz:g}, "
         f"deployment_hz={deployment_planning_hz:g}, "
-        f"prediction_horizon={training_prediction_horizon}, "
+        f"prediction_horizon={int(config.action_horizon)}, "
         f"execution_horizon={args.execution_horizon}, "
         f"checkpoint_execution_horizon={checkpoint_deployment_horizon}, "
         f"execution_ablation={int(args.allow_execution_horizon_ablation)}"
     )
+    all_tasks = list(language_features["metadata"]["tasks"])
+    selected_tasks = select_eval_tasks(all_tasks, args.task_ids, args.max_tasks)
+    if not selected_tasks:
+        raise ValueError("no tasks selected for evaluation")
+    task_indices = [index for index, _ in selected_tasks]
+    tasks = [text for _, text in selected_tasks]
+    descriptions_to_env = load_metaworld_description_to_env()
+    validate_mt50_benchmark_protocol(args, selected_tasks, descriptions_to_env)
     if args.task35_precision_contract or args.task35_causal_ablation != "none":
-        all_tasks = features["metadata"]["tasks"]
-        selected_early = select_eval_tasks(all_tasks, args.task_ids, args.max_tasks)
-        descriptions_to_env = load_metaworld_description_to_env()
-        env_name = require_task35_peg_insert_side(selected_early, descriptions_to_env)
+        env_name = require_task35_peg_insert_side(selected_tasks, descriptions_to_env)
         print(
             f"eval: preflight task35 -> {env_name} "
-            f"(id=35, text={selected_early[0][1]!r})",
+            f"(id=35, text={selected_tasks[0][1]!r})",
             flush=True,
         )
     sq01 = features["normalization"]["state_q01"].numpy()
@@ -3272,6 +3536,17 @@ def main() -> None:
             checkpoint_path=main_checkpoint,
             local_files_only=True,
         )
+        if policy_contract.get("main_vision_joint_trained"):
+            trained_main_state = ckpt.get("main_vision_state_dict")
+            if trained_main_state is None:
+                raise ValueError(
+                    "checkpoint declares trained DINO-main but lacks "
+                    "main_vision_state_dict"
+                )
+            main_vision_backbone.model.load_state_dict(
+                trained_main_state, strict=True
+            )
+            print("eval: loaded trained DINO-main state from checkpoint")
         main_vision_backbone.freeze_all()
         print(
             f"eval: DINO-main frozen {config.main_vision_backbone} replaces "
@@ -3439,27 +3714,23 @@ def main() -> None:
         compiler.load_state_dict(ckpt["semantic_compiler"])
         compiler.eval()
         print("eval: semantic_compiler loaded from checkpoint")
-    all_tasks = features["metadata"]["tasks"]
-    selected_tasks = select_eval_tasks(all_tasks, args.task_ids, args.max_tasks)
-    if not selected_tasks:
-        raise ValueError("no tasks selected for evaluation")
-    task_indices = [index for index, _ in selected_tasks]
-    tasks = [text for _, text in selected_tasks]
     can_use_feature_language = (
         not has_plan
         and not ckpt.get("qwen_state_dict")
         and not ckpt.get("lora")
         and not config.scene_teacher
-        and "language_hidden" in features
-        and "language_mask" in features
-        and "instruction_id" in features
+        and "language_hidden" in language_features
+        and "language_mask" in language_features
+        and "instruction_id" in language_features
     )
     text_backbone = None
     if can_use_feature_language:
         hidden_rows = []
         mask_rows = []
         for task_id, _ in selected_tasks:
-            hid, msk = cached_task_language(features, device, task_id=int(task_id))
+            hid, msk = cached_task_language(
+                language_features, device, task_id=int(task_id)
+            )
             hidden_rows.append(hid)
             mask_rows.append(msk)
         hidden = torch.cat(hidden_rows, dim=0)
@@ -3510,9 +3781,14 @@ def main() -> None:
 
     import metaworld
 
-    # 任务映射：数据 metadata.tasks 是任务描述（TASK_DESCRIPTIONS 的 value），
-    # 反查 lerobot 采集同款 env_name（metaworld_config.json，与 Evoagent 封装一致）
-    descriptions_to_env = load_metaworld_description_to_env()
+    dagger_compress_frames: Callable[[np.ndarray], list[bytes]] | None = None
+    dagger_get_policy: Callable[[str], Any] | None = None
+    if args.dagger_output_dir is not None:
+        from scripts.collect_long_trajectories import compress_frames, get_policy
+
+        dagger_compress_frames = compress_frames
+        dagger_get_policy = get_policy
+        args.dagger_output_dir.mkdir(parents=True, exist_ok=True)
 
     per_task = {}
     trial_records: list[dict[str, Any]] = []
@@ -3520,6 +3796,7 @@ def main() -> None:
     trial_start, trial_stop = parse_trial_range(
         args.trial_range, args.trials_per_task
     )
+    trials_in_shard = trial_stop - trial_start
     if (trial_start, trial_stop) != (0, args.trials_per_task):
         print(
             f"eval: trial shard [{trial_start}, {trial_stop}) of "
@@ -3543,9 +3820,28 @@ def main() -> None:
         env.set_task(mt1.train_tasks[0])
         env.model.cam_pos[2] = [0.75, 0.075, 0.7]  # corner2 位置（lerobot 采集同款）
         env._freeze_rand_vec = False
+        dagger_episodes: list[dict[str, Any]] = []
+        dagger_policy = (
+            None if dagger_get_policy is None else dagger_get_policy(env_name)
+        )
+        dagger_path = (
+            None
+            if args.dagger_output_dir is None
+            else args.dagger_output_dir
+            / (
+                f"metaworld_longtraj_{env_name}_dagger_"
+                f"seed{args.episode_seed_base}_t{trial_start}-{trial_stop}.pt"
+            )
+        )
+        if dagger_path is not None and dagger_path.exists():
+            raise FileExistsError(f"refusing to overwrite DAgger data: {dagger_path}")
         wins = 0
         for trial in range(trial_start, trial_stop):
-            episode_seed = evaluation_episode_seed(global_task_index, trial)
+            episode_seed = evaluation_episode_seed(
+                global_task_index,
+                trial,
+                base_seed=args.episode_seed_base,
+            )
             # MetaWorld v3 的 reset_model 在部分版本仍读全局 NumPy RNG；
             # 仅传 env.reset(seed=...) 不足以固定任务布局。显式同步后，基线与
             # 候选的同一 trial 才是真正同初态配对。
@@ -3607,6 +3903,24 @@ def main() -> None:
             active_peer_decision: dict[str, Any] | None = None
             last_env_info: dict[str, Any] = {}
             plan_queue = SynchronousPlanQueue(args.execution_horizon)
+            takeover_step = (
+                None
+                if dagger_policy is None
+                else dagger_takeover_step(
+                    global_task_index,
+                    episode_seed,
+                    args.dagger_takeover_min,
+                    args.dagger_takeover_max,
+                )
+            )
+            dagger_frames: list[np.ndarray] = []
+            dagger_actions: list[np.ndarray] = []
+            dagger_states: list[np.ndarray] = []
+            dagger_action_success: list[bool] = []
+            dagger_action_source: list[str] = []
+            dagger_metric_state: list[np.ndarray] = []
+            dagger_metric_valid: list[bool] = []
+            dagger_first_success_step: int | None = None
             plan_step = None  # C²/伺服：上次规划的原始步
             c2_token = 0  # C²/伺服：自规划以来消费的 token 索引
             c2_params = None  # C²：缓存的 {ū, c̄, K}
@@ -4250,7 +4564,7 @@ def main() -> None:
                         )
                         if getattr(model, "wmrm", None) is not None:
                             expected_world_horizon = (
-                                int(config.action_horizon)
+                                int(config.wmrm_cycle_steps)
                                 if peer_checkpoint
                                 else EXPECTED_WMRM_WORLD_HORIZON
                             )
@@ -4506,6 +4820,43 @@ def main() -> None:
                     norm_action = np.clip(plan_queue.action_at(step), -1.0, 1.0)
 
                 action = norm_action * (aq99 - aq01) / 2 + (aq99 + aq01) / 2
+                if takeover_step is not None and step >= takeover_step:
+                    action = np.clip(
+                        np.asarray(dagger_policy.get_action(obs), dtype=np.float32),
+                        -1.0,
+                        1.0,
+                    )
+                    scale = np.asarray(aq99 - aq01, dtype=np.float32)
+                    norm_action = np.clip(
+                        2.0 * (action - aq01) / scale - 1.0,
+                        -1.0,
+                        1.0,
+                    )
+                if takeover_step is not None:
+                    dagger_frames.append(np.asarray(img, dtype=np.uint8))
+                    dagger_actions.append(np.asarray(action, dtype=np.float32).copy())
+                    dagger_states.append(np.asarray(obs[:4], dtype=np.float32).copy())
+                    dagger_action_source.append(
+                        "expert_takeover" if step >= takeover_step else "current_policy"
+                    )
+                    if env_name == "door-lock-v3":
+                        lock_pos = np.asarray(obs[4:7], dtype=np.float32)
+                        lock_target = np.asarray(
+                            getattr(env, "_target_pos", np.full(3, np.nan)),
+                            dtype=np.float32,
+                        ).reshape(-1)[:3]
+                        valid_metric = (
+                            lock_pos.shape == (3,)
+                            and lock_target.shape == (3,)
+                            and np.isfinite(lock_pos).all()
+                            and np.isfinite(lock_target).all()
+                        )
+                        dagger_metric_state.append(
+                            np.concatenate((lock_pos, lock_target))
+                            if valid_metric
+                            else np.zeros(6, dtype=np.float32)
+                        )
+                        dagger_metric_valid.append(bool(valid_metric))
                 pre_tcp = (
                     np.asarray(env.tcp_center, dtype=float).reshape(3).copy()
                     if args.peer_eval_trace
@@ -4517,6 +4868,8 @@ def main() -> None:
                     else None
                 )
                 obs, reward, terminated, truncated, info = env.step(action)
+                if takeover_step is not None:
+                    dagger_action_success.append(bool(info.get("success")))
                 if args.peer_eval_trace:
                     if active_peer_decision is None or plan_queue.plan is None:
                         raise RuntimeError("peer trace token has no active decision plan")
@@ -4558,14 +4911,50 @@ def main() -> None:
                         stage_metrics["best_obj_step"] = step
                 if info.get("success"):
                     success = True
+                    if takeover_step is None or step < takeover_step:
+                        break
+                    if dagger_first_success_step is None:
+                        dagger_first_success_step = step
+                if (
+                    dagger_first_success_step is not None
+                    and step - dagger_first_success_step >= DAGGER_POST_SUCCESS_STEPS
+                ):
                     break
                 if terminated or truncated:
                     break
+            dagger_collected = False
+            if takeover_step is not None:
+                episode = build_dagger_episode(
+                    episode_seed=episode_seed,
+                    takeover_step=takeover_step,
+                    prefix_keep=args.dagger_prefix_keep,
+                    frames=dagger_frames,
+                    actions=dagger_actions,
+                    states=dagger_states,
+                    action_success=dagger_action_success,
+                    action_source=dagger_action_source,
+                    metric_state=(
+                        dagger_metric_state if env_name == "door-lock-v3" else None
+                    ),
+                    metric_state_valid=(
+                        dagger_metric_valid if env_name == "door-lock-v3" else None
+                    ),
+                )
+                if episode is not None:
+                    if dagger_compress_frames is None:
+                        raise RuntimeError("DAgger frame compressor was not loaded")
+                    episode["frames"] = dagger_compress_frames(episode["frames"])
+                    dagger_episodes.append(episode)
+                    dagger_collected = True
             wins += int(success)
             completed_trials += 1
             record: dict[str, Any] = {
                 "task_id": int(global_task_index),
                 "task": task_text,
+                "env_name": env_name,
+                "difficulty": MT50_BENCHMARK_TASK_TO_GROUP.get(
+                    canonical_mt50_benchmark_env(env_name)
+                ),
                 "trial": int(trial),
                 "seed": int(episode_seed),
                 "success": bool(success),
@@ -4583,6 +4972,9 @@ def main() -> None:
                 record["action_chunks"] = recorded_chunks
             if args.peer_eval_trace:
                 record["peer_eval_trace"] = peer_eval_trace
+            if takeover_step is not None:
+                record["dagger_takeover_step"] = int(takeover_step)
+                record["dagger_collected"] = bool(dagger_collected)
             trial_records.append(record)
             print(
                 f"trial task={global_task_index} trial={trial} seed={episode_seed} "
@@ -4600,7 +4992,41 @@ def main() -> None:
                     flush=True,
                 )
         per_task[task_text[:40]] = wins
-        print(f"task {task_text[:40]}: {wins}/{args.trials_per_task}")
+        print(f"task {task_text[:40]}: {wins}/{trials_in_shard}")
+        if dagger_path is not None:
+            payload = {
+                "episodes": dagger_episodes,
+                "task": env_name,
+                "n_episodes": len(dagger_episodes),
+                "normalization": dict(features["normalization"]),
+                "metadata": {
+                    "contract": "current_policy_dagger_v1",
+                    "fps": int(control_hz),
+                    "control_stride": 1,
+                    "checkpoint": str(args.checkpoint.expanduser().resolve()),
+                    "episode_seed_base": int(args.episode_seed_base),
+                    "trial_range": [int(trial_start), int(trial_stop)],
+                    "takeover_range": [
+                        int(args.dagger_takeover_min),
+                        int(args.dagger_takeover_max),
+                    ],
+                    "prefix_keep": int(args.dagger_prefix_keep),
+                    "post_success_steps": DAGGER_POST_SUCCESS_STEPS,
+                    "supervision_contract": (
+                        "current-policy prefix invalid; scripted-expert suffix valid "
+                        "through first success"
+                    ),
+                },
+            }
+            temporary = dagger_path.with_suffix(dagger_path.suffix + ".tmp")
+            if temporary.exists():
+                raise FileExistsError(f"stale DAgger temporary output: {temporary}")
+            torch.save(payload, temporary)
+            temporary.replace(dagger_path)
+            print(
+                f"DAgger saved: {dagger_path} ({len(dagger_episodes)} episodes)",
+                flush=True,
+            )
         env.close()
 
     if args.task35_precision_contract:
@@ -4631,7 +5057,7 @@ def main() -> None:
     ci_low = None
     ci_high = None
     if per_task:
-        scores = np.asarray([w / args.trials_per_task for w in per_task.values()])
+        scores = np.asarray([w / trials_in_shard for w in per_task.values()])
         if len(scores) == 1:
             # 单任务无法按 task bootstrap：唯一 task 被重复抽样只会产生 [p,p]
             # 的伪窄区间。此时不确定性单位应是独立 trial，使用 Wilson 区间。
@@ -4657,6 +5083,19 @@ def main() -> None:
                 f"[95% task-bootstrap CI: {lo:.1%}, {hi:.1%}] "
                 f"(n_tasks={len(scores)})"
             )
+    mt50_benchmark = summarize_mt50_benchmark_trials(trial_records)
+    if mt50_benchmark["complete_mt50"]:
+        print("MT50 DIFFICULTY BUCKETS:")
+        for name, values in mt50_benchmark["groups"].items():
+            print(
+                f"  {name}: {values['success_rate']:.1%} "
+                f"({values['successes']}/{values['trials']}, "
+                f"n_tasks={values['n_tasks']})"
+            )
+        print(
+            f"EVOMIND FOUR-TIER AVERAGE: "
+            f"{mt50_benchmark['bucket_average']:.1%}"
+        )
     if args.output_json is not None:
         import json
 
@@ -4665,8 +5104,19 @@ def main() -> None:
             "checkpoint": str(args.checkpoint.expanduser().resolve()),
             "checkpoint_sha256": _sha256_file(args.checkpoint.expanduser().absolute()),
             "features": str(args.features.expanduser().resolve()),
+            "language_features": (
+                None
+                if args.language_features is None
+                else str(args.language_features.expanduser().resolve())
+            ),
             "task_ids": [int(index) for index, _ in selected_tasks],
             "trials_per_task": int(args.trials_per_task),
+            "episode_seed_base": args.episode_seed_base,
+            "seed_protocol": (
+                "shared_base_plus_trial"
+                if args.episode_seed_base is not None
+                else "legacy_task_times_1000_plus_trial"
+            ),
             "completed_trials": int(completed_trials),
             "successes": int(total),
             "success_rate": float(total / trials),
@@ -4676,6 +5126,7 @@ def main() -> None:
                 "low_95": None if ci_low is None else float(ci_low),
                 "high_95": None if ci_high is None else float(ci_high),
             },
+            "mt50_benchmark": mt50_benchmark,
             "execute_steps": int(args.execution_horizon),
             "prediction_horizon": int(config.action_horizon),
             "execution_horizon": int(args.execution_horizon),

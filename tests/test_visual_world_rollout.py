@@ -8,7 +8,11 @@ import pytest
 import torch
 
 import train as train_module
-from train import prepare_visual_world_action_ranking, rollout_policy
+from train import (
+    cross_trajectory_progress_potential_loss,
+    prepare_visual_world_action_ranking,
+    rollout_policy,
+)
 from va_compound.model import VACompoundConfig, VACompoundPolicy
 from va_compound.world_supervision import (
     ActionTop10GapLoss,
@@ -17,7 +21,12 @@ from va_compound.world_supervision import (
 
 
 def _tiny_world_model(
-    *, va_world_mode: str = "legacy", num_layers: int = 2
+    *,
+    va_world_mode: str = "legacy",
+    num_layers: int = 2,
+    wmrm_predictor_copies: int = 1,
+    wmrm_stage_gate_start: int | None = None,
+    wmrm_full_language_tokens: bool = False,
 ) -> VACompoundPolicy:
     config = VACompoundConfig(
         language_dim=12,
@@ -40,6 +49,9 @@ def _tiny_world_model(
         wmrm_predictor_depth=1,
         wmrm_predictor_width=16,
         wmrm_predictor_heads=4,
+        wmrm_predictor_copies=wmrm_predictor_copies,
+        wmrm_stage_gate_start=wmrm_stage_gate_start,
+        wmrm_full_language_tokens=wmrm_full_language_tokens,
         main_vision_frames=1,
         main_vision_grid=2,
         va_world_mode=va_world_mode,
@@ -94,6 +106,135 @@ def _run_rollout(*, transitions_valid: bool) -> VACompoundPolicy:
     assert velocities.shape == (2, 3, 6, 4)
     assert conditions.shape == (2, 3, 6, 16)
     return model
+
+
+def test_cross_trajectory_progress_is_metadata_free_permutation_invariant_and_live() -> None:
+    torch.manual_seed(29)
+    batch, sequence, hidden = 4, 3, 4
+    task = torch.tensor([0, 0, 1, 1])
+    episode = torch.tensor([10, 11, 20, 21])
+    phases = torch.tensor(
+        [[1.0, 2.0, 3.0], [0.0, 1.0, 2.0],
+         [1.2, 2.2, 3.2], [0.2, 1.2, 2.2]]
+    )
+    descriptors = torch.stack(
+        (torch.cos(0.4 * phases), torch.sin(0.4 * phases)), dim=-1
+    )
+    states = torch.randn(batch, sequence, hidden, requires_grad=True)
+    task_language = torch.randn(2, hidden)
+    languages = (
+        task_language[task][:, None, :]
+        .expand(-1, sequence, -1)
+        .clone()
+        .requires_grad_()
+    )
+    head = torch.nn.Linear(2 * hidden, 4)
+
+    def score(state, language):
+        return head(torch.cat((state, state * torch.tanh(language)), dim=-1))
+
+    logits = score(states, languages)
+    logits.retain_grad()
+    valid = torch.ones(batch, sequence, dtype=torch.bool)
+    recovery = torch.zeros_like(valid)
+    loss, counts = cross_trajectory_progress_potential_loss(
+        score, logits, states, languages, descriptors, valid, recovery, task, episode
+    )
+    permutation = torch.tensor([2, 0, 3, 1])
+    permuted, permuted_counts = cross_trajectory_progress_potential_loss(
+        score,
+        logits[permutation],
+        states[permutation],
+        languages[permutation],
+        descriptors[permutation],
+        valid[permutation],
+        recovery[permutation],
+        task[permutation],
+        episode[permutation],
+    )
+
+    assert counts == permuted_counts == {
+        "cross_ordinal": 4,
+        "within_ordinal": 0,
+        "language": 8,
+    }
+    torch.testing.assert_close(loss, permuted)
+    crossing = descriptors.clone()
+    crossing[1] = descriptors[0].flip(0)
+    crossing[3] = descriptors[2].flip(0)
+    fallback, fallback_counts = cross_trajectory_progress_potential_loss(
+        score, logits, states, languages, crossing, valid, recovery, task, episode
+    )
+    assert torch.isfinite(fallback)
+    assert fallback_counts["cross_ordinal"] == 0
+    assert fallback_counts["within_ordinal"] > 0
+    one_state = valid.clone()
+    one_state[:, 1:] = False
+    zero, zero_counts = cross_trajectory_progress_potential_loss(
+        score, logits, states, languages, crossing, one_state, recovery, task, episode
+    )
+    assert zero_counts == {
+        "cross_ordinal": 0,
+        "within_ordinal": 0,
+        "language": 0,
+    }
+    torch.testing.assert_close(zero, logits.sum() * 0.0)
+    assert zero.requires_grad
+    loss.backward()
+    assert logits.grad is not None and torch.isfinite(logits.grad).all()
+    assert bool((logits.grad.abs().sum(dim=(0, 1)) > 0).all())
+    assert head.weight.grad is not None and torch.isfinite(head.weight.grad).all()
+    assert bool((head.weight.grad.abs().sum(dim=1) > 0).all())
+    assert states.grad is not None and torch.isfinite(states.grad).all()
+    assert languages.grad is not None and torch.isfinite(languages.grad).all()
+
+
+def test_stage0_progress_ignores_rollout_history_and_action_but_is_live() -> None:
+    model = _tiny_world_model(
+        va_world_mode="peer_sync_h6",
+        num_layers=3,
+        wmrm_full_language_tokens=True,
+    )
+    batch, _, _ = _rollout_batch(transitions_valid=True)
+    cache = model.build_language_cache(
+        batch["language_hidden"], batch["language_mask"]
+    )
+    with torch.no_grad():
+        _, memory = model.encode_condition(
+            batch["vision_tokens"][:, 0],
+            batch["proprio"][:, 0],
+            batch["previous_action"][:, 0],
+            language_cache=cache,
+            return_visual_memory=True,
+            env_action=batch["actions"][:, 0],
+        )
+        model.encode_condition(
+            batch["vision_tokens"][:, 1],
+            batch["proprio"][:, 1],
+            batch["previous_action"][:, 1],
+            language_cache=cache,
+            visual_memory=memory,
+            env_action=batch["actions"][:, 1],
+        )
+        with_history = model.last_wmrm_auxes[0].progress.clone()
+    model.encode_condition(
+        batch["vision_tokens"][:, 1],
+        batch["proprio"][:, 1],
+        -batch["previous_action"][:, 1],
+        language_cache=cache,
+        visual_memory=None,
+        env_action=-batch["actions"][:, 1],
+    )
+    without_history = model.last_wmrm_auxes[0].progress
+
+    torch.testing.assert_close(with_history, without_history)
+    without_history.square().mean().backward()
+    assert model.vision_projection.weight.grad is not None
+    assert bool(model.vision_projection.weight.grad.abs().sum() > 0)
+    assert model.wmrm.world_from_state.weight.grad is not None
+    assert bool(model.wmrm.world_from_state.weight.grad.abs().sum() > 0)
+    assert model.wmrm.progress_head.weight.grad is not None
+    assert bool(model.wmrm.progress_head.weight.grad.abs().sum() > 0)
 
 
 def test_two_task_visual_world_rollout_emits_metrics_and_world_gradient() -> None:
@@ -156,6 +297,25 @@ def test_empty_visual_world_transition_mask_backprops_connected_zero() -> None:
     assert out_weight.grad is not None
     assert torch.isfinite(out_weight.grad).all()
     torch.testing.assert_close(out_weight.grad, torch.zeros_like(out_weight.grad))
+
+
+def test_visual_world_metric_summary_can_be_skipped_without_skipping_loss() -> None:
+    model = _tiny_world_model()
+    batch, noisy_actions, flow_time = _rollout_batch(transitions_valid=True)
+
+    rollout_policy(
+        model,
+        batch,
+        noisy_actions,
+        flow_time,
+        visual_world_supervision=True,
+        summarize_visual_world_metrics=False,
+        flow_steps=2,
+    )
+
+    assert model.last_visual_world_metrics == {}
+    assert model.last_wmrm_loss is not None
+    assert torch.isfinite(model.last_wmrm_loss)
 
 
 def test_final_logged_map_recomputes_from_predictor_input_belief() -> None:
@@ -452,11 +612,16 @@ def test_legacy_rollout_keeps_adep_available() -> None:
     assert torch.isfinite(model.last_wmrm_adep_loss)
 
 
-def test_peer_world_rollout_uses_one_logged_encode_per_decision() -> None:
-    model = _tiny_world_model(va_world_mode="peer_sync_h6")
+def test_peer_world_action_ranking_reuses_the_final_stage_snapshot() -> None:
+    model = _tiny_world_model(
+        va_world_mode="peer_sync_h6",
+        num_layers=4,
+        wmrm_predictor_copies=3,
+        wmrm_stage_gate_start=1,
+    )
     batch, noisy_actions, flow_time = _rollout_batch(transitions_valid=True)
     encode_calls = 0
-    proposal_actions: list[torch.Tensor] = []
+    proposal_calls: list[dict] = []
     original_encode = model.encode_condition
     original_propose = model.wmrm.propose
 
@@ -466,7 +631,13 @@ def test_peer_world_rollout_uses_one_logged_encode_per_decision() -> None:
         return original_encode(*args, **kwargs)
 
     def record_propose(*args, **kwargs):
-        proposal_actions.append(kwargs["env_action"].detach().clone())
+        proposal_calls.append(
+            {
+                "env_action": kwargs["env_action"].detach().clone(),
+                "stage_index": kwargs["stage_index"],
+                "state": kwargs["state"],
+            }
+        )
         return original_propose(*args, **kwargs)
 
     model.encode_condition = record_encode
@@ -477,19 +648,36 @@ def test_peer_world_rollout_uses_one_logged_encode_per_decision() -> None:
         noisy_actions,
         flow_time,
         visual_world_supervision=True,
+        world_action_rank_stage="final",
         flow_steps=2,
     )
 
     assert encode_calls == batch["actions"].shape[1]
     stages = model.config.wmrm_stage_count()
-    assert len(proposal_actions) == batch["actions"].shape[1] * stages
+    assert stages == 3
+    assert len(proposal_calls) == (
+        batch["actions"].shape[1] * stages
+        + batch["actions"].shape[1] - 1
+    )
+    cursor = 0
     for time_index in range(batch["actions"].shape[1]):
-        start = time_index * stages
-        stage_actions = proposal_actions[start : start + stages]
+        logged = proposal_calls[cursor : cursor + stages]
+        cursor += stages
         assert all(
-            torch.equal(action, batch["actions"][:, time_index, :6])
-            for action in stage_actions
+            torch.equal(call["env_action"], batch["actions"][:, time_index, :6])
+            for call in logged
         )
+        assert [call["stage_index"] for call in logged] == list(range(stages))
+        if time_index + 1 < batch["actions"].shape[1]:
+            shuffled = proposal_calls[cursor]
+            cursor += 1
+            assert shuffled["stage_index"] == stages - 1
+            assert shuffled["state"] is logged[-1]["state"]
+            torch.testing.assert_close(
+                shuffled["env_action"],
+                batch["world_rank_shuffle_action"][:, time_index],
+            )
+    assert cursor == len(proposal_calls)
     assert model.last_world_action_readout_loss is not None
     assert torch.isfinite(model.last_world_action_readout_loss)
     assert model.last_world_action_readout_loss.item() > 0.0

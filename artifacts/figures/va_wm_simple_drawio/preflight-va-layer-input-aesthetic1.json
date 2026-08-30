@@ -1,0 +1,97 @@
+{
+  "file": "artifacts/figures/va_wm_simple_drawio/va_layer_input_origin.drawio",
+  "summary": {
+    "total_findings": 5,
+    "fail": 0,
+    "warn": 5,
+    "passed": true,
+    "clean": false
+  },
+  "fails": [],
+  "warns": [
+    {
+      "rule": "spacing-inconsistent-h",
+      "element_id": "observation",
+      "message": "Row at y≈165: horizontal gaps vary (gaps=['40', '40', '340'], mean=140, cv=1.01). Use uniform spacing.",
+      "detail": {
+        "row_y": 165,
+        "gaps": [
+          40.0,
+          40.0,
+          340.0
+        ],
+        "mean": 140.0,
+        "cv": 1.01,
+        "element_ids": [
+          "observation",
+          "dino_tokens",
+          "vision_projection",
+          "previous_layers"
+        ]
+      }
+    },
+    {
+      "rule": "spacing-inconsistent-h",
+      "element_id": "proprio",
+      "message": "Row at y≈405: horizontal gaps vary (gaps=['40', '40', '60', '130'], mean=68, cv=0.55). Use uniform spacing.",
+      "detail": {
+        "row_y": 405,
+        "gaps": [
+          40.0,
+          40.0,
+          60.0,
+          130.0
+        ],
+        "mean": 67.5,
+        "cv": 0.55,
+        "element_ids": [
+          "proprio",
+          "state_concat",
+          "state_projection",
+          "action_add",
+          "va_i"
+        ]
+      }
+    },
+    {
+      "rule": "spacing-inconsistent-v",
+      "element_id": "observation",
+      "message": "Column at x≈55: vertical gaps vary (gaps=['170', '40'], mean=105, cv=0.62). Use uniform spacing.",
+      "detail": {
+        "col_x": 55,
+        "gaps": [
+          170.0,
+          40.0
+        ],
+        "mean": 105.0,
+        "cv": 0.62,
+        "element_ids": [
+          "observation",
+          "proprio",
+          "previous_action"
+        ]
+      }
+    },
+    {
+      "rule": "orphan-empty-box",
+      "element_id": "init_container",
+      "message": "Box 'init_container' (830×590) has no text label. Add content or reduce size.",
+      "detail": {
+        "box_id": "init_container",
+        "size": "830×590"
+      }
+    },
+    {
+      "rule": "orphan-empty-box",
+      "element_id": "stack_container",
+      "message": "Box 'stack_container' (410×590) has no text label. Add content or reduce size.",
+      "detail": {
+        "box_id": "stack_container",
+        "size": "410×590"
+      }
+    }
+  ],
+  "vertex_count": 19,
+  "edge_count": 13,
+  "canvas": "1320x700"
+}

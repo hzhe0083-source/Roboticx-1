@@ -1,0 +1,25 @@
+{
+  "ok": true,
+  "strict": true,
+  "errors": [],
+  "warnings": [],
+  "stats": {
+    "file": "/home/ryan/Documents/robot/ORA0/artifacts/figures/va_wm_simple_drawio/final_three/02_va_component_qkv.drawio",
+    "pages": 1,
+    "cells": 25,
+    "vertices": 11,
+    "edges": 12,
+    "embedded_raster": false,
+    "external_image_count": 0,
+    "base64_payload_count": 0,
+    "largest_base64_payload_chars": 0,
+    "caption_like_text": false,
+    "duplicate_id_count": 0,
+    "missing_id_count": 0,
+    "empty_vertex_labels": 0,
+    "empty_edge_labels": 9,
+    "placeholder_label_count": 0,
+    "page_width": 1800.0,
+    "page_height": 620.0
+  }
+}

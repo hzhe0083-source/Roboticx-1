@@ -8,6 +8,7 @@ import copy
 
 import pytest
 import torch
+import va_compound.world_contract as world_contract
 
 from va_compound.world_contract import PEER_SHARED_FULL_DATA_CONTRACT
 
@@ -36,6 +37,39 @@ def _payload(episodes: list[int]) -> dict[str, torch.Tensor]:
         "proprio": torch.zeros(rows, 4, 3),
         "language_hidden": torch.zeros(rows, 5, 12),
     }
+
+
+def test_h50_action_only_checkpoint_has_named_joint_migration() -> None:
+    contract = {
+        "peer_training_mode": "va_only",
+        "peer_world_topology": world_contract.PEER_WORLD_TOPOLOGY_CONTRACT,
+        "peer_gradient_boundary": world_contract.PEER_GRADIENT_BOUNDARY_CONTRACT,
+        "peer_data_isolation": world_contract.PEER_ACTION_ONLY_DATA_CONTRACT,
+        "peer_dual_stream_optimizer": None,
+        "peer_world_action_source": world_contract.PEER_WORLD_ACTION_SOURCE_CONTRACT,
+        "peer_world_readout": world_contract.PEER_WORLD_READOUT_CONTRACT,
+        "peer_flow_topology": world_contract.PEER_H50_NESTED_FLOW_CONTRACT,
+        "planning_stride": 15,
+        "planning_hz": 80.0 / 15,
+        "peer_high_frequency_contract": world_contract.PEER_HIGH_FREQUENCY_CONTRACT,
+        "deployment_execution_horizon": 15,
+        "pcgrad": True,
+        "pcgrad_scope": "per_task_va_action_v1",
+    }
+    migration = world_contract.validate_peer_resume_weights_contract(
+        contract,
+        planning_stride=15,
+        migrating_action_only_to_joint=True,
+        action_horizon=50,
+        world_horizon=15,
+        deployment_execution_horizon=15,
+        peer_flow_topology=world_contract.PEER_H50_NESTED_FLOW_CONTRACT,
+        peer_data_isolation_contract=world_contract.PEER_SHARED_FULL_DATA_CONTRACT,
+    )
+    assert migration is not None
+    assert migration["migrations"][0]["kind"] == (
+        world_contract.PEER_H50_ACTION_ONLY_TO_JOINT_MIGRATION
+    )
 
 
 def _peer_args(tmp_path: Path, *extra: str) -> list[str]:

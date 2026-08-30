@@ -577,6 +577,33 @@ def test_h15_tail_flow_cannot_backpropagate_into_prefix_or_va_condition() -> Non
     assert any(grad is not None and float(grad.abs().sum()) > 0.0 for grad in tail_grads)
 
 
+def test_h15_frozen_tail_teacher_can_train_capacity_condition() -> None:
+    model = VACompoundPolicy(
+        _peer_config(
+            action_horizon=15,
+            planning_stride=2,
+            deployment_execution_horizon=15,
+            wmrm_cycle_steps=15,
+            wmrm_predictor="st_blocks",
+            wmrm_predictor_depth=1,
+            wmrm_predictor_width=16,
+            wmrm_predictor_heads=4,
+            tail_flow_condition_grad=True,
+        )
+    ).train()
+    model.flow_head.requires_grad_(False)
+    model.tail_flow_head.requires_grad_(False)
+    condition = torch.randn(2, 15, model.config.hidden_dim, requires_grad=True)
+    noisy = torch.randn(2, 15, model.config.action_dim)
+    velocity = model.flow_velocity(condition, noisy, torch.rand(2))
+    velocity[:, 6:].square().mean().backward()
+
+    assert condition.grad is not None
+    assert float(condition.grad.abs().sum()) > 0.0
+    assert all(parameter.grad is None for parameter in model.flow_head.parameters())
+    assert all(parameter.grad is None for parameter in model.tail_flow_head.parameters())
+
+
 def test_h15_prefix_queries_and_visual_stream_cannot_read_tail_tokens() -> None:
     model = VACompoundPolicy(
         _peer_config(
@@ -774,6 +801,187 @@ def test_old_world8_migration_rebuilds_dynamics_but_keeps_policy_interface() -> 
     assert int(torch.count_nonzero(model.world_action_readout.proj.weight - 4.0)) == 0
     torch.testing.assert_close(model.action_queries[:6], old_queries)
     torch.testing.assert_close(model.action_queries[6:], initial_tail_queries)
+
+
+def test_va8_to_va16_migration_preserves_four_decision_policy_state() -> None:
+    from train import migrate_peer_va8_to_va16_state
+
+    common = dict(
+        action_horizon=15,
+        planning_stride=15,
+        deployment_execution_horizon=15,
+        wmrm_cycle_steps=15,
+        wmrm_predictor="st_blocks",
+        wmrm_predictor_depth=6,
+        wmrm_predictor_width=12,
+        wmrm_predictor_heads=3,
+    )
+    torch.manual_seed(41)
+    source = VACompoundPolicy(_peer_config(num_layers=8, **common)).eval()
+    checkpoint = {
+        "config": dict(source.config.__dict__),
+        "model": source.state_dict(),
+    }
+    torch.manual_seed(42)
+    expanded_common = {
+        **common,
+        "wmrm_predictor_depth": 7,
+        "wmrm_predictor_copies": 11,
+    }
+    expanded = VACompoundPolicy(
+        _peer_config(
+            num_layers=16,
+            wmrm_stage_gate_start=7,
+            **expanded_common,
+        )
+    ).eval()
+    expanded.load_state_dict(
+        migrate_peer_va8_to_va16_state(expanded, checkpoint), strict=True
+    )
+
+    for index in range(8, 16):
+        for name in ("out_v", "out_a", "out_t"):
+            assert int(torch.count_nonzero(getattr(expanded.layers[index], name).weight)) == 0
+        for name in ("ffn_v", "ffn_a", "ffn_t"):
+            assert int(torch.count_nonzero(getattr(expanded.layers[index], name)[-1].weight)) == 0
+    assert int(torch.count_nonzero(expanded.wmrm_stage_scale)) == 0
+    assert int(torch.count_nonzero(expanded.wmrm_belief_message_scale)) == 0
+    assert len(expanded.wmrm.st_predictor_extra) == 10
+    for predictor in (expanded.wmrm.st_predictor, *expanded.wmrm.st_predictor_extra):
+        torch.testing.assert_close(
+            predictor.in_proj.weight,
+            source.wmrm.st_predictor.in_proj.weight,
+        )
+        for name in ("sa_o", "ca_o"):
+            assert int(torch.count_nonzero(getattr(predictor.blocks[6], name).weight)) == 0
+        assert int(torch.count_nonzero(predictor.blocks[6].ff[2].weight)) == 0
+
+    source_memory = None
+    expanded_memory = None
+    for step in range(4):
+        torch.manual_seed(100 + step)
+        vision, proprio, previous, language, mask = _policy_inputs(source.config)
+        with torch.no_grad():
+            source_action, source_memory = source.encode_condition(
+                vision,
+                proprio,
+                previous,
+                language_hidden=language,
+                language_mask=mask,
+                visual_memory=source_memory,
+                return_visual_memory=True,
+            )
+            expanded_action, expanded_memory = expanded.encode_condition(
+                vision,
+                proprio,
+                previous,
+                language_hidden=language,
+                language_mask=mask,
+                visual_memory=expanded_memory,
+                return_visual_memory=True,
+            )
+        torch.testing.assert_close(expanded_action, source_action, rtol=0.0, atol=1e-6)
+        for expanded_layer, source_layer in zip(
+            expanded_memory.layers[:8], source_memory.layers, strict=True
+        ):
+            torch.testing.assert_close(expanded_layer, source_layer, rtol=0.0, atol=1e-6)
+        for field in ("belief", "innovation", "world_map"):
+            torch.testing.assert_close(
+                getattr(expanded_memory.world_state, field),
+                getattr(source_memory.world_state, field),
+                rtol=0.0,
+                atol=1e-6,
+            )
+
+    belief = torch.randn(2, expanded.wmrm.n_belief, expanded.config.hidden_dim, requires_grad=True)
+    world_map = torch.randn(
+        2,
+        expanded.wmrm.dino_dim,
+        expanded.wmrm.world_grid,
+        expanded.wmrm.world_grid,
+        requires_grad=True,
+    )
+    state = WAMState(belief=belief, world_map=world_map)
+    with torch.no_grad():
+        map_only = expanded.wmrm.encode_world_tokens(world_map)
+        expanded.wmrm_belief_message_scale[0] = 1.0
+    bridged = expanded._peer_world_message(state, 0)
+    count = min(map_only.shape[1], belief.shape[1])
+    torch.testing.assert_close(
+        bridged[:, :count], map_only[:, :count] + belief[:, :count]
+    )
+    bridged.sum().backward()
+    assert belief.grad is not None and float(belief.grad.abs().sum()) > 0.0
+    assert world_map.grad is None
+
+
+def test_capacity_phase2_policy_gradient_reaches_gate_not_world_predictor() -> None:
+    config = _peer_config(
+        num_layers=4,
+        wmrm_stage_gate_start=1,
+        capacity_stage_gate_policy_grad=True,
+        wmrm_predictor="st_blocks",
+        wmrm_predictor_depth=1,
+        wmrm_predictor_width=16,
+        wmrm_predictor_heads=4,
+        wmrm_predictor_copies=2,
+    )
+    torch.manual_seed(42)
+    model = VACompoundPolicy(config)
+    with torch.no_grad():
+        model.wmrm_stage_scale.fill_(0.01)
+    proposal_maps = []
+    original_propose = model.wmrm.propose
+
+    def capture_proposal(*args, **kwargs):
+        proposal = original_propose(*args, **kwargs)
+        proposal.next_world_state.world_map.retain_grad()
+        proposal_maps.append(proposal.next_world_state.world_map)
+        return proposal
+
+    vision, proprio, previous, language, mask = _policy_inputs(config)
+    with mock.patch.object(model.wmrm, "propose", side_effect=capture_proposal):
+        condition = model.encode_condition(
+            vision,
+            proprio,
+            previous,
+            language_hidden=language,
+            language_mask=mask,
+        )
+    condition.square().sum().backward()
+
+    assert model.wmrm_stage_scale.grad is not None
+    assert float(model.wmrm_stage_scale.grad.abs().sum()) > 0.0
+    assert all(
+        world_map.grad is None or int(torch.count_nonzero(world_map.grad)) == 0
+        for world_map in proposal_maps
+    )
+    assert all(
+        parameter.grad is None or int(torch.count_nonzero(parameter.grad)) == 0
+        for name, parameter in model.named_parameters()
+        if name.startswith("wmrm.st_predictor")
+    )
+
+
+def test_capacity_gate_policy_gradient_is_off_by_default() -> None:
+    config = _peer_config(num_layers=4, wmrm_stage_gate_start=1)
+    assert config.capacity_stage_gate_policy_grad is False
+    torch.manual_seed(42)
+    model = VACompoundPolicy(config)
+    with torch.no_grad():
+        model.wmrm_stage_scale.fill_(0.01)
+    vision, proprio, previous, language, mask = _policy_inputs(config)
+    condition = model.encode_condition(
+        vision,
+        proprio,
+        previous,
+        language_hidden=language,
+        language_mask=mask,
+    )
+    condition.square().sum().backward()
+    assert model.wmrm_stage_scale.grad is None or int(
+        torch.count_nonzero(model.wmrm_stage_scale.grad)
+    ) == 0
 
 
 def test_terminal_world_state_is_read_by_next_decisions_first_va_layer() -> None:

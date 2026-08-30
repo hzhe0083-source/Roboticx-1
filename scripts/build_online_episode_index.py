@@ -65,15 +65,15 @@ def inspect_task(
     source_index: int,
     task: str,
     source_path: str,
+    expected_episodes: int,
 ) -> dict[str, Any]:
     source = Path(source_path).expanduser().resolve(strict=True)
     payload = torch.load(source, map_location="cpu", weights_only=False)
     if payload.get("task") != task or not isinstance(payload.get("episodes"), list):
         raise ValueError(f"{source}: invalid task payload for {task}")
-    expected = 270 if task in HARD_TASKS else 60
-    if len(payload["episodes"]) != expected:
+    if len(payload["episodes"]) != expected_episodes:
         raise ValueError(
-            f"{source}: {task} requires {expected} full episodes, "
+            f"{source}: {task} requires {expected_episodes} full episodes, "
             f"got {len(payload['episodes'])}"
         )
     episodes = []
@@ -117,10 +117,11 @@ def validate_index(path: Path) -> dict[str, Any]:
     eval_n = sum(item.get("split") == "eval" for item in episodes)
     if counts != {"source_episodes": source_n, "train_episodes": train_n, "eval_episodes": eval_n}:
         raise ValueError("online index episode counts are inconsistent")
-    if (source_n, train_n, eval_n) != (3420, 3222, 198):
+    declared_source_n = sum(int(item.get("source_episodes", -1)) for item in tasks)
+    if declared_source_n != source_n or eval_n != 198 or train_n != source_n - 198:
         raise ValueError(
-            "MT50 online index requires source/train/eval episodes "
-            f"3420/3222/198, got {source_n}/{train_n}/{eval_n}"
+            "MT50 online index source/train/eval episode contract differs: "
+            f"declared={declared_source_n}, actual={source_n}/{train_n}/{eval_n}"
         )
     identities = {(int(item["task_id"]), int(item["episode_index"])) for item in episodes}
     if len(identities) != source_n:
@@ -178,6 +179,9 @@ def build_index(
             "source_path": str(source),
             "sha256": str(item["sha256"]),
             "size_bytes": int(item["size_bytes"]),
+            "expected_source_episodes": int(
+                item.get("episode_count", 270 if task in HARD_TASKS else 60)
+            ),
         }
     if any(item is None for item in task_rows):
         raise ValueError("raw sources do not map bijectively onto language task ids 0..49")
@@ -210,6 +214,7 @@ def build_index(
                 item["source_index"],
                 item["task"],
                 item["source_path"],
+                item["expected_source_episodes"],
             ): item
             for item in resolved_tasks
         }

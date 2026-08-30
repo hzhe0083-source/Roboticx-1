@@ -90,10 +90,23 @@ PEER_H15_PREFIX_TAIL_FLOW_MIGRATION = (
 PEER_H15_P2_TO_P15_TEMPORAL_MIGRATION = (
     "peer_h15_p2_to_p15_temporal_weights_only_v1"
 )
+PEER_H15_TO_H50_ACTION_MIGRATION = (
+    "peer_h15_to_h50_action_horizon_weights_only_v1"
+)
+PEER_H50_ACTION_ONLY_TO_JOINT_MIGRATION = (
+    "peer_h50_action_only_to_joint_weights_only_v1"
+)
+PEER_H50_NESTED_FLOW_CONTRACT = (
+    "h6_prefix_h9_mid_h35_tail_nested_flow_v1"
+)
+PEER_VA8_TO_VA16_CAPACITY_MIGRATION = (
+    "peer_va8_world7_to_va16_world15_gated_capacity_v1"
+)
 PEER_DATA_ISOLATION_CONTRACT = "separate_va_world_episode_datasets_per_step_v1"
 PEER_SHARED_FULL_DATA_CONTRACT = (
     "shared_full_va_world_payload_independent_batches_per_step_v1"
 )
+PEER_ACTION_ONLY_DATA_CONTRACT = "single_va_stream_world_forward_only_v1"
 PEER_DUAL_STREAM_OPTIMIZER_CONTRACT = (
     "va_backward_then_world_backward_one_optimizer_step_v1"
 )
@@ -766,6 +779,9 @@ def validate_peer_resume_weights_contract(
     migrating_peer_world: bool = False,
     migrating_prefix_tail_flow: bool = False,
     migrating_p2_to_p15: bool = False,
+    migrating_h15_to_h50: bool = False,
+    migrating_action_only_to_joint: bool = False,
+    migrating_va_depth: bool = False,
     action_horizon: int | None = None,
     world_horizon: int | None = None,
     deployment_execution_horizon: int | None = None,
@@ -797,8 +813,35 @@ def validate_peer_resume_weights_contract(
     else:
         source_planning_stride = int(planning_stride)
 
+    if migrating_h15_to_h50 and (
+        action_horizon != 50
+        or int(planning_stride) != 15
+        or world_horizon != 15
+        or deployment_execution_horizon != 15
+        or peer_flow_topology != PEER_H50_NESTED_FLOW_CONTRACT
+    ):
+        raise ValueError(
+            f"{PEER_H15_TO_H50_ACTION_MIGRATION} requires H50 training with "
+            "P15 deployment, World+15, and the nested H6/H15 prefix Flow"
+        )
+
+    if migrating_action_only_to_joint and (
+        action_horizon != 50
+        or int(planning_stride) != 15
+        or world_horizon != 15
+        or deployment_execution_horizon != 15
+        or peer_flow_topology != PEER_H50_NESTED_FLOW_CONTRACT
+        or peer_data_isolation_contract != PEER_SHARED_FULL_DATA_CONTRACT
+    ):
+        raise ValueError(
+            f"{PEER_H50_ACTION_ONLY_TO_JOINT_MIGRATION} requires H50/P15 "
+            "joint training on the shared full VA/World payload"
+        )
+
     expected = {
-        "peer_training_mode": "joint_dual_stream",
+        "peer_training_mode": (
+            "va_only" if migrating_action_only_to_joint else "joint_dual_stream"
+        ),
         "peer_world_topology": (
             PEER_LEGACY_TOPOLOGY_CONTRACT
             if migrating_peer_world
@@ -809,8 +852,18 @@ def validate_peer_resume_weights_contract(
             if migrating_peer_world
             else PEER_GRADIENT_BOUNDARY_CONTRACT
         ),
-        "peer_data_isolation": peer_data_isolation_contract,
-        "peer_dual_stream_optimizer": PEER_DUAL_STREAM_OPTIMIZER_CONTRACT,
+        "peer_data_isolation": (
+            PEER_ACTION_ONLY_DATA_CONTRACT
+            if migrating_action_only_to_joint
+            else PEER_SHARED_FULL_DATA_CONTRACT
+            if migrating_h15_to_h50
+            else peer_data_isolation_contract
+        ),
+        "peer_dual_stream_optimizer": (
+            None
+            if migrating_action_only_to_joint
+            else PEER_DUAL_STREAM_OPTIMIZER_CONTRACT
+        ),
         "peer_world_action_source": PEER_WORLD_ACTION_SOURCE_CONTRACT,
         "planning_stride": source_planning_stride,
         "planning_hz": 80.0 / source_planning_stride,
@@ -834,14 +887,74 @@ def validate_peer_resume_weights_contract(
                 "target_previous_action": "prior_p15_segment_token14",
             }
         )
+    if migrating_va_depth:
+        migrations.append(
+            {
+                "kind": PEER_VA8_TO_VA16_CAPACITY_MIGRATION,
+                "source_va_layers": 8,
+                "source_world_stages": 7,
+                "target_va_layers": 16,
+                "target_world_stages": 15,
+                "new_world_stage_gate_start": 7,
+                "new_va_initialization": "zero_residual_output",
+                "source_world_predictors": 1,
+                "target_world_predictors": 11,
+                "source_world_predictor_depth": 6,
+                "target_world_predictor_depth": 7,
+                "new_world_predictor_block": "zero_residual_output",
+                "world_to_va_message": "map_plus_zero_gated_belief_residual_v1",
+                "target_world_feature_metric": "l2_normalized_cosine_plus_norm_v1",
+            }
+        )
+    if migrating_h15_to_h50:
+        migrations.append(
+            {
+                "kind": PEER_H15_TO_H50_ACTION_MIGRATION,
+                "source_action_horizon": 15,
+                "target_action_horizon": 50,
+                "protected_action_prefixes": [6, 15],
+                "planning_stride": 15,
+                "deployment_execution_horizon": 15,
+                "world_target_horizon": 15,
+            }
+        )
+    if migrating_action_only_to_joint:
+        expected.update(
+            pcgrad=True,
+            pcgrad_scope="per_task_va_action_v1",
+        )
+        migrations.append(
+            {
+                "kind": PEER_H50_ACTION_ONLY_TO_JOINT_MIGRATION,
+                "source_training_mode": "va_only",
+                "target_training_mode": "joint_dual_stream",
+                "source_data_isolation": PEER_ACTION_ONLY_DATA_CONTRACT,
+                "target_data_isolation": PEER_SHARED_FULL_DATA_CONTRACT,
+                "source_pcgrad_scope": "per_task_va_action_v1",
+                "target_pcgrad_scope": (
+                    "per_task_va_and_world_separate_dino_guard_v1"
+                ),
+            }
+        )
     if not migrating_peer_world:
         expected["peer_world_readout"] = PEER_WORLD_READOUT_CONTRACT
         expected["peer_flow_topology"] = (
-            None if migrating_prefix_tail_flow else peer_flow_topology
+            peer_flow_topology
+            if migrating_action_only_to_joint
+            else None
+            if migrating_prefix_tail_flow
+            else PEER_H15_PREFIX_TAIL_FLOW_CONTRACT
+            if migrating_h15_to_h50
+            else peer_flow_topology
         )
-        if action_horizon is not None and world_horizon is not None:
+        if (
+            not migrating_action_only_to_joint
+            and action_horizon is not None
+            and world_horizon is not None
+        ):
+            source_action_horizon = 15 if migrating_h15_to_h50 else action_horizon
             expected["world_action_source"] = (
-                f"logged_h{int(action_horizon)}_world_horizon_"
+                f"logged_h{int(source_action_horizon)}_world_horizon_"
                 f"{int(world_horizon)}"
             )
         if deployment_execution_horizon is not None:

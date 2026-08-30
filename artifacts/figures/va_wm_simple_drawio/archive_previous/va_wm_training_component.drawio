@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="app.diagrams.net" agent="Codex" version="26.0.9" pages="1">
+  <diagram id="va-wm-training-component" name="VA-WM Training">
+    <mxGraphModel dx="1300" dy="580" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1300" pageHeight="580" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="title" value="&lt;b&gt;VA / WM training&lt;/b&gt;" style="text;html=1;strokeColor=none;fillColor=none;whiteSpace=wrap;fontFamily=Helvetica;fontSize=22;fontColor=#262626;align=center;" vertex="1" parent="1">
+          <mxGeometry x="475" y="15" width="400" height="35" as="geometry" />
+        </mxCell>
+
+        <mxCell id="va_target" value="&lt;b&gt;VA batch · action target a*&lt;/b&gt;" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#FFDFDF;strokeColor=#262626;strokeWidth=2;fontFamily=Helvetica;fontSize=16;fontColor=#262626;" vertex="1" parent="1">
+          <mxGeometry x="90" y="85" width="420" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="wm_target" value="&lt;b&gt;Independent WM batch · next DINO Z*&lt;/b&gt;&lt;br&gt;target stop-grad" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#B7E9FB;strokeColor=#262626;strokeWidth=2;fontFamily=Helvetica;fontSize=15;fontColor=#262626;" vertex="1" parent="1">
+          <mxGeometry x="840" y="85" width="420" height="55" as="geometry" />
+        </mxCell>
+
+        <mxCell id="va_loss" value="&lt;b&gt;VA · Flow matching&lt;/b&gt;&lt;br&gt;x&lt;sub&gt;τ&lt;/sub&gt;=(1−τ)ε+τa* ; u*=a*−ε&lt;br&gt;L&lt;sub&gt;VA&lt;/sub&gt;=MaskedMSE(v&lt;sub&gt;θ&lt;/sub&gt;(x&lt;sub&gt;τ&lt;/sub&gt;,τ),u*)&lt;br&gt;&lt;font color=&quot;#646464&quot;&gt;prefix / tail weighted&lt;/font&gt;" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#FFE2B2;strokeColor=#262626;strokeWidth=2;fontFamily=Helvetica;fontSize=16;fontColor=#262626;" vertex="1" parent="1">
+          <mxGeometry x="90" y="205" width="420" height="145" as="geometry" />
+        </mxCell>
+        <mxCell id="wm_loss" value="&lt;b&gt;WM predictor / L&lt;sub&gt;WM&lt;/sub&gt;&lt;/b&gt;&lt;br&gt;WM batch: L&lt;sub&gt;i&lt;/sub&gt;=.25L&lt;sub&gt;all&lt;/sub&gt;+.25L&lt;sub&gt;motion&lt;/sub&gt;+.50L&lt;sub&gt;top20&lt;/sub&gt;+L&lt;sub&gt;NR(all)&lt;/sub&gt;&lt;br&gt;L&lt;sub&gt;WM&lt;/sub&gt;=Avg&lt;sub&gt;w&lt;/sub&gt;(L&lt;sub&gt;i&lt;/sub&gt;)+4L&lt;sub&gt;static&lt;/sub&gt;+L&lt;sub&gt;rank&lt;/sub&gt;+L&lt;sub&gt;readout&lt;/sub&gt;" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#B7E9FB;strokeColor=#262626;strokeWidth=2;fontFamily=Helvetica;fontSize=16;fontColor=#262626;" vertex="1" parent="1">
+          <mxGeometry x="840" y="205" width="420" height="145" as="geometry" />
+        </mxCell>
+        <mxCell id="belief_training" value="&lt;b&gt;B&lt;sub&gt;i&lt;/sub&gt;, ν&lt;sub&gt;i&lt;/sub&gt;: no direct target&lt;/b&gt;&lt;br&gt;trained through L&lt;sub&gt;WM&lt;/sub&gt;" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#F1F4B9;strokeColor=#262626;strokeWidth=2;fontFamily=Helvetica;fontSize=14;fontColor=#262626;" vertex="1" parent="1">
+          <mxGeometry x="545" y="85" width="260" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="optimizer" value="&lt;b&gt;VA backward + WM backward&lt;/b&gt;&lt;br&gt;separate batches · one optimizer step" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#C3E9CC;strokeColor=#262626;strokeWidth=2;fontFamily=Helvetica;fontSize=18;fontColor=#262626;" vertex="1" parent="1">
+          <mxGeometry x="470" y="440" width="410" height="85" as="geometry" />
+        </mxCell>
+        <mxCell id="joint_note" value="L&lt;sub&gt;WM&lt;/sub&gt; also shapes the VA snapshot features read by WM" style="text;html=1;strokeColor=none;fillColor=none;whiteSpace=wrap;fontFamily=Helvetica;fontSize=13;fontColor=#646464;align=center;" vertex="1" parent="1">
+          <mxGeometry x="390" y="550" width="570" height="28" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e_target_va" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeColor=#262626;strokeWidth=2;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="va_target" target="va_loss"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_target_wm" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeColor=#262626;strokeWidth=2;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="wm_target" target="wm_loss"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_va_optimizer" value="L&lt;sub&gt;VA&lt;/sub&gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeColor=#E66B19;strokeWidth=2.5;exitX=0.5;exitY=1;entryX=0;entryY=0.5;fontFamily=Helvetica;fontSize=13;fontColor=#E66B19;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="va_loss" target="optimizer"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_wm_optimizer" value="L&lt;sub&gt;WM&lt;/sub&gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeColor=#4D78B8;strokeWidth=2.5;exitX=0.5;exitY=1;entryX=1;entryY=0.5;fontFamily=Helvetica;fontSize=13;fontColor=#4D78B8;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="wm_loss" target="optimizer"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e_gradient_boundary" value="VA-batch forward: sg(Z) → K&lt;sup&gt;W&lt;/sup&gt;,V&lt;sup&gt;W&lt;/sup&gt; · no L&lt;sub&gt;VA&lt;/sub&gt; → predictor" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;dashed=1;endArrow=classic;endFill=1;strokeColor=#4D78B8;strokeWidth=2;exitX=0;exitY=0.5;entryX=1;entryY=0.5;fontFamily=Helvetica;fontSize=13;fontColor=#4D78B8;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="wm_loss" target="va_loss"><mxGeometry relative="1" as="geometry" /></mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
