@@ -77,6 +77,23 @@ class EndToEndPolicy(nn.Module):
         tokens = self.vision_backbone(flat, pooling=self.pooling)
         return tokens.reshape(batch, sequence, -1, tokens.shape[-1])
 
+    def _encode_language_hidden(
+        self, unique: Sequence[str]
+    ) -> tuple[Tensor, Tensor]:
+        if isinstance(self.text_backbone, QwenSemanticBackbone):
+            prior, mask = self.text_backbone.encode_prior(unique)
+            adapted, _ = self.text_backbone.encode_adapted(unique)
+            hidden = self.text_backbone.fused_embedding(prior, adapted)
+        elif self.policy.config.dino_qwen_cross_modal_bridge:
+            layers = list(range(10, 15))
+            hierarchy, mask = self.text_backbone.encode_trainable(
+                unique, output_layers=layers
+            )
+            hidden = self.text_backbone.mean_output_layers(hierarchy, layers)
+        else:
+            hidden, mask = self.text_backbone.encode_trainable(unique)
+        return hidden, mask
+
     def build_language_cache(
         self,
         instructions: Sequence[str],
@@ -89,12 +106,7 @@ class EndToEndPolicy(nn.Module):
         encode is used (legacy path, unchanged).
         """
         unique = list(dict.fromkeys(instructions))
-        if isinstance(self.text_backbone, QwenSemanticBackbone):
-            prior, mask = self.text_backbone.encode_prior(unique)
-            adapted, _ = self.text_backbone.encode_adapted(unique)
-            hidden = self.text_backbone.fused_embedding(prior, adapted)
-        else:
-            hidden, mask = self.text_backbone.encode_trainable(unique)
+        hidden, mask = self._encode_language_hidden(unique)
         lookup = {text: index for index, text in enumerate(unique)}
         indices = torch.tensor(
             [lookup[instruction] for instruction in instructions],
@@ -152,12 +164,7 @@ class EndToEndPolicy(nn.Module):
             raise ValueError(f"scene_delta must have shape [B, {self.config.vision_dim}]")
         # 纯文本 prior/adapted 与场景无关，按 unique 编码后经 indices 展开省算力。
         unique = list(dict.fromkeys(instructions))
-        if isinstance(self.text_backbone, QwenSemanticBackbone):
-            prior, mask = self.text_backbone.encode_prior(unique)
-            adapted, _ = self.text_backbone.encode_adapted(unique)
-            hidden = self.text_backbone.fused_embedding(prior, adapted)
-        else:
-            hidden, mask = self.text_backbone.encode_trainable(unique)
+        hidden, mask = self._encode_language_hidden(unique)
         lookup = {text: index for index, text in enumerate(unique)}
         indices = torch.tensor(
             [lookup[instruction] for instruction in instructions],
@@ -331,6 +338,7 @@ def build_e2e_policy(
     semantic_anchor_layers: tuple[int, ...] | None = None,
     semantic_lora_suffixes: Sequence[str] | None = None,
     language_max_length: int = 64,
+    qwen_keep_layers: int | None = None,
     compile_task: bool = False,
     compile_every: int = 4,
     n_scene_tokens: int = 16,
@@ -354,6 +362,9 @@ def build_e2e_policy(
     """
     import torch as _torch
 
+    if config.dino_qwen_cross_modal_bridge and semantic_adapter:
+        raise ValueError("DINO/Qwen bridge does not support semantic_adapter")
+
     def dtype(name: str) -> _torch.dtype:
         return {"float32": _torch.float32, "float16": _torch.float16, "bfloat16": _torch.bfloat16}[name]
 
@@ -361,6 +372,7 @@ def build_e2e_policy(
         device=device,
         dtype=language_dtype,
         max_length=language_max_length,
+        keep_layers=qwen_keep_layers,
         local_files_only=local_files_only,
     )
     if semantic_adapter:

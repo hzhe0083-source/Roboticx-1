@@ -20,8 +20,8 @@ import torch
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from train import DinoFeatureCache, _dino_main_encode_from_cache  # noqa: E402
 from va_compound.longtraj_frames import LongTrajFramesDataset  # noqa: E402
+from va_compound.vision.encoding import DinoFeatureCache, _dino_main_encode_from_cache  # noqa: E402
 
 DATA = REPO / "data/metaworld_longtraj_windows_h48_dino35_clean.pt"
 CACHE = REPO / "data/dino35_feature_cache"

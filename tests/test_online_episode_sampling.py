@@ -11,7 +11,7 @@ import numpy as np
 from PIL import Image
 import torch
 
-from train import TaskLocalityWeightedSampler
+from va_compound.data.samplers import TaskLocalityWeightedSampler
 from scripts.build_dagger_online_index import build_augmented_index
 from va_compound.flow import masked_flow_matching_loss
 from va_compound.vision import longtraj_frames as longtraj_impl

@@ -110,7 +110,7 @@ PEER_ACTION_ONLY_DATA_CONTRACT = "single_va_stream_world_forward_only_v1"
 PEER_DUAL_STREAM_OPTIMIZER_CONTRACT = (
     "va_backward_then_world_backward_one_optimizer_step_v1"
 )
-PEER_PLANNING_STRIDES = frozenset({1, 2, 3, 6, 15})
+PEER_PLANNING_STRIDES = frozenset({1, 2, 3, 4, 6, 15})
 PEER_HIGH_FREQUENCY_CONTRACT = {
     "action_prediction": "full_action_chunk_each_decision_v2",
     "world_transition": "logged_world_horizon_action_chunk_v2",
@@ -788,6 +788,9 @@ def validate_peer_resume_weights_contract(
     peer_flow_topology: str | None = None,
     assembly_metric_role_contract: str | None = None,
     peer_data_isolation_contract: str = PEER_DATA_ISOLATION_CONTRACT,
+    target_pcgrad_scope: str = (
+        "per_task_va_and_world_separate_bf16dino_guard_v1"
+    ),
 ) -> dict[str, object] | None:
     """Validate peer weights-only initialization and name known migrations.
 
@@ -931,9 +934,7 @@ def validate_peer_resume_weights_contract(
                 "source_data_isolation": PEER_ACTION_ONLY_DATA_CONTRACT,
                 "target_data_isolation": PEER_SHARED_FULL_DATA_CONTRACT,
                 "source_pcgrad_scope": "per_task_va_action_v1",
-                "target_pcgrad_scope": (
-                    "per_task_va_and_world_separate_dino_guard_v1"
-                ),
+                "target_pcgrad_scope": target_pcgrad_scope,
             }
         )
     if not migrating_peer_world:

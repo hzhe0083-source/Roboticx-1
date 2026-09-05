@@ -1308,7 +1308,7 @@ def _load_model_and_metric(
 
     metric_head = relation_encoder = None
     if config.dino_dense_metric:
-        from train import _build_dino_metric_stack
+        from va_compound.vision.metric_runtime import _build_dino_metric_stack
 
         metric_head, relation_encoder = _build_dino_metric_stack(
             device,
@@ -1818,14 +1818,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     model, metric_head, relation_encoder, config = _load_model_and_metric(
         checkpoint, device
     )
-    from train import (
+    from va_compound.vision.metric_runtime import _dino_metric_tokens
+    from va_compound.longtraj_frames import LongTrajFramesDataset, mtvj_collate
+    from va_compound.vision.encoding import (
         DinoFeatureCache,
         _build_dino_main_backbone,
         _dino_main_encode_from_cache,
         _dino_main_online_encode,
-        _dino_metric_tokens,
     )
-    from va_compound.longtraj_frames import LongTrajFramesDataset, mtvj_collate
 
     dino_cache = None
     main_backbone = None

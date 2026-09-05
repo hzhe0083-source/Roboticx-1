@@ -10,8 +10,9 @@ import torch
 from torch import Tensor
 
 from va_compound.statistics import fmt_ci, macro_bootstrap_ci
-from train import FeatureDataset, ensure_sequence, move_batch
 from va_compound import VACompoundConfig, VACompoundPolicy
+from va_compound.data.feature_dataset import FeatureDataset
+from va_compound.training.batch import ensure_sequence, move_batch
 
 
 @torch.no_grad()

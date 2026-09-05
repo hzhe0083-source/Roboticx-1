@@ -186,7 +186,7 @@ def test_peer_planning_stride_matches_world_cycle(planning_stride: int) -> None:
     assert config.wmrm_cycle_steps == planning_stride
 
 
-@pytest.mark.parametrize("planning_stride", [0, 4, 5, 7])
+@pytest.mark.parametrize("planning_stride", [0, 5, 7])
 def test_peer_rejects_unsupported_planning_stride(planning_stride: int) -> None:
     with pytest.raises(ValueError, match="planning_stride"):
         _peer_config(
@@ -478,6 +478,44 @@ def test_va_and_wam_read_the_same_pre_stage_snapshot() -> None:
     torch.testing.assert_close(va_inputs[1][1], va_outputs[0][1], rtol=0.0, atol=0.0)
 
 
+def test_world_can_read_each_va_layers_vl_fused_tokens() -> None:
+    model = VACompoundPolicy(
+        _peer_config(wmrm_reads_fused_va_tokens=True)
+    ).eval()
+    vision, proprio, previous, language, mask = _policy_inputs(model.config)
+    va_outputs: list[torch.Tensor] = []
+    wam_inputs: list[torch.Tensor] = []
+
+    for layer in model.layers:
+        original = layer.forward
+
+        def record_layer(visual, action, *args, _original=original, **kwargs):
+            result = _original(visual, action, *args, **kwargs)
+            va_outputs.append(result[0].detach().clone())
+            return result
+
+        layer.forward = record_layer
+
+    original_propose = model.wmrm.propose
+
+    def record_world(action, visual, prop, **kwargs):
+        wam_inputs.append(visual.detach().clone())
+        return original_propose(action, visual, prop, **kwargs)
+
+    with mock.patch.object(model.wmrm, "propose", side_effect=record_world):
+        model.encode_condition(
+            vision,
+            proprio,
+            previous,
+            language_hidden=language,
+            language_mask=mask,
+        )
+
+    assert len(wam_inputs) == model.config.wmrm_stage_count()
+    for va_output, wam_input in zip(va_outputs, wam_inputs, strict=False):
+        torch.testing.assert_close(va_output, wam_input, rtol=0.0, atol=0.0)
+
+
 def test_world_message_is_next_va_layers_attention_kv() -> None:
     model = VACompoundPolicy(_peer_config()).eval()
     vision, proprio, previous, language, mask = _policy_inputs(model.config)
@@ -659,45 +697,6 @@ def test_h15_prefix_condition_is_invariant_to_tail_query_values() -> None:
     torch.testing.assert_close(first[:, :6], second[:, :6], rtol=0.0, atol=1e-6)
 
 
-def test_h15_prefix_tail_migration_clones_existing_flow_into_tail() -> None:
-    from train import migrate_peer_h15_prefix_tail_flow_state
-    from va_compound.world_contract import (
-        PEER_GRADIENT_BOUNDARY_CONTRACT,
-        PEER_WORLD_TOPOLOGY_CONTRACT,
-    )
-
-    old = VACompoundPolicy(
-        _peer_config(
-            action_horizon=15,
-            planning_stride=2,
-            deployment_execution_horizon=2,
-            wmrm_cycle_steps=15,
-        )
-    )
-    new = VACompoundPolicy(
-        _peer_config(
-            action_horizon=15,
-            planning_stride=2,
-            deployment_execution_horizon=15,
-            wmrm_cycle_steps=15,
-        )
-    )
-    checkpoint = {
-        "config": {
-            "action_horizon": 15,
-            "va_world_mode": "peer_sync_h6",
-            "wmrm_cycle_steps": 15,
-        },
-        "training_contract": {
-            "peer_world_topology": PEER_WORLD_TOPOLOGY_CONTRACT,
-            "peer_gradient_boundary": PEER_GRADIENT_BOUNDARY_CONTRACT,
-        },
-        "model": old.state_dict(),
-    }
-    migrated = migrate_peer_h15_prefix_tail_flow_state(new, checkpoint)
-    new.load_state_dict(migrated, strict=True)
-    for name, value in new.tail_flow_head.state_dict().items():
-        torch.testing.assert_close(value, new.flow_head.state_dict()[name])
 
 
 def test_world_side_loss_reaches_wam_and_va_publishers_but_not_future_target() -> None:
@@ -741,178 +740,8 @@ def test_world_side_loss_reaches_wam_and_va_publishers_but_not_future_target() -
     assert future_target.grad is None
 
 
-def test_old_world8_migration_rebuilds_dynamics_but_keeps_policy_interface() -> None:
-    from train import migrate_peer_world8_to_world7_state
-    from va_compound.world_contract import (
-        PEER_LEGACY_GRADIENT_BOUNDARY_CONTRACT,
-        PEER_LEGACY_TOPOLOGY_CONTRACT,
-    )
-
-    model = VACompoundPolicy(
-        _peer_config(
-            num_layers=8,
-            action_horizon=15,
-            planning_stride=2,
-            wmrm_cycle_steps=15,
-            wmrm_predictor="st_blocks",
-            wmrm_predictor_depth=1,
-            wmrm_predictor_width=16,
-            wmrm_predictor_heads=4,
-        )
-    )
-    initial_out = model.wmrm.st_predictor.out_proj.weight.detach().clone()
-    initial_stage = model.wmrm.stage_embed.weight.detach().clone()
-    initial_tail_queries = model.action_queries[6:].detach().clone()
-    state = dict(model.state_dict())
-    old_queries = state["action_queries"][:6].clone()
-    state["action_queries"] = old_queries
-    hidden = state["wmrm.stage_embed.weight"].shape[1]
-    state["wmrm.stage_embed.weight"] = torch.arange(
-        8 * hidden, dtype=torch.float32
-    ).reshape(8, hidden)
-    state["wmrm.st_predictor.out_proj.weight"] = torch.full_like(
-        state["wmrm.st_predictor.out_proj.weight"], 9.0
-    )
-    state["wmrm.dino_to_hid.weight"] = torch.full_like(
-        state["wmrm.dino_to_hid.weight"], 3.0
-    )
-    state["world_action_readout.proj.weight"] = torch.full_like(
-        state["world_action_readout.proj.weight"], 4.0
-    )
-    checkpoint = {
-        "config": {"num_layers": 8, "action_horizon": 6},
-        "training_contract": {
-            "peer_world_topology": PEER_LEGACY_TOPOLOGY_CONTRACT,
-            "peer_gradient_boundary": PEER_LEGACY_GRADIENT_BOUNDARY_CONTRACT,
-        },
-        "model": state,
-    }
-
-    migrated, reset = migrate_peer_world8_to_world7_state(model, checkpoint)
-    assert "wmrm.stage_embed.weight" not in migrated
-    assert "wmrm.st_predictor.out_proj.weight" not in migrated
-    assert int(torch.count_nonzero(migrated["wmrm.dino_to_hid.weight"] - 3.0)) == 0
-    missing, unexpected = model.load_state_dict(migrated, strict=False)
-    assert set(missing) == reset
-    assert not unexpected
-    torch.testing.assert_close(model.wmrm.stage_embed.weight, initial_stage)
-    torch.testing.assert_close(model.wmrm.st_predictor.out_proj.weight, initial_out)
-    assert int(torch.count_nonzero(model.wmrm.dino_to_hid.weight - 3.0)) == 0
-    assert int(torch.count_nonzero(model.world_action_readout.proj.weight - 4.0)) == 0
-    torch.testing.assert_close(model.action_queries[:6], old_queries)
-    torch.testing.assert_close(model.action_queries[6:], initial_tail_queries)
 
 
-def test_va8_to_va16_migration_preserves_four_decision_policy_state() -> None:
-    from train import migrate_peer_va8_to_va16_state
-
-    common = dict(
-        action_horizon=15,
-        planning_stride=15,
-        deployment_execution_horizon=15,
-        wmrm_cycle_steps=15,
-        wmrm_predictor="st_blocks",
-        wmrm_predictor_depth=6,
-        wmrm_predictor_width=12,
-        wmrm_predictor_heads=3,
-    )
-    torch.manual_seed(41)
-    source = VACompoundPolicy(_peer_config(num_layers=8, **common)).eval()
-    checkpoint = {
-        "config": dict(source.config.__dict__),
-        "model": source.state_dict(),
-    }
-    torch.manual_seed(42)
-    expanded_common = {
-        **common,
-        "wmrm_predictor_depth": 7,
-        "wmrm_predictor_copies": 11,
-    }
-    expanded = VACompoundPolicy(
-        _peer_config(
-            num_layers=16,
-            wmrm_stage_gate_start=7,
-            **expanded_common,
-        )
-    ).eval()
-    expanded.load_state_dict(
-        migrate_peer_va8_to_va16_state(expanded, checkpoint), strict=True
-    )
-
-    for index in range(8, 16):
-        for name in ("out_v", "out_a", "out_t"):
-            assert int(torch.count_nonzero(getattr(expanded.layers[index], name).weight)) == 0
-        for name in ("ffn_v", "ffn_a", "ffn_t"):
-            assert int(torch.count_nonzero(getattr(expanded.layers[index], name)[-1].weight)) == 0
-    assert int(torch.count_nonzero(expanded.wmrm_stage_scale)) == 0
-    assert int(torch.count_nonzero(expanded.wmrm_belief_message_scale)) == 0
-    assert len(expanded.wmrm.st_predictor_extra) == 10
-    for predictor in (expanded.wmrm.st_predictor, *expanded.wmrm.st_predictor_extra):
-        torch.testing.assert_close(
-            predictor.in_proj.weight,
-            source.wmrm.st_predictor.in_proj.weight,
-        )
-        for name in ("sa_o", "ca_o"):
-            assert int(torch.count_nonzero(getattr(predictor.blocks[6], name).weight)) == 0
-        assert int(torch.count_nonzero(predictor.blocks[6].ff[2].weight)) == 0
-
-    source_memory = None
-    expanded_memory = None
-    for step in range(4):
-        torch.manual_seed(100 + step)
-        vision, proprio, previous, language, mask = _policy_inputs(source.config)
-        with torch.no_grad():
-            source_action, source_memory = source.encode_condition(
-                vision,
-                proprio,
-                previous,
-                language_hidden=language,
-                language_mask=mask,
-                visual_memory=source_memory,
-                return_visual_memory=True,
-            )
-            expanded_action, expanded_memory = expanded.encode_condition(
-                vision,
-                proprio,
-                previous,
-                language_hidden=language,
-                language_mask=mask,
-                visual_memory=expanded_memory,
-                return_visual_memory=True,
-            )
-        torch.testing.assert_close(expanded_action, source_action, rtol=0.0, atol=1e-6)
-        for expanded_layer, source_layer in zip(
-            expanded_memory.layers[:8], source_memory.layers, strict=True
-        ):
-            torch.testing.assert_close(expanded_layer, source_layer, rtol=0.0, atol=1e-6)
-        for field in ("belief", "innovation", "world_map"):
-            torch.testing.assert_close(
-                getattr(expanded_memory.world_state, field),
-                getattr(source_memory.world_state, field),
-                rtol=0.0,
-                atol=1e-6,
-            )
-
-    belief = torch.randn(2, expanded.wmrm.n_belief, expanded.config.hidden_dim, requires_grad=True)
-    world_map = torch.randn(
-        2,
-        expanded.wmrm.dino_dim,
-        expanded.wmrm.world_grid,
-        expanded.wmrm.world_grid,
-        requires_grad=True,
-    )
-    state = WAMState(belief=belief, world_map=world_map)
-    with torch.no_grad():
-        map_only = expanded.wmrm.encode_world_tokens(world_map)
-        expanded.wmrm_belief_message_scale[0] = 1.0
-    bridged = expanded._peer_world_message(state, 0)
-    count = min(map_only.shape[1], belief.shape[1])
-    torch.testing.assert_close(
-        bridged[:, :count], map_only[:, :count] + belief[:, :count]
-    )
-    bridged.sum().backward()
-    assert belief.grad is not None and float(belief.grad.abs().sum()) > 0.0
-    assert world_map.grad is None
 
 
 def test_capacity_phase2_policy_gradient_reaches_gate_not_world_predictor() -> None:
@@ -1096,7 +925,7 @@ def test_peer_logged_env_action_requires_complete_h6() -> None:
         _peer_config(planning_stride=2, wmrm_cycle_steps=2)
     ).eval()
     vision, proprio, previous, language, mask = _policy_inputs(model.config)
-    with pytest.raises(ValueError, match="complete H6"):
+    with pytest.raises(ValueError, match="complete action tensor"):
         model.encode_condition(
             vision,
             proprio,

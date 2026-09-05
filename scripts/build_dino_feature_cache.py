@@ -63,8 +63,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    from train import _build_dino_main_backbone
     from va_compound.model import VACompoundConfig
+    from va_compound.vision.encoding import _build_dino_main_backbone
 
     dataset = LongTrajFramesDataset(args.data, min_sequence_length=4)
     # 唯一帧 → 行号（首见顺序，确定性）。

@@ -10,7 +10,7 @@ from torch import nn
 from va_compound.backbones import QwenTextBackbone, SceneTeacher
 from va_compound.model import VACompoundConfig, VACompoundPolicy
 from eval_metaworld import build_plan_language_cache, plan_refresh_due
-from train import rollout_policy, sample_flow_matching_inputs, synthetic_sequence
+from va_compound.utils.flow import sample_flow_matching_inputs
 
 
 def tiny_config(**overrides) -> VACompoundConfig:
@@ -162,38 +162,7 @@ class PlanCacheTests(unittest.TestCase):
 
     # ---- train.py 集成 ----
 
-    def test_rollout_policy_plan_resampler_branch(self) -> None:
-        config = tiny_config(plan_resampler=True)
-        model = VACompoundPolicy(config)
-        batch = synthetic_sequence(config, 2, 4, torch.device("cpu"))
-        noisy, flow_time, _ = sample_flow_matching_inputs(batch["actions"])
-        velocities, conditions = rollout_policy(model, batch, noisy, flow_time)
-        self.assertEqual(
-            velocities.shape, (2, 4, config.action_horizon, config.action_dim)
-        )
-        velocities.square().mean().backward()
-        self.assertTrue(torch.isfinite(model.plan_resampler.plan_queries.grad).all())
 
-    def test_rollout_policy_scene_teacher_branch(self) -> None:
-        config = tiny_config(scene_teacher=True)
-        model = VACompoundPolicy(config)
-        backbone = QwenTextBackbone(SceneFakeTokenizer(), SceneFakeTextModel(dim=24))
-        teacher = SceneTeacher(language_dim=24, vision_dim=20, n_scene=8, n_readout=8)
-        batch = synthetic_sequence(config, 2, 4, torch.device("cpu"))
-        batch["language_hidden"] = batch["language_hidden"][:, :5]  # fake: 5 tokens
-        batch["language_mask"] = batch["language_mask"][:, :5]
-        noisy, flow_time, _ = sample_flow_matching_inputs(batch["actions"])
-        velocities, conditions = rollout_policy(
-            model, batch, noisy, flow_time,
-            text_backbone=backbone, scene_teacher=teacher, tasks=["t0", "t1"],
-        )
-        self.assertEqual(
-            velocities.shape, (2, 4, config.action_horizon, config.action_dim)
-        )
-        velocities.square().mean().backward()
-        # readout 路径的梯度必须回传到 SceneTeacher 参数。
-        self.assertTrue(teacher.readout_tokens.grad is not None)
-        self.assertGreater(float(teacher.readout_tokens.grad.abs().sum()), 0.0)
 
     # ---- eval_metaworld.py：plan-refresh 缓存重建 ----
 

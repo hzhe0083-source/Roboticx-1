@@ -21,7 +21,8 @@ import torch
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-import train as T  # noqa: E402
+import va_compound.training.engine as T
+from va_compound.training.config import parse_args  # noqa: E402
 
 STEPS_TO_REPORT = int(sys.argv[1]) if len(sys.argv) > 1 else 12
 # 可选第二个参数：exact-resume checkpoint。在训练过的权重上复测，用于区分
@@ -155,11 +156,11 @@ sys.argv = [
     "--save-every", "0", "--save", "/tmp/gradbal_probe.pt",
 ]
 
-sys.argv += ["--steps", str(STEPS_TO_REPORT + 2)]
+sys.argv += ["--slot-free-policy", "--steps", str(STEPS_TO_REPORT + 2)]
 if RESUME:
     # 只需要训练过的权重来测 ∂(flow loss)/∂(world_action_readout)；--resume 跳过
     # exact 契约校验（该契约嵌了绝对本地路径，无法跨机器复用）。
     sys.argv += ["--resume-weights", RESUME]
     print(f"[GRADBAL] loading trained weights from {RESUME}", flush=True)
 
-T.main()
+T.run_metaworld(parse_args())

@@ -62,6 +62,8 @@ class VACompoundConfig:
     action_dim: int = 7
     proprio_dim: int = 14
     flow_layers: int = 2
+    # Optional smaller action-decoder width. 0 keeps the historical shared width.
+    flow_hidden_dim: int = 0
     dropout: float = 0.0
     mode: AttentionMode = "bidir_va"
     # Su Shen-inspired upgrade (default off, backward compatible).
@@ -96,6 +98,9 @@ class VACompoundConfig:
     # checkpoints keep the old four-query language summary unless explicitly
     # enabled, so the new parameter set is an intentional architecture change.
     wmrm_full_language_tokens: bool = False
+    # Feed each World stage the current VA layer's language-grounded visual
+    # output. False preserves the legacy peer contract's pre-VA snapshot.
+    wmrm_reads_fused_va_tokens: bool = False
     wmrm_world_dim: int = 8
     # all = 每层更新 World state；last = 仅末层；even = 奇数层+末层。
     # peer_sync_h6 still requires this flag to be "all", but World is one
@@ -132,6 +137,14 @@ class VACompoundConfig:
     # flow 头深度条件（2026-08-07 审阅落地④）：每层 AdaLN-Zero + cross-attn
     # 注入条件（"entry" 为旧行为：仅入口相加）。
     flow_cond: str = "entry"
+    # Evo-1-style VA→Flow readout: three parallel cross-attention blocks read
+    # the final three VA action streams once per decision. Their zero-initialized
+    # residual gates keep the initial condition exactly equal to the last VA layer.
+    va_last3_cross_attn: bool = False
+    # Zero-gated bidirectional DINO↔Qwen bridge. The default four pairs keep
+    # old checkpoints loadable; new runs may fuse more tail layers one-to-one.
+    dino_qwen_cross_modal_bridge: bool = False
+    dino_qwen_cross_modal_layers: int = 4
     # Capacity warm-up only: let the frozen H9 Flow teacher pass its loss
     # through the action condition into newly appended VA layers.
     tail_flow_condition_grad: bool = False
@@ -249,6 +262,9 @@ class VACompoundConfig:
             raise ValueError("hidden_dim must be divisible by num_heads")
         if self.flow_layers < 1:
             raise ValueError("flow_layers must be positive")
+        flow_hidden_dim = self.flow_hidden_dim or self.hidden_dim
+        if flow_hidden_dim < 1 or flow_hidden_dim % self.num_heads:
+            raise ValueError("flow_hidden_dim must be positive and divisible by num_heads")
         if self.mode not in ("bidir_va", "uni_a"):
             raise ValueError(f"unsupported attention mode: {self.mode}")
         if self.attention_variant not in ("flat", "smc"):
@@ -259,8 +275,31 @@ class VACompoundConfig:
             )
         if self.sequential_coupling < 0:
             raise ValueError("sequential_coupling must be >= 0")
+        if self.sequential_coupling and self.mode == "uni_a":
+            raise ValueError("sequential_coupling does not support uni_a role masking")
+        if self.sequential_coupling and self.va_world_mode == "peer_sync_h6":
+            raise ValueError(
+                "sequential_coupling does not support protected action prefixes"
+            )
         if self.flow_cond not in ("entry", "adaln"):
             raise ValueError(f"unsupported flow conditioning: {self.flow_cond}")
+        if self.va_last3_cross_attn and self.num_layers < 3:
+            raise ValueError("va_last3_cross_attn requires num_layers >= 3")
+        if self.va_last3_cross_attn and self.direct_head:
+            raise ValueError("va_last3_cross_attn requires the Flow action head")
+        if self.dino_qwen_cross_modal_bridge and self.dino_dense_metric:
+            raise ValueError(
+                "dino_qwen_cross_modal_bridge is incompatible with dino_dense_metric"
+            )
+        if self.dino_qwen_cross_modal_layers < 1:
+            raise ValueError("dino_qwen_cross_modal_layers must be positive")
+        if (
+            self.dino_qwen_cross_modal_bridge
+            and self.num_layers < self.dino_qwen_cross_modal_layers
+        ):
+            raise ValueError(
+                "dino_qwen_cross_modal_bridge requires enough VA layers"
+            )
         if self.c2_controller and not self.direct_head:
             raise ValueError("c2_controller requires direct_head")
         if self.c2_control_dim < 1:
@@ -343,6 +382,8 @@ class VACompoundConfig:
                 )
         if self.wmrm_full_language_tokens and not self.wmrm:
             raise ValueError("wmrm_full_language_tokens requires wmrm=true")
+        if self.wmrm_reads_fused_va_tokens and not self.wmrm:
+            raise ValueError("wmrm_reads_fused_va_tokens requires wmrm=true")
         if self.slot_free_policy and (
             self.metric_geometry_inject
             or self.dino_dense_metric
@@ -408,9 +449,9 @@ class VACompoundConfig:
                 raise ValueError("peer_sync_h6 requires wmrm=true")
             if self.action_horizon not in {6, 15, 50}:
                 raise ValueError("peer mode requires action_horizon in {6, 15, 50}")
-            if self.planning_stride not in {1, 2, 3, 6, 15}:
+            if self.planning_stride not in {1, 2, 3, 4, 6, 15}:
                 raise ValueError(
-                    "peer_sync_h6 requires planning_stride in {1, 2, 3, 6, 15}"
+                    "peer_sync_h6 requires planning_stride in {1, 2, 3, 4, 6, 15}"
                 )
             if not 1 <= deployment_horizon <= self.action_horizon:
                 raise ValueError(
@@ -441,8 +482,8 @@ class VACompoundConfig:
                     "peer mode requires wmrm_cycle_steps to equal either the "
                     "execution prefix or full action horizon"
                 )
-            if self.action_dim != 4:
-                raise ValueError("peer_sync_h6 requires action_dim=4")
+            if self.action_dim < 1:
+                raise ValueError("peer_sync_h6 requires a positive action_dim")
             if self.num_layers < 2:
                 raise ValueError(
                     "peer_sync_h6 requires num_layers >= 2 so World can be one "
@@ -1442,11 +1483,8 @@ class VACouplingLayer(nn.Module):
                 # SMC-Attn：源测度校正（2026-08-05 原创）。
                 # softmax 前对每个来源减去 log N_s → 来源总质量 ∝ 平均证据而非
                 # token 数量 × 平均证据；复制/细分同一来源不再稀释其他来源。
-                # 只作用于动作 query 行（视觉 query 保持 uni_a 语义），L 计数按
+                # 只作用于动作 query 行（视觉/task query 不做源测度校正），L 计数按
                 # 实际有效 mask 计算（padding 不计入）。
-                n_lang = key.shape[2] - (
-                    n_visual + n_memory + n_action + n_task + n_state
-                )
                 log_n_v = math.log(max(1, n_visual))
                 log_n_m = math.log(max(1, n_memory))
                 log_n_a = math.log(max(1, n_action))
@@ -1464,14 +1502,17 @@ class VACouplingLayer(nn.Module):
                 for n_group, log_n_group in (
                     (n_visual, log_n_v),
                     (n_memory, log_n_m),
-                    (n_action, log_n_a),
                     (n_task, log_n_t),
-                    (n_state, log_n_s),
+                    (n_action, log_n_a),
                 ):
                     log_measure[:, off : off + n_group] = log_n_group
                     off += n_group
-                log_measure[:, off:] = log_n_l[:, None]
-                scores[:, :, n_visual:, :] -= log_measure[:, None, None, :]
+                log_measure[:, off : off + n_language] = log_n_l[:, None]
+                off += n_language
+                log_measure[:, off : off + n_state] = log_n_s
+                action_start = n_visual
+                action_end = n_visual + n_action
+                scores[:, :, action_start:action_end, :] -= log_measure[:, None, None, :]
             scores = scores.masked_fill(~allowed, torch.finfo(scores.dtype).min)
             self.last_max_logit = float(
                 scores.detach().masked_fill(~allowed, float("-inf")).amax()
@@ -1630,6 +1671,8 @@ class VACouplingLayer(nn.Module):
         n_other = 0
         for tokens, k_proj, u_proj, norm in groups:
             key_parts.append(self._to_heads(k_proj(norm(tokens))))
+            # Sequential attention intentionally keeps raw-token values; the flat
+            # path projects normalized values. Preserve this established behavior.
             value_parts.append(self._to_heads(u_proj(tokens)))
             n_other += tokens.shape[1]
         if language is not None:
@@ -1887,6 +1930,172 @@ class C2ActionHead(nn.Module):
         return delta, gain
 
 
+class EvoCrossAttentionBlock(nn.Module):
+    """Evo-1 cross-attention + FFN block adapted to VA hidden states."""
+
+    def __init__(self, hidden_dim: int, num_heads: int) -> None:
+        super().__init__()
+        self.attn = nn.MultiheadAttention(
+            hidden_dim, num_heads, dropout=0.0, batch_first=True
+        )
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+        self.ff = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 4),
+            nn.GELU(),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+        )
+
+    def forward(
+        self,
+        query: Tensor,
+        context: Tensor,
+        key_padding_mask: Tensor | None = None,
+        attn_mask: Tensor | None = None,
+    ) -> Tensor:
+        attended, _ = self.attn(
+            self.norm1(query),
+            context,
+            context,
+            key_padding_mask=key_padding_mask,
+            attn_mask=attn_mask,
+            need_weights=False,
+        )
+        hidden = query + attended
+        return hidden + self.ff(self.norm2(hidden))
+
+
+class VALast3CrossAttentionReadout(nn.Module):
+    """Read all final-three VA action streams without changing the base at init."""
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int,
+        action_horizon: int,
+        protected_action_prefixes: tuple[int, ...] = (),
+    ) -> None:
+        super().__init__()
+        self.readers = nn.ModuleList(
+            EvoCrossAttentionBlock(hidden_dim, num_heads) for _ in range(3)
+        )
+        self.gates = nn.Parameter(torch.zeros(3))
+        blocked = torch.zeros(
+            action_horizon, action_horizon, dtype=torch.bool
+        )
+        for prefix in protected_action_prefixes:
+            if not 0 < prefix < action_horizon:
+                raise ValueError("protected action prefix must be inside the horizon")
+            blocked[:, prefix:] = True
+            blocked[prefix:, prefix:] = False
+        self.register_buffer("attn_mask", blocked, persistent=False)
+
+    def forward(self, layer_actions: tuple[Tensor, Tensor, Tensor]) -> Tensor:
+        if len(layer_actions) != 3:
+            raise ValueError("VA last-three readout requires exactly three layer states")
+        query = layer_actions[-1]
+        output = query
+        for gate, reader, context in zip(
+            self.gates, self.readers, layer_actions, strict=True
+        ):
+            update = reader(query, context, attn_mask=self.attn_mask) - query
+            output = output + gate.to(dtype=query.dtype) * update
+        return output
+
+
+class DinoQwenCrossModalBridge(nn.Module):
+    """Zero-gated DINO/Qwen tail-layer pairs; no cross-layer averaging."""
+
+    def __init__(
+        self,
+        language_dim: int,
+        hidden_dim: int,
+        num_heads: int,
+        num_pairs: int = 4,
+    ) -> None:
+        super().__init__()
+        self.num_pairs = num_pairs
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        self.vision_norms = nn.ModuleList(
+            nn.LayerNorm(hidden_dim) for _ in range(num_pairs)
+        )
+        self.language_norms = nn.ModuleList(
+            nn.LayerNorm(language_dim) for _ in range(num_pairs)
+        )
+        self.language_projections = nn.ModuleList(
+            nn.Linear(language_dim, hidden_dim) for _ in range(num_pairs)
+        )
+        self.vision_readers = nn.ModuleList(
+            EvoCrossAttentionBlock(hidden_dim, num_heads) for _ in range(num_pairs)
+        )
+        self.language_readers = nn.ModuleList(
+            EvoCrossAttentionBlock(hidden_dim, num_heads) for _ in range(num_pairs)
+        )
+        self.language_delta_k = nn.ModuleList(
+            nn.Linear(hidden_dim, hidden_dim, bias=False) for _ in range(num_pairs)
+        )
+        self.language_delta_v = nn.ModuleList(
+            nn.Linear(hidden_dim, hidden_dim, bias=False) for _ in range(num_pairs)
+        )
+        self.gates = nn.Parameter(torch.zeros(num_pairs, 2))
+
+    def _to_heads(self, value: Tensor) -> Tensor:
+        batch, tokens, _ = value.shape
+        return value.view(
+            batch, tokens, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+
+    def forward(
+        self,
+        vision_layers: Tensor,
+        language_layers: Tensor,
+        language_mask: Tensor,
+    ) -> tuple[tuple[Tensor, ...], tuple[LayerLanguageCache, ...]]:
+        if vision_layers.ndim != 4 or vision_layers.shape[1] != self.num_pairs:
+            raise ValueError(
+                f"cross-modal bridge requires DINO [B,{self.num_pairs},N,H]"
+            )
+        if language_layers.ndim != 4 or language_layers.shape[1] != self.num_pairs:
+            raise ValueError(
+                f"cross-modal bridge requires Qwen [B,{self.num_pairs},L,D]"
+            )
+        if vision_layers.shape[0] != language_layers.shape[0]:
+            raise ValueError("cross-modal DINO/Qwen batch sizes differ")
+        if language_mask.shape != language_layers.shape[:1] + language_layers.shape[2:3]:
+            raise ValueError("cross-modal bridge language mask shape mismatch")
+        key_padding_mask = ~language_mask.bool()
+        visual_updates = []
+        language_deltas = []
+        for index in range(self.num_pairs):
+            vision = self.vision_norms[index](vision_layers[:, index])
+            language = self.language_projections[index](
+                self.language_norms[index](language_layers[:, index])
+            )
+            visual_update = (
+                self.vision_readers[index](vision, language, key_padding_mask)
+                - vision
+            )
+            visual_update = self.gates[index, 0].to(vision.dtype) * visual_update
+            language_update = (
+                self.language_readers[index](language, vision + visual_update)
+                - language
+            )
+            language_update = (
+                self.gates[index, 1].to(language.dtype)
+                * language_update
+                * language_mask[:, :, None].to(dtype=language.dtype)
+            )
+            visual_updates.append(visual_update)
+            language_deltas.append(
+                LayerLanguageCache(
+                    self._to_heads(self.language_delta_k[index](language_update)),
+                    self._to_heads(self.language_delta_v[index](language_update)),
+                )
+            )
+        return tuple(visual_updates), tuple(language_deltas)
+
+
 class FlowMatchingHead(nn.Module):
     """Small conditional vector field over a complete action chunk.
 
@@ -1989,8 +2198,10 @@ class FlowMatchingHead(nn.Module):
         [B, M, D]（compile readout tokens，D = semantic_in_dim，语言空间）;
         adaln 分支先经 ``semantic_proj`` 投影到 hidden，再与 action_condition
         拼接为 cross-attn 的 k/v（逐层读语义上下文）。None 时与旧行为逐位
-        一致。entry 分支无逐层 cross-attn，该参数被忽略（传入不报错）。
+        一致。entry 分支无逐层 cross-attn，传入该参数会显式报错。
         """
+        if self.flow_cond_mode == "entry" and semantic_context is not None:
+            raise ValueError("semantic_context requires flow_cond='adaln'")
         if noisy_actions.ndim != 3:
             raise ValueError("noisy_actions must have shape [batch, horizon, action_dim]")
         if noisy_actions.shape[:2] != action_condition.shape[:2]:
@@ -2018,16 +2229,14 @@ class FlowMatchingHead(nn.Module):
         action = self.action_projection(noisy_actions.to(dtype=dtype))
         time = self.time_projection(time_embedding)[:, None]
         if self.flow_cond_mode == "entry":
-            # entry 模式只在入口相加条件，无逐层注入机制；semantic_context 被
-            # 忽略（文档化：flow_semantic 需要 adaln 的逐层 cross-attn 才有意义）。
             hidden = action_condition + action + time
             for layer in self.layers:
                 hidden = layer(hidden)
         else:
-            # adaln（标准 AdaLN-Zero，DiT 风格）：入口不含条件，条件完全经
-            # 每层 scale/shift/gate 调制 + cross-attention 注入；零初始化
-            # gate=0 → 起点为无条件流场，条件通道从零开始学习。
-            hidden = action + time
+            # 每个 horizon 槽必须携带自己的 action condition；否则纯噪声
+            # 采样时整个 Flow 对槽位置换等变，无法区分第 1..H 步。AdaLN
+            # 仍负责全局调制，cross-attention 仍负责逐层读取完整条件序列。
+            hidden = action + action_condition + time
             global_cond = torch.cat(
                 (
                     time_embedding,
@@ -2089,6 +2298,8 @@ class VACompoundPolicy(nn.Module):
         # Training sequences advance at planning_stride. Evaluators may switch
         # this to the checkpoint's full-chunk deployment horizon.
         self.runtime_execution_horizon = config.planning_stride
+        # Runtime-only switch: excluded from state_dict and managed by training scripts.
+        self.runtime_dino_qwen_bridge_enabled = True
         self.vision_projection = nn.Linear(config.vision_dim, config.hidden_dim)
         self.state_projection = nn.Linear(config.proprio_dim + config.action_dim, config.hidden_dim)
         # Optional treatment-only modules must not consume the parent RNG stream:
@@ -2244,6 +2455,17 @@ class VACompoundPolicy(nn.Module):
             nn.init.zeros_(self.lang_to_query[-1].weight)
             nn.init.zeros_(self.lang_to_query[-1].bias)
 
+        protected_action_prefixes = (
+            (6, 15)
+            if config.va_world_mode == "peer_sync_h6"
+            and config.action_horizon == 50
+            and (config.deployment_execution_horizon or config.planning_stride) == 15
+            else (6,)
+            if config.va_world_mode == "peer_sync_h6"
+            and config.action_horizon == 15
+            and (config.deployment_execution_horizon or config.planning_stride) == 15
+            else ()
+        )
         self.layers = nn.ModuleList(
             VACouplingLayer(
                 hidden_dim=config.hidden_dim,
@@ -2268,22 +2490,31 @@ class VACompoundPolicy(nn.Module):
                 ),
                 dense_readout_mtvj=config.dense_readout_mtvj,
                 action_dense_readout=(config.action_vision_backbone != "none"),
-                protected_action_prefix=(
-                    (6, 15)
-                    if config.va_world_mode == "peer_sync_h6"
-                    and config.action_horizon == 50
-                    and (config.deployment_execution_horizon or config.planning_stride)
-                    == 15
-                    else 6
-                    if config.va_world_mode == "peer_sync_h6"
-                    and config.action_horizon == 15
-                    and (config.deployment_execution_horizon or config.planning_stride)
-                    == 15
-                    else 0
-                ),
+                protected_action_prefix=protected_action_prefixes,
             )
             for index in range(config.num_layers)
         )
+        with torch.random.fork_rng(devices=[]):
+            self.va_last3_readout = (
+                VALast3CrossAttentionReadout(
+                    config.hidden_dim,
+                    config.num_heads,
+                    config.action_horizon,
+                    protected_action_prefixes,
+                )
+                if config.va_last3_cross_attn
+                else None
+            )
+            self.dino_qwen_bridge = (
+                DinoQwenCrossModalBridge(
+                    config.language_dim,
+                    config.hidden_dim,
+                    config.num_heads,
+                    config.dino_qwen_cross_modal_layers,
+                )
+                if config.dino_qwen_cross_modal_bridge
+                else None
+            )
         # MT-VJ（2026-08-10 契约 §5）：dense evidence 共享投影（D/G/T：
         # 768 → 192 + 坐标嵌入投影），每层 dense K/V 复用其输出。
         # DINO-metric（2026-08-15）：DINO-main 下同一投影器以
@@ -2340,8 +2571,14 @@ class VACompoundPolicy(nn.Module):
                 dropout=config.dropout,
             )
         self.action_norm = nn.LayerNorm(config.hidden_dim)
+        flow_hidden_dim = config.flow_hidden_dim or config.hidden_dim
+        self.flow_condition_projection = (
+            nn.Identity()
+            if flow_hidden_dim == config.hidden_dim
+            else nn.Linear(config.hidden_dim, flow_hidden_dim)
+        )
         flow_head_kwargs = dict(
-            hidden_dim=config.hidden_dim,
+            hidden_dim=flow_hidden_dim,
             action_dim=config.action_dim,
             num_heads=config.num_heads,
             num_layers=config.flow_layers,
@@ -2591,6 +2828,8 @@ class VACompoundPolicy(nn.Module):
         language_hidden: Tensor | None = None,
         language_mask: Tensor | None = None,
         language_cache: LanguageCache | None = None,
+        cross_modal_vision_layers: Tensor | None = None,
+        cross_modal_language_layers: Tensor | None = None,
         visual_memory: VisualMemory | None = None,
         return_visual_memory: bool = False,
         dense_evidence: dict[int, Tensor] | None = None,
@@ -2636,6 +2875,33 @@ class VACompoundPolicy(nn.Module):
         if language_cache is None:
             language_cache = self.build_language_cache(language_hidden, language_mask)
 
+        bridge_visual_updates = None
+        bridge_language_deltas = None
+        if self.dino_qwen_bridge is not None and self.runtime_dino_qwen_bridge_enabled:
+            if cross_modal_vision_layers is None or cross_modal_language_layers is None:
+                raise ValueError(
+                    "enabled DINO/Qwen bridge requires layer-specific streams"
+                )
+            if (
+                cross_modal_vision_layers.ndim != 4
+                or cross_modal_vision_layers.shape[1]
+                != self.dino_qwen_bridge.num_pairs
+                or cross_modal_vision_layers.shape[0] != vision.shape[0]
+            ):
+                raise ValueError("cross_modal_vision_layers has the wrong shape")
+            projected_layers = torch.stack(
+                [
+                    self.project_shared_eye(cross_modal_vision_layers[:, index])
+                    for index in range(self.dino_qwen_bridge.num_pairs)
+                ],
+                dim=1,
+            )
+            bridge_visual_updates, bridge_language_deltas = self.dino_qwen_bridge(
+                projected_layers,
+                cross_modal_language_layers,
+                language_cache.attention_mask,
+            )
+
         action = self.action_queries[None].expand(vision.shape[0], -1, -1) + state[:, None]
         if self.config.action_query_cond:
             # Qwen-conditioned action queries：语言摘要（第 0 层投影 key 的 mask 加权均值）
@@ -2674,6 +2940,23 @@ class VACompoundPolicy(nn.Module):
                 raise ValueError(
                     "language cache device/dtype must match the policy; call cache.to(device, dtype)"
                 )
+
+        def layerwise_bridge(
+            index: int, current_vision: Tensor, current_cache: LayerLanguageCache
+        ) -> tuple[Tensor, LayerLanguageCache]:
+            if (
+                bridge_visual_updates is None
+                or index >= self.dino_qwen_bridge.num_pairs
+            ):
+                return current_vision, current_cache
+            pair = index
+            delta = bridge_language_deltas[pair]
+            return current_vision + bridge_visual_updates[pair].to(
+                dtype=current_vision.dtype
+            ), LayerLanguageCache(
+                current_cache.key + delta.key.to(dtype=current_cache.key.dtype),
+                current_cache.value + delta.value.to(dtype=current_cache.value.dtype),
+            )
 
         # MT-VJ dense readout（契约 §5）：dense_evidence 非 None 时共享投影
         # 一次，每层用各自 W_K/W_V 构建 dense K/V。None（False 或 True 但
@@ -2777,9 +3060,11 @@ class VACompoundPolicy(nn.Module):
             else:
                 task = commit
             task_hat = task
+            last_action_layers: list[Tensor] = []
             for index, (layer, layer_cache) in enumerate(
                 zip(self.layers, language_cache.layers, strict=True)
             ):
+                vision, layer_cache = layerwise_bridge(index, vision, layer_cache)
                 if layer.sequential:
                     vision, action, task_hat = layer.forward_sequential(
                         vision,
@@ -2804,12 +3089,16 @@ class VACompoundPolicy(nn.Module):
                         dense_input=dense_input,
                         action_dense_input=action_dense_input,
                     )
+                if self.va_last3_readout is not None and index >= len(self.layers) - 3:
+                    last_action_layers.append(action)
             # The VA layers propose a speculative task update; with EVSM it
             # goes to scratch (task_spec) and is only committed after evidence
             # verification at the next decision.  Without EVSM it commits
             # immediately (original behavior).
             spec = self.task_gate(task, task_hat)
             task_out = task if self.config.evsm else spec
+            if self.va_last3_readout is not None:
+                action = self.va_last3_readout(tuple(last_action_layers))
             action = action + self.task_to_action(spec.mean(dim=1, keepdim=True))
             action_condition = self.action_norm(action)
             if return_visual_memory:
@@ -2894,9 +3183,11 @@ class VACompoundPolicy(nn.Module):
         inject_layers = (
             self._wmrm_inject_layers() if self.wmrm is not None else set()
         )
+        last_action_layers: list[Tensor] = []
         for index, (layer, layer_cache) in enumerate(
             zip(self.layers, language_cache.layers, strict=True)
         ):
+            vision, layer_cache = layerwise_bridge(index, vision, layer_cache)
             previous_visual = None if visual_memory is None else visual_memory.layers[index]
             snapshot_action = action
             snapshot_vision = vision
@@ -2924,6 +3215,8 @@ class VACompoundPolicy(nn.Module):
                 )
             vision, action = va_vision, va_action
             next_memory.append(vision)
+            if self.va_last3_readout is not None and index >= len(self.layers) - 3:
+                last_action_layers.append(action)
             if (
                 self.wmrm is not None
                 and not skip_wmrm
@@ -2948,13 +3241,14 @@ class VACompoundPolicy(nn.Module):
                             dtype=language_keys.dtype
                         )[:, :, None]
                     language_tokens = None
-                    world_language_mask = None
+                    world_language_mask = mask
                 # Peer inputs expose one complete causal/logged action chunk.
                 # The World endpoint matches that full candidate horizon, while
                 # deployment executes only planning_stride actions before replanning.
-                # Propose uses this VA layer's snapshot; the next VA layer reads
-                # the new map. The last VA layer is not in inject_layers, so it
-                # consumes the final world map and does not open another stage.
+                # The LIBERO path gives World the current VA layer's VL-fused
+                # output. Legacy checkpoints keep the pre-VA peer snapshot.
+                # The next VA layer reads the new map; the final VA layer only
+                # consumes the last map and does not open another World stage.
                 if peer_mode:
                     full_env_action = (
                         self.world_action_readout(
@@ -2983,7 +3277,11 @@ class VACompoundPolicy(nn.Module):
                     snapshot_env_action = env_action
                 proposal = self.wmrm.propose(
                     snapshot_action,
-                    snapshot_vision,
+                    (
+                        va_vision
+                        if self.config.wmrm_reads_fused_va_tokens
+                        else snapshot_vision
+                    ),
                     proprio.to(dtype=snapshot_action.dtype),
                     state=world_state,
                     language_keys=language_keys,
@@ -3070,6 +3368,8 @@ class VACompoundPolicy(nn.Module):
                 self.last_wmrm = aux
                 self.last_wmrm_auxes.append(aux)
                 self.last_wmrm_pre_actions.append(snapshot_action)
+        if self.va_last3_readout is not None:
+            action = self.va_last3_readout(tuple(last_action_layers))
         action_condition = self.action_norm(action)
         if return_visual_memory:
             return action_condition, VisualMemory(
@@ -3096,6 +3396,7 @@ class VACompoundPolicy(nn.Module):
                 "action_condition must have shape "
                 f"[batch, {self.config.action_horizon}, {self.config.hidden_dim}]"
             )
+        flow_condition = self.flow_condition_projection(action_condition)
         if noisy_actions.shape != expected[:2] + (self.config.action_dim,):
             raise ValueError(
                 "noisy_actions must have shape "
@@ -3103,7 +3404,7 @@ class VACompoundPolicy(nn.Module):
             )
         if self.tail_flow_head is None:
             return self.flow_head(
-                action_condition, noisy_actions, flow_time, semantic_context
+                flow_condition, noisy_actions, flow_time, semantic_context
             )
 
         # The migrated H6 controller remains a closed prefix path. The H9
@@ -3111,15 +3412,15 @@ class VACompoundPolicy(nn.Module):
         # only tail_flow_head parameters and cannot overwrite VA/H6 features.
         prefix_horizon = 6
         prefix_velocity = self.flow_head(
-            action_condition[:, :prefix_horizon],
+            flow_condition[:, :prefix_horizon],
             noisy_actions[:, :prefix_horizon],
             flow_time,
             semantic_context,
         )
         tail_condition = (
-            action_condition
+            flow_condition
             if self.config.tail_flow_condition_grad
-            else action_condition.detach()
+            else flow_condition.detach()
         )
         tail_semantic = semantic_context
         if tail_semantic is not None and not self.config.tail_flow_condition_grad:

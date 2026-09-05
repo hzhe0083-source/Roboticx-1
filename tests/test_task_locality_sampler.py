@@ -5,13 +5,8 @@ from collections import Counter
 import pytest
 import torch
 
-from train import (
-    TaskLocalityWeightedSampler,
-    backward_pcgrad,
-    merge_separate_pcgrad_gradients,
-    partition_separate_pcgrad_parameters,
-    pop_update_gradients,
-)
+from va_compound.data.samplers import TaskLocalityWeightedSampler
+from va_compound.training.gradients import backward_pcgrad, merge_separate_pcgrad_gradients, partition_separate_pcgrad_parameters, pop_update_gradients
 
 
 def _sampler(seed: int = 7, block_batches: int = 2) -> TaskLocalityWeightedSampler:
@@ -412,6 +407,22 @@ def test_mixed_sampler_has_four_tasks_and_fixed_25_percent_anchors() -> None:
     assert anchors1 == anchors0
 
 
+def test_mixed_sampler_allows_dense_training_without_fixed_anchors() -> None:
+    instruction = torch.repeat_interleave(torch.arange(2), 20)
+    sampler = TaskLocalityWeightedSampler(
+        instruction_id=instruction,
+        episode_id=torch.arange(40),
+        task_weights=torch.ones(2),
+        batch_size=8,
+        sampling_mode="mixed",
+        mixed_tasks_per_batch=2,
+        anchor_replay_fraction=0.0,
+    )
+    for batch in sampler:
+        assert all(index >= 0 for index in batch)
+        assert Counter(sampler.task_ids[index] for index in batch) == {0: 4, 1: 4}
+
+
 def test_mixed_sampler_keeps_dagger_rows_out_of_fixed_anchors() -> None:
     instruction = torch.repeat_interleave(torch.arange(8), 20)
     eligible = torch.ones(160, dtype=torch.bool)
@@ -531,3 +542,27 @@ def test_separate_action_world_pcgrad_only_guards_shared_dino() -> None:
     assert stats["dino_projected"] == 1
     assert stats["dino_cosine"] < 0.0
     assert stats["dino_post_cosine"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_separate_action_world_pcgrad_supports_frozen_dino() -> None:
+    action = torch.nn.Parameter(torch.tensor(1.0))
+    world = torch.nn.Parameter(torch.tensor(1.0))
+    action_private, world_private, shared = partition_separate_pcgrad_parameters(
+        [("model.action", action), ("model.wmrm.weight", world)]
+    )
+    assert shared == []
+
+    backward_pcgrad([action, 2.0 * action], action_private, seed=3)
+    action_gradients = pop_update_gradients(action_private)
+    backward_pcgrad([world, 2.0 * world], world_private, seed=3)
+    stats = merge_separate_pcgrad_gradients(
+        action_private, shared, action_gradients
+    )
+
+    torch.testing.assert_close(action.grad, torch.tensor(1.5))
+    torch.testing.assert_close(world.grad, torch.tensor(1.5))
+    assert stats == {
+        "dino_projected": 0,
+        "dino_cosine": 0.0,
+        "dino_post_cosine": 0.0,
+    }

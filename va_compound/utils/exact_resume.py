@@ -4,10 +4,8 @@ These helpers freeze every runtime semantic (CLI, data identity, model config,
 optimizer) into a comparable ``exact_run_contract`` and serialize the training
 state (optimizer/sampler/RNG) needed to continue a run bit-for-bit.
 
-The module is intentionally light on imports: ``SAM``, the task samplers and
-``validate_optimizer_update_state`` live in ``train.py``, so they are imported
-lazily inside the few functions that touch them to avoid a circular import
-(train.py imports this module at top level).
+Sampler and optimizer implementations live in dataset and training modules;
+checkpoint helpers never depend on executable entrypoints.
 """
 
 from __future__ import annotations
@@ -24,8 +22,7 @@ import torch
 from torch import Tensor, nn
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only
-    from train import (
-        SAM,
+    from va_compound.data.samplers import (
         TaskLocalityWeightedSampler,
         TaskWeightedSampler,
     )
@@ -236,9 +233,13 @@ def build_dataset_content_identity(
 
 
 def _optimizer_contract(optimizer: torch.optim.Optimizer) -> dict:
-    from train import SAM
+    from va_compound.training.gradients import is_zero_redundancy_optimizer
 
-    kind = "sam_adamw" if isinstance(optimizer, SAM) else "adamw"
+    kind = (
+        "zero_adamw"
+        if is_zero_redundancy_optimizer(optimizer)
+        else "adamw"
+    )
     groups = []
     for group in optimizer.param_groups:
         parameters = list(group["params"])
@@ -309,9 +310,14 @@ def _normalize_legacy_exact_run_contract(contract: dict) -> dict:
         arguments.setdefault("lr_wmrm_predictor", None)
         arguments.setdefault("wmrm_predictor_grad_clip", None)
         arguments.setdefault("max_gradient_norm", None)
+        arguments.setdefault("va_last3_cross_attn", False)
+        arguments.setdefault("dino_qwen_cross_modal_bridge", False)
+        arguments.setdefault("qwen_keep_layers", 0)
     model_config = normalized.get("model_config")
     if isinstance(model_config, dict):
         model_config.setdefault("wmrm_detach_proposal_stage_state", False)
+        model_config.setdefault("va_last3_cross_attn", False)
+        model_config.setdefault("dino_qwen_cross_modal_bridge", False)
         # Checkpoints predating the peer core are exactly the legacy topology.
         # Normalizing this absent field is compatibility, not a migration to peer.
         model_config.setdefault("va_world_mode", "legacy")
@@ -576,21 +582,13 @@ def restore_rng_state(state: dict) -> None:
 
 
 def exact_optimizer_state_dict(optimizer: torch.optim.Optimizer) -> dict:
-    """Serialize AdamW, including SAM's real base optimizer state."""
-    from train import SAM
+    """Serialize AdamW or its distributed Zero wrapper."""
+    from va_compound.training.gradients import is_zero_redundancy_optimizer
 
-    if isinstance(optimizer, SAM):
-        if not isinstance(optimizer.base_optimizer, torch.optim.AdamW):
-            raise TypeError("--resume-exact only supports SAM with an AdamW base optimizer")
-        if any("pre_perturbation" in value for value in optimizer.state.values()):
-            raise RuntimeError("cannot checkpoint exact state between SAM first_step/second_step")
-        return {
-            "kind": "sam_adamw",
-            "state_dict": optimizer.base_optimizer.state_dict(),
-            "rho": [float(group["rho"]) for group in optimizer.param_groups],
-        }
+    if is_zero_redundancy_optimizer(optimizer):
+        return {"kind": "zero_adamw", "state_dict": optimizer.state_dict()}
     if not isinstance(optimizer, torch.optim.AdamW):
-        raise TypeError("--resume-exact currently supports AdamW (or SAM over AdamW) only")
+        raise TypeError("--resume-exact currently supports AdamW or Zero AdamW only")
     return {"kind": "adamw", "state_dict": optimizer.state_dict()}
 
 
@@ -599,23 +597,23 @@ def restore_exact_optimizer_state(
     saved: dict,
 ) -> None:
     """Strictly restore an optimizer produced by :func:`exact_optimizer_state_dict`."""
-    from train import SAM, validate_optimizer_update_state
+    from va_compound.training.gradients import (
+        is_zero_redundancy_optimizer,
+        validate_optimizer_update_state,
+    )
 
-    expected_kind = "sam_adamw" if isinstance(optimizer, SAM) else "adamw"
+    expected_kind = (
+        "zero_adamw"
+        if is_zero_redundancy_optimizer(optimizer)
+        else "adamw"
+    )
     if saved.get("kind") != expected_kind:
         raise ValueError(
             "exact resume optimizer mismatch: "
             f"checkpoint={saved.get('kind')!r} runtime={expected_kind!r}"
         )
-    if isinstance(optimizer, SAM):
-        saved_rho = [float(value) for value in saved.get("rho", [])]
-        runtime_rho = [float(group["rho"]) for group in optimizer.param_groups]
-        if saved_rho != runtime_rho:
-            raise ValueError(
-                f"exact resume SAM rho mismatch: {saved_rho!r} != {runtime_rho!r}"
-            )
-        optimizer.base_optimizer.load_state_dict(saved["state_dict"])
-        optimizer.param_groups = optimizer.base_optimizer.param_groups
+    if is_zero_redundancy_optimizer(optimizer):
+        optimizer.load_state_dict(saved["state_dict"])
     else:
         if not isinstance(optimizer, torch.optim.AdamW):
             raise TypeError("--resume-exact currently supports AdamW only")
@@ -657,7 +655,7 @@ def restore_exact_resume_state(
     restore_rng: bool = True,
 ) -> int:
     """Restore optimizer/sampler and optionally RNG; return completed updates."""
-    from train import TaskLocalityWeightedSampler
+    from va_compound.data.samplers import TaskLocalityWeightedSampler
 
     required = {
         "exact_resume_version",

@@ -75,9 +75,9 @@ _BELIEF_WORLD_GATE_BIAS = -6.0
 def _gate_fuse(gate: nn.Module, memory: Tensor, update: Tensor) -> Tensor:
     """凸组合写入 ``g * update + (1 - g) * memory``，g 逐通道由内容决定。
 
-    ``memory`` 不 detach：门必须看见已积累的记忆，"该记什么"才是可学的。sigmoid
-    导数 <= 0.25、``1 - g < 1``，所以这条路的递归雅可比是收缩的（与 LSTM/GRU 门控
-    稳定的论证相同）。有界性还需要调用点对结果做 normalization，见文件头说明。
+    ``memory`` 不 detach：门必须看见已积累的记忆，"该记什么"才是可学的。凸组合只
+    约束单次输出的逐坐标范围，不约束状态映射的 Jacobian；稳定性仍依赖 update 分支
+    的 Jacobian，以及调用点 RMSNorm 对激活幅值的封顶，见文件头说明。
     """
     gate_input = torch.cat((memory, update), dim=-1)
     weight = torch.sigmoid(gate(gate_input))
@@ -845,23 +845,17 @@ class WAM4VA(nn.Module):
                 drop, projection, torch.zeros_like(projection)
             )
 
-    def _span_ids(self, horizon: int, device: torch.device) -> Tensor:
-        n_spans = self.n_spans
-        return (
-            torch.arange(horizon, device=device, dtype=torch.long) * n_spans
-        ) // max(horizon, 1)
-
     def _segment_means(self, action: Tensor) -> list[Tensor]:
         used = min(self.cycle_steps, action.shape[1])
         action = action[:, :used]
         horizon = action.shape[1]
-        ids = self._span_ids(horizon, action.device)
         spans = []
         for index in range(self.n_spans):
-            mask = ids == index
-            if not bool(mask.any()):
-                mask = ids == ids[-1]
-            spans.append(action[:, mask].mean(dim=1))
+            start = (index * horizon + self.n_spans - 1) // self.n_spans
+            end = ((index + 1) * horizon + self.n_spans - 1) // self.n_spans
+            if start >= end:
+                start, end = horizon - 1, horizon
+            spans.append(action[:, start:end].mean(dim=1))
         return spans
 
     def encode_env_action(self, env_action: Tensor | None, *, batch: int, dtype: torch.dtype, device: torch.device) -> tuple[Tensor | None, Tensor]:
@@ -1080,6 +1074,11 @@ class WAM4VA(nn.Module):
             )
             scale = self.film_scale(fused)[:, :, None, None]
             shift = self.film_shift(fused)[:, :, None, None]
+            # Legacy predictor semantics, not standard one-shot FiLM: the same
+            # scale/shift condition both stages, so the linearized gain includes
+            # scale², and shift also appears in the final residual. Since map_pw2
+            # is zero-initialized, scale initially has no gradient; shift alone
+            # has the direct residual gradient.
             conditioned = context * scale + shift
             hidden = torch.relu(self.map_pw1(self.map_dw1(conditioned)))
             hidden = hidden * scale + shift
@@ -1176,9 +1175,9 @@ class WAM4VA(nn.Module):
         # dependency a memory has to learn, and detaching here made it a
         # constant.  The chain this opens is 32 steps deep (8 stages x T=4
         # decisions, all differentiable because wmrm_detach_proposal_stage_state
-        # defaults off and visual_memory is not detached across decisions), so it
-        # is only safe now that belief_norm bounds the activations and the convex
-        # gate contributes a <1 Jacobian per step instead of truncation.
+        # defaults off and visual_memory is not detached across decisions).
+        # belief_norm bounds activation scale; the learned gate itself does not
+        # guarantee a contractive Jacobian.
         predicted = self.evidence_from_belief(working)
         innovation = evidence - predicted
         if prev_innovation is not None:
@@ -1252,6 +1251,9 @@ class WAM4VA(nn.Module):
             task_tokens = self.task_attention(
                 self.task_queries[None].expand(batch, -1, -1),
                 language_keys.to(dtype=action.dtype),
+                None
+                if language_mask is None
+                else language_mask.to(device=action.device, dtype=torch.bool),
             )
             task_summary = task_tokens.mean(dim=1)
             progress_task_summary = task_summary

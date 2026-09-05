@@ -26,7 +26,7 @@ from unittest import mock
 import torch
 from torch import nn
 
-from train import parse_args, scale_semantic_lora_grads, validate_args
+from va_compound.training.gradients import scale_semantic_lora_grads
 from va_compound.backbones import (
     QwenSemanticBackbone,
     QwenTextBackbone,
@@ -137,6 +137,31 @@ class FakeVideoModel(nn.Module):
 
 def make_backbone(num_layers: int = 2, dim: int = 32) -> QwenTextBackbone:
     return QwenTextBackbone(FakeTokenizer(), FakeDecoder(dim=dim, num_layers=num_layers))
+
+
+def test_qwen_text_backbone_keeps_layers_zero_through_fourteen():
+    backbone = make_backbone(num_layers=24)
+    original = list(backbone.text_model.layers)
+    backbone.truncate(15)
+    assert backbone.original_num_layers == 24
+    assert backbone.keep_layers == 15
+    assert len(backbone.text_model.layers) == 15
+    assert backbone.text_model.layers[-1] is original[14]
+    hidden, mask = backbone.encode(["pick red cup"])
+    assert hidden.shape == (1, 5, 32)
+    assert mask.shape == (1, 5)
+
+
+def test_qwen_multilevel_mean_uses_final_norm():
+    backbone = make_backbone(num_layers=15)
+    layers = list(range(10, 15))
+    hierarchy, _ = backbone.encode(["pick red cup"], output_layers=layers)
+    expected = backbone.text_model.norm(
+        torch.stack([hierarchy[layer] for layer in layers]).mean(dim=0)
+    )
+    torch.testing.assert_close(
+        backbone.mean_output_layers(hierarchy, layers), expected
+    )
 
 
 def tiny_config(**overrides) -> VACompoundConfig:
@@ -469,7 +494,7 @@ class FlowSemanticTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "semantic_context"):
             head(cond, noise, time, semantic_context=torch.randn(4, 5, 32))
 
-    def test_entry_mode_ignores_context(self):
+    def test_entry_mode_rejects_context(self):
         head = FlowMatchingHead(
             hidden_dim=16, action_dim=4, num_heads=4, num_layers=2, dropout=0.0,
             flow_cond="entry",
@@ -478,9 +503,24 @@ class FlowSemanticTests(unittest.TestCase):
         noise = torch.randn(2, 3, 4)
         time = torch.rand(2)
         ctx = torch.randn(2, 5, 16)
-        torch.testing.assert_close(
-            head(cond, noise, time, semantic_context=ctx), head(cond, noise, time)
+        with self.assertRaisesRegex(ValueError, "flow_cond='adaln'"):
+            head(cond, noise, time, semantic_context=ctx)
+
+    def test_entry_mode_keeps_horizon_slot_identity(self):
+        torch.manual_seed(0)
+        head = FlowMatchingHead(
+            hidden_dim=16, action_dim=4, num_heads=4, num_layers=2, dropout=0.0,
+            flow_cond="entry",
         )
+        cond = torch.randn(2, 8, 16)
+        noise = torch.randn(2, 8, 4)
+        time = torch.rand(2)
+        perm = torch.tensor([7, 2, 5, 0, 6, 1, 4, 3])
+        original = head(cond, noise, time)
+        reordered_condition = head(cond[:, perm], noise, time)
+        self.assertFalse(torch.allclose(original, reordered_condition))
+        reordered_noise = head(cond, noise[:, perm], time)
+        self.assertFalse(torch.allclose(original[:, perm], reordered_noise))
 
     def test_policy_passthrough(self):
         policy = VACompoundPolicy(tiny_config(flow_cond="adaln", flow_semantic=True))
@@ -635,85 +675,6 @@ class LoraSuffixTests(unittest.TestCase):
         self.assertEqual(e2e.text_backbone.lora_layer_count, 2)
 
 
-class TrainArgRound2Tests(unittest.TestCase):
-    def test_role_query_tokens_must_be_positive(self):
-        args = parse_args(
-            ["--role-query", "--memory-split", "--role-query-tokens", "0"]
-        )
-        with self.assertRaisesRegex(ValueError, "role-query-tokens"):
-            validate_args(args)
-
-    def test_compile_n_readout_must_be_positive(self):
-        args = parse_args(["--compile-n-readout", "0"])
-        with self.assertRaisesRegex(ValueError, "compile-n-readout"):
-            validate_args(args)
-
-    def test_language_max_length_must_be_positive(self):
-        args = parse_args(["--language-max-length", "0"])
-        with self.assertRaisesRegex(ValueError, "language-max-length"):
-            validate_args(args)
-
-    def test_semantic_act_grad_scale_non_negative(self):
-        args = parse_args(["--semantic-act-grad-scale", "-0.5"])
-        with self.assertRaisesRegex(ValueError, "act-grad-scale"):
-            validate_args(args)
-
-    def test_semantic_lora_suffixes_non_empty(self):
-        args = parse_args(["--semantic-lora-suffixes", ","])
-        with self.assertRaisesRegex(ValueError, "lora-suffixes"):
-            validate_args(args)
-
-    def test_new_flags_have_structural_prerequisites(self):
-        # P0-高优 fail-fast：flow-semantic 需要 compile-task + adaln；role-query
-        # 需要 memory-split/action-query-cond 之一（旧版静默失效，改为报错）。
-        with self.assertRaisesRegex(ValueError, "compile-task"):
-            validate_args(parse_args(["--flow-semantic", "--single-task"]))
-        with self.assertRaisesRegex(ValueError, "adaln"):
-            validate_args(
-                parse_args(["--flow-semantic", "--compile-task", "--e2e-data", "x.pt",
-                            "--flow-cond", "entry", "--single-task"])
-            )
-        with self.assertRaisesRegex(ValueError, "memory-split"):
-            validate_args(parse_args(["--role-query", "--single-task"]))
-        # 满足前置条件后合法
-        args = parse_args(
-            [
-                "--role-query", "--action-query-cond",
-                "--flow-semantic", "--flow-cond", "adaln",
-                "--compile-task", "--e2e-data", "x.pt", "--single-task",
-            ]
-        )
-        validate_args(args)
-
-    def test_dual_attention_with_sequential_warns_but_passes(self):
-        args = parse_args(["--dual-attention", "--sequential-coupling", "2"])
-        validate_args(args)  # 仅打印警告，不报错
-
-    def test_dual_attention_with_coupling_one_rejected(self):
-        # P0-高优：coupling=1 时每层都是 sequential，双注意力永不生效 → 报错
-        args = parse_args(["--dual-attention", "--sequential-coupling", "1"])
-        with self.assertRaisesRegex(ValueError, "dual-attention"):
-            validate_args(args)
-
-    def test_flow_semantic_with_adaln_allowed(self):
-        args = parse_args(["--flow-semantic", "--flow-cond", "adaln", "--compile-task",
-                           "--e2e-data", "x.pt"])
-        validate_args(args)
-
-    def test_round2_defaults(self):
-        args = parse_args([])
-        self.assertFalse(args.role_query)
-        self.assertEqual(args.role_query_tokens, 16)
-        self.assertFalse(args.dual_attention)
-        self.assertFalse(args.flow_semantic)
-        self.assertEqual(
-            args.semantic_lora_suffixes,
-            "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
-        )
-        self.assertEqual(args.language_max_length, 64)
-        self.assertEqual(args.compile_n_readout, 16)
-        self.assertEqual(args.semantic_act_grad_scale, 0.1)
-        validate_args(args)
 
 
 class EtaActScalingTests(unittest.TestCase):

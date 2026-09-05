@@ -1036,7 +1036,7 @@ def update_multitask_rlt(
     update_actor: bool = True,
 ) -> tuple[int, dict[str, float]]:
     """Update balanced per-task critics and PCGrad the shared actor."""
-    from train import backward_pcgrad
+    from va_compound.training.gradients import backward_pcgrad
 
     task_ids = replay.available_task_ids()
     if not task_ids:
@@ -1163,7 +1163,7 @@ def _extract_vla_token_batch(
     memory_commit_every: int = 1,
 ) -> torch.Tensor:
     """Return final VLA tokens [B*T,H,D], after peer-World layer injection."""
-    from train import _dino_main_online_encode
+    from va_compound.vision.encoding import _dino_main_online_encode
 
     if memory_commit_every < 1:
         raise ValueError("memory commit cadence must be positive")

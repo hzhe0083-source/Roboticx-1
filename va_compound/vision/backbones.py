@@ -287,6 +287,27 @@ class QwenTextBackbone(nn.Module):
         self.tokenizer = tokenizer
         self.text_model = text_model
         self.max_length = max_length
+        self.original_num_layers = len(text_model.layers)
+        self.keep_layers = self.original_num_layers
+
+    def truncate(self, keep_layers: int) -> None:
+        """Keep decoder layers ``0..keep_layers-1`` and physically drop the rest."""
+        current = len(self.text_model.layers)
+        if not 1 <= keep_layers <= current:
+            raise ValueError(
+                f"keep_layers must be in [1, {current}], got {keep_layers}"
+            )
+        self.text_model.layers = nn.ModuleList(
+            list(self.text_model.layers[:keep_layers])
+        )
+        config = getattr(self.text_model, "config", None)
+        if config is not None:
+            if hasattr(config, "num_hidden_layers"):
+                config.num_hidden_layers = keep_layers
+            layer_types = getattr(config, "layer_types", None)
+            if layer_types is not None:
+                config.layer_types = list(layer_types[:keep_layers])
+        self.keep_layers = keep_layers
 
     @classmethod
     def from_pretrained(
@@ -296,6 +317,7 @@ class QwenTextBackbone(nn.Module):
         device: str | torch.device = "cuda",
         dtype: str = "bfloat16",
         max_length: int = 64,
+        keep_layers: int | None = None,
         local_files_only: bool = False,
     ) -> "QwenTextBackbone":
         from transformers import AutoModelForMultimodalLM, AutoTokenizer
@@ -312,8 +334,11 @@ class QwenTextBackbone(nn.Module):
         )
         text_model = full_model.model.language_model
         del full_model
+        backbone = cls(tokenizer=tokenizer, text_model=text_model, max_length=max_length)
+        if keep_layers is not None:
+            backbone.truncate(keep_layers)
         text_model.requires_grad_(False).eval().to(device)
-        return cls(tokenizer=tokenizer, text_model=text_model, max_length=max_length)
+        return backbone
 
     @torch.no_grad()
     def encode(
@@ -326,22 +351,18 @@ class QwenTextBackbone(nn.Module):
         0..N-1 over the decoder layers (embedding excluded).
         """
         input_ids, attention_mask = self._tokenize_instructions(instructions)
+        if output_layers is not None:
+            self._check_output_layers(output_layers)
+            hidden, _ = self._encode_selected_layers(
+                input_ids, attention_mask, output_layers
+            )
+            return {layer: value.detach() for layer, value in hidden.items()}, attention_mask.bool()
         output = self.text_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             use_cache=False,
             return_dict=True,
-            output_hidden_states=output_layers is not None,
         )
-        if output_layers is not None:
-            self._check_output_layers(output_layers)
-            return (
-                {
-                    layer: output.hidden_states[layer + 1].detach()
-                    for layer in output_layers
-                },
-                attention_mask.bool(),
-            )
         return output.last_hidden_state.detach(), attention_mask.bool()
 
     def apply_lora(
@@ -408,6 +429,45 @@ class QwenTextBackbone(nn.Module):
                     f"layer index {layer} out of range [0, {num_layers - 1}]"
                 )
 
+    def _encode_selected_layers(
+        self,
+        input_ids: Tensor,
+        attention_mask: Tensor,
+        output_layers: Sequence[int],
+    ) -> tuple[dict[int, Tensor], object]:
+        """Capture real decoder outputs; Qwen3.5 does not populate hidden_states."""
+        captured: dict[int, Tensor] = {}
+        handles = []
+        for index in output_layers:
+            def capture(_module, _inputs, output, *, layer=index):
+                captured[layer] = output[0] if isinstance(output, tuple) else output
+
+            handles.append(self.text_model.layers[index].register_forward_hook(capture))
+        try:
+            output = self.text_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+                return_dict=True,
+            )
+        finally:
+            for handle in handles:
+                handle.remove()
+        if set(captured) != set(output_layers):
+            raise RuntimeError("Qwen decoder hooks did not capture every requested layer")
+        return captured, output
+
+    def mean_output_layers(
+        self, hidden: dict[int, Tensor], output_layers: Sequence[int]
+    ) -> Tensor:
+        """Average selected decoder layers, then restore Qwen's output scale."""
+        self._check_output_layers(output_layers)
+        if set(hidden) != set(output_layers):
+            raise ValueError("hidden layer keys do not match output_layers")
+        fused = torch.stack([hidden[layer] for layer in output_layers], dim=0).mean(dim=0)
+        norm = getattr(self.text_model, "norm", None)
+        return norm(fused) if norm is not None else fused
+
     def encode_trainable(
         self,
         instructions: Sequence[str],
@@ -420,19 +480,18 @@ class QwenTextBackbone(nn.Module):
         ({layer: [B, L, D]}, mask).
         """
         input_ids, attention_mask = self._tokenize_instructions(instructions)
+        if output_layers is not None:
+            self._check_output_layers(output_layers)
+            hidden, _ = self._encode_selected_layers(
+                input_ids, attention_mask, output_layers
+            )
+            return hidden, attention_mask.bool()
         output = self.text_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             use_cache=False,
             return_dict=True,
-            output_hidden_states=output_layers is not None,
         )
-        if output_layers is not None:
-            self._check_output_layers(output_layers)
-            return (
-                {layer: output.hidden_states[layer + 1] for layer in output_layers},
-                attention_mask.bool(),
-            )
         return output.last_hidden_state, attention_mask.bool()
 
     def encode_with_scene(
@@ -1194,11 +1253,32 @@ class TimmActionVisionBackbone(nn.Module):
             set_checkpointing(True)
         super().train(True)
 
+    def unfreeze_last(self, blocks: int = 4) -> None:
+        """Train only the final ``blocks`` transformer blocks and final norm."""
+        layers = getattr(self.model, "blocks", None)
+        if layers is None or blocks < 0 or blocks > len(layers):
+            raise ValueError("invalid number of DINO transformer blocks to unfreeze")
+        self.freeze_all()
+        if not blocks:
+            return
+        norm = getattr(self.model, "norm", None)
+        if norm is None:
+            raise ValueError("DINO backbone has no final norm to unfreeze")
+        self._trainable = True
+        for layer in layers[-blocks:]:
+            layer.requires_grad_(True).train()
+        norm.requires_grad_(True).train()
+        set_checkpointing = getattr(self.model, "set_grad_checkpointing", None)
+        if callable(set_checkpointing):
+            set_checkpointing(True)
+
     def train(self, mode: bool = True) -> "TimmActionVisionBackbone":
         super().train(bool(mode) and self._trainable)
         return self
 
-    def forward_hierarchical_dense(self, images: Tensor) -> dict[int, Tensor]:
+    def _forward_dense_layers(
+        self, images: Tensor, output_layers: tuple[int, ...]
+    ) -> list[Tensor]:
         if images.ndim != 4 or images.shape[1] != 3:
             raise ValueError("action-vision images must have shape [batch, 3, H, W]")
         if tuple(images.shape[-2:]) != (self.image_size, self.image_size):
@@ -1210,14 +1290,14 @@ class TimmActionVisionBackbone(nn.Module):
         images = images.to(device=parameter.device, dtype=parameter.dtype)
         outputs = self.model.get_intermediate_layers(
             images,
-            n=list(self.output_layers),
+            n=list(output_layers),
             reshape=False,
             return_prefix_tokens=True,
             norm=True,
         )
         outputs = list(outputs)
-        if len(outputs) != 2:
-            raise RuntimeError("action-vision tower must return two intermediate levels")
+        if len(outputs) != len(output_layers):
+            raise RuntimeError("action-vision tower returned the wrong layer count")
         patches: list[Tensor] = []
         for output in outputs:
             if not isinstance(output, tuple) or len(output) != 2:
@@ -1231,7 +1311,36 @@ class TimmActionVisionBackbone(nn.Module):
                     f"{tuple(patch_tokens.shape)}"
                 )
             patches.append(patch_tokens)
+        return patches
+
+    def forward_hierarchical_dense(self, images: Tensor) -> dict[int, Tensor]:
+        patches = self._forward_dense_layers(images, self.output_layers)
         return {5: patches[0], 11: patches[1]}
+
+    def forward_final_dense(self, images: Tensor) -> Tensor:
+        return self._forward_dense_layers(images, (self.output_layers[-1],))[0]
+
+    def forward_last_four_mean_dense(self, images: Tensor) -> Tensor:
+        """Mean the final four ViT block grids without retaining all four."""
+        last = int(self.output_layers[-1])
+        patches = self._forward_dense_layers(
+            images, tuple(range(last - 3, last + 1))
+        )
+        return torch.stack(patches, dim=0).mean(dim=0)
+
+    def forward_last_four_dense(self, images: Tensor) -> Tensor:
+        """Return normalized blocks 20--23 separately as [B,4,N,D]."""
+        return self.forward_last_layers_dense(images, 4)
+
+    def forward_last_layers_dense(self, images: Tensor, count: int) -> Tensor:
+        """Return the final ``count`` normalized blocks as [B,count,N,D]."""
+        last = int(self.output_layers[-1])
+        if not 1 <= count <= last + 1:
+            raise ValueError("DINO tail layer count is out of range")
+        patches = self._forward_dense_layers(
+            images, tuple(range(last - count + 1, last + 1))
+        )
+        return torch.stack(patches, dim=1)
 
 
 class DINOv2ActionBackbone(TimmActionVisionBackbone):

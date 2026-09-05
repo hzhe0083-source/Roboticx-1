@@ -232,7 +232,7 @@ class LiveVJEPADataset:
         frame_aug_geometric: bool = True,
         dense_readout: bool = False,
     ) -> None:
-        from train import FeatureDataset  # 延迟导入避免循环依赖
+        from va_compound.data.feature_dataset import FeatureDataset  # 延迟导入避免循环依赖
 
         self._inner = FeatureDataset(
             path,

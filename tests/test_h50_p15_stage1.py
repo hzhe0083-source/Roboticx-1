@@ -4,7 +4,7 @@ from pathlib import Path
 
 import torch
 
-from train import migrate_peer_h15_to_h50_state
+from va_compound.training.model_setup import migrate_peer_h15_to_h50_state
 from va_compound.policy.model import VACompoundConfig, VACompoundPolicy
 
 
@@ -136,11 +136,29 @@ def test_joint_full3_launcher_unfreezes_all_three_trainable_branches() -> None:
         ROOT / "scripts/run_mw_mt50_h50_p15_joint_full3_v1.sh"
     ).read_text()
     assert "EPOCHS=3" in text
-    assert "BATCH=${BATCH:-16}" in text
+    assert "BATCH=${BATCH:-32}" in text
     assert "--va-data" in text and "--world-data" in text
     assert "--visual-world-supervision" in text
     assert "--pcgrad --pcgrad-separate-world" in text
+    assert "--zero-redundancy-optimizer" in text
     assert "--vision-unfreeze-all --lr-vision 0.000001" in text
     assert "--va-only" not in text
     assert "peer_h50_action_only_to_joint_weights_only_v1" in text
     assert "--save-step-copies" not in text
+    assert 'if [[ -n "${RUN_STEPS_OVERRIDE:-}" ]]; then' in text
+    assert "RUN_STEPS_OVERRIDE > 0 && completed > 0" in text
+
+
+def test_stable_joint_launcher_freezes_dino_and_samples_recovery() -> None:
+    text = (
+        ROOT / "scripts/run_mw_mt50_h50_p15_joint_stable3_v1.sh"
+    ).read_text()
+    assert "EXPECTED_EPISODES=${EXPECTED_EPISODES:-3470}" in text
+    assert "ONLINE_RECOVERY_SAMPLES=${ONLINE_RECOVERY_SAMPLES:-2}" in text
+    assert "TRAIN_DINO=${TRAIN_DINO:-0}" in text
+    assert "WMRM_FEATURE_METRIC=${WMRM_FEATURE_METRIC:-cosine}" in text
+    assert "MODEL_LR=${MODEL_LR:-0.000003}" in text
+    assert "WMRM_PREDICTOR_LR=${WMRM_PREDICTOR_LR:-0.00001}" in text
+    assert "MAIN_VISION_ENCODE_BATCH=${MAIN_VISION_ENCODE_BATCH:-16}" in text
+    assert "LONGTRAJ_DECODE_CACHE_TASKS=${LONGTRAJ_DECODE_CACHE_TASKS:-149}" in text
+    assert "PEER_PREFETCH_DEPTH=${PEER_PREFETCH_DEPTH:-4}" in text

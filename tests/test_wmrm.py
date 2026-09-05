@@ -128,81 +128,8 @@ def test_encode_condition_stage_detach_is_forward_only_for_candidate_context() -
     assert detached_grad is None or int(torch.count_nonzero(detached_grad)) == 0
 
 
-def test_rollout_proposal_stage_detach_is_explicit_and_forward_identical() -> None:
-    from train import rollout_policy
-
-    base_config = _tiny_spatial_config()
-    detached_config = _tiny_config(
-        vision_dim=8,
-        main_vision_dim=8,
-        num_layers=2,
-        action_horizon=6,
-        action_dim=4,
-        wmrm=True,
-        wmrm_cycle_steps=6,
-        wmrm_inject="all",
-        wmrm_detach_proposal_stage_state=True,
-        wmrm_predictor="st_blocks",
-        wmrm_predictor_depth=1,
-        wmrm_predictor_width=16,
-        wmrm_predictor_heads=4,
-        wmrm_map_size=4,
-        wmrm_map_channels=8,
-        wmrm_world_grid=4,
-        main_vision_grid=4,
-        main_vision_frames=2,
-        main_vision_tokens=32,
-    )
-    legacy = VACompoundPolicy(base_config).eval()
-    detached = VACompoundPolicy(detached_config).eval()
-    detached.load_state_dict(legacy.state_dict(), strict=True)
-
-    vision, proprio, previous, language, mask, actions = _spatial_inputs(base_config)
-    sequence = 2
-    batch = {
-        "vision_tokens": vision[:, None].expand(-1, sequence, -1, -1).clone(),
-        "proprio": proprio[:, None].expand(-1, sequence, -1).clone(),
-        "previous_action": previous[:, None].expand(-1, sequence, -1).clone(),
-        "actions": actions[:, None].expand(-1, sequence, -1, -1).clone(),
-        "language_hidden": language,
-        "language_mask": mask,
-    }
-    noisy = torch.randn(
-        vision.shape[0], sequence, base_config.action_horizon, base_config.action_dim
-    )
-    flow_time = torch.rand(vision.shape[0], sequence)
-
-    calls: dict[str, list[bool]] = {"legacy": [], "detached": []}
-    for name, model in (("legacy", legacy), ("detached", detached)):
-        original = model.encode_condition
-
-        def record(*args, _name=name, _original=original, **kwargs):
-            if not kwargs.get("skip_wmrm", False):
-                calls[_name].append(bool(kwargs.get("detach_wmrm_stage_state", False)))
-            return _original(*args, **kwargs)
-
-        model.encode_condition = record
-
-    legacy_outputs = rollout_policy(legacy, batch, noisy, flow_time, flow_steps=2)
-    detached_outputs = rollout_policy(detached, batch, noisy, flow_time, flow_steps=2)
-
-    assert calls == {"legacy": [False, False], "detached": [True, True]}
-    for legacy_output, detached_output in zip(
-        legacy_outputs, detached_outputs, strict=True
-    ):
-        torch.testing.assert_close(
-            legacy_output, detached_output, rtol=0.0, atol=0.0
-        )
-    torch.testing.assert_close(
-        torch.stack([aux.z_tokens for aux in legacy.last_wmrm_auxes]),
-        torch.stack([aux.z_tokens for aux in detached.last_wmrm_auxes]),
-        rtol=0.0,
-        atol=0.0,
-    )
-
-
 def test_cli_proposal_stage_detach_defaults_off_and_is_configurable() -> None:
-    from train import parse_args
+    from va_compound.training.config import parse_args
 
     assert parse_args([]).wmrm_detach_proposal_stage_state is False
     assert (
@@ -210,6 +137,7 @@ def test_cli_proposal_stage_detach_defaults_off_and_is_configurable() -> None:
         .wmrm_detach_proposal_stage_state
         is True
     )
+
 
 
 def test_evaluator_world_forward_matches_full_logged_forward_stage_maps() -> None:
@@ -355,14 +283,6 @@ def test_shared_eye_is_pre_va_projection() -> None:
     assert not torch.allclose(evidence_a, evidence_b)
 
 
-def test_cli_mutex_direct_head() -> None:
-    from train import parse_args, validate_args
-
-    args = parse_args(["--wam4va", "--direct-head"])
-    with pytest.raises(ValueError, match="direct-head"):
-        validate_args(args)
-
-
 def test_policy_wires_executable_action_dim() -> None:
     model = VACompoundPolicy(_tiny_config(wmrm=True, action_dim=4, action_horizon=6))
     assert model.wmrm is not None
@@ -462,6 +382,34 @@ def test_language_keys_condition_world_transition_without_writing_va() -> None:
     aux_a, aux_b = plain.aux, conditioned.aux
     assert aux_b.task_summary.shape == (2, 32)
     assert not torch.equal(aux_a.task_summary, aux_b.task_summary)
+
+
+def test_legacy_language_padding_does_not_change_world_output() -> None:
+    torch.manual_seed(19)
+    block = WAM4VA(32, world_dim=8, proprio_dim=9).eval()
+    action = torch.randn(2, 5, 32)
+    vision = torch.randn(2, 6, 32)
+    proprio = torch.randn(2, 9)
+    valid = torch.randn(2, 3, 32)
+    short = torch.cat((valid, torch.randn(2, 2, 32) * 100.0), dim=1)
+    long = torch.cat((valid, torch.randn(2, 5, 32) * -100.0), dim=1)
+    short_mask = torch.tensor([[1, 1, 1, 0, 0]] * 2, dtype=torch.bool)
+    long_mask = torch.tensor([[1, 1, 1, 0, 0, 0, 0, 0]] * 2, dtype=torch.bool)
+
+    with torch.no_grad():
+        short_proposal = block.propose(
+            action, vision, proprio, language_keys=short, language_mask=short_mask
+        )
+        long_proposal = block.propose(
+            action, vision, proprio, language_keys=long, language_mask=long_mask
+        )
+
+    torch.testing.assert_close(
+        short_proposal.aux.task_summary, long_proposal.aux.task_summary
+    )
+    torch.testing.assert_close(
+        short_proposal.world_message, long_proposal.world_message
+    )
 
 
 def test_full_language_world_reads_tokens_directly_and_masks_padding() -> None:
@@ -572,17 +520,16 @@ def test_full_language_world_can_skip_only_mask_content_check() -> None:
         )
 
 
-def test_span_ids_cover_horizon_when_not_divisible() -> None:
+def test_segment_means_cover_horizon_when_not_divisible() -> None:
     block = WAM4VA(
         32, world_dim=8, proprio_dim=9, n_spans=3, cycle_steps=8
     )
-    ids = block._span_ids(8, torch.device("cpu"))
-    assert ids.tolist() == [0, 0, 0, 1, 1, 1, 2, 2]
     action = torch.randn(1, 8, 32)
     means = block._segment_means(action)
     assert len(means) == 3
-    torch.testing.assert_close(means[0], action[:, :3].mean(dim=1))
-    torch.testing.assert_close(means[2], action[:, 6:].mean(dim=1))
+    torch.testing.assert_close(means[0], action[:, 0:3].mean(dim=1))
+    torch.testing.assert_close(means[1], action[:, 3:6].mean(dim=1))
+    torch.testing.assert_close(means[2], action[:, 6:8].mean(dim=1))
 
 
 def test_action_dep_hinge_penalizes_action_independent_z() -> None:
@@ -600,7 +547,7 @@ def test_world_span_heads_exist() -> None:
 
 
 def test_dino_target_is_raw_tokens() -> None:
-    from train import wmrm_next_feature_target
+    from va_compound.training.rollout import wmrm_next_feature_target
 
     model = VACompoundPolicy(_tiny_config(wmrm=True)).eval()
     batch = {
@@ -879,29 +826,6 @@ def test_world_memory_keeps_native_16x16() -> None:
     assert tokens.shape == (1, 256, 32)
 
 
-def test_cli_mutex_vjepa_target_on_dino(tmp_path) -> None:
-    from train import parse_args, validate_args
-
-    data = tmp_path / "windows.pt"
-    ckpt = tmp_path / "dino.pt"
-    data.write_bytes(b"x")
-    ckpt.write_bytes(b"x")
-    args = parse_args(
-        [
-            "--wmrm",
-            "--dino-main-vision",
-            "--wmrm-target",
-            "vjepa",
-            "--data",
-            str(data),
-            "--main-vision-checkpoint",
-            str(ckpt),
-        ]
-    )
-    with pytest.raises(ValueError, match="vjepa"):
-        validate_args(args)
-
-
 def test_matched_no_fixed_point_perm_same_task() -> None:
     task_id = torch.tensor([0, 0, 1, 1])
     eye = torch.tensor([[0.0], [0.1], [10.0], [10.2]])
@@ -932,75 +856,10 @@ def test_wmrm_target_vjepa_rejected_on_dino_config() -> None:
         )
 
 
-def test_cli_wmrm_only_requires_wam4va() -> None:
-    from train import parse_args, validate_args
-
-    args = parse_args(["--wmrm-only"])
-    with pytest.raises(ValueError, match="wmrm-only"):
-        validate_args(args)
-
-
-def test_cli_wam4va_uses_state_exchange_without_writeback_flags() -> None:
-    from train import parse_args, validate_args
-
-    args = parse_args(["--wam4va"])
-    validate_args(args)
-    assert not hasattr(args, "wmrm_handshake")
-    assert not hasattr(args, "wmrm_med_weight")
-    assert not hasattr(args, "wmrm_pi_kl_weight")
-
-
-def test_cli_late_stage_anchor_defaults_off_and_requires_visual_world() -> None:
-    from train import parse_args, validate_args
-
-    assert parse_args([]).wmrm_late_stage_anchor_weight == 0.0
-    assert parse_args([]).wmrm_stage_s5_weight is None
-    assert parse_args([]).wmrm_stage_s6_weight is None
-    assert parse_args([]).lr_wmrm_predictor is None
-    assert parse_args([]).wmrm_predictor_grad_clip is None
-    args = parse_args(
-        ["--wam4va", "--wmrm-late-stage-anchor-weight", "0.25"]
-    )
-    with pytest.raises(ValueError, match="visual-world-supervision"):
-        validate_args(args)
-    ok = parse_args(
-        [
-            "--wam4va",
-            "--visual-world-supervision",
-            "--wmrm-late-stage-anchor-weight",
-            "0.25",
-            "--lr-wmrm-predictor",
-            "3e-5",
-            "--wmrm-predictor-grad-clip",
-            "0.5",
-        ]
-    )
-    assert ok.wmrm_late_stage_anchor_weight == 0.25
-    assert ok.lr_wmrm_predictor == pytest.approx(3e-5)
-    assert ok.wmrm_predictor_grad_clip == pytest.approx(0.5)
-    weights = parse_args(
-        [
-            "--wam4va",
-            "--visual-world-supervision",
-            "--wmrm-stage-s5-weight",
-            "0.5",
-            "--wmrm-stage-s6-weight",
-            "1.0",
-        ]
-    )
-    from train import visual_world_stage_weight_overrides
-    from va_compound.world_supervision import stage_supervision_weights
-
-    assert visual_world_stage_weight_overrides(weights) == {5: 0.5, 6: 1.0}
-    assert stage_supervision_weights(
-        8, overrides=visual_world_stage_weight_overrides(weights)
-    ) == (0.1, 0.1, 0.1, 0.1, 0.1, 0.5, 1.0, 1.0)
-
-
 def test_feature_optimizer_groups_can_give_st_predictor_its_own_lr() -> None:
     from argparse import Namespace
 
-    from train import _feature_optimizer_groups
+    from va_compound.training.model_setup import _feature_optimizer_groups
 
     model = VACompoundPolicy(_tiny_spatial_config())
     groups = _feature_optimizer_groups(
@@ -1036,10 +895,7 @@ def test_feature_optimizer_groups_can_give_st_predictor_its_own_lr() -> None:
 
 
 def test_predictor_gradient_clip_does_not_overlap_main_clip() -> None:
-    from train import (
-        clip_main_and_optional_predictor_gradients,
-        named_trainable_parameters,
-    )
+    from va_compound.training.gradients import clip_main_and_optional_predictor_gradients, named_trainable_parameters
 
     model = VACompoundPolicy(_tiny_spatial_config())
     named = list(named_trainable_parameters(("model", model)))
@@ -1059,7 +915,7 @@ def test_predictor_gradient_clip_does_not_overlap_main_clip() -> None:
 def test_peer_joint_optimizer_keeps_va_world_and_flow_trainable() -> None:
     from argparse import Namespace
 
-    from train import _feature_optimizer_groups
+    from va_compound.training.model_setup import _feature_optimizer_groups
 
     model = VACompoundPolicy(
         _tiny_config(
@@ -1089,160 +945,10 @@ def test_peer_joint_optimizer_keeps_va_world_and_flow_trainable() -> None:
     assert grouped == {id(parameter) for parameter in model.parameters()}
 
 
-def test_capacity_new_only_optimizer_freezes_small_model_base() -> None:
-    from argparse import Namespace
-
-    from train import _feature_optimizer_groups
-
-    model = VACompoundPolicy(
-        _tiny_config(
-            vision_dim=8,
-            main_vision_dim=8,
-            num_layers=16,
-            action_horizon=15,
-            action_dim=4,
-            planning_stride=15,
-            deployment_execution_horizon=15,
-            wmrm=True,
-            wmrm_cycle_steps=15,
-            wmrm_inject="all",
-            va_world_mode="peer_sync_h6",
-            wmrm_predictor="st_blocks",
-            wmrm_predictor_depth=7,
-            wmrm_predictor_width=16,
-            wmrm_predictor_heads=4,
-            wmrm_predictor_copies=11,
-            wmrm_stage_gate_start=7,
-            wmrm_map_size=4,
-            wmrm_map_channels=8,
-            wmrm_world_grid=4,
-            main_vision_grid=4,
-            main_vision_frames=2,
-            main_vision_tokens=32,
-            tail_flow_condition_grad=True,
-        )
-    )
-    groups = _feature_optimizer_groups(
-        Namespace(
-            capacity_new_only=True,
-            lr=5e-5,
-            action_vision_only=False,
-            wmrm_only=False,
-            va_only=False,
-            head_only=False,
-            servo_only=False,
-        ),
-        model,
-        None,
-    )
-    trainable = {
-        name for name, parameter in model.named_parameters() if parameter.requires_grad
-    }
-    assert "wmrm_stage_scale" in trainable
-    assert any(name.startswith("layers.8.") for name in trainable)
-    assert not any(name.startswith("layers.7.") for name in trainable)
-    assert any(name.startswith("wmrm.st_predictor_extra.4.") for name in trainable)
-    assert not any(name.startswith("wmrm.st_predictor_extra.3.") for name in trainable)
-    assert not any(name.startswith("flow_head.") for name in trainable)
-    assert not any(name.startswith("tail_flow_head.") for name in trainable)
-    assert "wmrm_belief_message_scale" not in trainable
-    grouped = {id(parameter) for group in groups for parameter in group["params"]}
-    assert grouped == {
-        id(parameter) for parameter in model.parameters() if parameter.requires_grad
-    }
-    assert groups[0]["lr"] == 5e-5
-
-
-def test_capacity_phase2_gate_group_and_projection_are_isolated() -> None:
-    from argparse import Namespace
-
-    from train import (
-        _feature_optimizer_groups,
-        project_capacity_stage_gates,
-    )
-
-    model = VACompoundPolicy(
-        _tiny_config(
-            vision_dim=8,
-            main_vision_dim=8,
-            num_layers=16,
-            action_horizon=15,
-            action_dim=4,
-            planning_stride=15,
-            deployment_execution_horizon=15,
-            wmrm=True,
-            wmrm_cycle_steps=15,
-            wmrm_inject="all",
-            va_world_mode="peer_sync_h6",
-            wmrm_predictor="st_blocks",
-            wmrm_predictor_depth=7,
-            wmrm_predictor_width=16,
-            wmrm_predictor_heads=4,
-            wmrm_predictor_copies=11,
-            wmrm_stage_gate_start=7,
-            wmrm_map_size=4,
-            wmrm_map_channels=8,
-            wmrm_world_grid=4,
-            main_vision_grid=4,
-            main_vision_frames=2,
-            main_vision_tokens=32,
-            capacity_stage_gate_policy_grad=True,
-        )
-    )
-    groups = _feature_optimizer_groups(
-        Namespace(
-            capacity_new_only=False,
-            capacity_phase2_gates=True,
-            lr=1e-5,
-            lr_wmrm_predictor=None,
-            action_vision_only=False,
-            wmrm_only=False,
-            va_only=False,
-            head_only=False,
-            servo_only=False,
-        ),
-        model,
-        None,
-    )
-    assert all(parameter.requires_grad for parameter in model.parameters())
-    assert {
-        id(parameter) for group in groups for parameter in group["params"]
-    } == {id(parameter) for parameter in model.parameters()}
-    gate_groups = [
-        group
-        for group in groups
-        if any(p is model.wmrm_stage_scale for p in group["params"])
-    ]
-    assert len(gate_groups) == 1
-    assert gate_groups[0]["lr"] == 1e-5
-
-    with torch.no_grad():
-        model.wmrm_stage_scale.copy_(
-            torch.tensor([-0.2, -1e-4, 0.0, 0.2, 0.8, 1.0, 1.1, 3.0])
-        )
-    project_capacity_stage_gates(model, enabled=True)
-    torch.testing.assert_close(
-        model.wmrm_stage_scale,
-        torch.tensor([0.0, 0.0, 0.0, 0.2, 0.8, 1.0, 1.0, 1.0]),
-    )
-    project_capacity_stage_gates(model, enabled=True, reset=True)
-    torch.testing.assert_close(model.wmrm_stage_scale, torch.ones(8))
-
-
-def test_capacity_phase2_projection_disabled_leaves_gate_unchanged() -> None:
-    from train import project_capacity_stage_gates
-
-    model = torch.nn.Module()
-    model.wmrm_stage_scale = torch.nn.Parameter(torch.linspace(-0.5, 1.5, 8))
-    before = model.wmrm_stage_scale.detach().clone()
-    assert project_capacity_stage_gates(model, enabled=False, reset=True) is None
-    torch.testing.assert_close(model.wmrm_stage_scale, before)
-
-
 def test_wmrm_only_freezes_va_and_flow() -> None:
     from argparse import Namespace
 
-    from train import _feature_optimizer_groups
+    from va_compound.training.model_setup import _feature_optimizer_groups
 
     model = VACompoundPolicy(_tiny_config(wmrm=True))
     args = Namespace(

@@ -138,6 +138,10 @@ def reduce_update_gradients(
     """
     if not topology.is_distributed:
         return
+    if not named_parameters:
+        return
+    device = named_parameters[0][1].device
+    _assert_gradient_symmetry(named_parameters, topology, device)
     gradients = [
         parameter.grad
         for _, parameter in named_parameters
@@ -145,11 +149,10 @@ def reduce_update_gradients(
     ]
     if not gradients:
         return
-    device = gradients[0].device
-    _assert_gradient_symmetry(named_parameters, topology, device)
     scale = 1.0 / float(topology.world_size)
     bucket: list[Tensor] = []
     bucket_bytes = 0
+    bucket_dtype = None
 
     def flush(entries: list[Tensor]) -> None:
         if not entries:
@@ -165,9 +168,13 @@ def reduce_update_gradients(
 
     for gradient in gradients:
         span = gradient.numel() * gradient.element_size()
-        if bucket and bucket_bytes + span > BUCKET_BYTES:
+        if bucket and (
+            bucket_bytes + span > BUCKET_BYTES or gradient.dtype != bucket_dtype
+        ):
             flush(bucket)
-            bucket, bucket_bytes = [], 0
+            bucket, bucket_bytes, bucket_dtype = [], 0, None
+        if bucket_dtype is None:
+            bucket_dtype = gradient.dtype
         bucket.append(gradient)
         bucket_bytes += span
     flush(bucket)

@@ -67,6 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--horizon", type=int, default=400)
     parser.add_argument("--mt50-benchmark", action="store_true")
     parser.add_argument("--align-init", action="store_true")
+    parser.add_argument("--peer-world-off", action="store_true")
     parser.add_argument("--dagger-output-dir", default=None)
     parser.add_argument("--dagger-takeover-min", type=int, default=45)
     parser.add_argument("--dagger-takeover-max", type=int, default=120)
@@ -152,6 +153,8 @@ def main() -> int:
             command.append("--mt50-benchmark")
         if args.align_init:
             command.append("--align-init")
+        if args.peer_world_off:
+            command.append("--peer-world-off")
         if args.dagger_output_dir is not None:
             command.extend(
                 (

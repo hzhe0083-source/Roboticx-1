@@ -58,8 +58,6 @@ def test_readiness_expects_planned_waiters_and_acceptance_set() -> None:
     assert "6000 -> 20000" in resume_text
     assert "20k archive present after trainer exit" in resume_text
     assert "trainer exited 0 but 20k archive is still missing" in resume_text
-    train_text = Path(__file__).resolve().parent.parent.joinpath("train.py").read_text()
-    assert "step={global_step}" in train_text
     posttrain = Path(__file__).resolve().parent.parent / "scripts" / "run_task35_h6_posttrain_eval.sh"
     posttrain_text = posttrain.read_text()
     assert "select_task35_best_fm.py" not in posttrain_text

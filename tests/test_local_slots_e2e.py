@@ -139,7 +139,7 @@ class LocalSlotDataLoaderTests(unittest.TestCase):
         """Codex P0-2：DataLoader 会把 coords [288,3] 堆叠成 [B,288,3]——
         必须取 [0] 再进 reader；本测试走真实 collate 路径。"""
         import torch.utils.data as data_utils
-        from train import FeatureDataset
+        from va_compound.data.feature_dataset import FeatureDataset
         import tempfile
 
         payload = make_fake_payload(samples=4)

@@ -9,54 +9,13 @@ import pytest
 import torch
 from torch import nn
 
-from train import (
-    ASSEMBLY_METRIC_ROLE_CONTRACT,
-    ASSEMBLY_METRIC_ROLE_WEIGHTS_MIGRATION,
-    SAM,
-    TaskLocalityWeightedSampler,
-    TaskWeightedSampler,
-    WORLD_ACTION_DONOR_CONTRACT,
-    WORLD_ACTION_RANKING,
-    WORLD_LOGGED_BRANCH_CONTRACT,
-    WORLD_LOSS_COMPONENT_WEIGHTS,
-    WORLD_NO_REGRESSION,
-    PEER_DATA_ISOLATION_CONTRACT,
-    PEER_DUAL_STREAM_OPTIMIZER_CONTRACT,
-    PEER_GRADIENT_BOUNDARY_CONTRACT,
-    PEER_H15_P2_TO_P15_TEMPORAL_MIGRATION,
-    PEER_H15_PREFIX_TAIL_FLOW_CONTRACT,
-    PEER_HIGH_FREQUENCY_CONTRACT,
-    PEER_READOUT_V2_HIGH_FREQUENCY_CONTRACT,
-    PEER_READOUT_V2_TO_V3_WEIGHTS_MIGRATION,
-    PEER_WORLD_ACTION_SOURCE_CONTRACT,
-    PEER_WORLD_READOUT_CONTRACT,
-    PEER_WORLD_READOUT_V2_CONTRACT,
-    PEER_WORLD_TOPOLOGY_CONTRACT,
-    PEER_WEIGHTS_SEMANTIC_MIGRATION_CONTRACT,
-    WORLD_STAGE_AUXILIARY_DECAY,
-    WORLD_STAGE_AUXILIARY_FLOOR,
-    WORLD_STATIC_COPY_CONSTRAINT,
-    WORLD_SUPERVISION_CONTRACT,
-    WORLD_TRANSITION_CONTRACT,
-    build_dataset_content_identity,
-    build_exact_resume_state,
-    build_exact_run_contract,
-    clip_update_gradients,
-    named_optimizer_parameters,
-    validate_args,
-    validate_finite_update_scalars,
-    validate_optimizer_update_state,
-    validate_preclip_gradient_norms,
-    validate_update_gradients,
-    final_checkpoint_save_due,
-    parse_args,
-    restore_exact_resume_state,
-    save_checkpoint,
-    validate_exact_run_contract,
-    validate_peer_resume_weights_contract,
-    validate_visual_world_resume_contract,
-    world_action_ranking_contract,
-)
+from va_compound.vision.metric_roi import ASSEMBLY_METRIC_ROLE_CONTRACT
+from va_compound.world.world_contract import ASSEMBLY_METRIC_ROLE_WEIGHTS_MIGRATION, WORLD_ACTION_DONOR_CONTRACT, WORLD_ACTION_RANKING, WORLD_LOGGED_BRANCH_CONTRACT, WORLD_LOSS_COMPONENT_WEIGHTS, WORLD_NO_REGRESSION, PEER_DATA_ISOLATION_CONTRACT, PEER_DUAL_STREAM_OPTIMIZER_CONTRACT, PEER_GRADIENT_BOUNDARY_CONTRACT, PEER_H15_P2_TO_P15_TEMPORAL_MIGRATION, PEER_H15_PREFIX_TAIL_FLOW_CONTRACT, PEER_HIGH_FREQUENCY_CONTRACT, PEER_READOUT_V2_HIGH_FREQUENCY_CONTRACT, PEER_READOUT_V2_TO_V3_WEIGHTS_MIGRATION, PEER_WORLD_ACTION_SOURCE_CONTRACT, PEER_WORLD_READOUT_CONTRACT, PEER_WORLD_READOUT_V2_CONTRACT, PEER_WORLD_TOPOLOGY_CONTRACT, PEER_WEIGHTS_SEMANTIC_MIGRATION_CONTRACT, WORLD_STAGE_AUXILIARY_DECAY, WORLD_STAGE_AUXILIARY_FLOOR, WORLD_STATIC_COPY_CONSTRAINT, WORLD_SUPERVISION_CONTRACT, WORLD_TRANSITION_CONTRACT, validate_peer_resume_weights_contract, validate_visual_world_resume_contract, world_action_ranking_contract
+from va_compound.data.samplers import TaskLocalityWeightedSampler, TaskWeightedSampler
+from va_compound.utils.exact_resume import build_dataset_content_identity, build_exact_resume_state, final_checkpoint_save_due, restore_exact_resume_state, validate_exact_run_contract
+from va_compound.training.checkpoint import build_exact_run_contract, save_checkpoint
+from va_compound.training.gradients import clip_update_gradients, named_optimizer_parameters, validate_finite_update_scalars, validate_optimizer_update_state, validate_preclip_gradient_norms, validate_update_gradients
+from va_compound.training.config import validate_args, parse_args
 
 
 def _sampler() -> TaskLocalityWeightedSampler:
@@ -439,47 +398,8 @@ def test_parameter_guard_rejects_nonfinite_value_before_update() -> None:
         validate_update_gradients([("model.weight", model.weight)])
 
 
-def test_sam_guard_can_restore_perturbation_without_base_step() -> None:
-    model = nn.Linear(1, 1)
-    optimizer = SAM(model.parameters(), torch.optim.AdamW, rho=0.1, lr=1e-2)
-    original = {
-        name: value.detach().clone() for name, value in model.named_parameters()
-    }
-    model(torch.ones(1, 1)).backward()
-    optimizer.first_step(zero_grad=True)
-    model.weight.grad = torch.tensor([[float("nan")]])
-    with pytest.raises(FloatingPointError, match="model.weight"):
-        validate_update_gradients([("model.weight", model.weight)])
-    optimizer.restore_step(zero_grad=True)
-    for name, value in model.named_parameters():
-        assert torch.equal(value, original[name]), f"SAM restore changed bits for {name}"
-    assert optimizer.base_optimizer.state_dict()["state"] == {}
 
 
-def test_sam_roundtrip_uses_base_adamw_state() -> None:
-    torch.manual_seed(7)
-    model = nn.Linear(2, 1)
-    optimizer = SAM(
-        model.parameters(), torch.optim.AdamW, rho=0.05, lr=1e-3, weight_decay=0.0
-    )
-    model(torch.ones(1, 2)).square().mean().backward()
-    optimizer.step()
-    payload = build_exact_resume_state(optimizer, 1, _sampler(), _contract())
-    assert payload["optimizer_state"]["kind"] == "sam_adamw"
-    assert payload["optimizer_state"]["state_dict"]["state"]
-
-    fresh = nn.Linear(2, 1)
-    fresh_optimizer = SAM(
-        fresh.parameters(), torch.optim.AdamW, rho=0.05, lr=1e-3, weight_decay=0.0
-    )
-    restore_exact_resume_state(
-        payload,
-        fresh_optimizer,
-        _sampler(),
-        runtime_exact_run_contract=_contract(),
-        restore_rng=False,
-    )
-    assert fresh_optimizer.base_optimizer.state_dict()["state"]
 
 
 def test_resume_flags_are_mutually_exclusive() -> None:
@@ -522,7 +442,7 @@ def test_dataset_identity_rejects_changed_action_payload(tmp_path, changed_key: 
         )
 
 
-def test_exact_contract_tracks_dino_roi_identity() -> None:
+def test_generic_exact_contract_rejects_retired_roi_training() -> None:
     _, optimizer = _model_and_optimizer()
     args = parse_args(["--single-task"])
     config = SimpleNamespace(num_layers=8, action_horizon=6)
@@ -535,24 +455,8 @@ def test_exact_contract_tracks_dino_roi_identity() -> None:
         },
         _mtvj_roi_config={"canonical_image_size": 224},
     )
-    roi_b = SimpleNamespace(
-        _dino_roi_identity={
-            "sha256": "b" * 64,
-            "size_bytes": 123,
-            "contract": "dino_metric_roi_task35_v2",
-            "path": "/ignored/b.pt",
-        },
-        _mtvj_roi_config={"canonical_image_size": 224},
-    )
-    baseline = build_exact_run_contract(
-        args, config, optimizer, _sampler(), roi_head=roi_a
-    )
-    changed = build_exact_run_contract(
-        args, config, optimizer, _sampler(), roi_head=roi_b
-    )
-    assert baseline["mtvj"]["roi_checkpoint_identity"]["sha256"] == "a" * 64
-    with pytest.raises(ValueError, match="roi_checkpoint_identity"):
-        validate_exact_run_contract(baseline, changed)
+    with pytest.raises(ValueError, match="metric/ROI trainer checkpoints are retired"):
+        build_exact_run_contract(args, config, optimizer, _sampler(), roi_head=roi_a)
 
 
 @pytest.mark.parametrize(
@@ -585,16 +489,18 @@ def test_exact_contract_rejects_changed_objective_args(
 def test_va_world_mode_cli_requires_joint_dual_data() -> None:
     assert parse_args([]).va_world_mode == "legacy"
     peer = parse_args(
-        ["--wam4va", "--va-only", "--va-world-mode", "peer_sync_h6"]
+        ["--wam4va", "--va-only", "--va-world-mode", "peer_sync_h6",
+         "--single-task", "--slot-free-policy", "--dino-main-vision"]
     )
-    with pytest.raises(ValueError, match="both --va-data and --world-data"):
+    with pytest.raises(ValueError, match="requires joint --va-data/--world-data or Stage1 --va-only with --data"):
         validate_args(peer)
 
 
-def test_legacy_preserves_nonzero_adep_weight() -> None:
-    legacy = parse_args(["--wam4va", "--wmrm-adep-weight", "0.1"])
-    validate_args(legacy)
-    assert legacy.wmrm_adep_weight == pytest.approx(0.1)
+def test_retired_adep_cli_rejects_nonzero_weight() -> None:
+    assert parse_args(["--wmrm-adep-weight", "0"]).wmrm_adep_weight == 0
+    with pytest.raises(SystemExit) as rejected:
+        parse_args(["--wmrm-adep-weight", "0.1"])
+    assert rejected.value.code == 2
 
 
 def test_peer_exact_contract_binds_dual_data_and_joint_loss_protocol() -> None:

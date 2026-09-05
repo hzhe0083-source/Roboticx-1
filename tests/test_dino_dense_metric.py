@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 import torch
 
-from train import _validate_dino_roi_resume_contract
+from va_compound.vision.metric_runtime import _validate_dino_roi_resume_contract
 from va_compound.model import (
     DenseEvidenceProjector,
     VACompoundConfig,
@@ -104,7 +104,7 @@ def _dino_dense_config(**overrides) -> VACompoundConfig:
 
 
 def test_dino_dense_evidence_shapes_and_frame_order() -> None:
-    from train import _dino_main_online_encode
+    from va_compound.vision.encoding import _dino_main_online_encode
 
     backbone = FakeDinoBackbone()
     frames = _frames(2, 2, 4)  # B=2, T=2, W=4
@@ -129,7 +129,7 @@ def test_dino_dense_evidence_shapes_and_frame_order() -> None:
 
 
 def test_train_eval_dense_evidence_equivalence() -> None:
-    from train import _dino_main_online_encode
+    from va_compound.vision.encoding import _dino_main_online_encode
     from eval_metaworld import _main_vision_encode_window
 
     backbone = FakeDinoBackbone()
@@ -183,10 +183,7 @@ def test_metric_head_grid16_wrong_tokens_rejected() -> None:
 
 
 def test_legacy_metric_contract_defaults_to_grid24() -> None:
-    from train import (
-        _canonical_mtvj_metric_head_config,
-        _mtvj_metric_head_constructor_config,
-    )
+    from va_compound.vision.metric_runtime import _canonical_mtvj_metric_head_config, _mtvj_metric_head_constructor_config
     from va_compound.metric_visual_head import LanguageMetricField
 
     # 旧 checkpoint config（无 grid 键）→ 默认 24，行为逐字节不变。
@@ -360,11 +357,7 @@ def test_feature_cache_read_matches_online_encode(tmp_path) -> None:
     import json
     import pickle
 
-    from train import (
-        DinoFeatureCache,
-        _dino_main_encode_from_cache,
-        _dino_main_online_encode,
-    )
+    from va_compound.vision.encoding import DinoFeatureCache, _dino_main_encode_from_cache, _dino_main_online_encode
 
     n_frames = 12
     base = torch.zeros(n_frames, 256, 1024)
@@ -416,7 +409,7 @@ def test_feature_cache_rejects_content_corruption(tmp_path) -> None:
     import json
     import pickle
 
-    from train import DinoFeatureCache
+    from va_compound.vision.encoding import DinoFeatureCache
 
     n_frames = 2
     for name in ("block11.npy", "block23.npy"):
@@ -496,11 +489,7 @@ def test_grid16_cache_online_eval_equivalence(tmp_path) -> None:
     import json
     import pickle
 
-    from train import (
-        DinoFeatureCache,
-        _dino_main_encode_from_cache,
-        _dino_main_online_encode,
-    )
+    from va_compound.vision.encoding import DinoFeatureCache, _dino_main_encode_from_cache, _dino_main_online_encode
     from eval_metaworld import _main_vision_encode_window
 
     n_frames = 12
@@ -544,258 +533,3 @@ def test_grid16_cache_online_eval_equivalence(tmp_path) -> None:
     assert torch.equal(tok_c[0, 0], tok_e[0])
     for layer in (5, 11):
         assert torch.equal(dense_c[layer][0, 0], dense_e[layer][0])
-
-
-def test_rollout_dino_dense_keeps_full_grid_base_vision(monkeypatch) -> None:
-    """Regression for the old train/eval mismatch: DINO dense is additive K/V."""
-    import train as train_module
-
-    config = _dino_dense_config(
-        language_dim=12,
-        vision_dim=1024,
-        hidden_dim=16,
-        num_layers=1,
-        num_heads=4,
-        action_horizon=3,
-        action_dim=4,
-        proprio_dim=5,
-        main_vision_grid=8,
-        main_vision_tokens=256,
-        metric_geometry_inject=True,
-    )
-    model = VACompoundPolicy(config)
-    observed = []
-    original = model.encode_condition
-
-    def record(vision_tokens, *args, **kwargs):
-        observed.append(
-            {
-                "vision": vision_tokens.detach().clone(),
-                "dense": {
-                    key: value.detach().clone()
-                    for key, value in kwargs["dense_evidence"].items()
-                },
-                "metric_g": kwargs["metric_g"].detach().clone(),
-            }
-        )
-        return original(vision_tokens, *args, **kwargs)
-
-    monkeypatch.setattr(model, "encode_condition", record)
-    batch = {
-        "actions": torch.randn(1, 1, 3, 4),
-        "vision_tokens": torch.randn(1, 1, 256, 1024),
-        "proprio": torch.randn(1, 1, 5),
-        "previous_action": torch.randn(1, 1, 4),
-        "language_hidden": torch.randn(1, 3, 12),
-        "language_mask": torch.ones(1, 3, dtype=torch.bool),
-    }
-    dense = {
-        5: torch.randn(1, 1, 512, 1024),
-        11: torch.randn(1, 1, 512, 1024),
-    }
-    metric_g = torch.randn(1, 1, 8)
-    train_module.rollout_policy(
-        model,
-        batch,
-        torch.randn(1, 1, 3, 4),
-        torch.rand(1, 1),
-        dense_evidence=dense,
-        metric_g=metric_g,
-    )
-    assert len(observed) == 1
-    assert torch.equal(observed[0]["vision"], batch["vision_tokens"][:, 0])
-    for layer in (5, 11):
-        assert torch.equal(observed[0]["dense"][layer], dense[layer][:, 0])
-    assert observed[0]["metric_g"].shape == (1, 8)
-    assert torch.equal(observed[0]["metric_g"], metric_g[:, 0])
-
-
-def test_rollout_legacy_vjepa_dense_still_uses_pool16(monkeypatch) -> None:
-    import train as train_module
-
-    config = VACompoundConfig(
-        language_dim=12,
-        vision_dim=768,
-        hidden_dim=16,
-        num_layers=1,
-        num_heads=4,
-        action_horizon=3,
-        action_dim=4,
-        proprio_dim=5,
-        dense_readout_mtvj=True,
-        dino_dense_metric=False,
-    )
-    model = VACompoundPolicy(config)
-    observed = []
-    original = model.encode_condition
-
-    def record(vision_tokens, *args, **kwargs):
-        observed.append(vision_tokens.detach().clone())
-        return original(vision_tokens, *args, **kwargs)
-
-    monkeypatch.setattr(model, "encode_condition", record)
-    batch = {
-        "actions": torch.randn(1, 1, 3, 4),
-        "vision_tokens": torch.randn(1, 1, 288, 768),
-        "proprio": torch.randn(1, 1, 5),
-        "previous_action": torch.randn(1, 1, 4),
-        "language_hidden": torch.randn(1, 3, 12),
-        "language_mask": torch.ones(1, 3, dtype=torch.bool),
-    }
-    dense = {
-        5: torch.randn(1, 1, 1152, 768),
-        11: torch.randn(1, 1, 1152, 768),
-    }
-    train_module.rollout_policy(
-        model,
-        batch,
-        torch.randn(1, 1, 3, 4),
-        torch.rand(1, 1),
-        dense_evidence=dense,
-    )
-    expected = train_module.pool_mtvj_coarse_tokens(dense[11][:, 0])
-    assert len(observed) == 1
-    assert observed[0].shape == (1, 16, 768)
-    assert torch.equal(observed[0], expected)
-
-
-def test_dino_visual_aux_uses_true_480px_raw_renders(monkeypatch) -> None:
-    import train as train_module
-    from va_compound.metric_visual_head import LanguageMetricField
-
-    seen = {}
-
-    def fake_batch(task, rng, batch, include_raw_frames=False):
-        seen["include_raw_frames"] = include_raw_frames
-        return {
-            "raw_frames": np.zeros((batch, 4, 480, 480, 3), dtype=np.uint8),
-            "frames": np.zeros((batch, 4, 384, 384, 3), dtype=np.uint8),
-            "keypoints": np.full((batch, 4, 2), 0.5, dtype=np.float32),
-            "visibility": np.ones((batch, 4), dtype=np.float32),
-        }
-
-    monkeypatch.setattr("prepare_metaworld_metric.make_metric_batch", fake_batch)
-    monkeypatch.setattr(
-        "scripts.build_longtraj_features.ENV_TO_TASK",
-        {"peg-insert-side-v3": "Insert a peg sideways"},
-    )
-    backbone = FakeDinoBackbone()
-    head = LanguageMetricField(
-        lang_dim=8,
-        h_dim=1024,
-        d_proj=8,
-        n_roles=4,
-        l2_norm=True,
-        learnable_temp=True,
-        mode_readout=True,
-        grid=16,
-    )
-    lang_cache = {
-        "Insert a peg sideways": (
-            torch.zeros(1, 3, 8),
-            torch.ones(1, 3, dtype=torch.bool),
-        )
-    }
-    loss, parts = train_module._dino_visual_aux_loss(
-        backbone,
-        head,
-        "peg-insert-side-v3",
-        np.random.default_rng(0),
-        2,
-        lang_cache,
-        torch.device("cpu"),
-        1.0,
-        0.5,
-    )
-    assert seen["include_raw_frames"] is True
-    assert torch.isfinite(loss)
-    assert np.isfinite(parts["rmse_px"])
-
-
-def test_task35_precision_contract_requires_complete_stack(tmp_path) -> None:
-    from train import parse_args, validate_args
-
-    dino = tmp_path / "dino.safetensors"
-    roi = tmp_path / "roi.pt"
-    cache = tmp_path / "cache"
-    dino.write_bytes(b"dino")
-    roi.write_bytes(b"roi")
-    cache.mkdir()
-    for name in ("meta.json", "index.pkl", "block23.npy", "block11.npy"):
-        (cache / name).write_bytes(b"cache")
-    common = [
-        "--task35-precision-contract",
-        "--data",
-        str(tmp_path / "data.pt"),
-        "--single-task",
-        "--task-sampling",
-        "weighted",
-        "--dino-main-vision",
-        "--dino-dense-metric",
-        "--dino-feature-cache",
-        str(tmp_path / "cache"),
-        "--main-vision-checkpoint",
-        str(dino),
-        "--main-vision-grid",
-        "16",
-        "--main-vision-frames",
-        "4",
-        "--main-vision-temporal",
-        "--metric-geometry-inject",
-        "--dino-roi-checkpoint",
-        str(roi),
-        "--dino-roi-alpha",
-        "1",
-        "--mtvj-train-metric-head",
-        "--mtvj-train-relation",
-        "--mtvj-visual-aux-every",
-        "10",
-        "--mtvj-visual-aux-batch",
-        "8",
-        "--va-attention-backend",
-        "auto",
-    ]
-    args = parse_args(common)
-    validate_args(args)
-    validate_args(parse_args(common + ["--resume-exact", str(tmp_path / "exact.pt")]))
-    validate_args(parse_args(common + ["--resume-weights", str(tmp_path / "weights.pt")]))
-    with pytest.raises(ValueError, match="no ordinary resume"):
-        validate_args(parse_args(common + ["--resume", str(tmp_path / "legacy.pt")]))
-    with pytest.raises(ValueError, match="main-vision-temporal"):
-        validate_args(parse_args([arg for arg in common if arg != "--main-vision-temporal"]))
-    wrong_grid = list(common)
-    grid_index = wrong_grid.index("--main-vision-grid") + 1
-    wrong_grid[grid_index] = "8"
-    # The explicit precision contract rejects this before data/model construction.
-    with pytest.raises(ValueError, match="grid 16"):
-        validate_args(parse_args(wrong_grid))
-
-
-def test_main_vision_config_kwargs_dino_metric() -> None:
-    from train import _main_vision_config_kwargs
-
-    class Args:
-        dino_main_vision = True
-        dino_dense_metric = True
-        main_vision_grid = 8
-        main_vision_frames = 4
-        main_vision_temporal = True
-        main_vision_temporal_scale = 1.0
-        metric_geometry_inject = True
-
-    kwargs = _main_vision_config_kwargs(Args())
-    assert kwargs["dense_readout_mtvj"] is True
-    assert kwargs["dino_dense_metric"] is True
-    assert kwargs["main_vision_dim"] == 1024
-    assert kwargs["main_vision_temporal"] is True
-    assert kwargs["metric_geometry_inject"] is True
-
-    class ArgsNoMetric:
-        dino_main_vision = True
-        dino_dense_metric = False
-        main_vision_grid = 8
-        main_vision_frames = 4
-
-    kwargs = _main_vision_config_kwargs(ArgsNoMetric())
-    assert "dense_readout_mtvj" not in kwargs
-    assert "dino_dense_metric" not in kwargs

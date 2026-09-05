@@ -1613,6 +1613,12 @@ def parse_args() -> argparse.Namespace:
         help="实时显示闭环 corner2 RGB 画面；按 q 可提前关闭显示窗口",
     )
     parser.add_argument(
+        "--video-output-dir",
+        type=Path,
+        default=None,
+        help="Save each evaluated trial as a concatenated MJPEG stream for later MP4 encoding.",
+    )
+    parser.add_argument(
         "--output-json",
         type=Path,
         default=None,
@@ -1917,6 +1923,7 @@ def _main_vision_encode_window(
     grid: int,
     window: int,
     return_dense: bool = False,
+    last_four_mean: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, dict[int, torch.Tensor]]:
     """DINO-main replacement: [1, window*grid*grid, dim] tokens per decision.
 
@@ -1932,19 +1939,25 @@ def _main_vision_encode_window(
         raise ValueError(
             f"dino-main expects {VISION_WINDOW} history frames, got {len(frames)}"
         )
+    if return_dense and last_four_mean:
+        raise ValueError("DINO last-four fusion cannot be combined with dense evidence")
     # Encode one frame at a time so ViT-L/14-reg4 + VA + FM fit a 16 GiB laptop
     # GPU. The per-frame contract is identical to a batched 4-frame encode.
-    hierarchical_parts = [
-        backbone.forward_hierarchical_dense(
-            preprocess(frames[i], backbone.image_size).to(device)
-        )
-        for i in range(window)
-    ]
-    hierarchical = {
-        layer: torch.cat([part[layer] for part in hierarchical_parts], dim=0)
-        for layer in hierarchical_parts[0]
-    }
-    tokens = hierarchical[11].float()  # [window, 256, D]
+    images = [preprocess(frames[i], backbone.image_size).to(device) for i in range(window)]
+    if last_four_mean:
+        hierarchical = None
+        tokens = torch.cat(
+            [backbone.forward_last_four_mean_dense(image) for image in images], dim=0
+        ).float()
+    else:
+        hierarchical_parts = [
+            backbone.forward_hierarchical_dense(image) for image in images
+        ]
+        hierarchical = {
+            layer: torch.cat([part[layer] for part in hierarchical_parts], dim=0)
+            for layer in hierarchical_parts[0]
+        }
+        tokens = hierarchical[11].float()  # [window, 256, D]
     if tokens.shape[-2] != 256 or tokens.shape[-1] != backbone.feature_dim:
         raise RuntimeError(
             "dino-main expects 256 patch tokens per frame, got "
@@ -1956,6 +1969,8 @@ def _main_vision_encode_window(
     tokens = tokens.permute(0, 2, 3, 1).reshape(1, window * grid * grid, dim)
     if not return_dense:
         return tokens
+    if hierarchical is None:
+        raise RuntimeError("DINO dense evidence was not encoded")
     # 帧 [d-2, d] = 窗口内索引 2, 3（时间升序 → 前 256 = d-2）。
     dense_evidence = {
         layer: torch.cat((ev[2], ev[3]), dim=0).float()[None]
@@ -2766,6 +2781,11 @@ def restore_text_backbone(
         dtype=language_dtype,
         local_files_only=True,
         max_length=int(contract.get("language_max_length", language_max_length)),
+        keep_layers=(
+            int(contract["qwen_keep_layers"])
+            if contract.get("qwen_keep_layers") is not None
+            else None
+        ),
     )
     if contract.get("semantic_adapter"):
         text_backbone = QwenSemanticBackbone(
@@ -3391,6 +3411,14 @@ def main() -> None:
             f"({len(language_features['metadata']['tasks'])} tasks)",
             flush=True,
         )
+    if config.dino_qwen_cross_modal_bridge:
+        language_metadata = language_features.get("metadata") or {}
+        if language_metadata.get("qwen_fusion_layers") != list(
+            range(10, 15)
+        ) or language_metadata.get("qwen_layer_reduce") != "mean_then_final_norm":
+            raise ValueError(
+                "DINO/Qwen bridge evaluation requires a Qwen 10-14 mean cache"
+            )
     feature_metadata = features.get("metadata") or {}
     try:
         training_control_stride = int(feature_metadata["control_stride"])
@@ -3781,14 +3809,19 @@ def main() -> None:
 
     import metaworld
 
-    dagger_compress_frames: Callable[[np.ndarray], list[bytes]] | None = None
+    compress_render_frames: Callable[[np.ndarray], list[bytes]] | None = None
     dagger_get_policy: Callable[[str], Any] | None = None
-    if args.dagger_output_dir is not None:
-        from scripts.collect_long_trajectories import compress_frames, get_policy
+    if args.dagger_output_dir is not None or args.video_output_dir is not None:
+        from scripts.collect_long_trajectories import compress_frames
 
-        dagger_compress_frames = compress_frames
+        compress_render_frames = compress_frames
+    if args.dagger_output_dir is not None:
+        from scripts.collect_long_trajectories import get_policy
+
         dagger_get_policy = get_policy
         args.dagger_output_dir.mkdir(parents=True, exist_ok=True)
+    if args.video_output_dir is not None:
+        args.video_output_dir.mkdir(parents=True, exist_ok=True)
 
     per_task = {}
     trial_records: list[dict[str, Any]] = []
@@ -3921,6 +3954,9 @@ def main() -> None:
             dagger_metric_state: list[np.ndarray] = []
             dagger_metric_valid: list[bool] = []
             dagger_first_success_step: int | None = None
+            video_frames: list[np.ndarray] | None = (
+                [] if args.video_output_dir is not None else None
+            )
             plan_step = None  # C²/伺服：上次规划的原始步
             c2_token = 0  # C²/伺服：自规划以来消费的 token 索引
             c2_params = None  # C²：缓存的 {ū, c̄, K}
@@ -3931,6 +3967,8 @@ def main() -> None:
             servo_first = True  # 首决策 a_prev=None（ν≡0，servo.py 契约）
             for step in range(args.horizon):
                 img = env.render()  # 数据图像与本地渲染一致（实测 MAE 0.48 vs flip 55，勿加 flip）
+                if video_frames is not None:
+                    video_frames.append(np.asarray(img).copy())
                 if args.show_window:
                     import cv2
 
@@ -4394,6 +4432,7 @@ def main() -> None:
                                     device,
                                     grid=config.main_vision_grid,
                                     window=config.main_vision_frames,
+                                    last_four_mean=config.dino_qwen_cross_modal_bridge,
                                 )
                         else:
                             tokens = vision_backbone(clip.unsqueeze(0), pooling=vision_pooling)
@@ -4911,6 +4950,8 @@ def main() -> None:
                         stage_metrics["best_obj_step"] = step
                 if info.get("success"):
                     success = True
+                    if video_frames is not None:
+                        video_frames.append(np.asarray(env.render()).copy())
                     if takeover_step is None or step < takeover_step:
                         break
                     if dagger_first_success_step is None:
@@ -4941,11 +4982,26 @@ def main() -> None:
                     ),
                 )
                 if episode is not None:
-                    if dagger_compress_frames is None:
+                    if compress_render_frames is None:
                         raise RuntimeError("DAgger frame compressor was not loaded")
-                    episode["frames"] = dagger_compress_frames(episode["frames"])
+                    episode["frames"] = compress_render_frames(episode["frames"])
                     dagger_episodes.append(episode)
                     dagger_collected = True
+            if video_frames is not None:
+                if compress_render_frames is None or args.video_output_dir is None:
+                    raise RuntimeError("video frame compressor was not loaded")
+                video_path = args.video_output_dir / (
+                    f"task{global_task_index:02d}_{env_name}_trial{trial}_"
+                    f"seed{episode_seed}_success{int(success)}.mjpg"
+                )
+                if video_path.exists():
+                    raise FileExistsError(f"refusing to overwrite video: {video_path}")
+                with video_path.open("wb") as stream:
+                    for encoded_frame in compress_render_frames(
+                        np.asarray(video_frames, dtype=np.uint8)
+                    ):
+                        stream.write(encoded_frame)
+                print(f"video frames saved: {video_path}", flush=True)
             wins += int(success)
             completed_trials += 1
             record: dict[str, Any] = {

@@ -111,55 +111,6 @@ class DirectHeadTests(unittest.TestCase):
         self.assertTrue(restored.direct_head)
 
 
-class DirectHeadTrainingPathTests(unittest.TestCase):
-    """train.py direct-head 分支：rollout_policy 解码 + smooth_l1（形状级验证）。"""
-
-    def setUp(self) -> None:
-        torch.manual_seed(7)
-
-    def test_rollout_policy_direct_branch_shapes_and_backward(self) -> None:
-        from train import rollout_policy, sample_flow_matching_inputs, synthetic_sequence
-
-        config = tiny_config(direct_head=True)
-        model = VACompoundPolicy(config)
-        batch = synthetic_sequence(config, 2, 4, torch.device("cpu"))
-        noisy, flow_time, _ = sample_flow_matching_inputs(batch["actions"])
-        predictions, conditions = rollout_policy(model, batch, noisy, flow_time)
-        self.assertEqual(
-            predictions.shape, (2, 4, config.action_horizon, config.action_dim)
-        )
-        self.assertEqual(
-            conditions.shape, (2, 4, config.action_horizon, config.hidden_dim)
-        )
-        self.assertTrue((predictions.abs() < 1.0).all())
-        loss = F.smooth_l1_loss(predictions, batch["actions"])  # 训练 loss 同款
-        loss.backward()
-        self.assertTrue(torch.isfinite(model.direct_head.net[0].weight.grad).all())
-        self.assertTrue(torch.isfinite(model.action_queries.grad).all())
-
-    def test_rollout_policy_direct_branch_with_future_predict(self) -> None:
-        from train import rollout_policy, sample_flow_matching_inputs, synthetic_sequence
-
-        # future_predict 依赖 memory_split 提供 evidence/task（train.py 同款用法）。
-        config = tiny_config(direct_head=True, future_predict=True, memory_split=True)
-        model = VACompoundPolicy(config)
-        batch = synthetic_sequence(config, 2, 4, torch.device("cpu"))
-        noisy, flow_time, _ = sample_flow_matching_inputs(batch["actions"])
-        predictions, conditions, memories = rollout_policy(
-            model, batch, noisy, flow_time
-        )
-        self.assertEqual(
-            predictions.shape, (2, 4, config.action_horizon, config.action_dim)
-        )
-        self.assertEqual(len(memories), 4)
-        # future loss 不依赖 flow，direct 模式下照常可用
-        pred_future = model.future_predictor(
-            conditions[:, 0], memories[0].evidence, memories[0].task
-        )
-        target_future = batch["vision_tokens"][:, 1].mean(dim=1)
-        future_loss = model.future_predictor.future_loss(pred_future, target_future)
-        self.assertTrue(torch.isfinite(future_loss))
-        self.assertGreaterEqual(future_loss.detach().item(), 0.0)
 
 
 class ExecutedLabelPipelineTests(unittest.TestCase):

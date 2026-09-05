@@ -29,8 +29,9 @@ from collections import defaultdict
 import torch
 
 from evaluate import persistence_baseline
-from train import FeatureDataset, ensure_sequence, move_batch
 from va_compound import VACompoundConfig, VACompoundPolicy
+from va_compound.data.feature_dataset import FeatureDataset
+from va_compound.training.batch import ensure_sequence, move_batch
 
 
 def parse_args() -> argparse.Namespace:

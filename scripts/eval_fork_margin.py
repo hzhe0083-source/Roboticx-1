@@ -30,7 +30,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))  # 根模块（train 等）导入兼容
 
-from train import FeatureDataset
+from va_compound.data.feature_dataset import FeatureDataset
 from va_compound.model import VACompoundConfig
 
 

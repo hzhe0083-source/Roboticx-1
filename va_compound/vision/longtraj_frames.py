@@ -388,13 +388,21 @@ class LongTrajFramesDataset:
         decoded = []
         for ep in data["episodes"]:
             ep_frames = ep["frames"]
-            with ThreadPoolExecutor(max_workers=8) as pool:
-                frames = list(pool.map(
-                    lambda b: np.asarray(
-                        Image.open(io.BytesIO(b)).convert("RGB"), dtype=np.uint8
-                    ),
-                    ep_frames,
-                ))
+            if (
+                isinstance(ep_frames, np.ndarray)
+                and ep_frames.ndim == 4
+                and ep_frames.shape[-1] == 3
+                and ep_frames.dtype == np.uint8
+            ):
+                frames = list(ep_frames)
+            else:
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    frames = list(pool.map(
+                        lambda b: np.asarray(
+                            Image.open(io.BytesIO(b)).convert("RGB"), dtype=np.uint8
+                        ),
+                        ep_frames,
+                    ))
             decoded.append(frames)
         print(f"  [longtraj] 解码 {task_file}: {sum(len(e) for e in decoded)} 帧, "
               f"{time.time()-t0:.0f}s", flush=True)
@@ -542,7 +550,8 @@ class OnlineLongTrajEpisodeDataset(LongTrajFramesDataset):
 
         reference_path = Path(str(index["language_reference"]["path"]))
         reference = torch.load(reference_path, map_location="cpu", weights_only=True)
-        descriptions = list((reference.get("metadata") or {}).get("tasks") or [])
+        reference_metadata = reference.get("metadata") or {}
+        descriptions = list(reference_metadata.get("tasks") or [])
         if descriptions != [str(item["description"]) for item in tasks]:
             raise ValueError("online index task descriptions differ from language cache")
         language_hidden = reference.get("language_hidden")
@@ -672,6 +681,8 @@ class OnlineLongTrajEpisodeDataset(LongTrajFramesDataset):
                 "index_path": str(self.path),
                 "index_sha256": _sha256_file(self.path),
                 "raw_sources": raw_sources,
+                "qwen_fusion_layers": reference_metadata.get("qwen_fusion_layers"),
+                "qwen_layer_reduce": reference_metadata.get("qwen_layer_reduce"),
             },
         }
         if short_episode_padding is not None:

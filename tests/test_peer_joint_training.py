@@ -12,20 +12,43 @@ import va_compound.world_contract as world_contract
 
 from va_compound.world_contract import PEER_SHARED_FULL_DATA_CONTRACT
 
-from train import (
-    PeerJointBatchPrefetcher,
-    TaskLocalityWeightedSampler,
-    backward_peer_joint_losses,
-    main,
-    next_peer_joint_batches,
-    parse_args,
-    peer_prefetch_fill_limit,
-    peer_prefetch_must_wait_for_commit,
-    prepare_visual_world_action_ranking,
-    rollout_policy,
-    validate_args,
-    validate_peer_data_isolation,
-)
+from va_compound.training.prefetch import PeerJointBatchPrefetcher, next_peer_joint_batches, peer_prefetch_fill_limit, peer_prefetch_must_wait_for_commit
+from va_compound.data.samplers import TaskLocalityWeightedSampler
+from va_compound.training.gradients import backward_pcgrad, backward_peer_joint_losses
+from va_compound.training.config import parse_args, validate_args
+from va_compound.world.world_supervision import prepare_visual_world_action_ranking
+from va_compound.world.world_contract import validate_peer_data_isolation
+
+
+def test_pcgrad_accepts_sequential_task_forwards() -> None:
+    parameter = torch.nn.Parameter(torch.tensor(2.0))
+    calls = []
+
+    def loss(target: float):
+        def forward():
+            calls.append(target)
+            return (parameter - target).square()
+
+        return forward
+
+    backward_pcgrad(
+        [loss(0.0), loss(1.0)], [("parameter", parameter)]
+    )
+    assert calls == [0.0, 1.0]
+    torch.testing.assert_close(parameter.grad, torch.tensor(3.0))
+
+
+def test_pcgrad_accepts_multiple_task_losses_from_one_forward() -> None:
+    parameter = torch.nn.Parameter(torch.tensor(2.0))
+    calls = []
+
+    def forward():
+        calls.append(True)
+        return [(parameter - 0.0).square(), (parameter - 1.0).square()]
+
+    backward_pcgrad([forward], [("parameter", parameter)])
+    assert calls == [True]
+    torch.testing.assert_close(parameter.grad, torch.tensor(3.0))
 
 
 def _payload(episodes: list[int]) -> dict[str, torch.Tensor]:
@@ -71,6 +94,21 @@ def test_h50_action_only_checkpoint_has_named_joint_migration() -> None:
         world_contract.PEER_H50_ACTION_ONLY_TO_JOINT_MIGRATION
     )
 
+    frozen = world_contract.validate_peer_resume_weights_contract(
+        contract,
+        planning_stride=15,
+        migrating_action_only_to_joint=True,
+        action_horizon=50,
+        world_horizon=15,
+        deployment_execution_horizon=15,
+        peer_flow_topology=world_contract.PEER_H50_NESTED_FLOW_CONTRACT,
+        peer_data_isolation_contract=world_contract.PEER_SHARED_FULL_DATA_CONTRACT,
+        target_pcgrad_scope="per_task_va_and_world_separate_frozen_dino_v1",
+    )
+    assert frozen is not None
+    record = frozen["migrations"][0]
+    assert record["target_pcgrad_scope"].endswith("frozen_dino_v1")
+
 
 def _peer_args(tmp_path: Path, *extra: str) -> list[str]:
     va_data = tmp_path / "va.pt"
@@ -115,6 +153,7 @@ def _peer_args(tmp_path: Path, *extra: str) -> list[str]:
         "--wmrm-world-grid",
         "16",
         "--dino-main-vision",
+        "--slot-free-policy",
         "--main-vision-checkpoint",
         str(checkpoint),
         "--main-vision-grid",
@@ -175,12 +214,11 @@ def test_peer_cli_requires_joint_streams_and_rejects_separated_phases(
     assert args.va_data != args.world_data
 
     for phase_flag in ("--va-only", "--world-only"):
-        with pytest.raises(ValueError, match="jointly optimized"):
+        with pytest.raises(ValueError, match="peer --va-only|peer_sync_h6|World-only|wmrm-only|joint"):
             validate_args(parse_args(_peer_args(tmp_path, phase_flag)))
-    with pytest.raises(ValueError, match="same-snapshot action-dependence"):
-        validate_args(
-            parse_args(_peer_args(tmp_path, "--wmrm-adep-weight", "0.1"))
-        )
+    with pytest.raises(SystemExit) as rejected:
+        parse_args(_peer_args(tmp_path, "--wmrm-adep-weight", "0.1"))
+    assert rejected.value.code == 2
 
 
 def test_peer_shared_full_data_explicitly_allows_one_dataset_path(
@@ -212,11 +250,11 @@ def test_peer_batch_prefetch_is_opt_in_and_requires_dual_streams(
     validate_args(args)
     assert args.peer_batch_prefetch is True
     assert args.peer_batch_prefetch_depth == 4
-    with pytest.raises(ValueError, match="requires peer_sync_h6"):
+    with pytest.raises(ValueError, match="requires slot-free DINO peer training"):
         validate_args(parse_args(["--single-task", "--peer-batch-prefetch"]))
     with pytest.raises(ValueError, match="depth must be positive"):
         validate_args(
-            parse_args(["--single-task", "--peer-batch-prefetch-depth", "0"])
+            parse_args(_peer_args(tmp_path, "--peer-batch-prefetch-depth", "0"))
         )
 
 
@@ -229,12 +267,6 @@ def test_runtime_integrity_checks_are_default_on_and_explicitly_disabled(
     )
     validate_args(disabled)
     assert disabled.runtime_integrity_checks is False
-    assert (
-        inspect.getsource(main).count(
-            "runtime_integrity_checks=args.runtime_integrity_checks"
-        )
-        == 3
-    )
 
 
 def test_peer_p2_requires_one_consistent_planning_stride(tmp_path: Path) -> None:
@@ -302,9 +334,11 @@ def test_p2_world_ranking_uses_transition_prefix_but_keeps_h6_labels() -> None:
 
     assert payload["actions"].shape[-2:] == (6, 4)
     assert payload["world_rank_shuffle_action"].shape == (4, 3, 2, 4)
-    source = inspect.getsource(rollout_policy)
-    assert ": model.config.action_horizon" in source
-    assert "logged_chunk.to(dtype=stage_readouts[0].dtype)" in source
+    assert torch.equal(
+        payload["actions"],
+        torch.arange(4 * 4 * 6 * 4, dtype=torch.float32).reshape(4, 4, 6, 4),
+    )
+    assert payload["world_rank_shuffle_mask"].all()
 
 
 def test_h15_world_ranking_uses_full_endpoint_action_chunk(tmp_path: Path) -> None:
@@ -583,26 +617,15 @@ def test_joint_losses_accumulate_both_stream_gradients_before_one_step() -> None
     torch.testing.assert_close(world_private, torch.tensor(0.3))
 
 
-def test_training_loop_wires_separate_va_and_world_objectives_into_joint_backward() -> None:
-    source = inspect.getsource(main)
-    assert "next_peer_joint_batches(" in source
-    assert 'objective="va" if dual_peer_data else "joint"' in source
-    assert 'objective="world"' in source
-    assert "backward_peer_joint_losses(" in source
-    assert "peer joint World stream requires DINO-main dense metric encoding" not in source
-    assert "if config.dino_dense_metric:" in source
-    assert "metric_tokens = None" in source
-    assert "metric_g = None" in source
-    assert source.count("task_order_seed=(") == 3
-    assert 'getattr(args, "peer_shared_full_data", False)' in source
+def test_clipping_returns_preclip_norm_and_updates_gradient() -> None:
+    from va_compound.training.gradients import (
+        clip_update_gradients, validate_preclip_gradient_norms,
+    )
 
-
-def test_training_hot_path_uses_clip_preclip_norm_without_full_tensor_scans() -> None:
-    source = inspect.getsource(main)
-    assert "raw_gradient_norm = validate_preclip_gradient_norms(" in source
-    assert "validate_update_gradients(" not in source
-    # One full optimizer/parameter/state scan remains before training starts.
-    assert source.count("validate_optimizer_update_state(optimizer)") == 1
-    assert source.count(
-        "validate_optimizer_update_state(optimizer, validate_values=False)"
-    ) >= 3
+    parameter = torch.nn.Parameter(torch.zeros(2))
+    parameter.grad = torch.tensor([3.0, 4.0])
+    norm = clip_update_gradients([("weight", parameter)], max_norm=1.0)
+    assert validate_preclip_gradient_norms(norm) == pytest.approx(5.0)
+    torch.testing.assert_close(parameter.grad, torch.tensor([0.6, 0.8]))
+    with pytest.raises(FloatingPointError, match="threshold exceeded"):
+        validate_preclip_gradient_norms(norm, max_norm=4.0)

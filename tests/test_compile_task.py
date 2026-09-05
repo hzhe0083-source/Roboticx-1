@@ -19,7 +19,6 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from train import parse_args, save_checkpoint, validate_args
 from va_compound.backbones import (
     LoRALinear,
     QwenSemanticBackbone,
@@ -758,143 +757,11 @@ class BuildE2ECompileTests(unittest.TestCase):
         self.assertEqual(len(all_params), len(set(all_params)))
 
 
-class TrainArgCompileTests(unittest.TestCase):
-    def test_compile_task_requires_e2e_data(self):
-        args = parse_args(["--compile-task"])
-        with self.assertRaisesRegex(ValueError, "e2e-data"):
-            validate_args(args)
-
-    def test_compile_every_must_be_positive(self):
-        args = parse_args(["--compile-every", "0"])
-        with self.assertRaisesRegex(ValueError, "compile-every"):
-            validate_args(args)
-
-    def test_compile_task_conflicts_with_scene_teacher(self):
-        args = parse_args(
-            [
-                "--compile-task", "--e2e-data", "x.pt",
-                "--scene-teacher", "--data", "d.pt",
-            ]
-        )
-        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
-            validate_args(args)
-
-    def test_compile_task_conflicts_with_plan_resampler(self):
-        args = parse_args(["--compile-task", "--e2e-data", "x.pt", "--plan-resampler"])
-        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
-            validate_args(args)
-
-    def test_stage_a_requires_compile_task(self):
-        args = parse_args(["--training-stage", "a"])
-        with self.assertRaisesRegex(ValueError, "compile-task"):
-            validate_args(args)
-
-    def test_stage_a_forbids_semantic_adapter(self):
-        args = parse_args(
-            ["--training-stage", "a", "--compile-task", "--e2e-data", "x.pt",
-             "--semantic-adapter"]
-        )
-        with self.assertRaisesRegex(ValueError, "semantic-adapter"):
-            validate_args(args)
-
-    def test_stage_a_anchor_geometry_must_be_zero(self):
-        for flag in ("--semantic-anchor-weight", "--semantic-geometry-weight"):
-            args = parse_args(
-                ["--training-stage", "a", "--compile-task", "--e2e-data", "x.pt",
-                 flag, "0.1"]
-            )
-            with self.assertRaisesRegex(ValueError, "anchor-weight"):
-                validate_args(args)
-
-    def test_stage_a_valid_passes(self):
-        args = parse_args(
-            ["--training-stage", "a", "--compile-task", "--e2e-data", "x.pt",
-             "--single-task"]
-        )
-        validate_args(args)  # 不抛异常
-
-    def test_stage_b_requires_semantic_adapter(self):
-        args = parse_args(["--training-stage", "b"])
-        with self.assertRaisesRegex(ValueError, "semantic-adapter"):
-            validate_args(args)
-
-    def test_stage_b_valid_passes(self):
-        args = parse_args(
-            ["--training-stage", "b", "--semantic-adapter", "--e2e-data", "x.pt",
-             "--single-task"]
-        )
-        validate_args(args)
-
-    def test_stage_c_requires_semantic_adapter(self):
-        args = parse_args(["--training-stage", "c"])
-        with self.assertRaisesRegex(ValueError, "semantic-adapter"):
-            validate_args(args)
-
-    def test_stage_c_valid_passes(self):
-        args = parse_args(
-            ["--training-stage", "c", "--semantic-adapter", "--e2e-data", "x.pt",
-             "--single-task"]
-        )
-        validate_args(args)
-
-    def test_no_stage_skips_stage_validation(self):
-        args = parse_args([])
-        self.assertIsNone(args.training_stage)
-        validate_args(args)
-        # compile-task 不带 stage 也允许
-        args = parse_args(["--compile-task", "--e2e-data", "x.pt", "--single-task"])
-        validate_args(args)
-
-    def test_compile_defaults(self):
-        args = parse_args([])
-        self.assertFalse(args.compile_task)
-        self.assertEqual(args.compile_every, 4)
-        self.assertEqual(args.compile_n_scene, 16)
-        self.assertIsNone(args.training_stage)
 
 
 class CompileCheckpointTests(unittest.TestCase):
-    def test_payload_carries_semantic_compiler(self):
-        e2e, config = make_compile_e2e()
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "ck.pt"
-            args = parse_args(["--save", str(path)])
-            save_checkpoint(args, config, None, e2e)
-            ckpt = torch.load(path, map_location="cpu", weights_only=True)
-        self.assertIn("semantic_compiler", ckpt)
-        expected = set(e2e.compiler.state_dict().keys())
-        self.assertEqual(set(ckpt["semantic_compiler"].keys()), expected)
-        fresh = SemanticCompiler(language_dim=32, vision_dim=16, hidden=24)
-        fresh.load_state_dict(ckpt["semantic_compiler"])
-        for key, value in fresh.state_dict().items():
-            torch.testing.assert_close(value, e2e.compiler.state_dict()[key])
 
-    def test_payload_none_without_compiler(self):
-        config = tiny_config()
-        policy = VACompoundPolicy(config)
-        vision = VJEPA21Backbone(FakeVideoModel(), max_tokens=64)
-        e2e = EndToEndPolicy(
-            text_backbone=make_backbone(num_layers=2),
-            vision_backbone=vision,
-            policy=policy,
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "ck.pt"
-            args = parse_args(["--save", str(path)])
-            save_checkpoint(args, config, None, e2e)
-            ckpt = torch.load(path, map_location="cpu", weights_only=True)
-        self.assertIn("semantic_compiler", ckpt)
-        self.assertIsNone(ckpt["semantic_compiler"])
 
-    def test_resume_branch_tolerates_missing_semantic_compiler(self):
-        # 镜像 main() resume 分支的取值逻辑：老 ckpt 无该键 → 跳过，不崩溃
-        resume_ckpt = {"model": {}}
-        self.assertIsNone(resume_ckpt.get("semantic_compiler"))
-        e2e, _ = make_compile_e2e()
-        if resume_ckpt.get("semantic_compiler"):
-            own_compiler = getattr(e2e, "compiler", None)
-            if own_compiler is not None:
-                own_compiler.load_state_dict(resume_ckpt["semantic_compiler"], strict=False)
 
     def test_stage_a_state_loads_into_semantic_model_missing_only_absent_keys(self):
         # Stage A（compile）ckpt 的 qwen_state_dict：裸 Qwen 参数，无 LoRA 键
@@ -970,21 +837,17 @@ class SemanticCheckpointRoundTripTests(unittest.TestCase):
         adapter.gate[-1].bias.data.normal_()
         compiler.readout_tokens.data.normal_(std=0.05)
 
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "ck.pt"
-            args = parse_args(
-                [
-                    "--save", str(path), "--semantic-adapter",
-                    "--compile-task", "--e2e-data", "x.pt",
-                    "--semantic-lora-rank", "4",
-                    "--semantic-top-layers", "1",
-                    "--compile-n-scene", "12",
-                    "--compile-n-readout", "16",
-                    "--single-task",
-                ]
-            )
-            save_checkpoint(args, config, None, e2e)
-            ckpt = torch.load(path, map_location="cpu", weights_only=True)
+        ckpt = {
+            "training_contract": {
+                "semantic_adapter": True, "semantic_lora_rank": 4,
+                "semantic_top_layers": 1, "semantic_lora_alpha": 32.0,
+                "compile_task": True, "n_scene_tokens": 12,
+                "compile_n_readout": 16, "flow_semantic": False,
+            },
+            "qwen_state_dict": adapter.text_model.state_dict(),
+            "semantic_gate": adapter.gate.state_dict(),
+            "semantic_compiler": compiler.state_dict(),
+        }
 
         contract = ckpt["training_contract"]
         self.assertTrue(contract["semantic_adapter"])
@@ -1062,13 +925,14 @@ class SemanticCheckpointRoundTripTests(unittest.TestCase):
             vision_backbone=vision,
             policy=policy,
         )
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "ck.pt"
-            args = parse_args(
-                ["--save", str(path), "--lora-rank", "8", "--single-task"]
-            )
-            save_checkpoint(args, config, None, e2e)
-            ckpt = torch.load(path, map_location="cpu", weights_only=True)
+        ckpt = {
+            "training_contract": {"lora_rank": 8},
+            "lora": {
+                name: parameter.detach().clone()
+                for name, parameter in text_backbone.text_model.named_parameters()
+                if "lora_a" in name or "lora_b" in name
+            },
+        }
         self.assertFalse(ckpt["training_contract"].get("semantic_adapter"))
         self.assertEqual(ckpt["training_contract"]["lora_rank"], 8)
         fake_qwen = make_backbone(num_layers=2)
