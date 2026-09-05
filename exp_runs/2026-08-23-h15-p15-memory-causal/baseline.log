@@ -1,0 +1,17 @@
+eval: action_horizon=15 (from checkpoint config), flow_steps=8 (from checkpoint contract)
+eval: action decoder = flow_matching (Euler steps=8)
+eval: deployment cadence fps=80, training_stride=2, training_hz=40, deployment_hz=5.33333, prediction_horizon=15, execution_horizon=15, checkpoint_execution_horizon=15, execution_ablation=0
+eval: DINO-main frozen dinov2_vitl14_reg4 replaces V-JEPA (224px, dim=1024, 1024 tokens/decision, params=303,230,976)
+eval: DINO-metric 冻结 metric head（grid=16, dense_tokens=512, params=2,266,506）+ relation encoder（params=14,344） 从主 checkpoint 严格恢复
+eval: using cached language_hidden for task_ids=[0]; Qwen not loaded
+trial task=0 trial=0 seed=0 success=1
+stage task=0 trial=0 near=0.999 grasp=1.000 grasp_reward=0.874 in_place=0.471 min_obj_to_target=0.0000 best_step=0
+trial task=0 trial=1 seed=1 success=0
+stage task=0 trial=1 near=0.999 grasp=1.000 grasp_reward=0.872 in_place=0.949 min_obj_to_target=0.0000 best_step=0
+trial task=0 trial=2 seed=2 success=0
+stage task=0 trial=2 near=0.999 grasp=0.000 grasp_reward=0.386 in_place=0.992 min_obj_to_target=0.0000 best_step=0
+task Pick up a nut and place it onto a peg: 1/3
+
+CLOSED-LOOP SUCCESS: 1/3 = 33.3%
+single-task success: 33.3% [95% Wilson CI: 6.1%, 79.2%] (n_trials=3)
+structured results saved: exp_runs/2026-08-23-h15-p15-memory-causal/baseline.json

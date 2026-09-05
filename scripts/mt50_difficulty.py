@@ -52,6 +52,7 @@ TASK_WEIGHTS: dict[str, float] = {
     "Pick and place a puck onto a shelf": 2.0,
     "Pick and place a puck to a goal": 2.0,
     "Pick up a puck from a hole": 2.0,
+    "Pull a puck to a goal": 2.0,
     "Unplug a peg sideways": 2.0,
     "Pick a nut out of a peg": 2.0,
     "Grasp a stick and push a box using the stick": 2.0,
@@ -65,9 +66,148 @@ TASK_WEIGHTS: dict[str, float] = {
 DEFAULT_WEIGHT = 1.0
 
 
+# Evo-1 / FabriVLA / EvoMind 的 MT50 报告分桶。训练采样权重是本项目自己的
+# curriculum，不能拿上面的权重反推 benchmark 难度。
+MT50_BENCHMARK_GROUPS: dict[str, frozenset[str]] = {
+    "easy": frozenset(
+        {
+            "button-press-topdown-v3",
+            "button-press-topdown-wall-v3",
+            "button-press-v3",
+            "button-press-wall-v3",
+            "coffee-button-v3",
+            "dial-turn-v3",
+            "door-close-v3",
+            "door-lock-v3",
+            "door-unlock-v3",
+            "door-v3",
+            "drawer-close-v3",
+            "drawer-open-v3",
+            "faucet-close-v3",
+            "faucet-open-v3",
+            "handle-press-side-v3",
+            "handle-press-v3",
+            "handle-pull-side-v3",
+            "handle-pull-v3",
+            "lever-pull-v3",
+            "peg-unplug-side-v3",
+            "plate-slide-back-side-v3",
+            "plate-slide-back-v3",
+            "plate-slide-side-v3",
+            "plate-slide-v3",
+            "reach-v3",
+            "reach-wall-v3",
+            "window-close-v3",
+            "window-open-v3",
+        }
+    ),
+    "medium": frozenset(
+        {
+            "basketball-v3",
+            "bin-picking-v3",
+            "box-close-v3",
+            "coffee-pull-v3",
+            "coffee-push-v3",
+            "hammer-v3",
+            "peg-insertion-side-v3",
+            "push-wall-v3",
+            "soccer-v3",
+            "sweep-into-goal-v3",
+            "sweep-v3",
+        }
+    ),
+    "hard": frozenset(
+        {
+            "hand-insert-v3",
+            "nut-assembly-v3",
+            "pick-out-of-hole-v3",
+            "pick-place-v3",
+            "push-back-v3",
+            "push-v3",
+        }
+    ),
+    "very_hard": frozenset(
+        {
+            "nut-disassemble-v3",
+            "pick-place-wall-v3",
+            "shelf-place-v3",
+            "stick-pull-v3",
+            "stick-push-v3",
+        }
+    ),
+}
+MT50_BENCHMARK_TASK_TO_GROUP = {
+    task: group
+    for group, tasks in MT50_BENCHMARK_GROUPS.items()
+    for task in tasks
+}
+if len(MT50_BENCHMARK_TASK_TO_GROUP) != 50:
+    raise RuntimeError("official MT50 benchmark groups must contain 50 unique tasks")
+
+# MetaWorld's native v3 registry and the Evo-1/FabriVLA Gym wrapper use five
+# different slugs for the same environments. Keep rollout slugs native and
+# canonicalize only for leaderboard grouping.
+MT50_BENCHMARK_ENV_ALIASES = {
+    "assembly-v3": "nut-assembly-v3",
+    "disassemble-v3": "nut-disassemble-v3",
+    "door-open-v3": "door-v3",
+    "peg-insert-side-v3": "peg-insertion-side-v3",
+    "sweep-into-v3": "sweep-into-goal-v3",
+}
+
+
+def canonical_mt50_benchmark_env(env_name: str) -> str:
+    return MT50_BENCHMARK_ENV_ALIASES.get(env_name, env_name)
+
+
 def task_weights_for(tasks: list[str]) -> list[float]:
     """数据集 metadata.tasks（instruction_id 顺序）→ per-task 权重列表。"""
     unknown = [t for t in tasks if t not in TASK_WEIGHTS]
     if unknown:
         print(f"[task-sampling] WARNING: {len(unknown)} 任务无难度定义，按 1.0：{unknown[:5]}")
     return [TASK_WEIGHTS.get(t, DEFAULT_WEIGHT) for t in tasks]
+
+
+def summarize_mt50_benchmark_trials(trials: list[dict]) -> dict:
+    """Reduce raw trials to the official four equally weighted difficulty tiers."""
+    counts = {
+        group: {"successes": 0, "trials": 0, "tasks": set()}
+        for group in MT50_BENCHMARK_GROUPS
+    }
+    for row in trials:
+        task = canonical_mt50_benchmark_env(str(row.get("env_name", "")))
+        group = MT50_BENCHMARK_TASK_TO_GROUP.get(task)
+        if group is None:
+            raise ValueError(f"trial has unknown MT50 env_name: {task!r}")
+        counts[group]["successes"] += int(bool(row.get("success")))
+        counts[group]["trials"] += 1
+        counts[group]["tasks"].add(task)
+
+    seen = set().union(*(values["tasks"] for values in counts.values()))
+    complete = seen == set(MT50_BENCHMARK_TASK_TO_GROUP)
+    groups = {}
+    for name, values in counts.items():
+        n_trials = int(values["trials"])
+        groups[name] = {
+            "successes": int(values["successes"]),
+            "trials": n_trials,
+            "n_tasks": len(values["tasks"]),
+            "success_rate": (
+                None if n_trials == 0 else float(values["successes"] / n_trials)
+            ),
+        }
+    rates = [groups[name]["success_rate"] for name in MT50_BENCHMARK_GROUPS]
+    return {
+        "contract": "evomind_mt50_four_tier_v1",
+        "complete_mt50": complete,
+        "n_tasks": len(seen),
+        "groups": groups,
+        "bucket_average": (
+            float(sum(rates) / len(rates)) if complete else None
+        ),
+        "raw_episode_success": (
+            None
+            if not trials
+            else float(sum(bool(row.get("success")) for row in trials) / len(trials))
+        ),
+    }

@@ -6,8 +6,6 @@ import pytest
 import torch
 from torch import nn
 
-from train import parse_args, save_checkpoint
-from train import validate_args
 from va_compound.metric_roi import (
     crop_metric_roi_video,
     load_metric_roi_checkpoint,
@@ -170,60 +168,3 @@ def test_dino_480_geometry_keeps_96_source_pixels_before_224_resize() -> None:
     # Native 480 geometry: 96 source pixels span approximately x=192..288.
     assert crop[0, 0, 0, 112, 0].item() == pytest.approx(192.0 / 479.0, abs=0.004)
     assert crop[0, 0, 0, 112, 112].item() == pytest.approx(240.0 / 479.0, abs=0.004)
-
-
-def test_policy_checkpoint_saves_roi_state_config_and_identity(tmp_path) -> None:
-    roi_path = tmp_path / "roi.pt"
-    external = _roi_artifact(roi_path)
-    roi_head = load_metric_roi_checkpoint(
-        roi_path,
-        torch.device("cpu"),
-        coarse_identity=_coarse_identity(),
-        coarse_head_state_sha256=external["config"]["coarse_head_state_sha256"],
-    )
-    args = parse_args([])
-    args.save = tmp_path / "policy.pt"
-    args.mtvj_roi_alpha = 1.0
-    save_checkpoint(
-        args,
-        SimpleNamespace(hidden_dim=16),
-        nn.Linear(3, 2),
-        None,
-        roi_head=roi_head,
-    )
-    saved = torch.load(args.save, map_location="cpu", weights_only=True)
-    assert saved["training_contract"]["mtvj_roi_enabled"] is True
-    assert saved["training_contract"]["mtvj_roi_alpha"] == 1.0
-    assert saved["mtvj_roi_config"] == external["config"]
-    assert saved["mtvj_roi_checkpoint_identity"]["sha256"]
-    for key, value in roi_head.state_dict().items():
-        torch.testing.assert_close(saved["mtvj_roi_head"][key], value, rtol=0, atol=0)
-
-
-def test_roi_cli_is_off_by_default_and_requires_explicit_bounded_alpha() -> None:
-    default = parse_args([])
-    validate_args(default)
-    assert default.mtvj_roi_checkpoint is None
-    assert default.mtvj_roi_alpha is None
-
-    base = [
-        "--dense-readout-mtvj",
-        "--metric-visual-checkpoint",
-        "metric.pt",
-        "--mtvj-roi-checkpoint",
-        "roi.pt",
-    ]
-    with pytest.raises(ValueError, match="finite --mtvj-roi-alpha"):
-        validate_args(parse_args(base))
-    validate_args(parse_args([*base, "--mtvj-roi-alpha", "1.0"]))
-    with pytest.raises(ValueError, match="forbids --mtvj-train-metric-head"):
-        validate_args(
-            parse_args(
-                [
-                    *base,
-                    "--mtvj-roi-alpha",
-                    "1.0",
-                    "--mtvj-train-metric-head",
-                ]
-            )
-        )

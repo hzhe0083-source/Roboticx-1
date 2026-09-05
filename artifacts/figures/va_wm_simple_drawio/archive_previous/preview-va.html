@@ -1,0 +1,78 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>va_actual_internal.drawio</title>
+<style>
+  html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #f7f7f7; }
+  iframe { border: 0; width: 100vw; height: 100vh; display: block; }
+  #export-png { position: fixed; left: 0; top: 0; width: 2px; height: 2px; padding: 0; border: 0; opacity: 0.01; z-index: 9999; }
+</style>
+</head>
+<body>
+<button id="export-png">Export PNG</button>
+<textarea id="export-data" hidden></textarea>
+<iframe id="drawio" src="https://embed.diagrams.net/?embed=1&proto=json&spin=1&ui=atlas&libraries=0&grid=0&pv=0"></iframe>
+<script>
+const xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<mxfile host=\"app.diagrams.net\" agent=\"Codex\" version=\"26.0.9\" pages=\"1\">\n  <diagram id=\"va-internal-overview\" name=\"VA Internal Structure\">\n    <mxGraphModel dx=\"1800\" dy=\"620\" grid=\"1\" gridSize=\"10\" guides=\"1\" tooltips=\"1\" connect=\"1\" arrows=\"1\" fold=\"1\" page=\"1\" pageScale=\"1\" pageWidth=\"1800\" pageHeight=\"620\" math=\"0\" shadow=\"0\">\n      <root>\n        <mxCell id=\"0\" />\n        <mxCell id=\"1\" parent=\"0\" />\n\n        <mxCell id=\"title\" value=\"&lt;b&gt;Vision\u2013Action (VA) policy \u00b7 internal structure&lt;/b&gt;\" style=\"text;html=1;strokeColor=none;fillColor=none;whiteSpace=wrap;fontFamily=Helvetica;fontSize=22;fontColor=#262626;align=center;\" vertex=\"1\" parent=\"1\">\n          <mxGeometry x=\"520\" y=\"12\" width=\"760\" height=\"38\" as=\"geometry\" />\n        </mxCell>\n\n        <mxCell id=\"input_group\" value=\"&lt;b&gt;1 \u00b7 Token initialization&lt;/b&gt;\" style=\"rounded=1;arcSize=8;dashed=1;dashPattern=8 8;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#8A8A8A;strokeWidth=2;fontFamily=Helvetica;fontSize=18;fontColor=#262626;align=center;verticalAlign=top;spacingTop=12;\" vertex=\"1\" parent=\"1\">\n          <mxGeometry x=\"30\" y=\"70\" width=\"420\" height=\"500\" as=\"geometry\" />\n        </mxCell>\n        <mxCell id=\"stack_group\" value=\"&lt;b&gt;2 \u00b7 VA coupling stack&lt;/b&gt;\" style=\"rounded=1;arcSize=8;dashed=1;dashPattern=8 8;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#8A8A8A;strokeWidth=2;fontFamily=Helvetica;fontSize=18;fontColor=#262626;align=center;verticalAlign=top;spacingTop=12;\" vertex=\"1\" parent=\"1\">\n          <mxGeometry x=\"500\" y=\"70\" width=\"540\" height=\"500\" as=\"geometry\" />\n        </mxCell>\n        <mxCell id=\"output_group\" value=\"&lt;b&gt;3 \u00b7 Policy outputs&lt;/b&gt;\" style=\"rounded=1;arcSize=8;dashed=1;dashPattern=8 8;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#8A8A8A;strokeWidth=2;fontFamily=Helvetica;fontSize=18;fontColor=#262626;align=center;verticalAlign=top;spacingTop=12;\" vertex=\"1\" parent=\"1\">\n          <mxGeometry x=\"1090\" y=\"70\" width=\"680\" height=\"500\" as=\"geometry\" />\n        </mxCell>\n\n        <mxCell id=\"dino_input\" value=\"&lt;b&gt;DINO tokens&lt;/b&gt;&lt;br&gt;D&lt;sub&gt;t&lt;/sub&gt;\" style=\"rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#FFDFDF;strokeColor=#262626;strokeWidth=2;fontFamily=Helvetica;fontSize=15;fontColor=#262626;\" vertex=\"1\" parent=\"1\">\n          <mxGeometry x=\"60\" y=\"195\" width=\"140\" height=\"70\" as=\"geometry\" />\n        </mxCell>\n        <mxCell id=\"vision_projection\" value=\"&lt;b&gt;Vision projection&lt;/b&gt;&lt;br&gt;V&lt;sub&gt;0&lt;/sub&gt; = Linear(D&lt;sub&gt;t&lt;/sub&gt;)\" style=\"rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#D9DFF2;strokeColor=#262626;strokeWidth=2;fontFamily=Helvetica;fontSize=15;fontColor=#262626;\" vertex=\"1\" parent=\"1\">\n          <mxGeometry x=\"240\" y=\"195\" width=\"170\" height=\"70\" as=\"geometry\" />\n        </mxCell>\n\n        <mxCell id=\"state_input\" value=\"&lt;b&gt;Robot state&lt;/b&gt;&lt;br&gt;p&lt;sub&gt;t&lt;/sub&gt;, u&lt;sub&gt;t\u22121&lt;/sub&gt;\" style=\"rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#FFDFDF;strokeColor=#262626;strokeWidth=2;fontFamily=Helvetica;fontSize=15;fontColor=#262626;\" vertex=\"1\" parent=\"1\">\n          <mxGeometry x=\"60\" y=\"295\" width=\"140\" height=\"70\" as=\"geometry\" />\n        </mxCell>\n        <mxCell id=\"action_init\" value=\"&lt;b&gt;Action-token init&lt;/b&gt;&lt;br&gt;A&lt;sub&gt;0&lt;/sub&gt; = queries + Linear[p&lt;sub&gt;t&lt;/sub&gt;;u&lt;sub&gt;t\u22121&lt;/sub&gt;]\" style=\"rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#D9DFF2;strokeColor=#262626;strokeWidth=2;fontFamily=Helvetica;fontSize=14;fontColor=#262626;\" vertex=\"1\" parent=\"1\">\n          <mxGeometry x=\"240\" y=\"285\" width=\"170\" height=\"90\" as=\"geometry\" />\n        </mxCell>\n\n        <mxCell id=\"language_input\" value=\"&lt;b&gt;Language&lt;/b&gt;&lt;br&gt;L\" style=\"rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#FFDFDF;strokeColor=#262626;strokeWidth=2;fontFamily=Helvetica;fontSize=15;fontColor=#262626;\" vertex=\"1\" parent=\"1\">\n          <mxGeometry x=\"60\" y=\"395\" width=\"140\" height=\"70\" as=\"geometry\" />\n        </mxCell>\n        <mxCell id=\"language_cache\" value=\"&lt;b&gt;Language projection&lt;/b&gt;&lt;br&gt;per-layer K&lt;sup&gt;L&lt;/sup&gt;, V&lt;sup&gt;L&lt;/sup&gt; cache\" style=\"rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#D9DFF2;strokeColor=#262626;strokeWidth=2;fontFamily=Helvetica;fontSize=14;fontColor=#262626;\" vertex=\"1\" parent=\"1\">\n          <mxGeometry x=\"240\" y=\"390\" width=\"170\" height=\"80\" as=\"geometry\" />\n        </mxCell>\n\n        <mxCell id=\"va_stack\" value=\"&lt;b&gt;VA Component \u00d7 N&lt;/b&gt;\" style=\"rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#FFE2B2;strokeColor=#262626;strokeWidth=2;fontFamily=Helvetica;fontSize=22;fontColor=#262626;\" vertex=\"1\" parent=\"1\">\n          <mxGeometry x=\"630\" y=\"240\" width=\"280\" height=\"180\" as=\"geometry\" />\n        </mxCell>\n\n        <mxCell id=\"visual_memory\" value=\"&lt;b&gt;VisualMemory&lt;/b&gt;&lt;br&gt;layers = (V&lt;sub&gt;1&lt;/sub&gt;, \u2026, V&lt;sub&gt;N&lt;/sub&gt;)\" style=\"rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#FFDFDF;strokeColor=#262626;strokeWidth=2;fontFamily=Helvetica;fontSize=15;fontColor=#262626;\" vertex=\"1\" parent=\"1\">\n          <mxGeometry x=\"1260\" y=\"165\" width=\"340\" height=\"90\" as=\"geometry\" />\n        </mxCell>\n\n        <mxCell id=\"action_norm\" value=\"&lt;b&gt;LayerNorm&lt;/b&gt;&lt;br&gt;A&lt;sub&gt;N&lt;/sub&gt;\" style=\"rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#D9DFF2;strokeColor=#262626;strokeWidth=2;fontFamily=Helvetica;fontSize=15;fontColor=#262626;\" vertex=\"1\" parent=\"1\">\n          <mxGeometry x=\"1130\" y=\"360\" width=\"130\" height=\"80\" as=\"geometry\" />\n        </mxCell>\n        <mxCell id=\"flow_state\" value=\"&lt;b&gt;Flow state&lt;/b&gt;&lt;br&gt;noisy action x&lt;sub&gt;t&lt;/sub&gt; + time t\" style=\"rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#FFDFDF;strokeColor=#262626;strokeWidth=2;fontFamily=Helvetica;fontSize=14;fontColor=#262626;\" vertex=\"1\" parent=\"1\">\n          <mxGeometry x=\"1310\" y=\"275\" width=\"230\" height=\"70\" as=\"geometry\" />\n        </mxCell>\n        <mxCell id=\"flow_head\" value=\"&lt;b&gt;FlowMatchingHead&lt;/b&gt;&lt;br&gt;conditional Transformer \u00d7 F&lt;br&gt;v&lt;sub&gt;\u03b8&lt;/sub&gt;(x&lt;sub&gt;t&lt;/sub&gt;, t | LN(A&lt;sub&gt;N&lt;/sub&gt;))\" style=\"rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#B7E9FB;strokeColor=#262626;strokeWidth=2;fontFamily=Helvetica;fontSize=15;fontColor=#262626;\" vertex=\"1\" parent=\"1\">\n          <mxGeometry x=\"1310\" y=\"365\" width=\"230\" height=\"130\" as=\"geometry\" />\n        </mxCell>\n        <mxCell id=\"euler\" value=\"&lt;b&gt;Euler update \u00d7 K&lt;/b&gt;&lt;br&gt;x \u2190 x + \u0394t\u00b7v&lt;sub&gt;\u03b8&lt;/sub&gt;\" style=\"rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#D9DFF2;strokeColor=#262626;strokeWidth=2;fontFamily=Helvetica;fontSize=14;fontColor=#262626;\" vertex=\"1\" parent=\"1\">\n          <mxGeometry x=\"1580\" y=\"385\" width=\"145\" height=\"90\" as=\"geometry\" />\n        </mxCell>\n        <mxCell id=\"action_chunk\" value=\"&lt;b&gt;Action chunk&lt;/b&gt;&lt;br&gt;\u00e2&lt;sub&gt;1:H&lt;/sub&gt;\" style=\"rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#F1F4B9;strokeColor=#262626;strokeWidth=2;fontFamily=Helvetica;fontSize=16;fontColor=#262626;\" vertex=\"1\" parent=\"1\">\n          <mxGeometry x=\"1582\" y=\"490\" width=\"140\" height=\"65\" as=\"geometry\" />\n        </mxCell>\n\n        <mxCell id=\"e_dino_proj\" value=\"\" style=\"edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeColor=#262626;strokeWidth=2;exitX=1;exitY=0.5;entryX=0;entryY=0.5;\" edge=\"1\" parent=\"1\" source=\"dino_input\" target=\"vision_projection\"><mxGeometry relative=\"1\" as=\"geometry\" /></mxCell>\n        <mxCell id=\"e_state_action\" value=\"\" style=\"edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeColor=#262626;strokeWidth=2;exitX=1;exitY=0.5;entryX=0;entryY=0.5;\" edge=\"1\" parent=\"1\" source=\"state_input\" target=\"action_init\"><mxGeometry relative=\"1\" as=\"geometry\" /></mxCell>\n        <mxCell id=\"e_lang_cache\" value=\"\" style=\"edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeColor=#262626;strokeWidth=2;exitX=1;exitY=0.5;entryX=0;entryY=0.5;\" edge=\"1\" parent=\"1\" source=\"language_input\" target=\"language_cache\"><mxGeometry relative=\"1\" as=\"geometry\" /></mxCell>\n\n        <mxCell id=\"e_v0_stack\" value=\"\" style=\"edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeColor=#262626;strokeWidth=2;exitX=1;exitY=0.5;entryX=0;entryY=0.05;\" edge=\"1\" parent=\"1\" source=\"vision_projection\" target=\"va_stack\"><mxGeometry relative=\"1\" as=\"geometry\" /></mxCell>\n        <mxCell id=\"e_a0_stack\" value=\"\" style=\"edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeColor=#262626;strokeWidth=2;exitX=1;exitY=0.5;entryX=0;entryY=0.5;\" edge=\"1\" parent=\"1\" source=\"action_init\" target=\"va_stack\"><mxGeometry relative=\"1\" as=\"geometry\" /></mxCell>\n        <mxCell id=\"e_l_stack\" value=\"\" style=\"edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeColor=#262626;strokeWidth=2;exitX=1;exitY=0.5;entryX=0;entryY=0.95;\" edge=\"1\" parent=\"1\" source=\"language_cache\" target=\"va_stack\"><mxGeometry relative=\"1\" as=\"geometry\" /></mxCell>\n\n        <mxCell id=\"e_stack_memory\" value=\"\" style=\"edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeColor=#262626;strokeWidth=2;exitX=1;exitY=0.3;entryX=0;entryY=0.5;\" edge=\"1\" parent=\"1\" source=\"va_stack\" target=\"visual_memory\"><mxGeometry relative=\"1\" as=\"geometry\"><Array as=\"points\"><mxPoint x=\"1060\" y=\"294\" /><mxPoint x=\"1060\" y=\"210\" /></Array></mxGeometry></mxCell>\n        <mxCell id=\"e_stack_norm\" value=\"\" style=\"edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeColor=#262626;strokeWidth=2;exitX=1;exitY=0.7;entryX=0;entryY=0.5;\" edge=\"1\" parent=\"1\" source=\"va_stack\" target=\"action_norm\"><mxGeometry relative=\"1\" as=\"geometry\"><Array as=\"points\"><mxPoint x=\"1060\" y=\"366\" /><mxPoint x=\"1060\" y=\"400\" /></Array></mxGeometry></mxCell>\n        <mxCell id=\"e_norm_flow\" value=\"\" style=\"edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeColor=#262626;strokeWidth=2;exitX=1;exitY=0.5;entryX=0;entryY=0.6;\" edge=\"1\" parent=\"1\" source=\"action_norm\" target=\"flow_head\"><mxGeometry relative=\"1\" as=\"geometry\" /></mxCell>\n        <mxCell id=\"e_state_flow\" value=\"\" style=\"edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeColor=#262626;strokeWidth=2;exitX=0.5;exitY=1;entryX=0.5;entryY=0;\" edge=\"1\" parent=\"1\" source=\"flow_state\" target=\"flow_head\"><mxGeometry relative=\"1\" as=\"geometry\" /></mxCell>\n        <mxCell id=\"e_flow_euler\" value=\"\" style=\"edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeColor=#262626;strokeWidth=2;exitX=1;exitY=0.5;entryX=0;entryY=0.5;\" edge=\"1\" parent=\"1\" source=\"flow_head\" target=\"euler\"><mxGeometry relative=\"1\" as=\"geometry\" /></mxCell>\n        <mxCell id=\"e_euler_action\" value=\"\" style=\"edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=classic;endFill=1;strokeColor=#262626;strokeWidth=2;exitX=0.5;exitY=1;entryX=0.5;entryY=0;\" edge=\"1\" parent=\"1\" source=\"euler\" target=\"action_chunk\"><mxGeometry relative=\"1\" as=\"geometry\" /></mxCell>\n      </root>\n    </mxGraphModel>\n  </diagram>\n</mxfile>\n";
+const diagramTitle = "va_actual_internal.drawio";
+const DRAWIO_ORIGIN = 'https://embed.diagrams.net';
+const iframe = document.getElementById('drawio');
+let loaded = false;
+function downloadXml(savedXml) {
+  const blob = new Blob([savedXml], { type: 'application/xml' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  const cleanTitle = diagramTitle.endsWith('.drawio') ? diagramTitle : `${diagramTitle}.drawio`;
+  link.href = url;
+  link.download = cleanTitle;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+function sendLoad() {
+  iframe.contentWindow.postMessage(JSON.stringify({
+    action: 'load',
+    autosave: 0,
+    modified: 0,
+    title: diagramTitle,
+    xml
+  }), DRAWIO_ORIGIN);
+}
+document.getElementById('export-png').addEventListener('click', () => {
+  document.getElementById('export-data').value = '';
+  iframe.contentWindow.postMessage(JSON.stringify({
+    action: 'export', format: 'png', scale: 0.9, border: 12, background: '#FFFFFF'
+  }), DRAWIO_ORIGIN);
+});
+window.__drawioPreview = {
+  requestSave: () => iframe.contentWindow.postMessage(JSON.stringify({ action: 'save' }), DRAWIO_ORIGIN)
+};
+window.addEventListener('message', (evt) => {
+  if (evt.source !== iframe.contentWindow || evt.origin !== DRAWIO_ORIGIN) return;
+  let msg = evt.data;
+  try { if (typeof msg === 'string') msg = JSON.parse(msg); } catch (e) { return; }
+  if (!msg) return;
+  if (msg.event === 'export' && msg.data) {
+    document.getElementById('export-data').value = msg.data;
+    return;
+  }
+  if (msg.event === 'save' && msg.xml) {
+    downloadXml(msg.xml);
+    iframe.contentWindow.postMessage(JSON.stringify({
+      action: 'status',
+      modified: false,
+      message: 'Downloaded .drawio file'
+    }), DRAWIO_ORIGIN);
+    return;
+  }
+  if (!loaded && (msg.event === 'init' || msg.event === 'configure')) {
+    loaded = true;
+    sendLoad();
+  }
+});
+setTimeout(() => { if (!loaded) sendLoad(); }, 2500);
+</script>
+</body>
+</html>

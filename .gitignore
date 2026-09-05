@@ -1,6 +1,8 @@
 # 大文件产物(超出 GitHub 大小限制,不入库)
 checkpoints/
 data/
+!va_compound/data/
+!va_compound/data/*.py
 papers/*.pdf
 logs/
 *.pt

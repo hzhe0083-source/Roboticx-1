@@ -5,6 +5,7 @@ from functools import cache
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 import prepare_metaworld_metric as metric_data
@@ -71,7 +72,8 @@ def test_all_49_tasks_follow_declared_role_contracts() -> None:
     assert SUPPORTED_TASKS == tuple(ENV_TO_TASK)
     assert len(SUPPORTED_TASKS) == 49
     assert TASK_ALIGNED_ROLE_SOURCES == {
-        "peg-insert-side-v3": ("tcp_center", "pegGrasp", "hole", "pegHead")
+        "peg-insert-side-v3": ("tcp_center", "pegGrasp", "hole", "pegHead"),
+        "assembly-v3": ("tcp_center", "RoundNut-8", "_target_pos", "RoundNut"),
     }
 
     checked = []
@@ -88,6 +90,11 @@ def test_all_49_tasks_follow_declared_role_contracts() -> None:
                 np.testing.assert_allclose(world[3], env.data.site("pegHead").xpos)
                 assert not np.allclose(world[1], world[3])
                 assert not np.allclose(world[2], env._target_pos)
+            elif task == "assembly-v3":
+                np.testing.assert_allclose(world[1], env.data.site("RoundNut-8").xpos)
+                np.testing.assert_allclose(world[2], env._target_pos)
+                np.testing.assert_allclose(world[3], env.data.site("RoundNut").xpos)
+                assert np.linalg.norm(world[1] - world[3]) == pytest.approx(0.13)
             else:
                 np.testing.assert_allclose(world[2], env._target_pos)
                 entities = np.asarray(env._get_pos_objects()).reshape(-1, 3)
@@ -119,8 +126,30 @@ def test_task35_aligned_roles_are_observable_and_distinct() -> None:
         batch["relation"][:, 2:4], relation_error, atol=1e-7, rtol=1e-6
     )
     assert batch["meta"]["task_role_source"]["task_overrides"] == {
-        "peg-insert-side-v3": ["tcp_center", "pegGrasp", "hole", "pegHead"]
+        "peg-insert-side-v3": ["tcp_center", "pegGrasp", "hole", "pegHead"],
+        "assembly-v3": ["tcp_center", "RoundNut-8", "_target_pos", "RoundNut"],
     }
+
+
+def test_assembly_roles_separate_grasp_handle_from_reward_center() -> None:
+    batch = make_metric_batch("assembly-v3", np.random.default_rng(20260823), 8)
+    separation = np.linalg.norm(batch["world"][:, 1] - batch["world"][:, 3], axis=-1)
+    np.testing.assert_allclose(separation, np.full(8, 0.13), atol=1e-6, rtol=0.0)
+    assert batch["meta"]["task_role_source"]["contracts"]["assembly-v3"] == (
+        "slots_tool_RoundNut-8_target_RoundNut_reward_center_v1"
+    )
+    # Both semantic points receive localization labels in normal randomized
+    # views, and their 13 cm physical offset remains visibly separated.
+    assert float(batch["visibility"][:, 1].mean()) >= 0.75
+    assert float(batch["visibility"][:, 3].mean()) >= 0.75
+    pixel_separation = np.linalg.norm(
+        batch["keypoints"][:, 1] - batch["keypoints"][:, 3], axis=-1
+    ) * metric_data.RENDER_SIZE
+    assert float(pixel_separation.mean()) >= 25.0
+    relation_error = batch["keypoints"][:, 3] - batch["keypoints"][:, 2]
+    np.testing.assert_allclose(
+        batch["relation"][:, 2:4], relation_error, atol=1e-7, rtol=1e-6
+    )
 
 
 def test_dual_entity_and_direct_tcp_families_have_correct_relations() -> None:

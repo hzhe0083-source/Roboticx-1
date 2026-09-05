@@ -1,0 +1,15 @@
+{
+  "file": "artifacts/figures/va_wm_simple_drawio/wm_update_component.drawio",
+  "summary": {
+    "total_findings": 0,
+    "fail": 0,
+    "warn": 0,
+    "passed": true,
+    "clean": true
+  },
+  "fails": [],
+  "warns": [],
+  "vertex_count": 27,
+  "edge_count": 28,
+  "canvas": "1320x820"
+}

@@ -575,7 +575,7 @@ data scale; the VA2 gains concentrate in closed-loop control and in
 language grounding (§5.3 ablation below, §6).
 *Development record: the initial VA2 run used the v3 "prev-fix" contract,
 which was later found to leak the future action into `previous_action`
-(prepare_prev_fix.py wrote `actions[t-1,-1]`, which equals `actions[t,1]`
+(scripts/migrations/prepare_prev_fix_v3.py wrote `actions[t-1,-1]`, which equals `actions[t,1]`
 under the 6-step control stride / 8-step horizon overlap; verified equality
 rate 1.0000). That run's open-loop chunk MAE (0.0706) was a leakage
 artifact, not a real gain; its numbers are superseded by the v4 retest

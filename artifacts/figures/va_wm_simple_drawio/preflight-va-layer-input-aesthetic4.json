@@ -1,0 +1,54 @@
+{
+  "file": "artifacts/figures/va_wm_simple_drawio/va_layer_input_origin.drawio",
+  "summary": {
+    "total_findings": 2,
+    "fail": 0,
+    "warn": 2,
+    "passed": true,
+    "clean": false
+  },
+  "fails": [],
+  "warns": [
+    {
+      "rule": "spacing-inconsistent-h",
+      "element_id": "previous_action",
+      "message": "Row at y≈520: horizontal gaps vary (gaps=['455', '140'], mean=298, cv=0.53). Use uniform spacing.",
+      "detail": {
+        "row_y": 520,
+        "gaps": [
+          455.0,
+          140.0
+        ],
+        "mean": 297.5,
+        "cv": 0.53,
+        "element_ids": [
+          "previous_action",
+          "learned_queries",
+          "layer_output"
+        ]
+      }
+    },
+    {
+      "rule": "spacing-inconsistent-v",
+      "element_id": "initial_state",
+      "message": "Column at x≈650: vertical gaps vary (gaps=['80', '25'], mean=52, cv=0.52). Use uniform spacing.",
+      "detail": {
+        "col_x": 650,
+        "gaps": [
+          80.0,
+          25.0
+        ],
+        "mean": 52.5,
+        "cv": 0.52,
+        "element_ids": [
+          "initial_state",
+          "action_add",
+          "learned_queries"
+        ]
+      }
+    }
+  ],
+  "vertex_count": 17,
+  "edge_count": 13,
+  "canvas": "1320x660"
+}

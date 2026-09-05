@@ -1,0 +1,350 @@
+{
+  "contract": "metaworld_closed_loop_trials_v1",
+  "checkpoint": "/home/ryan/.cache/ora0_eval_audit/mw_hard2_h15_p15_s5037.eval_only.pt",
+  "checkpoint_sha256": "b9d35b32b404ffdb003bb4bfed71c11cd492e0773c5c9d1db175c60c2ed315e1",
+  "features": "/home/ryan/Documents/robot/ORA0/data/all49_peer_h15_p2_eval_v1.pt",
+  "task_ids": [
+    0
+  ],
+  "trials_per_task": 30,
+  "completed_trials": 20,
+  "successes": 5,
+  "success_rate": 0.25,
+  "ci": {
+    "kind": "wilson",
+    "estimate": 0.25,
+    "low_95": 0.11186170140766569,
+    "high_95": 0.468700877618744
+  },
+  "execute_steps": 15,
+  "prediction_horizon": 15,
+  "execution_horizon": 15,
+  "checkpoint_deployment_execution_horizon": 15,
+  "execution_horizon_ablation": false,
+  "world_horizon": 15,
+  "flow_solver_steps": 8,
+  "source_fps": 80,
+  "control_hz": 80,
+  "training_control_stride": 2,
+  "control_stride": 2,
+  "planning_stride": 2,
+  "planning_hz": 5.333333333333333,
+  "training_planning_hz": 40.0,
+  "deployment_planning_hz": 5.333333333333333,
+  "world_transition_stride": 2,
+  "observation_stride": 2,
+  "memory_reset_every": 0,
+  "wmrm_mode": "state-exchange",
+  "peer_world_off": false,
+  "horizon": 500,
+  "flow_samples": 1,
+  "action_decoder": "conditional_flow_matching",
+  "wmrm_state_exchange": true,
+  "task35_precision_contract": false,
+  "task35_causal_ablation": "none",
+  "dino_feature_cache": null,
+  "env_name": "assembly-v3",
+  "language_source": "feature_language_cache",
+  "trials": [
+    {
+      "task_id": 0,
+      "task": "Pick up a nut and place it onto a peg",
+      "trial": 10,
+      "seed": 10,
+      "success": false,
+      "stage": {
+        "near_object": 0.9993529810308824,
+        "grasp_success": 0.0,
+        "grasp_reward": 0.4672581249698055,
+        "in_place_reward": 0.973520664776142,
+        "min_obj_to_target": 0.0,
+        "best_obj_step": 0
+      }
+    },
+    {
+      "task_id": 0,
+      "task": "Pick up a nut and place it onto a peg",
+      "trial": 11,
+      "seed": 11,
+      "success": false,
+      "stage": {
+        "near_object": 0.9993529810308823,
+        "grasp_success": 1.0,
+        "grasp_reward": 0.8844430400799372,
+        "in_place_reward": 0.9983029483021703,
+        "min_obj_to_target": 0.0,
+        "best_obj_step": 0
+      }
+    },
+    {
+      "task_id": 0,
+      "task": "Pick up a nut and place it onto a peg",
+      "trial": 12,
+      "seed": 12,
+      "success": false,
+      "stage": {
+        "near_object": 0.9993529810308824,
+        "grasp_success": 1.0,
+        "grasp_reward": 0.8660637906630313,
+        "in_place_reward": 0.9818588260845929,
+        "min_obj_to_target": 0.0,
+        "best_obj_step": 0
+      }
+    },
+    {
+      "task_id": 0,
+      "task": "Pick up a nut and place it onto a peg",
+      "trial": 13,
+      "seed": 13,
+      "success": false,
+      "stage": {
+        "near_object": 0.9993529810308824,
+        "grasp_success": 1.0,
+        "grasp_reward": 0.8720161383334437,
+        "in_place_reward": 0.8772679221398696,
+        "min_obj_to_target": 0.0,
+        "best_obj_step": 0
+      }
+    },
+    {
+      "task_id": 0,
+      "task": "Pick up a nut and place it onto a peg",
+      "trial": 14,
+      "seed": 14,
+      "success": false,
+      "stage": {
+        "near_object": 0.9993529810308823,
+        "grasp_success": 1.0,
+        "grasp_reward": 0.9022590477342991,
+        "in_place_reward": 0.9709825223872133,
+        "min_obj_to_target": 0.0,
+        "best_obj_step": 0
+      }
+    },
+    {
+      "task_id": 0,
+      "task": "Pick up a nut and place it onto a peg",
+      "trial": 15,
+      "seed": 15,
+      "success": true,
+      "stage": {
+        "near_object": 0.9993529810308824,
+        "grasp_success": 1.0,
+        "grasp_reward": 0.8776857448334596,
+        "in_place_reward": 0.8913581394126103,
+        "min_obj_to_target": 0.0,
+        "best_obj_step": 0
+      }
+    },
+    {
+      "task_id": 0,
+      "task": "Pick up a nut and place it onto a peg",
+      "trial": 16,
+      "seed": 16,
+      "success": false,
+      "stage": {
+        "near_object": 0.9993529810308824,
+        "grasp_success": 0.0,
+        "grasp_reward": 0.47110372735874184,
+        "in_place_reward": 0.9597414004884037,
+        "min_obj_to_target": 0.0,
+        "best_obj_step": 0
+      }
+    },
+    {
+      "task_id": 0,
+      "task": "Pick up a nut and place it onto a peg",
+      "trial": 17,
+      "seed": 17,
+      "success": false,
+      "stage": {
+        "near_object": 0.9993529810308824,
+        "grasp_success": 0.0,
+        "grasp_reward": 0.43458817767713737,
+        "in_place_reward": 0.9755413969206179,
+        "min_obj_to_target": 0.0,
+        "best_obj_step": 0
+      }
+    },
+    {
+      "task_id": 0,
+      "task": "Pick up a nut and place it onto a peg",
+      "trial": 18,
+      "seed": 18,
+      "success": false,
+      "stage": {
+        "near_object": 0.9993529810308824,
+        "grasp_success": 0.0,
+        "grasp_reward": 0.4859876004145881,
+        "in_place_reward": 0.871405157903828,
+        "min_obj_to_target": 0.0,
+        "best_obj_step": 0
+      }
+    },
+    {
+      "task_id": 0,
+      "task": "Pick up a nut and place it onto a peg",
+      "trial": 19,
+      "seed": 19,
+      "success": false,
+      "stage": {
+        "near_object": 0.9993529810308824,
+        "grasp_success": 1.0,
+        "grasp_reward": 0.8945831776378158,
+        "in_place_reward": 0.9128386398795414,
+        "min_obj_to_target": 0.0,
+        "best_obj_step": 0
+      }
+    },
+    {
+      "task_id": 0,
+      "task": "Pick up a nut and place it onto a peg",
+      "trial": 20,
+      "seed": 20,
+      "success": false,
+      "stage": {
+        "near_object": 0.9993529810308823,
+        "grasp_success": 0.0,
+        "grasp_reward": 0.4857458548845232,
+        "in_place_reward": 0.9867315048261701,
+        "min_obj_to_target": 0.0,
+        "best_obj_step": 0
+      }
+    },
+    {
+      "task_id": 0,
+      "task": "Pick up a nut and place it onto a peg",
+      "trial": 21,
+      "seed": 21,
+      "success": false,
+      "stage": {
+        "near_object": 0.9993529810308824,
+        "grasp_success": 1.0,
+        "grasp_reward": 0.8942970002096382,
+        "in_place_reward": 0.958599829786082,
+        "min_obj_to_target": 0.0,
+        "best_obj_step": 0
+      }
+    },
+    {
+      "task_id": 0,
+      "task": "Pick up a nut and place it onto a peg",
+      "trial": 22,
+      "seed": 22,
+      "success": false,
+      "stage": {
+        "near_object": 0.9993529810308824,
+        "grasp_success": 1.0,
+        "grasp_reward": 0.88245509412452,
+        "in_place_reward": 0.9579102257506001,
+        "min_obj_to_target": 0.0,
+        "best_obj_step": 0
+      }
+    },
+    {
+      "task_id": 0,
+      "task": "Pick up a nut and place it onto a peg",
+      "trial": 23,
+      "seed": 23,
+      "success": false,
+      "stage": {
+        "near_object": 0.9993529810308824,
+        "grasp_success": 1.0,
+        "grasp_reward": 0.8796728709377523,
+        "in_place_reward": 0.9655023663882274,
+        "min_obj_to_target": 0.0,
+        "best_obj_step": 0
+      }
+    },
+    {
+      "task_id": 0,
+      "task": "Pick up a nut and place it onto a peg",
+      "trial": 24,
+      "seed": 24,
+      "success": false,
+      "stage": {
+        "near_object": 0.9993529810308824,
+        "grasp_success": 1.0,
+        "grasp_reward": 0.8796514560023858,
+        "in_place_reward": 0.9937767507082639,
+        "min_obj_to_target": 0.0,
+        "best_obj_step": 0
+      }
+    },
+    {
+      "task_id": 0,
+      "task": "Pick up a nut and place it onto a peg",
+      "trial": 25,
+      "seed": 25,
+      "success": true,
+      "stage": {
+        "near_object": 0.9993529810308824,
+        "grasp_success": 1.0,
+        "grasp_reward": 0.8762517523559326,
+        "in_place_reward": 0.4938344435896329,
+        "min_obj_to_target": 0.0,
+        "best_obj_step": 0
+      }
+    },
+    {
+      "task_id": 0,
+      "task": "Pick up a nut and place it onto a peg",
+      "trial": 26,
+      "seed": 26,
+      "success": false,
+      "stage": {
+        "near_object": 0.9993529810308824,
+        "grasp_success": 0.0,
+        "grasp_reward": 0.4487474847353724,
+        "in_place_reward": 0.9732932961885966,
+        "min_obj_to_target": 0.0,
+        "best_obj_step": 0
+      }
+    },
+    {
+      "task_id": 0,
+      "task": "Pick up a nut and place it onto a peg",
+      "trial": 27,
+      "seed": 27,
+      "success": true,
+      "stage": {
+        "near_object": 0.9993529810308824,
+        "grasp_success": 1.0,
+        "grasp_reward": 0.863670125260567,
+        "in_place_reward": 0.3833731857683641,
+        "min_obj_to_target": 0.0,
+        "best_obj_step": 0
+      }
+    },
+    {
+      "task_id": 0,
+      "task": "Pick up a nut and place it onto a peg",
+      "trial": 28,
+      "seed": 28,
+      "success": true,
+      "stage": {
+        "near_object": 0.9993529810308824,
+        "grasp_success": 1.0,
+        "grasp_reward": 0.8902661408645726,
+        "in_place_reward": 0.9997982585968501,
+        "min_obj_to_target": 0.0,
+        "best_obj_step": 0
+      }
+    },
+    {
+      "task_id": 0,
+      "task": "Pick up a nut and place it onto a peg",
+      "trial": 29,
+      "seed": 29,
+      "success": true,
+      "stage": {
+        "near_object": 0.9993529810308824,
+        "grasp_success": 1.0,
+        "grasp_reward": 0.8764371856536542,
+        "in_place_reward": 0.998639417867778,
+        "min_obj_to_target": 0.0,
+        "best_obj_step": 0
+      }
+    }
+  ]
+}

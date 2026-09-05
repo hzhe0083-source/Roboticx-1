@@ -1,0 +1,46 @@
+{
+  "file": "artifacts/figures/va_wm_simple_drawio/va_internal_simple_landscape.drawio",
+  "summary": {
+    "total_findings": 3,
+    "fail": 0,
+    "warn": 3,
+    "passed": true,
+    "clean": false
+  },
+  "fails": [],
+  "warns": [
+    {
+      "rule": "font-box-cavernous",
+      "element_id": "va_input",
+      "message": "Box 'va_input' is 270px tall with effective fontSize=20.0 (ratio 13.5:1). Text will look tiny and lost. Either shrink box or increase font.",
+      "detail": {
+        "box_height": 270.0,
+        "font_size": 20.0,
+        "ratio": 13.5
+      }
+    },
+    {
+      "rule": "font-box-cavernous",
+      "element_id": "va_attention",
+      "message": "Box 'va_attention' is 340px tall with effective fontSize=19.0 (ratio 17.9:1). Text will look tiny and lost. Either shrink box or increase font.",
+      "detail": {
+        "box_height": 340.0,
+        "font_size": 19.0,
+        "ratio": 17.9
+      }
+    },
+    {
+      "rule": "font-box-cavernous",
+      "element_id": "va_output",
+      "message": "Box 'va_output' is 270px tall with effective fontSize=20.0 (ratio 13.5:1). Text will look tiny and lost. Either shrink box or increase font.",
+      "detail": {
+        "box_height": 270.0,
+        "font_size": 20.0,
+        "ratio": 13.5
+      }
+    }
+  ],
+  "vertex_count": 13,
+  "edge_count": 8,
+  "canvas": "1600x700"
+}

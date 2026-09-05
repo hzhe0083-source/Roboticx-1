@@ -34,8 +34,8 @@ os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("EGL_PLATFORM", "surfaceless")
 
 from prepare_metaworld_metric import ROLE_NAMES, make_metric_batch  # noqa: E402
-from train import _build_dino_main_backbone  # noqa: E402
 from va_compound.model import VACompoundConfig  # noqa: E402
+from va_compound.vision.encoding import _build_dino_main_backbone  # noqa: E402
 
 GRID = 16
 SLICES = 2

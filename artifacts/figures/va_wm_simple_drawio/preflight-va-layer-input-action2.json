@@ -1,0 +1,15 @@
+{
+  "file": "artifacts/figures/va_wm_simple_drawio/va_layer_input_origin.drawio",
+  "summary": {
+    "total_findings": 0,
+    "fail": 0,
+    "warn": 0,
+    "passed": true,
+    "clean": true
+  },
+  "fails": [],
+  "warns": [],
+  "vertex_count": 16,
+  "edge_count": 13,
+  "canvas": "2160x650"
+}

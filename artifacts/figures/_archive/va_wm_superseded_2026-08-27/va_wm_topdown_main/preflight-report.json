@@ -1,0 +1,43 @@
+{
+  "file": "artifacts/figures/va_wm_topdown_main/va_wm_topdown_main.drawio",
+  "summary": {
+    "total_findings": 1,
+    "fail": 0,
+    "warn": 1,
+    "passed": true,
+    "clean": false
+  },
+  "fails": [],
+  "warns": [
+    {
+      "rule": "spacing-inconsistent-v",
+      "element_id": "wm_input",
+      "message": "Column at x≈1080: vertical gaps vary (gaps=['17', '18', '68', '12', '5', '12'], mean=22, cv=0.95). Use uniform spacing.",
+      "detail": {
+        "col_x": 1080,
+        "gaps": [
+          17.0,
+          18.0,
+          68.0,
+          12.0,
+          5.0,
+          12.0
+        ],
+        "mean": 22.0,
+        "cv": 0.95,
+        "element_ids": [
+          "wm_input",
+          "wm_evidence",
+          "wm_belief",
+          "wm_self_attn",
+          "wm_cross_attn",
+          "wm_ffn",
+          "wm_map"
+        ]
+      }
+    }
+  ],
+  "vertex_count": 35,
+  "edge_count": 33,
+  "canvas": "1600x1400"
+}

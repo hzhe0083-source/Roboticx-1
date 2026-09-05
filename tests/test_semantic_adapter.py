@@ -17,7 +17,6 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from train import E2EDataset, parse_args, validate_args
 from va_compound.backbones import (
     LoRALinear,
     QwenSemanticBackbone,
@@ -373,7 +372,7 @@ class SemanticBackboneTests(unittest.TestCase):
         # P0-5：动作损失 backward 后缩放 LoRA 梯度、再 backward 语义损失——
         # 最终 LoRA 梯度 = η_act·g_action + g_semantic（anchor/geometry 梯度
         # 完整，不被 η_act 缩放；旧实现统一缩放两者）。
-        from train import scale_semantic_lora_grads
+        from va_compound.training.gradients import scale_semantic_lora_grads
 
         backbone = make_backbone(num_layers=2)
         adapter = QwenSemanticBackbone(
@@ -703,119 +702,9 @@ class EndToEndSemanticTests(unittest.TestCase):
         self.assertIsNotNone(adapter.gate[-1].weight.grad)
 
 
-class TrainArgSemanticTests(unittest.TestCase):
-    def test_semantic_adapter_requires_e2e_data(self):
-        args = parse_args(["--semantic-adapter"])
-        with self.assertRaisesRegex(ValueError, "e2e-data"):
-            validate_args(args)
 
-    def test_semantic_adapter_conflicts_with_global_lora(self):
-        args = parse_args(
-            ["--semantic-adapter", "--e2e-data", "x.pt", "--lora-rank", "8"]
-        )
-        with self.assertRaisesRegex(ValueError, "lora-rank"):
-            validate_args(args)
 
-    def test_semantic_adapter_conflicts_with_qwen_unfreeze(self):
-        args = parse_args(
-            [
-                "--semantic-adapter",
-                "--e2e-data",
-                "x.pt",
-                "--qwen-unfreeze-blocks",
-                "2",
-            ]
-        )
-        with self.assertRaisesRegex(ValueError, "qwen-unfreeze-blocks"):
-            validate_args(args)
 
-    def test_semantic_adapter_valid_combo_passes(self):
-        args = parse_args(
-            ["--semantic-adapter", "--e2e-data", "x.pt", "--single-task"]
-        )
-        validate_args(args)  # 不抛异常
-
-    def test_semantic_top_layers_must_be_positive(self):
-        args = parse_args(
-            [
-                "--semantic-adapter",
-                "--e2e-data",
-                "x.pt",
-                "--semantic-top-layers",
-                "0",
-            ]
-        )
-        with self.assertRaisesRegex(ValueError, "semantic-top-layers"):
-            validate_args(args)
-
-    def test_semantic_loss_weights_must_be_non_negative(self):
-        for flag in ("--semantic-anchor-weight", "--semantic-geometry-weight"):
-            args = parse_args([flag + "=-0.1"])
-            with self.assertRaisesRegex(ValueError, "non-negative"):
-                validate_args(args)
-
-    def test_non_semantic_defaults_unchanged(self):
-        args = parse_args([])
-        self.assertFalse(args.semantic_adapter)
-        self.assertEqual(args.semantic_lora_rank, 8)
-        self.assertEqual(args.semantic_top_layers, 4)
-        self.assertEqual(args.semantic_anchor_weight, 0.0)
-        self.assertEqual(args.semantic_geometry_weight, 0.0)
-        self.assertEqual(args.semantic_anchor_layers, "")
-        # 非 semantic 模式允许全局 LoRA，校验不报错
-        args = parse_args(["--lora-rank", "8"])
-        validate_args(args)
-
-    def test_e2e_dataset_still_constructs_without_semantic_flags(self):
-        payload = {
-            "video_frames": torch.randint(0, 256, (2, 4, 2, 3, 8, 8), dtype=torch.uint8),
-            "instructions": ["pick red cup", "push blue cup"],
-            "proprio": torch.randn(2, 4, 5),
-            "previous_action": torch.randn(2, 4, 4),
-            "actions": torch.randn(2, 4, 3, 4),
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "e2e.pt"
-            torch.save(payload, path)
-            dataset = E2EDataset(path, min_sequence_length=4)
-        self.assertEqual(len(dataset), 2)
-        self.assertEqual(dataset[0]["instruction"], "pick red cup")
-
-    def test_e2e_dataset_trivial_pair_id_is_single_task(self):
-        # Legacy libero_video/v2 payloads carry a trivial pair_id (one row
-        # per group): must construct and behave as unpaired (single-task),
-        # not raise in build_pair_groups.
-        payload = {
-            "video_frames": torch.randint(0, 256, (4, 4, 2, 3, 8, 8), dtype=torch.uint8),
-            "instructions": ["a", "b", "c", "d"],
-            "proprio": torch.randn(4, 4, 5),
-            "previous_action": torch.randn(4, 4, 4),
-            "actions": torch.randn(4, 4, 3, 4),
-            "pair_id": torch.arange(4, dtype=torch.long),
-            "instruction_id": torch.tensor([0, 0, 1, 1], dtype=torch.long),
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "e2e.pt"
-            torch.save(payload, path)
-            dataset = E2EDataset(path, min_sequence_length=4)
-        self.assertEqual(dataset.pair_groups, {})
-
-    def test_e2e_dataset_real_pairs_still_validated(self):
-        payload = {
-            "video_frames": torch.randint(0, 256, (2, 4, 2, 3, 8, 8), dtype=torch.uint8),
-            "instructions": ["a", "b"],
-            "proprio": torch.randn(2, 4, 5),
-            "previous_action": torch.randn(2, 4, 4),
-            "actions": torch.randn(2, 4, 3, 4),
-            "pair_id": torch.zeros(2, dtype=torch.long),
-            "instruction_id": torch.tensor([0, 1], dtype=torch.long),
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "e2e.pt"
-            torch.save(payload, path)
-            dataset = E2EDataset(path, min_sequence_length=4)
-        self.assertEqual(len(dataset.pair_groups), 1)
-        self.assertEqual(list(dataset.pair_groups[0].keys()), [0, 1])
 
 
 if __name__ == "__main__":

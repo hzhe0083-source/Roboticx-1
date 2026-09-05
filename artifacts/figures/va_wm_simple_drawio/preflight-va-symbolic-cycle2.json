@@ -1,0 +1,75 @@
+{
+  "file": "artifacts/figures/va_wm_simple_drawio/va_actual_internal.drawio",
+  "summary": {
+    "total_findings": 3,
+    "fail": 0,
+    "warn": 3,
+    "passed": true,
+    "clean": false
+  },
+  "fails": [],
+  "warns": [
+    {
+      "rule": "spacing-inconsistent-h",
+      "element_id": "vision_projection",
+      "message": "Row at y≈215: horizontal gaps vary (gaps=['50', '270'], mean=160, cv=0.69). Use uniform spacing.",
+      "detail": {
+        "row_y": 215,
+        "gaps": [
+          50.0,
+          270.0
+        ],
+        "mean": 160.0,
+        "cv": 0.69,
+        "element_ids": [
+          "vision_projection",
+          "state_projection",
+          "language_projection"
+        ]
+      }
+    },
+    {
+      "rule": "spacing-inconsistent-v",
+      "element_id": "dino_tokens",
+      "message": "Column at x≈60: vertical gaps vary (gaps=['30', '25', '340'], mean=132, cv=1.12). Use uniform spacing.",
+      "detail": {
+        "col_x": 60,
+        "gaps": [
+          30.0,
+          25.0,
+          340.0
+        ],
+        "mean": 131.7,
+        "cv": 1.12,
+        "element_ids": [
+          "dino_tokens",
+          "vision_projection",
+          "v0_tokens",
+          "visual_memory_out"
+        ]
+      }
+    },
+    {
+      "rule": "spacing-inconsistent-v",
+      "element_id": "language_tokens",
+      "message": "Column at x≈730: vertical gaps vary (gaps=['30', '355'], mean=192, cv=0.84). Use uniform spacing.",
+      "detail": {
+        "col_x": 730,
+        "gaps": [
+          30.0,
+          355.0
+        ],
+        "mean": 192.5,
+        "cv": 0.84,
+        "element_ids": [
+          "language_tokens",
+          "language_projection",
+          "flow_state"
+        ]
+      }
+    }
+  ],
+  "vertex_count": 25,
+  "edge_count": 21,
+  "canvas": "1320x850"
+}

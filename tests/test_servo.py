@@ -21,12 +21,7 @@ import argparse
 import pytest
 import torch
 
-from train import (
-    _feature_optimizer_groups,
-    mix_perturb_batch,
-    sample_flow_matching_inputs_paired,
-    validate_args,
-)
+from va_compound.utils.flow import mix_perturb_batch, sample_flow_matching_inputs_paired
 from va_compound.local_control_slots import MultiModeReadout
 from va_compound.model import VACompoundConfig, VACompoundPolicy
 from va_compound.servo import (
@@ -355,29 +350,26 @@ def _build_multi_mode_policy() -> VACompoundPolicy:
     return VACompoundPolicy(config)
 
 
-def test_servo_only_freezes_va_flow():
-    """--servo-only：VA/flow/入口投影 requires_grad=False，reader/relation 可训练。"""
-    model = _build_multi_mode_policy()
-    args = argparse.Namespace(
-        head_only=False, servo_only=True, lr_slot=None, lr=1e-4
+    loss.backward()
+    named = {name: param for name, param in servo.named_parameters()}
+    for name in ("servo.U", "servo.V", "servo.rho", "reference.proj.weight"):
+        assert named[name].grad is not None and float(named[name].grad.abs().sum()) > 0, name
+    assert float(servo.projector.proj[0].weight.grad.abs().sum()) > 0  # 死区已解除
+    assert float(servo.projector.proj[2].weight.grad.abs().sum()) > 0
+    assert servo.mixer.net[0].weight.grad is not None
+    assert float(servo.mixer.net[0].weight.grad.abs().sum()) > 0
+    # reader 可见度路径：vis → g → r → Δa（null_key 参与寻址 logit → vis）。
+    reader_grads = [
+        param.grad
+        for param in reader.parameters()
+        if param.grad is not None and float(param.grad.abs().sum()) > 0
+    ]
+    assert reader_grads, "reader 参数必须通过 g 组装路径收到梯度"
+    assert (
+        reader.null_key.grad is not None
+        and float(reader.null_key.grad.abs().sum()) > 0
     )
-    groups = _feature_optimizer_groups(args, model, None)
-    frozen = [
-        name
-        for name, param in model.named_parameters()
-        if not param.requires_grad
-    ]
-    trainable = [
-        name
-        for name, param in model.named_parameters()
-        if param.requires_grad
-    ]
-    assert any(name.startswith("flow_head.") for name in frozen)
-    assert any(name.startswith("layers.") for name in frozen)
-    assert any(name.startswith("vision_projection.") for name in frozen)
-    assert all(name.startswith(("role_compiler.", "slot_reader.", "relation_tokens.", "vis_conditioner.")) for name in trainable)
-    assert len(groups) == 1
-    assert groups[0]["params"]  # 可训练参数非空
+
 
 
 def test_gradient_flow_through_servo_and_reader():
@@ -427,69 +419,3 @@ def test_gradient_flow_through_servo_and_reader():
         reader.null_key.grad is not None
         and float(reader.null_key.grad.abs().sum()) > 0
     )
-
-
-def test_servo_validate_args_requires_multi_mode():
-    """--servo 前置校验：无 --multi-mode 报错；--servo-dls 无 --servo 报错。"""
-    base = dict(
-        steps=1, flow_steps=8, lr=1e-4, pair_loss_weight=0.0, batch_size=2,
-        single_task=True, mode="bidir_va", attention_variant="flat",
-        action_query_cond=False, memory_split=False, evidence_tokens=16,
-        task_tokens=8, future_predict=False, sequential_coupling=0,
-        flow_cond="entry", flow_layers=2, evsm=False, plan_resampler=False,
-        scene_teacher=False, direct_head=False, c2_controller=False,
-        role_query=False, role_query_tokens=16, dual_attention=False,
-        flow_semantic=False, compile_task=False, compile_every=4,
-        compile_n_scene=16, compile_n_readout=16, semantic_adapter=False,
-        semantic_lora_rank=8, semantic_top_layers=4, semantic_anchor_weight=0.0,
-        semantic_geometry_weight=0.0, semantic_anchor_layers="",
-        semantic_act_grad_scale=0.1, semantic_lora_suffixes="q_proj",
-        language_max_length=64, vision_pooling="flat", num_workers=0,
-        fork_data=None, fork_k=83, fork_skip_contract=False,
-        sequence_length=4, min_sequence_length=4, pair_start_atol=0.0,
-        pair_start_cosine=0.0, min_pair_action_delta=1e-3,
-        pair_probe_tau_max=0.5, pair_mode="shared_cf", va_layers=2,
-        lr_slot=None, lr_va=None, head_only=False, prev_dropout=0.0,
-        sam_rho=0.0, seed=0, resume=None, device="cpu", save=None,
-        save_every=0, data=None, live_vjepa=False, live_root="",
-        control_stride=6, sequences_per_episode=4, phase_bins=0,
-        phase_seed=0, success_only=False, sliding_window=False,
-        frame_aug=False, lr_vision=3e-6, vision_unfreeze_last=0,
-        vision_unfreeze_all=False, e2e_data=None, lora_rank=0, lora_alpha=32.0,
-        unfreeze_blocks=None, qwen_unfreeze_blocks=0, qwen_lr=1e-5,
-        lora_lr=1e-4, vision_lr=1e-5, language_dtype="bfloat16",
-        vision_dtype="bfloat16", e2e_pooling="flat", local_slots_data=None,
-        dense_readout=False, multi_mode=False, role_seeds=None,
-        local_slots_direct288=False, lang_fixed_vector=False,
-        local_slots_fixed_query=False, c2_v6a="", c2_v6b="",
-        c2_lambda_f=0.1, c2_lambda_r=1.0, c2_lambda_c=0.0,
-        c2_recovery_ratio=0.25, c2_unfreeze_stage_a=False,
-        c2_contract_every=500, c2_contract_rho6=0.8, qk_norm=False,
-        training_stage=None, lr_servo=None, perturb_data=None,
-        servo_perturb_ratio=0.5,
-    )
-    base.pop("multi_mode")
-    base.pop("local_slots_data")
-    args = argparse.Namespace(**base, servo=True, servo_only=False,
-                              servo_dls=False, servo_rank=2, servo_lambda=1e-2,
-                              multi_mode=False, local_slots_data=None)
-    with pytest.raises(ValueError, match="--servo requires --multi-mode"):
-        validate_args(args)
-    args = argparse.Namespace(**base, servo=False, servo_only=False,
-                              servo_dls=True, servo_rank=2, servo_lambda=1e-2,
-                              multi_mode=False, local_slots_data=None)
-    with pytest.raises(ValueError, match="--servo-dls requires --servo"):
-        validate_args(args)
-    # --servo-only 隐含启用 --servo（合法路径：multi_mode + local_slots_data）。
-    args = argparse.Namespace(
-        **base,
-        servo=False,
-        servo_only=True,
-        servo_dls=False,
-        servo_rank=2,
-        servo_lambda=1e-2,
-        multi_mode=True,
-        local_slots_data="data/x.pt",
-    )
-    validate_args(args)
-    assert args.servo

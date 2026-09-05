@@ -1,17 +1,29 @@
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 import torch
 
 from eval_metaworld import (
     TASK35_EVAL50_SEEDS,
+    build_dagger_episode,
     cached_task35_language,
+    dagger_takeover_step,
     evaluation_episode_seed,
+    load_metaworld_description_to_env,
     select_eval_tasks,
     task35_ablation_dense,
     task35_ablation_frames,
     task35_ablation_geometry,
+    validate_language_features,
+)
+from scripts.build_longtraj_features import resolve_episode_semantics
+from scripts.mt50_difficulty import (
+    MT50_BENCHMARK_ENV_ALIASES,
+    MT50_BENCHMARK_GROUPS,
+    summarize_mt50_benchmark_trials,
 )
 
 
@@ -29,6 +41,116 @@ def test_task35_paired_protocol_uses_seeds_35000_through_35049() -> None:
     assert [evaluation_episode_seed(35, trial) for trial in range(50)] == list(
         TASK35_EVAL50_SEEDS
     )
+
+
+def test_formal_mt50_protocol_shares_reset_seeds_across_tasks() -> None:
+    assert [
+        evaluation_episode_seed(0, trial, base_seed=4042) for trial in range(10)
+    ] == list(range(4042, 4052))
+    assert evaluation_episode_seed(49, 9, base_seed=4042) == 4051
+
+
+def test_dagger_takeover_keeps_only_expert_recovery_supervision() -> None:
+    takeover = dagger_takeover_step(7, 14042, 45, 120)
+    assert takeover % 15 == 0
+    assert 45 <= takeover <= 120
+    n = takeover + 81
+    success_step = takeover + 20
+    success = [index == success_step for index in range(n)]
+    episode = build_dagger_episode(
+        episode_seed=14042,
+        takeover_step=takeover,
+        prefix_keep=45,
+        frames=[np.full((2, 2, 3), index, dtype=np.uint8) for index in range(n)],
+        actions=[np.full(4, index, dtype=np.float32) for index in range(n)],
+        states=[np.full(4, index, dtype=np.float32) for index in range(n)],
+        action_success=success,
+        action_source=[
+            "current_policy" if index < takeover else "expert_takeover"
+            for index in range(n)
+        ],
+    )
+    assert episode is not None
+    assert episode["perturb_start"] == 45
+    assert episode["first_success"] == 65
+    assert not episode["action_supervision_valid"][:45].any()
+    assert episode["action_supervision_valid"][45:66].all()
+    assert not episode["action_supervision_valid"][66:].any()
+    semantics = resolve_episode_semantics(episode, "dagger-test", legacy_policy="error")
+    assert np.array_equal(semantics["valid"], episode["action_supervision_valid"])
+    assert np.array_equal(semantics["recovery"], episode["recovery_mask"])
+    assert build_dagger_episode(
+        episode_seed=14043,
+        takeover_step=45,
+        prefix_keep=45,
+        frames=[np.zeros((2, 2, 3), dtype=np.uint8) for _ in range(10)],
+        actions=[np.zeros(4, dtype=np.float32) for _ in range(10)],
+        states=[np.zeros(4, dtype=np.float32) for _ in range(10)],
+        action_success=[False] * 9 + [True],
+        action_source=["current_policy"] * 10,
+    ) is None
+
+
+def test_official_mt50_four_tier_average_is_equal_weighted() -> None:
+    assert [len(tasks) for tasks in MT50_BENCHMARK_GROUPS.values()] == [28, 11, 6, 5]
+    trials = [
+        {
+            "env_name": task,
+            "success": group in {"easy", "hard"},
+        }
+        for group, tasks in MT50_BENCHMARK_GROUPS.items()
+        for task in tasks
+    ]
+    summary = summarize_mt50_benchmark_trials(trials)
+    assert summary["complete_mt50"] is True
+    assert summary["bucket_average"] == pytest.approx(0.5)
+    assert summary["raw_episode_success"] == pytest.approx(34 / 50)
+
+
+def test_native_metaworld_aliases_keep_official_bucket_membership() -> None:
+    inverse_alias = {canonical: native for native, canonical in MT50_BENCHMARK_ENV_ALIASES.items()}
+    trials = [
+        {"env_name": inverse_alias.get(task, task), "success": True}
+        for tasks in MT50_BENCHMARK_GROUPS.values()
+        for task in tasks
+    ]
+    summary = summarize_mt50_benchmark_trials(trials)
+    assert summary["complete_mt50"] is True
+    assert summary["bucket_average"] == 1.0
+
+
+def test_push_and_push_back_descriptions_are_disambiguated(tmp_path) -> None:
+    config = tmp_path / "metaworld_config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "TASK_DESCRIPTIONS": {
+                    "push-back-v3": "Push the puck to a goal",
+                    "push-v3": "Push the puck to a goal",
+                }
+            }
+        )
+    )
+    mapping = load_metaworld_description_to_env(config)
+    assert mapping["Push the puck to a goal"] == "push-v3"
+    assert mapping["Pull a puck to a goal"] == "push-back-v3"
+
+
+def test_compact_language_features_must_share_normalization_and_cover_mt50() -> None:
+    normalization = {
+        "state_q01": torch.zeros(4),
+        "state_q99": torch.ones(4),
+    }
+    base = {"normalization": normalization}
+    language = {
+        "normalization": {key: value.clone() for key, value in normalization.items()},
+        "metadata": {"tasks": [f"task-{index}" for index in range(50)]},
+        "instruction_id": torch.arange(50),
+    }
+    validate_language_features(base, language)
+    language["normalization"]["state_q99"][0] = 2
+    with pytest.raises(ValueError, match="normalization differs"):
+        validate_language_features(base, language)
 
 
 def test_task35_metadata_index_maps_to_peg_insert_side() -> None:

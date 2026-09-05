@@ -1,0 +1,46 @@
+{
+  "file": "artifacts/figures/va_wm_simple_drawio/va_wm_interaction_simple_landscape.drawio",
+  "summary": {
+    "total_findings": 3,
+    "fail": 0,
+    "warn": 3,
+    "passed": true,
+    "clean": false
+  },
+  "fails": [],
+  "warns": [
+    {
+      "rule": "font-box-cavernous",
+      "element_id": "va_peer",
+      "message": "Box 'va_peer' is 470px tall with effective fontSize=20.0 (ratio 23.5:1). Text will look tiny and lost. Either shrink box or increase font.",
+      "detail": {
+        "box_height": 470.0,
+        "font_size": 20.0,
+        "ratio": 23.5
+      }
+    },
+    {
+      "rule": "font-box-cavernous",
+      "element_id": "wm_peer",
+      "message": "Box 'wm_peer' is 470px tall with effective fontSize=20.0 (ratio 23.5:1). Text will look tiny and lost. Either shrink box or increase font.",
+      "detail": {
+        "box_height": 470.0,
+        "font_size": 20.0,
+        "ratio": 23.5
+      }
+    },
+    {
+      "rule": "low-composition-density",
+      "element_id": "*",
+      "message": "Only 5 shapes on a 1600x820 canvas (density 44.5%). The diagram looks sparse. Either reduce canvas size to fit content, or add the additional regions/panels/elements that a paper figure at this scale would normally contain.",
+      "detail": {
+        "shape_count": 5,
+        "canvas": "1600x820",
+        "density": 0.445
+      }
+    }
+  ],
+  "vertex_count": 7,
+  "edge_count": 6,
+  "canvas": "1600x820"
+}

@@ -1,0 +1,52 @@
+eval: action_horizon=15 (from checkpoint config), flow_steps=8 (from checkpoint contract)
+eval: action decoder = flow_matching (Euler steps=8)
+eval: deployment cadence fps=80, training_stride=2, training_hz=40, deployment_hz=5.33333, prediction_horizon=15, execution_horizon=15, checkpoint_execution_horizon=15, execution_ablation=0
+eval: DINO-main frozen dinov2_vitl14_reg4 replaces V-JEPA (224px, dim=1024, 1024 tokens/decision, params=303,230,976)
+eval: DINO-metric 冻结 metric head（grid=16, dense_tokens=512, params=2,266,506）+ relation encoder（params=14,344） 从主 checkpoint 严格恢复
+eval: using cached language_hidden for task_ids=[0]; Qwen not loaded
+eval: trial shard [10, 30) of 30 per task
+trial task=0 trial=10 seed=10 success=0
+stage task=0 trial=10 near=0.999 grasp=0.000 grasp_reward=0.463 in_place=0.972 min_obj_to_target=0.0000 best_step=0
+trial task=0 trial=11 seed=11 success=0
+stage task=0 trial=11 near=0.999 grasp=1.000 grasp_reward=0.918 in_place=0.999 min_obj_to_target=0.0000 best_step=0
+trial task=0 trial=12 seed=12 success=0
+stage task=0 trial=12 near=0.999 grasp=1.000 grasp_reward=0.838 in_place=0.968 min_obj_to_target=0.0000 best_step=0
+trial task=0 trial=13 seed=13 success=0
+stage task=0 trial=13 near=0.999 grasp=1.000 grasp_reward=0.873 in_place=0.900 min_obj_to_target=0.0000 best_step=0
+trial task=0 trial=14 seed=14 success=0
+stage task=0 trial=14 near=0.999 grasp=1.000 grasp_reward=0.904 in_place=0.973 min_obj_to_target=0.0000 best_step=0
+trial task=0 trial=15 seed=15 success=1
+stage task=0 trial=15 near=0.999 grasp=1.000 grasp_reward=0.879 in_place=0.466 min_obj_to_target=0.0000 best_step=0
+trial task=0 trial=16 seed=16 success=0
+stage task=0 trial=16 near=0.999 grasp=0.000 grasp_reward=0.469 in_place=0.885 min_obj_to_target=0.0000 best_step=0
+trial task=0 trial=17 seed=17 success=0
+stage task=0 trial=17 near=0.999 grasp=0.000 grasp_reward=0.426 in_place=1.000 min_obj_to_target=0.0000 best_step=0
+trial task=0 trial=18 seed=18 success=0
+stage task=0 trial=18 near=0.999 grasp=1.000 grasp_reward=0.864 in_place=0.819 min_obj_to_target=0.0000 best_step=0
+trial task=0 trial=19 seed=19 success=0
+stage task=0 trial=19 near=0.999 grasp=1.000 grasp_reward=0.896 in_place=0.909 min_obj_to_target=0.0000 best_step=0
+trial task=0 trial=20 seed=20 success=0
+stage task=0 trial=20 near=0.999 grasp=0.000 grasp_reward=0.486 in_place=0.977 min_obj_to_target=0.0000 best_step=0
+trial task=0 trial=21 seed=21 success=0
+stage task=0 trial=21 near=0.999 grasp=1.000 grasp_reward=0.897 in_place=0.915 min_obj_to_target=0.0000 best_step=0
+trial task=0 trial=22 seed=22 success=0
+stage task=0 trial=22 near=0.999 grasp=1.000 grasp_reward=0.874 in_place=0.967 min_obj_to_target=0.0000 best_step=0
+trial task=0 trial=23 seed=23 success=0
+stage task=0 trial=23 near=0.999 grasp=1.000 grasp_reward=0.874 in_place=0.958 min_obj_to_target=0.0000 best_step=0
+trial task=0 trial=24 seed=24 success=1
+stage task=0 trial=24 near=0.999 grasp=1.000 grasp_reward=0.855 in_place=0.580 min_obj_to_target=0.0000 best_step=0
+trial task=0 trial=25 seed=25 success=1
+stage task=0 trial=25 near=0.999 grasp=1.000 grasp_reward=0.877 in_place=0.528 min_obj_to_target=0.0000 best_step=0
+trial task=0 trial=26 seed=26 success=0
+stage task=0 trial=26 near=0.999 grasp=0.000 grasp_reward=0.430 in_place=0.972 min_obj_to_target=0.0000 best_step=0
+trial task=0 trial=27 seed=27 success=0
+stage task=0 trial=27 near=0.999 grasp=1.000 grasp_reward=0.862 in_place=0.980 min_obj_to_target=0.0000 best_step=0
+trial task=0 trial=28 seed=28 success=1
+stage task=0 trial=28 near=0.999 grasp=1.000 grasp_reward=0.887 in_place=1.000 min_obj_to_target=0.0000 best_step=0
+trial task=0 trial=29 seed=29 success=1
+stage task=0 trial=29 near=0.999 grasp=1.000 grasp_reward=0.877 in_place=1.000 min_obj_to_target=0.0000 best_step=0
+task Pick up a nut and place it onto a peg: 5/30
+
+CLOSED-LOOP SUCCESS: 5/20 = 25.0%
+single-task success: 25.0% [95% Wilson CI: 11.2%, 46.9%] (n_trials=20)
+structured results saved: exp_runs/2026-08-23-h15-p15-memory-causal/memory_reset1_10_30.json

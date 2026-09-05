@@ -1,0 +1,37 @@
+{
+  "file": "artifacts/figures/va_wm_simple_drawio/va_layer_input_origin.drawio",
+  "summary": {
+    "total_findings": 1,
+    "fail": 0,
+    "warn": 1,
+    "passed": true,
+    "clean": false
+  },
+  "fails": [],
+  "warns": [
+    {
+      "rule": "spacing-inconsistent-h",
+      "element_id": "va1",
+      "message": "Row at y≈260: horizontal gaps vary (gaps=['150', '330', '60'], mean=180, cv=0.62). Use uniform spacing.",
+      "detail": {
+        "row_y": 260,
+        "gaps": [
+          150.0,
+          330.0,
+          60.0
+        ],
+        "mean": 180.0,
+        "cv": 0.62,
+        "element_ids": [
+          "va1",
+          "va_prev",
+          "va_i",
+          "layer_output"
+        ]
+      }
+    }
+  ],
+  "vertex_count": 14,
+  "edge_count": 11,
+  "canvas": "2180x620"
+}

@@ -3,8 +3,17 @@ import unittest
 import torch
 from torch import nn
 
-from va_compound.backbones import VJEPA21Backbone
-from va_compound.model import VACompoundConfig, VACompoundPolicy, VACouplingLayer
+from va_compound.backbones import TimmActionVisionBackbone, VJEPA21Backbone
+from va_compound.model import (
+    VACompoundConfig,
+    VACompoundPolicy,
+    VACouplingLayer,
+    DinoQwenCrossModalBridge,
+    FlowMatchingHead,
+    VALast3CrossAttentionReadout,
+    VisualMemory,
+)
+from va_compound.wmrm import WAMState
 
 
 def tiny_config(mode: str = "bidir_va") -> VACompoundConfig:
@@ -108,6 +117,7 @@ class VACompoundTests(unittest.TestCase):
         _, _, _, language, mask = self.inputs(config)
         cache = model.build_language_cache(language, mask, detach=True).to(dtype=torch.float64)
         self.assertEqual(cache.layers[0].key.dtype, torch.float64)
+        self.assertEqual(cache.tokens.dtype, torch.float64)
         self.assertEqual(cache.attention_mask.dtype, torch.bool)
 
     def test_language_mask_shape_is_validated(self) -> None:
@@ -349,9 +359,274 @@ class VACompoundTests(unittest.TestCase):
         self.assertEqual(sampled.shape, noise.shape)
         self.assertTrue(torch.isfinite(sampled).all())
 
+    def test_va_last3_cross_attention_is_zero_gated_and_reads_all_layers(self) -> None:
+        base_values = {**tiny_config().__dict__, "num_layers": 4}
+        base_config = VACompoundConfig(**base_values)
+        readout_config = VACompoundConfig(
+            **{**base_values, "va_last3_cross_attn": True}
+        )
+        torch.manual_seed(13)
+        base = VACompoundPolicy(base_config).eval()
+        torch.manual_seed(13)
+        treatment = VACompoundPolicy(readout_config).eval()
+
+        treatment_state = treatment.state_dict()
+        for name, value in base.state_dict().items():
+            torch.testing.assert_close(value, treatment_state[name], rtol=0, atol=0)
+
+        vision, proprio, previous, language, mask = self.inputs(base_config)
+        with torch.no_grad():
+            base_condition = base.encode_condition(
+                vision,
+                proprio,
+                previous,
+                language_hidden=language,
+                language_mask=mask,
+            )
+            treatment_condition = treatment.encode_condition(
+                vision,
+                proprio,
+                previous,
+                language_hidden=language,
+                language_mask=mask,
+            )
+        torch.testing.assert_close(
+            base_condition, treatment_condition, rtol=0, atol=0
+        )
+
+        readout = treatment.va_last3_readout
+        self.assertIsNotNone(readout)
+        with torch.no_grad():
+            readout.gates.fill_(1.0)
+        states = tuple(
+            torch.randn(
+                2,
+                readout_config.action_horizon,
+                readout_config.hidden_dim,
+                requires_grad=True,
+            )
+            for _ in range(3)
+        )
+        readout(states).square().mean().backward()
+        for state in states:
+            self.assertIsNotNone(state.grad)
+            self.assertGreater(state.grad.abs().sum().item(), 0.0)
+
+    def test_va_last3_cross_attention_requires_three_va_layers_and_flow(self) -> None:
+        with self.assertRaisesRegex(ValueError, "num_layers >= 3"):
+            VACompoundConfig(
+                **{**tiny_config().__dict__, "va_last3_cross_attn": True}
+            )
+        with self.assertRaisesRegex(ValueError, "Flow action head"):
+            VACompoundConfig(
+                **{
+                    **tiny_config().__dict__,
+                    "num_layers": 3,
+                    "va_last3_cross_attn": True,
+                    "direct_head": True,
+                }
+            )
+
+    def test_va_last3_h50_readout_preserves_nested_prefixes(self) -> None:
+        readout = VALast3CrossAttentionReadout(
+            hidden_dim=16,
+            num_heads=4,
+            action_horizon=50,
+            protected_action_prefixes=(6, 15),
+        ).eval()
+        with torch.no_grad():
+            readout.gates.fill_(1.0)
+        states = tuple(torch.randn(2, 50, 16) for _ in range(3))
+        baseline = readout(states)
+
+        tail = tuple(state.clone() for state in states)
+        for state in tail:
+            state[:, 15:] += 100.0 * torch.randn_like(state[:, 15:])
+        torch.testing.assert_close(readout(tail)[:, :15], baseline[:, :15])
+
+        middle = tuple(state.clone() for state in states)
+        for state in middle:
+            state[:, 6:15] += 100.0 * torch.randn_like(state[:, 6:15])
+        torch.testing.assert_close(readout(middle)[:, :6], baseline[:, :6])
+    def test_dino_qwen_bridge_is_zero_gated_and_bidirectional(self) -> None:
+        base_values = {**tiny_config().__dict__, "num_layers": 4}
+        base_config = VACompoundConfig(**base_values)
+        bridge_config = VACompoundConfig(
+            **{**base_values, "dino_qwen_cross_modal_bridge": True}
+        )
+        torch.manual_seed(29)
+        base = VACompoundPolicy(base_config).eval()
+        torch.manual_seed(29)
+        treatment = VACompoundPolicy(bridge_config).eval()
+
+        treatment_state = treatment.state_dict()
+        for name, value in base.state_dict().items():
+            torch.testing.assert_close(value, treatment_state[name], rtol=0, atol=0)
+
+        vision, proprio, previous, language, mask = self.inputs(base_config)
+        vision_layers = vision[:, None].expand(-1, 4, -1, -1).clone()
+        language_layers = language[:, None].expand(-1, 4, -1, -1).clone()
+        with torch.no_grad():
+            base_condition = base.encode_condition(
+                vision,
+                proprio,
+                previous,
+                language_hidden=language,
+                language_mask=mask,
+            )
+            treatment_condition = treatment.encode_condition(
+                vision,
+                proprio,
+                previous,
+                language_hidden=language,
+                language_mask=mask,
+                cross_modal_vision_layers=vision_layers,
+                cross_modal_language_layers=language_layers,
+            )
+        torch.testing.assert_close(
+            base_condition, treatment_condition, rtol=0, atol=0
+        )
+
+        bridge = treatment.dino_qwen_bridge
+        self.assertIsNotNone(bridge)
+        treatment.zero_grad(set_to_none=True)
+        treatment.encode_condition(
+            vision,
+            proprio,
+            previous,
+            language_hidden=language,
+            language_mask=mask,
+            cross_modal_vision_layers=vision_layers,
+            cross_modal_language_layers=language_layers,
+        ).square().mean().backward()
+        self.assertIsNotNone(bridge.gates.grad)
+        self.assertGreater(bridge.gates.grad.abs().sum().item(), 0.0)
+        with torch.no_grad():
+            bridge.gates.fill_(1.0)
+        treatment.zero_grad(set_to_none=True)
+        changed = treatment.encode_condition(
+            vision,
+            proprio,
+            previous,
+            language_hidden=language,
+            language_mask=mask,
+            cross_modal_vision_layers=vision_layers,
+            cross_modal_language_layers=language_layers,
+        )
+        self.assertFalse(torch.allclose(changed, base_condition))
+        changed.square().mean().backward()
+        for readers in (bridge.vision_readers, bridge.language_readers):
+            for reader in readers:
+                gradient = reader.attn.in_proj_weight.grad
+                self.assertIsNotNone(gradient)
+                self.assertGreater(gradient.abs().sum().item(), 0.0)
+        treatment.runtime_dino_qwen_bridge_enabled = False
+        treatment.zero_grad(set_to_none=True)
+        disabled = treatment.encode_condition(
+            vision,
+            proprio,
+            previous,
+            language_hidden=language,
+            language_mask=mask,
+        )
+        torch.testing.assert_close(disabled, base_condition, rtol=0, atol=0)
+        disabled.square().mean().backward()
+        self.assertIsNone(bridge.gates.grad)
+
+    def test_dino_qwen_bridge_keeps_six_layer_pairs_separate(self) -> None:
+        bridge = DinoQwenCrossModalBridge(24, 16, 4, num_pairs=6).eval()
+        with torch.no_grad():
+            bridge.gates.fill_(1.0)
+        vision = torch.randn(2, 6, 5, 16)
+        language = torch.randn(2, 6, 3, 24)
+        mask = torch.ones(2, 3, dtype=torch.bool)
+        visual_a, language_a = bridge(vision, language, mask)
+        changed = vision.clone()
+        changed[:, 0] += 10.0 * torch.randn_like(changed[:, 0])
+        visual_b, language_b = bridge(changed, language, mask)
+        self.assertFalse(torch.allclose(visual_a[0], visual_b[0]))
+        for index in range(1, 6):
+            torch.testing.assert_close(visual_a[index], visual_b[index])
+            torch.testing.assert_close(language_a[index].key, language_b[index].key)
+
+    def test_timm_dino_unfreeze_last_opens_only_tail_and_norm(self) -> None:
+        class FakeDINO(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.stem = nn.Linear(2, 2)
+                self.blocks = nn.ModuleList(nn.Linear(2, 2) for _ in range(6))
+                self.norm = nn.LayerNorm(2)
+                self.grad_checkpointing = False
+
+            def set_grad_checkpointing(self, enabled: bool) -> None:
+                self.grad_checkpointing = enabled
+
+        backbone = TimmActionVisionBackbone(
+            FakeDINO(),
+            model_id="fake",
+            image_size=2,
+            feature_dim=2,
+            output_layers=(0, 5),
+        )
+        backbone.unfreeze_last()
+        self.assertTrue(backbone.model.grad_checkpointing)
+        self.assertTrue(all(not p.requires_grad for p in backbone.model.stem.parameters()))
+        self.assertTrue(
+            all(
+                not p.requires_grad
+                for layer in backbone.model.blocks[:2]
+                for p in layer.parameters()
+            )
+        )
+        self.assertTrue(
+            all(
+                p.requires_grad
+                for layer in backbone.model.blocks[2:]
+                for p in layer.parameters()
+            )
+        )
+        self.assertTrue(all(p.requires_grad for p in backbone.model.norm.parameters()))
+
     def test_flow_matching_loss_is_zero_for_exact_velocity(self) -> None:
         velocity = torch.randn(2, 5, 6)
         self.assertEqual(VACompoundPolicy.flow_matching_loss(velocity, velocity).item(), 0.0)
+
+    def test_va_world_mode_defaults_legacy_and_validates_peer_h6(self) -> None:
+        self.assertEqual(tiny_config().va_world_mode, "legacy")
+        with self.assertRaisesRegex(ValueError, "va_world_mode"):
+            VACompoundConfig(**{**tiny_config().__dict__, "va_world_mode": "bogus"})
+        with self.assertRaisesRegex(ValueError, "requires wmrm"):
+            VACompoundConfig(
+                **{
+                    **tiny_config().__dict__,
+                    "action_horizon": 6,
+                    "action_dim": 4,
+                    "wmrm_cycle_steps": 6,
+                    "va_world_mode": "peer_sync_h6",
+                }
+            )
+
+    def test_visual_memory_world_state_transforms_and_indexes(self) -> None:
+        memory = VisualMemory(
+            layers=(torch.randn(3, 4, 8, requires_grad=True),),
+            world_state=WAMState(
+                belief=torch.randn(3, 2, 8, requires_grad=True),
+                innovation=torch.randn(3, 2, 8, requires_grad=True),
+                world_map=torch.randn(3, 5, 2, 2, requires_grad=True),
+            ),
+        )
+        detached = memory.detach()
+        self.assertFalse(detached.world_state.belief.requires_grad)
+        converted = memory.to(dtype=torch.float64)
+        self.assertEqual(converted.layers[0].dtype, torch.float64)
+        self.assertEqual(converted.world_state.belief.dtype, torch.float32)
+        self.assertEqual(converted.world_state.innovation.dtype, torch.float32)
+        self.assertEqual(converted.world_state.world_map.dtype, torch.float32)
+        selected = memory.index_select(torch.tensor([2, 0]))
+        torch.testing.assert_close(selected.layers[0], memory.layers[0][[2, 0]])
+        torch.testing.assert_close(
+            selected.world_state.belief, memory.world_state.belief[[2, 0]]
+        )
 
     def test_unfreeze_zero_keeps_vjepa_frozen(self) -> None:
         class FakeVJEPA(nn.Module):
@@ -457,6 +732,56 @@ class SMCAttnTests(unittest.TestCase):
         self.assertLess(d_smc, 1e-4, f"SMC 应保持复制不变性，实际位移 {d_smc:.6f}")
         self.assertGreater(d_flat, 1e-2, f"flat 应随 token 数量改变，实际位移 {d_flat:.6f}")
 
+    def test_smc_measure_matches_key_layout_with_task_and_state(self) -> None:
+        """Action rows use [V, M, T, A, L, S] source sizes; task rows stay flat."""
+        from va_compound.model import LayerLanguageCache
+
+        layer = self._layer("smc").eval()
+        layer.save_attention = True
+        for projection in (
+            layer.q_v, layer.q_a, layer.q_t,
+            layer.k_v, layer.k_m, layer.k_t, layer.k_a, layer.k_s,
+        ):
+            nn.init.zeros_(projection.weight)
+            nn.init.zeros_(projection.bias)
+        sizes = (2, 3, 5, 7, 11, 13)  # V, M, T, A, L, S
+        nv, nm, nt, na, nl, ns = sizes
+        batch, heads, head_dim = 1, 4, 8
+        language = LayerLanguageCache(
+            torch.zeros(batch, heads, nl, head_dim),
+            torch.randn(batch, heads, nl, head_dim),
+        )
+        layer(
+            torch.randn(batch, nv, 32),
+            torch.randn(batch, na, 32),
+            language,
+            torch.ones(batch, nl, dtype=torch.bool),
+            visual_memory=torch.randn(batch, nm, 32),
+            task=torch.randn(batch, nt, 32),
+            state=torch.randn(batch, ns, 32),
+        )
+        weights = layer._last_attention[0][0, 0]
+        action_row = weights[nv]
+        offsets = (0, nv, nv + nm, nv + nm + nt, nv + nm + nt + na,
+                   nv + nm + nt + na + nl)
+        block_masses = torch.stack([
+            action_row[start:start + size].sum()
+            for start, size in zip(offsets, sizes, strict=True)
+        ])
+        torch.testing.assert_close(
+            block_masses,
+            torch.full_like(block_masses, 1.0 / len(sizes)),
+            atol=1e-6,
+            rtol=1e-6,
+        )
+        task_row = weights[nv + na]
+        expected_task = torch.tensor(sizes, dtype=task_row.dtype) / sum(sizes)
+        task_masses = torch.stack([
+            task_row[start:start + size].sum()
+            for start, size in zip(offsets, sizes, strict=True)
+        ])
+        torch.testing.assert_close(task_masses, expected_task, atol=1e-6, rtol=1e-6)
+
     def test_smc_invalid_variant_rejected(self) -> None:
         with self.assertRaises(ValueError):
             VACompoundConfig(
@@ -469,6 +794,29 @@ class SMCAttnTests(unittest.TestCase):
                 action_dim=6,
                 proprio_dim=9,
                 attention_variant="bogus",
+            )
+
+    def test_sequential_rejects_role_masks_it_cannot_enforce(self) -> None:
+        with self.assertRaisesRegex(ValueError, "uni_a role masking"):
+            VACompoundConfig(sequential_coupling=1, mode="uni_a")
+        with self.assertRaisesRegex(ValueError, "protected action prefixes"):
+            VACompoundConfig(
+                sequential_coupling=1,
+                va_world_mode="peer_sync_h6",
+                wmrm=True,
+                action_horizon=15,
+                planning_stride=15,
+                deployment_execution_horizon=15,
+            )
+
+    def test_entry_flow_rejects_semantic_context(self) -> None:
+        head = FlowMatchingHead(16, 4, 4, 1, 0.0, flow_cond="entry")
+        with self.assertRaisesRegex(ValueError, "flow_cond='adaln'"):
+            head(
+                torch.randn(2, 3, 16),
+                torch.randn(2, 3, 4),
+                torch.rand(2),
+                semantic_context=torch.randn(2, 5, 16),
             )
 
     def test_action_query_cond_zero_init_equals_static(self) -> None:
@@ -652,18 +1000,28 @@ class SequentialAndAdaLNTests(unittest.TestCase):
         self.assertTrue(m.layers[3].sequential)
         self.assertFalse(m.layers[0].sequential)
 
-    def test_adaln_flow_zero_init_condition_independent(self) -> None:
-        """AdaLN-Zero 零初始化：训练起点 gate=0 → 输出与条件无关（条件通道
-        从零开始学，不破坏起点行为）。"""
+    def test_adaln_flow_keeps_horizon_slot_identity(self) -> None:
+        """固定逐槽条件时，重排噪声不得只等价地重排输出。"""
         torch.manual_seed(0)
         m_ada = self._policy(flow_cond="adaln")
         noisy = torch.randn(2, 3, 4)
         t = torch.zeros(2)
-        cond_a = torch.randn(2, 3, 16)
-        cond_b = torch.randn(2, 3, 16)
-        v_a = m_ada.flow_velocity(cond_a, noisy, t)
-        v_b = m_ada.flow_velocity(cond_b, noisy, t)
-        torch.testing.assert_close(v_a, v_b, atol=1e-5, rtol=1e-5)
+        condition = torch.randn(2, 3, 16)
+        permutation = torch.tensor([2, 0, 1])
+        original = m_ada.flow_velocity(condition, noisy, t)
+        permuted_noise = m_ada.flow_velocity(condition, noisy[:, permutation], t)
+        self.assertFalse(torch.allclose(original[:, permutation], permuted_noise))
+
+    def test_flow_decoder_can_use_a_smaller_internal_width(self) -> None:
+        model = self._policy(flow_cond="adaln", flow_hidden_dim=8)
+        condition = torch.randn(2, 3, 16, requires_grad=True)
+        velocity = model.flow_velocity(
+            condition, torch.randn(2, 3, 4), torch.rand(2)
+        )
+        self.assertEqual(velocity.shape, (2, 3, 4))
+        self.assertEqual(model.flow_head.hidden_dim, 8)
+        velocity.square().mean().backward()
+        self.assertGreater(model.flow_condition_projection.weight.grad.abs().sum(), 0)
 
 
 class FuturePredictContractTests(unittest.TestCase):

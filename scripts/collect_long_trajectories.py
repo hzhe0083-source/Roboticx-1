@@ -46,7 +46,7 @@ JPEG_QUALITY = 90  # 帧压缩：当前 env.render() 原生 480×480 RGB → JPE
 # Same contract as eval_metaworld.TASK35_EVAL50_SEEDS. Kept local so this
 # CPU collector does not import the GPU eval module.
 TASK35_EVAL50_SEEDS = tuple(range(35000, 35050))
-DEFAULT_PINNED_ATTEMPTS = 10
+DEFAULT_PINNED_ATTEMPTS = 30
 
 
 def compress_frames(frames: np.ndarray) -> list[bytes]:
@@ -240,45 +240,65 @@ def _collect_episode_inner(
             consec_success = 0
         return reward, term, trunc, info
 
+    def _record_applied_perturb(kind: str, mag: float, applied: dict) -> bool:
+        nonlocal obs, perturb_event
+        get_obs = getattr(env, "_get_obs", None)
+        if callable(get_obs):
+            obs = get_obs()
+        start = len(actions)
+        settle_truncated = False
+        for _ in range(PERTURB_SETTLE_STEPS):
+            _r2, _t2, _tr2, _i2 = _execute(
+                np.zeros(4, dtype=np.float32), "perturb_settle"
+            )
+            if _t2 or _tr2:
+                settle_truncated = True
+                break
+        perturb_event = {
+            "start": start,
+            "end": len(actions),
+            "kind": kind,
+            "magnitude_m": float(mag),
+            "magnitude_mm": float(mag * 1000.0),
+            "delta": applied["delta"],
+            "applied": True,
+        }
+        return settle_truncated
+
+    # Immediate-success inits (faucet/coffee at step 0) have no mid-loop
+    # window. Force the disruption before the first policy action.
+    if force_perturb and perturb:
+        mag = float(rng.uniform(*PERTURB_MM) / 1000.0)
+        kind = str(rng.choice(kinds))
+        applied = _apply_perturb(env, kind, mag, rng)
+        if not applied["applied"]:
+            kind = "eef_height"
+            applied = _apply_perturb(env, kind, mag, rng)
+        if applied["applied"] and _record_applied_perturb(kind, mag, applied):
+            pass
+
     for policy_step in range(500):
         a = np.clip(np.asarray(policy.get_action(obs), dtype=np.float32), -1.0, 1.0)
         # 契约（Codex P0-1，2026-08-09）：先保存【当前观测 + 即将执行的动作】，
         # 再 step。此前顺序是 step 后才保存 (o_{t+1}, a_t)——图像/状态泄漏
         # a_t 的执行结果且 prev 错位，整批数据作废需重采。
         _r, term, trunc, info = _execute(a, "policy")
-        # 接触扰动：成功前随机一步注入 2-8mm，之后继续 policy 恢复
+        # 接触扰动：成功前随机一步注入 2-8mm，之后继续 policy 恢复。
+        # force_perturb 必须赶在 scripted policy 早成功之前注入；普通 5%
+        # 采样仍等过了接近接触的 20 步，避免把自由运动段当成恢复。
+        # object/peg kinds can fail to find a body; eef always applies.
+        min_pre_success_step = 0 if force_perturb else 20
         if (perturb and perturb_event is None and first_success is None
-                and not term and not trunc and policy_step > 20
+                and not term and not trunc and policy_step > min_pre_success_step
                 and (force_perturb or rng.random() < 0.05)):
             mag = rng.uniform(*PERTURB_MM) / 1000.0
             kind = str(rng.choice(kinds))
             applied = _apply_perturb(env, kind, mag, rng)
-            if applied["applied"]:
-                # MuJoCo state changed outside env.step; refresh the proprio/object
-                # observation before recording the first settle action.
-                get_obs = getattr(env, "_get_obs", None)
-                if callable(get_obs):
-                    obs = get_obs()
-                start = len(actions)
-                settle_truncated = False
-                for _ in range(PERTURB_SETTLE_STEPS):
-                    _r2, _t2, _tr2, _i2 = _execute(
-                        np.zeros(4, dtype=np.float32), "perturb_settle"
-                    )
-                    if _t2 or _tr2:
-                        settle_truncated = True
-                        break
-                perturb_event = {
-                    "start": start,
-                    "end": len(actions),  # exclusive
-                    "kind": kind,
-                    "magnitude_m": float(mag),
-                    "magnitude_mm": float(mag * 1000.0),
-                    "delta": applied["delta"],
-                    "applied": True,
-                }
-                if settle_truncated:
-                    term, trunc = True, True
+            if force_perturb and not applied["applied"]:
+                kind = "eef_height"
+                applied = _apply_perturb(env, kind, mag, rng)
+            if applied["applied"] and _record_applied_perturb(kind, mag, applied):
+                term, trunc = True, True
         # hold：所有真实执行步（包括 settle）都参与成功状态计数。
         if first_success is not None and consec_success >= hold_target:
             break
@@ -289,8 +309,13 @@ def _collect_episode_inner(
     # hold 未达标但含成功段：保留（精密任务 success 信号会抖动，连续达标
     # 过苛会整条丢弃；全局成功跨度 >= HOLD_FRAMES[0] 即视为含稳定成功段）。
     completed_hold = hold_target is not None and consec_success >= hold_target
-    if (not completed_hold
-            and len(actions) - 1 - first_success < int(HOLD_FRAMES[0])):
+    short_hold = (
+        not completed_hold
+        and len(actions) - 1 - first_success < int(HOLD_FRAMES[0])
+    )
+    # Recovery needs perturb→success, not a full 1s hold. Late successes
+    # that hit the 500-step cap were being discarded as None.
+    if short_hold and perturb_event is None:
         return None
 
     n = len(actions)
@@ -363,13 +388,41 @@ def _apply_perturb(env, kind: str, mag: float,
         env.data.mocap_pos[0] += delta
         return {"applied": True, "delta": delta.astype(np.float32)}
     else:
-        from scripts.prepare_mw_perturbations import move_obj1
+        from mw_expert_replay import move_body
+
         delta = np.zeros(3)
         theta = rng.uniform(0, 2 * np.pi)
         delta[:2] = mag * np.array([np.cos(theta), np.sin(theta)])
-        try:
-            move_obj1(env, delta)
-        except RuntimeError:
+
+        def _is_robot_body(env, bid: int) -> bool:
+            while bid > 0:
+                name = env.model.body(bid).name or ""
+                if name.startswith(("right", "left")) or "claw" in name or name == "hand":
+                    return True
+                bid = int(env.model.body_parentid[bid])
+            return False
+
+        cur = env._get_obs()[4:7].copy()
+        moved = False
+        for i in range(env.model.nsite):
+            if _is_robot_body(env, int(env.model.site_bodyid[i])):
+                continue
+            if np.allclose(env.data.site_xpos[i], cur, atol=0.02):
+                move_body(env, int(env.model.site_bodyid[i]), delta)
+                moved = True
+                break
+        if not moved:
+            for bid in range(env.model.nbody):
+                if _is_robot_body(env, bid):
+                    continue
+                name = env.model.body(bid).name
+                if not name:
+                    continue
+                if np.allclose(env.data.body(bid).xpos, cur, atol=0.02):
+                    move_body(env, bid, delta)
+                    moved = True
+                    break
+        if not moved:
             return {"applied": False, "delta": np.zeros(3, dtype=np.float32)}
         return {"applied": True, "delta": delta.astype(np.float32)}
 
@@ -409,6 +462,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow episode seeds in 35000-35049 (eval50 inits). Default is forbid.",
     )
     parser.add_argument(
+        "--normalization-ref", type=Path, default=None,
+        help="继承 action/state q01/q99 的来源文件；缺省是 9.8GB 的 "
+        "data/metaworld_fullframe_executed.pt。只读取其 ``normalization`` 字段，"
+        "所以任何已继承同一份归一化的文件都等价（可用小参考文件避免搬 9.8GB）。",
+    )
+    parser.add_argument(
         "--output", type=Path,
         help="新输出路径；默认使用带 clean/recovery、v2、seed 后缀的新文件",
     )
@@ -422,6 +481,12 @@ def build_parser() -> argparse.ArgumentParser:
 def _accept_episode(ep: dict | None, *, recovery: bool) -> tuple[dict | None, str | None]:
     if ep is None:
         return None, "failed-or-no-success"
+    valid = np.asarray(ep.get("action_supervision_valid", []), dtype=bool)
+    if valid.shape != (len(ep.get("actions", [])),) or not bool(valid.any()):
+        # Some MetaWorld resets already satisfy the success predicate.  They
+        # are successful rollouts statistically, but contain no expert action
+        # target and must not count toward a training-episode quota.
+        return None, "zero-supervision"
     if recovery and not ep["perturbed"]:
         return None, "nominal"
     return ep, None
@@ -453,6 +518,7 @@ def collect_requested_episodes(
     attempts = 0
     max_attempts = max(len(target) * DEFAULT_PINNED_ATTEMPTS, n_episodes * 10)
     seed_index = 0
+    seed_failures = 0
     while seed_index < len(target) and attempts < max_attempts:
         attempts += 1
         pinned = target[seed_index]
@@ -476,8 +542,20 @@ def collect_requested_episodes(
         )
         accepted, reason = _accept_episode(ep, recovery=recovery)
         if accepted is None:
+            seed_failures += 1
             if reason == "nominal":
                 print("  skip nominal episode: recovery collection requires >=1 perturb event")
+            elif pinned is not None:
+                print(
+                    f"  skip {reason} seed={pinned} "
+                    f"({seed_failures}/{DEFAULT_PINNED_ATTEMPTS})"
+                )
+            if seed_failures >= DEFAULT_PINNED_ATTEMPTS:
+                raise SystemExit(
+                    f"collected only {len(episodes)}/{len(target)} "
+                    f"contract-valid episodes; pinned seed {pinned} failed "
+                    f"after {seed_failures} attempts"
+                )
             continue
         if not allow_eval_seeds and blocked_eval50_seeds([accepted["episode_seed"]]):
             print(
@@ -487,6 +565,7 @@ def collect_requested_episodes(
             continue
         episodes.append(accepted)
         seed_index += 1
+        seed_failures = 0
         lens = [len(e["frames"]) for e in episodes]
         print(
             f"  ep {len(episodes)}: seed={accepted['episode_seed']} "
@@ -525,35 +604,18 @@ def main(argv: list[str] | None = None) -> None:
         f"force_perturb={args.force_perturb} allow_eval_seeds={args.allow_eval_seeds}"
     )
 
-    if pinned is None:
-        episodes = collect_requested_episodes(
-            env,
-            policy,
-            args.task,
-            rng,
-            perturb=not args.no_perturb,
-            force_perturb=args.force_perturb,
-            perturb_kinds=args.perturb_kinds,
-            episode_seeds=None,
-            n_episodes=n_episodes,
-            allow_eval_seeds=args.allow_eval_seeds,
-        )
-    else:
-        episodes = []
-        for seed in pinned:
-            batch = collect_requested_episodes(
-                env,
-                policy,
-                args.task,
-                rng,
-                perturb=not args.no_perturb,
-                force_perturb=args.force_perturb,
-                perturb_kinds=args.perturb_kinds,
-                episode_seeds=[seed],
-                n_episodes=1,
-                allow_eval_seeds=args.allow_eval_seeds,
-            )
-            episodes.extend(batch)
+    episodes = collect_requested_episodes(
+        env,
+        policy,
+        args.task,
+        rng,
+        perturb=not args.no_perturb,
+        force_perturb=args.force_perturb,
+        perturb_kinds=args.perturb_kinds,
+        episode_seeds=pinned,
+        n_episodes=n_episodes,
+        allow_eval_seeds=args.allow_eval_seeds,
+    )
     if args.no_perturb:
         if any(ep["perturbed"] or ep["n_perturb_events"] for ep in episodes):
             raise RuntimeError("clean collection contains a perturbation event")
@@ -563,8 +625,16 @@ def main(argv: list[str] | None = None) -> None:
 
     # ---- 统一归一化：继承 fullframe executed 的 q01/q99（Codex：禁止单独算） ----
     import torch
-    src = torch.load(ROOT / "data" / "metaworld_fullframe_executed.pt",
-                     map_location="cpu", weights_only=True)
+    norm_ref = args.normalization_ref or (
+        ROOT / "data" / "metaworld_fullframe_executed.pt"
+    )
+    if not Path(norm_ref).is_file():
+        raise SystemExit(
+            f"missing normalization reference: {norm_ref}\n"
+            "继承 q01/q99 是硬契约（禁止单独算）。若默认的 9.8GB fullframe 文件不在，"
+            "用 --normalization-ref 指向任一已继承同一份归一化的文件。"
+        )
+    src = torch.load(norm_ref, map_location="cpu", weights_only=True)
     aq01, aq99 = src["normalization"]["action_q01"], src["normalization"]["action_q99"]
     sq01, sq99 = src["normalization"]["state_q01"], src["normalization"]["state_q99"]
     norm = dict(src["normalization"])

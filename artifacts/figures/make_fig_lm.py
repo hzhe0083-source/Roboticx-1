@@ -1,6 +1,6 @@
 """Fig 8: L_m same-scene dual-objective verdict (A vs B40k).
 
-Data: eval_libero_Lm.py output — per-pair D, O, L_m with block-bootstrap CI.
+Data: scripts/eval/eval_libero_language.py output — per-pair D, O, L_m with block-bootstrap CI.
 Run: python artifacts/figures/make_fig_lm.py
 """
 import matplotlib

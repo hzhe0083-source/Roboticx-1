@@ -1,0 +1,17 @@
+file: /home/ryan/Documents/robot/ORA0/artifacts/figures/va_wm_simple_drawio/va_wm_interaction_simple_landscape.drawio
+pages: 1
+cells: 14
+vertices: 6
+edges: 6
+embedded_raster: False
+external_image_count: 0
+base64_payload_count: 0
+largest_base64_payload_chars: 0
+caption_like_text: False
+duplicate_id_count: 0
+empty_vertex_labels: 0
+empty_edge_labels: 4
+placeholder_label_count: 0
+page_width: 1600.0
+page_height: 740.0
+OK

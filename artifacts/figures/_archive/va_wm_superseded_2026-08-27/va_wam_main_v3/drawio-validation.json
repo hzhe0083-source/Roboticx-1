@@ -1,0 +1,25 @@
+{
+  "ok": true,
+  "strict": true,
+  "errors": [],
+  "warnings": [],
+  "stats": {
+    "file": "/home/ryan/Documents/robot/ORA0/artifacts/figures/va_wam_main_v3/va_wam_main_v3.drawio",
+    "pages": 1,
+    "cells": 98,
+    "vertices": 46,
+    "edges": 50,
+    "embedded_raster": false,
+    "external_image_count": 0,
+    "base64_payload_count": 0,
+    "largest_base64_payload_chars": 0,
+    "caption_like_text": false,
+    "duplicate_id_count": 0,
+    "missing_id_count": 0,
+    "empty_vertex_labels": 0,
+    "empty_edge_labels": 50,
+    "placeholder_label_count": 0,
+    "page_width": 1200.0,
+    "page_height": 1780.0
+  }
+}

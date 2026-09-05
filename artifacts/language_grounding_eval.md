@@ -53,7 +53,7 @@
 
 ## 与本项目现状的对接
 - 现有资产：C_OL（col_* 脚本）、L_m、wrong(+1210%)、blank/swap（evaluate.py，仅
-  flat/spatial）、task-id（eval_mw_lang_ablation --taskid-lang）。
+  flat/spatial）、task-id（scripts/eval/eval_mw_lang_ablation.py --taskid-lang）。
 - 缺口：①M_fork 需两套专家动作（fork 数据，见 pair_contract_go_no_go.md 的
   同场景任务对）；②闭环 G_ij 需 sim state 克隆 + noise tape；③paraphrase 未见
   评测（Qwen 已冻结，只需文本改写重编码）。

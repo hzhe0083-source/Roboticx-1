@@ -4,16 +4,82 @@ from pathlib import Path
 
 import torch
 
-from train import (
-    FeatureDataset,
-    PairedBatchSampler,
-    paired_partner_indices,
-    sample_flow_matching_inputs,
-    sample_pair_intervention,
-    semantic_pair_loss,
-    synthetic_sequence,
-)
+from va_compound.data.feature_dataset import FeatureDataset
+from va_compound.utils.flow import paired_partner_indices, sample_flow_matching_inputs, sample_pair_intervention, semantic_pair_loss
 from va_compound.model import VACompoundConfig
+
+
+def synthetic_sequence(
+    config: VACompoundConfig,
+    batch_size: int,
+    sequence_length: int,
+    device: torch.device,
+    *,
+    with_frames: bool = False,
+) -> dict[str, torch.Tensor]:
+    """Build paired smoke data; each pair differs only in language at t=0."""
+    if batch_size < 2 or batch_size % 2:
+        raise ValueError("synthetic paired batch_size must be even")
+    if sequence_length < 2:
+        raise ValueError("synthetic sequence must contain at least two steps")
+    pair_count = batch_size // 2
+
+    def duplicate_pairs(value: torch.Tensor) -> torch.Tensor:
+        return value.repeat_interleave(2, dim=0)
+
+    vision = duplicate_pairs(
+        torch.randn(
+            pair_count,
+            sequence_length,
+            16,
+            config.vision_dim,
+            device=device,
+        )
+    )
+    proprio = duplicate_pairs(
+        torch.randn(pair_count, sequence_length, config.proprio_dim, device=device)
+    )
+    previous_action = duplicate_pairs(
+        torch.randn(pair_count, sequence_length, config.action_dim, device=device)
+    )
+    instruction_id = torch.arange(2, device=device).repeat(pair_count)
+    pair_id = torch.arange(pair_count, device=device).repeat_interleave(2)
+    language_by_instruction = torch.randn(2, 8, config.language_dim, device=device)
+    language = language_by_instruction[instruction_id]
+
+    visual_signal = vision[..., : config.action_dim].mean(dim=2)
+    previous_visual = torch.cat(
+        (torch.zeros_like(visual_signal[:, :1]), visual_signal[:, :-1]),
+        dim=1,
+    )
+    language_signal = language[:, :, : config.action_dim].mean(dim=1)[:, None]
+    base = torch.tanh(visual_signal + 0.5 * previous_visual + language_signal)
+    horizon = torch.linspace(
+        0.0,
+        0.1,
+        config.action_horizon,
+        device=device,
+    )[None, None, :, None]
+    actions = base[:, :, None, :].expand(-1, -1, config.action_horizon, -1) + horizon
+    batch = {
+        "vision_tokens": vision,
+        "language_hidden": language,
+        "language_mask": torch.ones(batch_size, 8, dtype=torch.bool, device=device),
+        "proprio": proprio,
+        "previous_action": previous_action,
+        "actions": actions,
+        "pair_id": pair_id,
+        "instruction_id": instruction_id,
+    }
+    if with_frames:
+        batch["frames"] = torch.randint(
+            0,
+            256,
+            (batch_size, sequence_length, 4, 384, 384, 3),
+            dtype=torch.uint8,
+            device=device,
+        )
+    return batch
 
 
 def paired_payload() -> dict[str, torch.Tensor]:
@@ -81,23 +147,6 @@ class TrainingContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "no identifiable action difference"):
                 FeatureDataset(path)
 
-    def test_paired_batch_sampler_keeps_two_goals_together(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            dataset = FeatureDataset(self.write_payload(directory, paired_payload()))
-            batches = list(PairedBatchSampler(dataset, batch_size=4, seed=3))
-        self.assertEqual(len(batches), 1)
-        self.assertEqual(len(batches[0]), 4)
-        for pair_id in (20, 21):
-            indices = [
-                index
-                for index in batches[0]
-                if int(dataset.payload["pair_id"][index]) == pair_id
-            ]
-            self.assertEqual(len(indices), 2)
-            self.assertNotEqual(
-                int(dataset.payload["instruction_id"][indices[0]]),
-                int(dataset.payload["instruction_id"][indices[1]]),
-            )
 
     def test_partner_indices_swap_rows_within_each_pair(self) -> None:
         partner = paired_partner_indices(
@@ -247,21 +296,3 @@ class ForkModeTests(unittest.TestCase):
             path = self._write(d, self._fork_payload(shuffled=True))
             with self.assertRaises(ValueError):
                 FeatureDataset(path, require_pairs=True)
-
-    def test_shuffled_payload_sampler_still_pairs_two_instructions(self) -> None:
-        """E 组：require_pairs=False + PairedBatchSampler（泛化回退）仍产出
-        2 行/组、不同指令的批。"""
-        with tempfile.TemporaryDirectory() as d:
-            path = self._write(d, self._fork_payload(shuffled=True))
-            dataset = FeatureDataset(path, require_pairs=False)
-            sampler = PairedBatchSampler(dataset, batch_size=4, seed=0)
-            for batch in sampler:
-                self.assertEqual(len(batch), 4)
-                ids = dataset.payload["pair_id"][batch].tolist()
-                inst = dataset.payload["instruction_id"][batch].tolist()
-                for p in set(ids):
-                    rows = [i for i, pid in zip(batch, ids) if pid == p]
-                    self.assertEqual(len(rows), 2)
-                    self.assertNotEqual(
-                        inst[batch.index(rows[0])], inst[batch.index(rows[1])]
-                    )

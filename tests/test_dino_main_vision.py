@@ -31,6 +31,24 @@ class FakeDinoBackbone:
         tokens[..., 2] = torch.arange(16).repeat(16).view(1, 256)
         return {5: tokens.clone(), 11: tokens}
 
+    def forward_final_dense(self, images: torch.Tensor) -> torch.Tensor:
+        return self.forward_hierarchical_dense(images)[11]
+
+    def forward_last_four_mean_dense(self, images: torch.Tensor) -> torch.Tensor:
+        return self.forward_final_dense(images) + 1000.0
+
+    def forward_last_four_dense(self, images: torch.Tensor) -> torch.Tensor:
+        base = self.forward_final_dense(images)
+        return torch.stack([base + 1000.0 * index for index in range(4)], dim=1)
+
+    def forward_last_layers_dense(
+        self, images: torch.Tensor, count: int
+    ) -> torch.Tensor:
+        base = self.forward_final_dense(images)
+        return torch.stack(
+            [base + 1000.0 * index for index in range(count)], dim=1
+        )
+
 
 def _dino_config(**overrides) -> VACompoundConfig:
     base = dict(
@@ -65,6 +83,74 @@ def test_main_vision_config_validation() -> None:
         _dino_config(main_vision_frames=0)
     with pytest.raises(ValueError, match="main_vision_model_id"):
         _dino_config(main_vision_model_id="")
+    with pytest.raises(ValueError, match="incompatible"):
+        _dino_config(
+            dino_qwen_cross_modal_bridge=True,
+            dino_dense_metric=True,
+        )
+
+
+def test_online_encoder_selects_dino_last_four_mean() -> None:
+    from va_compound.vision.encoding import _dino_main_online_encode
+
+    frames = np.zeros((1, 1, 4, 32, 32, 3), dtype=np.uint8)
+    base = _dino_main_online_encode(
+        frames,
+        FakeDinoBackbone(),
+        torch.device("cpu"),
+        encode_batch=4,
+        grid=16,
+        window=4,
+    )
+    fused = _dino_main_online_encode(
+        frames,
+        FakeDinoBackbone(),
+        torch.device("cpu"),
+        encode_batch=4,
+        grid=16,
+        window=4,
+        last_four_mean=True,
+    )
+    torch.testing.assert_close(fused, base + 1000.0)
+
+
+def test_online_encoder_keeps_dino_last_four_layers_separate() -> None:
+    from va_compound.vision.encoding import _dino_main_online_encode
+
+    frames = np.zeros((1, 1, 4, 32, 32, 3), dtype=np.uint8)
+    base, layers = _dino_main_online_encode(
+        frames,
+        FakeDinoBackbone(),
+        torch.device("cpu"),
+        encode_batch=4,
+        grid=16,
+        window=4,
+        return_last_four=True,
+    )
+    assert layers.shape == (1, 1, 4, 1024, 1024)
+    torch.testing.assert_close(base, layers[:, :, -1].float())
+    for index in range(1, 4):
+        torch.testing.assert_close(
+            layers[:, :, index] - layers[:, :, index - 1],
+            torch.full_like(layers[:, :, index], 1000.0),
+        )
+
+
+def test_online_encoder_keeps_dino_last_six_layers_separate() -> None:
+    from va_compound.vision.encoding import _dino_main_online_encode
+
+    frames = np.zeros((1, 1, 4, 32, 32, 3), dtype=np.uint8)
+    base, layers = _dino_main_online_encode(
+        frames,
+        FakeDinoBackbone(),
+        torch.device("cpu"),
+        encode_batch=4,
+        grid=16,
+        window=4,
+        return_last_layers=6,
+    )
+    assert layers.shape == (1, 1, 6, 1024, 1024)
+    torch.testing.assert_close(base, layers[:, :, -1].float())
 
 
 def test_temporal_embedding_breaks_frame_permutation_invariance() -> None:
@@ -121,7 +207,7 @@ def test_temporal_embedding_disabled_preserves_old_state_dict_contract() -> None
 
 
 def test_dino_main_pool_preserves_row_major_grid() -> None:
-    from train import _dino_main_online_encode
+    from va_compound.vision.encoding import _dino_main_online_encode
 
     backbone = FakeDinoBackbone()
     # [B=1, T=1, W=4, H=224, W=224, 3] 随机帧（假塔忽略内容）
@@ -190,7 +276,7 @@ def test_eval_one_frame_encode_matches_batched_window() -> None:
 
 
 def test_train_eval_main_encode_equivalence() -> None:
-    from train import _dino_main_online_encode
+    from va_compound.vision.encoding import _dino_main_online_encode
     from eval_metaworld import _main_vision_encode_window
 
     backbone = FakeDinoBackbone()
@@ -209,7 +295,7 @@ def test_train_eval_main_encode_equivalence() -> None:
 
 
 def test_main_vision_vision_dim_override_via_kwargs() -> None:
-    from train import _main_vision_config_kwargs
+    from va_compound.training.model_setup import _main_vision_config_kwargs
 
     class Args:
         dino_main_vision = True
@@ -228,3 +314,37 @@ def test_main_vision_vision_dim_override_via_kwargs() -> None:
         dino_main_vision = False
 
     assert _main_vision_config_kwargs(ArgsOff()) == {}
+
+
+def test_timm_dino_full_unfreeze_enables_gradients_and_checkpointing() -> None:
+    from va_compound.backbones import TimmActionVisionBackbone
+
+    class TinyTimm(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.projection = torch.nn.Linear(3, 4)
+            self.grad_checkpointing = False
+
+        def set_grad_checkpointing(self, enabled: bool) -> None:
+            self.grad_checkpointing = enabled
+
+        def get_intermediate_layers(self, images, **_kwargs):
+            tokens = self.projection(images.mean(dim=(-1, -2)))[:, None, :]
+            prefixes = tokens[:, :0]
+            return [(tokens, prefixes), (tokens + 1.0, prefixes)]
+
+    model = TinyTimm()
+    backbone = TimmActionVisionBackbone(
+        model,
+        model_id="tiny",
+        image_size=2,
+        feature_dim=4,
+        output_layers=(0, 1),
+    )
+    assert not any(parameter.requires_grad for parameter in backbone.parameters())
+    backbone.unfreeze_all()
+    assert model.grad_checkpointing
+    assert all(parameter.requires_grad for parameter in backbone.parameters())
+    output = backbone.forward_hierarchical_dense(torch.randn(2, 3, 2, 2))[11]
+    output.sum().backward()
+    assert model.projection.weight.grad is not None

@@ -201,6 +201,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--model-dtype", choices=("float16", "bfloat16", "float32"), default="float16")
+    parser.add_argument(
+        "--qwen-keep-layers",
+        type=int,
+        default=0,
+        help="physically keep only the first N Qwen text layers; 0 keeps all 24",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
         "--video-output",
@@ -325,9 +331,23 @@ def main() -> None:
 
     # Language encoding (one pass per task).
     text_backbone = QwenTextBackbone.from_pretrained(
-        device=args.device, dtype=args.model_dtype, local_files_only=True
+        device=args.device,
+        dtype=args.model_dtype,
+        keep_layers=args.qwen_keep_layers or None,
+        local_files_only=True,
     )
-    language_hidden, language_mask = text_backbone.encode(task_texts)
+    if args.qwen_keep_layers == 15:
+        fusion_layers = list(range(10, 15))
+        language_hierarchy, language_mask = text_backbone.encode(
+            task_texts, output_layers=fusion_layers
+        )
+        language_hidden = text_backbone.mean_output_layers(
+            language_hierarchy, fusion_layers
+        )
+    else:
+        fusion_layers = None
+        language_hidden, language_mask = text_backbone.encode(task_texts)
+    qwen_keep_layers = text_backbone.keep_layers
     language_hidden = language_hidden.to(device="cpu", dtype=torch.float16)
     language_mask = language_mask.cpu()
     del text_backbone
@@ -529,6 +549,10 @@ def main() -> None:
             "fps": int(info["fps"]),
             "control_stride": cs,
             "action_horizon": ACTION_HORIZON,
+            "qwen_keep_layers": qwen_keep_layers,
+            "qwen_output_layer": qwen_keep_layers - 1,
+            "qwen_fusion_layers": fusion_layers,
+            "qwen_layer_reduce": "mean_then_final_norm" if fusion_layers else None,
             # 采样协议自描述：live 训练必须用完全相同的参数重建计划，
             # 否则行数相同但起点不同的静默错配会毒化监督信号（Grok P0）。
             "sampling": {

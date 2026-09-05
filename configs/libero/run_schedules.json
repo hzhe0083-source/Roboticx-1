@@ -1,0 +1,22 @@
+{
+  "40": {
+    "rows": 32000,
+    "batch_size": 32,
+    "mixed_tasks": 4,
+    "stage1_steps": 8000,
+    "suites": ["libero_spatial", "libero_object", "libero_goal", "libero_10"],
+    "local_task_ids": null,
+    "grouping": "stage1_local16_stage2_local8_v1",
+    "epochs": 50
+  },
+  "2": {
+    "rows": 9843,
+    "batch_size": 8,
+    "mixed_tasks": 2,
+    "stage1_steps": 0,
+    "suites": ["libero_10"],
+    "local_task_ids": [3, 4],
+    "grouping": "two_task_t8_dense_local2_deferred_v4",
+    "epochs": 4
+  }
+}

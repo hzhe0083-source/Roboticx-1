@@ -37,5 +37,5 @@ PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 \
   --dino-roi-checkpoint "$ROI" --dino-roi-alpha 1.0 \
   --task-ids 35 --trials-per-task 50 --execute-steps 6 --horizon 500 \
   --output-json "$JSON" \
-  --wam off --direct-head auto --debug-stage-metrics --flow-samples 1 \
+  --direct-head auto --debug-stage-metrics --flow-samples 1 \
   --device cuda 2>&1 | tee "$LOG"

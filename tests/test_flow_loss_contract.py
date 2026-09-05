@@ -6,12 +6,10 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from train import (
-    effective_action_valid_fraction,
-    masked_flow_matching_loss,
-    parse_args,
-    validate_args,
-)
+from va_compound.utils.flow import effective_action_valid_fraction, masked_flow_matching_loss
+from va_compound.training.batch import feature_no_grad_decode_autocast, feature_policy_autocast
+from va_compound.training.config import parse_args, validate_args
+from va_compound.model import FlowMatchingHead
 
 
 def test_default_flow_loss_is_exact_legacy_mse() -> None:
@@ -83,10 +81,52 @@ def test_flow_loss_rejects_zero_valid_supervision() -> None:
         )
 
 
-def test_flow_weight_argument_contract() -> None:
-    args = parse_args(["--flow-prefix-weight", "1", "--flow-tail-weight", "0.1"])
+def test_flow_weight_argument_contract(tmp_path) -> None:
+    checkpoint = tmp_path / "dino.pt"
+    checkpoint.touch()
+    args = parse_args([
+        "--single-task", "--dino-main-vision", "--slot-free-policy",
+        "--va-world-mode", "peer_sync_h6", "--va-only", "--data", "features.pt",
+        "--main-vision-checkpoint", str(checkpoint), "--wam4va",
+        "--task-sampling", "balanced",
+        "--flow-prefix-weight", "1", "--flow-tail-weight", "0.1",
+    ])
     validate_args(args)
 
     args.flow_tail_weight = -0.1
     with pytest.raises(ValueError, match="must be non-negative"):
         validate_args(args)
+
+
+def test_feature_autocast_keeps_flow_trainable_after_no_grad_decode() -> None:
+    torch.manual_seed(11)
+    head = FlowMatchingHead(
+        hidden_dim=64,
+        action_dim=4,
+        num_heads=4,
+        num_layers=2,
+        dropout=0.0,
+        flow_cond="adaln",
+    )
+    condition = torch.randn(3, 12, 64)
+    noisy_actions = torch.randn(3, 12, 4)
+    flow_time = torch.rand(3)
+    target = torch.randn(3, 12, 4)
+
+    with feature_policy_autocast(torch.device("cpu"), enabled=True):
+        with feature_no_grad_decode_autocast(
+            torch.device("cpu"), enabled=True
+        ):
+            with torch.no_grad():
+                head(condition, noisy_actions, flow_time)
+        prediction = head(condition, noisy_actions, flow_time)
+        loss = F.mse_loss(prediction.float(), target)
+    loss.backward()
+
+    for parameter in (
+        head.action_projection.weight,
+        head.velocity_head.weight,
+        head.ada_mlps[0].weight,
+    ):
+        assert parameter.grad is not None
+        assert torch.count_nonzero(parameter.grad) > 0

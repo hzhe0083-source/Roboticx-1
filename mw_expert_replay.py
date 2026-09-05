@@ -19,17 +19,33 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import numpy as np
 
-ROOT = Path("/home/ryan/Documents/robot/benchmark_data/raw/metaworld/lerobot_metaworld_mt50")
-CONFIG = json.load(
-    open(
+ROOT = Path(os.environ.get(
+    "METAWORLD_DATASET_ROOT",
+    "/home/ryan/Documents/robot/benchmark_data/raw/metaworld/lerobot_metaworld_mt50",
+))
+_CONFIG_CANDIDATES = (
+    Path(__file__).resolve().parent / "metaworld_config.json",
+    Path(
         "/home/ryan/Documents/robot/Evoagent/Evo-1/evo1_lerobot/lerobot/envs/metaworld_config.json"
-    )
+    ),
 )
-TASK_DESCRIPTIONS = CONFIG["TASK_DESCRIPTIONS"]  # env_name -> description
+
+
+def _load_task_descriptions() -> dict:
+    for path in _CONFIG_CANDIDATES:
+        if path.is_file():
+            with path.open() as handle:
+                return json.load(handle)["TASK_DESCRIPTIONS"]
+    return {}
+
+
+CONFIG: dict | None = None
+TASK_DESCRIPTIONS = _load_task_descriptions()
 
 
 def parse_args() -> argparse.Namespace:

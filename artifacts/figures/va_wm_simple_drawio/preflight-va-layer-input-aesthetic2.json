@@ -1,0 +1,55 @@
+{
+  "file": "artifacts/figures/va_wm_simple_drawio/va_layer_input_origin.drawio",
+  "summary": {
+    "total_findings": 3,
+    "fail": 0,
+    "warn": 3,
+    "passed": true,
+    "clean": false
+  },
+  "fails": [],
+  "warns": [
+    {
+      "rule": "spacing-inconsistent-h",
+      "element_id": "observation",
+      "message": "Row at y≈165: horizontal gaps vary (gaps=['40', '40', '320'], mean=133, cv=0.99). Use uniform spacing.",
+      "detail": {
+        "row_y": 165,
+        "gaps": [
+          40.0,
+          40.0,
+          320.0
+        ],
+        "mean": 133.3,
+        "cv": 0.99,
+        "element_ids": [
+          "observation",
+          "dino_tokens",
+          "vision_projection",
+          "previous_layers"
+        ]
+      }
+    },
+    {
+      "rule": "orphan-empty-box",
+      "element_id": "init_container",
+      "message": "Box 'init_container' (830×590) has no text label. Add content or reduce size.",
+      "detail": {
+        "box_id": "init_container",
+        "size": "830×590"
+      }
+    },
+    {
+      "rule": "orphan-empty-box",
+      "element_id": "stack_container",
+      "message": "Box 'stack_container' (410×590) has no text label. Add content or reduce size.",
+      "detail": {
+        "box_id": "stack_container",
+        "size": "410×590"
+      }
+    }
+  ],
+  "vertex_count": 19,
+  "edge_count": 13,
+  "canvas": "1320x700"
+}
