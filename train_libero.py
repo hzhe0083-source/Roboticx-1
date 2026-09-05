@@ -56,6 +56,7 @@ from va_compound.data.libero import (
     EXECUTION_HORIZON,
     FRESH_INITIALIZATION,
     FUSION_LAYERS,
+    JOINT_DATA_CONTRACT,
     LIBERO_SUITES,
     SEQUENCE,
     SOURCE_DATA_CONTRACT,
@@ -295,7 +296,7 @@ def _validate_model_contract(config: VACompoundConfig) -> None:
         "dino_qwen_cross_modal_layers": len(FUSION_LAYERS),
     }
     if config.architecture_version == "dual_tower_expert_v1":
-        expected.update(va_last3_cross_attn=False, dino_qwen_cross_modal_bridge=False, flow_layers=3, fusion_pair_count=6)
+        expected.update(va_last3_cross_attn=False, dino_qwen_cross_modal_bridge=False, flow_layers=3, fusion_pair_count=6, tail_flow_condition_grad=False)
     mismatch = {
         key: (getattr(config, key), value)
         for key, value in expected.items()
@@ -328,7 +329,10 @@ def preflight(args: argparse.Namespace) -> None:
                 mmap=True,
             )
         )
-    payload = _validate_data(args.data)
+    payload = _validate_data(
+        args.data,
+        architecture_version=getattr(args, "architecture_version", "legacy"),
+    )
     if args.prev_dropout != 1.0:
         raise ValueError("the H50/P15 run requires --prev-dropout 1")
     if args.lr != 1e-5 or args.lr_new != 3e-5:
@@ -572,7 +576,11 @@ def _atomic_checkpoint(
                 "suites": list(run_metadata["suites"]),
                 "n_tasks": int(run_metadata["n_tasks"]),
                 "task_specs": list(run_metadata["task_specs"]),
-                "data_contract": DATA_CONTRACT,
+                "data_contract": (
+                    JOINT_DATA_CONTRACT
+                    if config.architecture_version == "dual_tower_expert_v1"
+                    else DATA_CONTRACT
+                ),
                 "data_sha256": data_sha256,
                 "action_decoder": "conditional_flow_matching",
                 "flow_steps": 8,
@@ -616,6 +624,11 @@ def _atomic_checkpoint(
                 "world_target_view": "eye_in_hand_rgb",
                 "fusion_initialization": ("dual_tower_zero_output_v1" if config.architecture_version == "dual_tower_expert_v1" else "zero_output_unit_gate_v1"),
                 "architecture_version": config.architecture_version,
+                **(
+                    {"execution_gradient_contract": "p15_live_h50_tail_detached_v1"}
+                    if config.architecture_version == "dual_tower_expert_v1"
+                    else {}
+                ),
                 "main_vision_encode_batch": encode_batch,
                 "stage1_world_current_vision_cache": (
                     "disabled_joint_frontend_v1" if config.architecture_version == "dual_tower_expert_v1" else "same_step_action_detached_v1"
@@ -670,7 +683,10 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("the all-fixes run requires --lr 1e-5 --lr-new 3e-5")
     if args.stage1_steps < 0:
         raise ValueError("stage1 steps must be non-negative")
-    payload = _validate_data(args.data)
+    payload = _validate_data(
+        args.data,
+        architecture_version=getattr(args, "architecture_version", "legacy"),
+    )
     metadata = payload["metadata"]
     tasks = list(metadata["tasks"])
     _, expected_total_steps, pcgrad_forward_grouping = _validate_run_schedule(
@@ -835,7 +851,11 @@ def train(args: argparse.Namespace) -> None:
                 "source_checkpoint": source["source_checkpoint"],
                 "source_global_step": (int(source.get("source_global_step", -1)) if joint_frontend else 1_000),
                 "optimizer_initialization": ("fresh_adamw_v1" if config.architecture_version == "dual_tower_expert_v1" else "continued_from_source_v1"),
-                "data_contract": DATA_CONTRACT,
+                "data_contract": (
+                    JOINT_DATA_CONTRACT
+                    if config.architecture_version == "dual_tower_expert_v1"
+                    else DATA_CONTRACT
+                ),
                 "data_sha256": data_sha256,
                 "suites": list(metadata["suites"]),
                 "n_tasks": int(metadata["n_tasks"]),
@@ -872,6 +892,11 @@ def train(args: argparse.Namespace) -> None:
                 "wmrm_target_teacher": "shared_online_dino_block23_stopgrad_v1",
                 "fusion_initialization": ("dual_tower_zero_output_v1" if config.architecture_version == "dual_tower_expert_v1" else "zero_output_unit_gate_v1"),
                 "architecture_version": config.architecture_version,
+                **(
+                    {"execution_gradient_contract": "p15_live_h50_tail_detached_v1"}
+                    if config.architecture_version == "dual_tower_expert_v1"
+                    else {}
+                ),
                 "main_vision_encode_batch": args.encode_batch,
                 "stage1_world_current_vision_cache": (
                     "disabled_joint_frontend_v1" if config.architecture_version == "dual_tower_expert_v1" else "same_step_action_detached_v1"

@@ -22,6 +22,7 @@ import numpy as np
 import torch
 
 from va_compound import VACompoundConfig, VACompoundPolicy
+from va_compound.data.libero import JOINT_DATA_CONTRACT, _validate_data
 from va_compound.backbones import QwenTextBackbone, TimmActionVisionBackbone
 from va_compound.vision.dual_tower_batch import encode_dual_tower_batch
 from va_compound.vision.encoding import _dino_main_online_encode
@@ -498,12 +499,14 @@ def main() -> None:
         DUAL_VIEW_WORLD_LAST6_DATA_CONTRACT,
         DENSE_WORLD_LAST6_DATA_CONTRACT,
         T8_DENSE_WORLD_LAST6_DATA_CONTRACT,
+        JOINT_DATA_CONTRACT,
     }
     dual_view = payload_contract in {
         DUAL_VIEW_DATA_CONTRACT,
         DUAL_VIEW_WORLD_LAST6_DATA_CONTRACT,
         DENSE_WORLD_LAST6_DATA_CONTRACT,
         T8_DENSE_WORLD_LAST6_DATA_CONTRACT,
+        JOINT_DATA_CONTRACT,
     }
     world_horizon = (
         15
@@ -512,11 +515,12 @@ def main() -> None:
             DUAL_VIEW_WORLD_LAST6_DATA_CONTRACT,
             DENSE_WORLD_LAST6_DATA_CONTRACT,
             T8_DENSE_WORLD_LAST6_DATA_CONTRACT,
+            JOINT_DATA_CONTRACT,
         }
         else None
     )
     dense_t4 = payload_contract == DENSE_WORLD_LAST6_DATA_CONTRACT
-    dense_t8 = payload_contract == T8_DENSE_WORLD_LAST6_DATA_CONTRACT
+    dense_t8 = payload_contract in {T8_DENSE_WORLD_LAST6_DATA_CONTRACT, JOINT_DATA_CONTRACT}
     dense_continuation = dense_t4 or dense_t8
     task_specs = _task_specs(payload)
     specs_by_id = {spec["global_task_id"]: spec for spec in task_specs}
@@ -526,6 +530,10 @@ def main() -> None:
         raise ValueError(f"task ids are absent from payload: {missing_task_ids}")
     config = VACompoundConfig(**checkpoint["config"])
     joint_frontend = config.architecture_version == "dual_tower_expert_v1"
+    if joint_frontend != (payload_contract == JOINT_DATA_CONTRACT):
+        raise ValueError("checkpoint architecture and data coverage contract disagree")
+    if joint_frontend:
+        _validate_data(args.data, architecture_version=config.architecture_version)
     if joint_frontend and args.qwen is None:
         raise ValueError("dual_tower_expert_v1 evaluation requires --qwen")
     expected = {
@@ -628,7 +636,8 @@ def main() -> None:
     else:
         raise ValueError(f"unsupported LIBERO action horizon: {config.action_horizon}")
     if joint_frontend:
-        expected.update(va_last3_cross_attn=False, dino_qwen_cross_modal_bridge=False, flow_layers=3)
+        protocol = "libero_fixed_init_t8_p15complete_dual_tower_expert_v1"
+        expected.update(va_last3_cross_attn=False, dino_qwen_cross_modal_bridge=False, flow_layers=3, fusion_pair_count=6, tail_flow_condition_grad=False)
     mismatches = {
         key: (getattr(config, key), value)
         for key, value in expected.items()
@@ -645,14 +654,14 @@ def main() -> None:
         if world_horizon and (
             metadata.get("world_target_horizon") != world_horizon
             or metadata.get("world_target_offsets")
-            != [world_horizon + offset for offset in (0, 15, 30, 45)]
+            != [world_horizon + 15 * index for index in range(8 if dense_t8 else 4)]
             or metadata.get("world_target_alignment")
             != f"obs[d+{world_horizon}]"
         ):
             raise ValueError("dual-view World supervision has the wrong horizon")
         if dense_continuation and (
             metadata.get("window_sampling") != "all_legal_starts_v1"
-            or len(payload["actions"]) != (9_843 if dense_t8 else 15_843)
+            or (not joint_frontend and len(payload["actions"]) != (9_843 if dense_t8 else 15_843))
             or metadata.get("sequence_length") != (8 if dense_t8 else 4)
         ):
             raise ValueError("dense continuation payload has the wrong window set")
@@ -867,6 +876,7 @@ def main() -> None:
                 stage1_steps=stage1_steps,
                 total_steps=total_steps,
                 optimizer_initialization="fresh_adamw_v1",
+                execution_gradient_contract="p15_live_h50_tail_detached_v1",
                 qwen_world_cache="per_observation_joint_live_v1",
                 stage1_world_current_vision_cache="disabled_joint_frontend_v1",
             )

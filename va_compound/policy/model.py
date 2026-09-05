@@ -3516,7 +3516,9 @@ class VACompoundPolicy(nn.Module):
                 return predict(self.action_expert, action_condition, self.config.action_horizon)
             prefix = predict(self.action_expert, action_condition, 6)
             tail_condition = action_condition if self.config.tail_flow_condition_grad else action_condition.detach()
-            middle = predict(self.tail_action_expert, tail_condition, 15)[:, 6:15]
+            # The deployed P15 prefix must train its VA conditions; forward
+            # prefix isolation does not require detaching the executed suffix.
+            middle = predict(self.tail_action_expert, action_condition, 15)[:, 6:15]
             if self.config.action_horizon == 50:
                 tail = predict(self.extension_action_expert, tail_condition, 50)[:, 15:]
                 return torch.cat((prefix, middle, tail), dim=1)

@@ -15,6 +15,7 @@ from va_compound.data.libero import (
     DECISION_OFFSETS,
     EXECUTION_HORIZON,
     FUSION_LAYERS,
+    JOINT_DATA_CONTRACT,
     LIBERO_SUITES,
     SEQUENCE,
     SOURCE_DATA_CONTRACT,
@@ -100,9 +101,36 @@ def _ensure_longtraj(
     )
 
 
+def _window_max_start(length: int, *, joint_frontend: bool) -> int:
+    p15_max_start = (
+        length
+        - 1
+        - int(DECISION_OFFSETS[-1])
+        - EXECUTION_HORIZON
+    )
+    if p15_max_start < 0:
+        return -1
+    if joint_frontend:
+        return p15_max_start
+    action_h50_max_start = (
+        length
+        - 1
+        - int(DECISION_OFFSETS[-1])
+        - ACTION_HORIZON
+    )
+    return (
+        action_h50_max_start
+        if action_h50_max_start >= 0
+        else p15_max_start
+    )
+
+
 def prepare_data(args: argparse.Namespace) -> None:
     import h5py
 
+    joint_frontend = getattr(args, "architecture_version", "legacy") == "dual_tower_expert_v1"
+    if joint_frontend and not args.dense_windows:
+        raise ValueError("dual_tower_expert_v1 requires --dense-windows")
     if args.windows_per_demo < 1:
         raise ValueError("--windows-per-demo must be positive")
     suites = _suite_names(args.suites)
@@ -177,25 +205,9 @@ def prepare_data(args: argparse.Namespace) -> None:
                 raw_state = np.concatenate(
                     (obs["joint_states"][()], obs["gripper_states"][()]), axis=1
                 ).astype(np.float32)
-                p15_max_start = (
-                    len(raw_actions)
-                    - 1
-                    - int(DECISION_OFFSETS[-1])
-                    - EXECUTION_HORIZON
-                )
-                if p15_max_start < 0:
+                max_start = _window_max_start(len(raw_actions), joint_frontend=joint_frontend)
+                if max_start < 0:
                     raise ValueError(f"demo too short for T8/H50/P15: {source}:{name}")
-                action_h50_max_start = (
-                    len(raw_actions)
-                    - 1
-                    - int(DECISION_OFFSETS[-1])
-                    - ACTION_HORIZON
-                )
-                max_start = (
-                    action_h50_max_start
-                    if action_h50_max_start >= 0
-                    else p15_max_start
-                )
                 starts = (
                     np.arange(max_start + 1, dtype=np.int64)
                     if args.dense_windows
@@ -261,6 +273,61 @@ def prepare_data(args: argparse.Namespace) -> None:
     # Online Qwen replaces these tiny schema placeholders before every forward.
     language_hidden = torch.zeros((len(actions), 1, 1), dtype=torch.float16)
     language_mask = torch.ones((len(actions), 1), dtype=torch.bool)
+    contract_str = (
+        JOINT_DATA_CONTRACT
+        if joint_frontend
+        else (DATA_CONTRACT if args.dense_windows else SOURCE_DATA_CONTRACT)
+    )
+    metadata_payload = {
+        "contract": contract_str,
+        "tasks": [spec["description"] for spec in specs],
+        "task_specs": specs,
+        "suites": list(suites),
+        "n_tasks": len(specs),
+        "n_demos": global_episode,
+        "windows_per_demo": None if args.dense_windows else args.windows_per_demo,
+        "window_sampling": (
+            "all_legal_starts_v1" if args.dense_windows else "fixed_linspace16_v1"
+        ),
+        "task_counts": task_counts,
+        "sequence_length": SEQUENCE,
+        "action_horizon": ACTION_HORIZON,
+        "planning_stride": EXECUTION_HORIZON,
+        "control_stride": EXECUTION_HORIZON,
+        "decision_offsets": DECISION_OFFSETS.tolist(),
+        "vision_offsets": VISION_OFFSETS.tolist(),
+        "vision_input": "agentview_history4_plus_current_wrist_v2",
+        "vision_frame_layout": [
+            "agentview_d-6",
+            "agentview_d-4",
+            "agentview_d-2",
+            "agentview_d",
+            "eye_in_hand_d",
+        ],
+        "world_target_view": "eye_in_hand_rgb",
+        "logged_action_chunk": "masked_h50_real_p15_prefix",
+        "world_target_horizon": WORLD_HORIZON,
+        "world_target_offsets": (
+            DECISION_OFFSETS + WORLD_HORIZON
+        ).tolist(),
+        "world_target_alignment": f"obs[d+{WORLD_HORIZON}]",
+        "target_alignment": "obs[d]_to_actions[d+1:d+51]_masked_tail",
+        "previous_action_alignment": "actions[d]",
+        "previous_action_model_input": "zero_v1",
+        "orientation_contract": "vertical_flip_opengl_to_upright_once",
+        "action_contract": "raw_libero_osc_pose_minus1_plus1",
+        "proprio_contract": "q01q99(joint_states7+gripper_states2)",
+        "language_source": "online_qwen35_0_8b_last6_full_v1",
+        "language_dim": 1024,
+        "qwen_keep_layers": 24,
+        "qwen_fusion_layers": FUSION_LAYERS,
+        "qwen_base_readout": "layer23_final_norm",
+        "qwen_fusion_reduce": "none",
+        "short_horizon_padding": "repeat_last_masked_v1",
+        "minimum_real_action_prefix": EXECUTION_HORIZON,
+    }
+    if joint_frontend:
+        metadata_payload["window_bound"] = "complete_p15_masked_h50_v1"
     payload = {
         "actions": actions,
         "previous_action": previous,
@@ -283,54 +350,7 @@ def prepare_data(args: argparse.Namespace) -> None:
             "state_q01": torch.from_numpy(state_low),
             "state_q99": torch.from_numpy(state_high),
         },
-        "metadata": {
-            "contract": DATA_CONTRACT if args.dense_windows else SOURCE_DATA_CONTRACT,
-            "tasks": [spec["description"] for spec in specs],
-            "task_specs": specs,
-            "suites": list(suites),
-            "n_tasks": len(specs),
-            "n_demos": global_episode,
-            "windows_per_demo": None if args.dense_windows else args.windows_per_demo,
-            "window_sampling": (
-                "all_legal_starts_v1" if args.dense_windows else "fixed_linspace16_v1"
-            ),
-            "task_counts": task_counts,
-            "sequence_length": SEQUENCE,
-            "action_horizon": ACTION_HORIZON,
-            "planning_stride": EXECUTION_HORIZON,
-            "control_stride": EXECUTION_HORIZON,
-            "decision_offsets": DECISION_OFFSETS.tolist(),
-            "vision_offsets": VISION_OFFSETS.tolist(),
-            "vision_input": "agentview_history4_plus_current_wrist_v2",
-            "vision_frame_layout": [
-                "agentview_d-6",
-                "agentview_d-4",
-                "agentview_d-2",
-                "agentview_d",
-                "eye_in_hand_d",
-            ],
-            "world_target_view": "eye_in_hand_rgb",
-            "logged_action_chunk": "masked_h50_real_p15_prefix",
-            "world_target_horizon": WORLD_HORIZON,
-            "world_target_offsets": (
-                DECISION_OFFSETS + WORLD_HORIZON
-            ).tolist(),
-            "world_target_alignment": f"obs[d+{WORLD_HORIZON}]",
-            "target_alignment": "obs[d]_to_actions[d+1:d+51]_masked_tail",
-            "previous_action_alignment": "actions[d]",
-            "previous_action_model_input": "zero_v1",
-            "orientation_contract": "vertical_flip_opengl_to_upright_once",
-            "action_contract": "raw_libero_osc_pose_minus1_plus1",
-            "proprio_contract": "q01q99(joint_states7+gripper_states2)",
-            "language_source": "online_qwen35_0_8b_last6_full_v1",
-            "language_dim": 1024,
-            "qwen_keep_layers": 24,
-            "qwen_fusion_layers": FUSION_LAYERS,
-            "qwen_base_readout": "layer23_final_norm",
-            "qwen_fusion_reduce": "none",
-            "short_horizon_padding": "repeat_last_masked_v1",
-            "minimum_real_action_prefix": EXECUTION_HORIZON,
-        },
+        "metadata": metadata_payload,
     }
     if args.dense_windows:
         _attach_dense_world_action_donors(payload)
@@ -339,7 +359,9 @@ def prepare_data(args: argparse.Namespace) -> None:
             payload, planning_stride=EXECUTION_HORIZON
         )
     expected = sum(task_counts)
-    if args.dense_windows:
+    if joint_frontend:
+        assert min(task_counts) > 0
+    elif args.dense_windows:
         if len(specs) == 2:
             assert task_counts == [4684, 5159]
         else:
@@ -384,6 +406,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--windows-per-demo", type=int, default=16)
     parser.add_argument("--dense-windows", action="store_true")
+    parser.add_argument(
+        "--architecture-version",
+        choices=("legacy", "dual_tower_expert_v1"),
+        default="legacy",
+        help="Architecture version for LIBERO data preparation.",
+    )
     return parser
 
 

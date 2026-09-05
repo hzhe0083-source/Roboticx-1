@@ -58,6 +58,26 @@ def test_nested_expert_prefix_does_not_read_future_tail():
     torch.testing.assert_close(actual[:, :6], expected[:, :6], rtol=0, atol=0)
 
 
+def test_executed_suffix_trains_all_va_layers_without_future_tail_leakage():
+    torch.manual_seed(18)
+    model = VACompoundPolicy(config()).eval()
+    condition = torch.randn(1, 3, 50, 16, requires_grad=True)
+    velocity = model.flow_velocity(condition, torch.randn(1, 50, 4), torch.rand(1))
+    gradient = torch.autograd.grad(velocity[:, 6:15].square().mean(), condition, retain_graph=True)[0]
+    assert all(gradient[:, layer, :15].norm() > 0 for layer in range(3))
+    assert torch.count_nonzero(gradient[:, :, 15:]) == 0
+    tail_gradient = torch.autograd.grad(velocity[:, 15:].square().mean(), condition)[0]
+    assert torch.count_nonzero(tail_gradient) == 0
+
+
+def test_legacy_executed_suffix_keeps_checkpoint_gradient_contract():
+    model = VACompoundPolicy(config(architecture_version="legacy")).eval()
+    condition = torch.randn(1, 50, 16, requires_grad=True)
+    velocity = model.flow_velocity(condition, torch.randn(1, 50, 4), torch.rand(1))
+    gradient = torch.autograd.grad(velocity[:, 6:15].square().mean(), condition)[0]
+    assert torch.count_nonzero(gradient) == 0
+
+
 def test_new_expert_checkpoint_roundtrip_and_cached_sampling():
     model = VACompoundPolicy(config()).eval()
     restored = VACompoundPolicy(VACompoundConfig(**model.config.__dict__)).eval()

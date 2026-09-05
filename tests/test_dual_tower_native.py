@@ -43,3 +43,13 @@ def test_native_hybrid_qwen_and_dino_fusion_backward():
             assert torch.isfinite(projection.weight.grad).all()
             assert torch.count_nonzero(projection.weight.grad)
     assert all(not block._forward_hooks for block in qwen.layers)
+
+    dino.requires_grad_(False)
+    for module in (dino, qwen, fusion):
+        module.zero_grad(set_to_none=True)
+    visual, language, _ = encode_dual_tower(images, ["pick"], SimpleNamespace(model=dino), text, fusion)
+    ((visual * torch.randn_like(visual)).sum() + (language * torch.randn_like(language)).sum()).backward()
+    assert all(parameter.grad is None for parameter in dino.parameters())
+    assert all(pair.vision_out_proj.weight.grad.norm() > 0 for pair in fusion.pairs)
+    assert all(pair.language_out_proj.weight.grad.norm() > 0 for pair in fusion.pairs)
+    assert any(parameter.grad is not None and parameter.grad.norm() > 0 for parameter in qwen.parameters())

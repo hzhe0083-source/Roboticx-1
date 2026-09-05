@@ -22,6 +22,7 @@ LIBERO_SUITES = ("libero_spatial", "libero_object", "libero_goal", "libero_10")
 SOURCE_DATA_CONTRACT = "libero_4suite_h50p15_t4_dualview5_worldh15_va1024_qwen08_last6_denseall_v7"
 SOURCE_INITIALIZATION = "dense_all_windows_continue_from_s5000_v1"
 DATA_CONTRACT = "libero_4suite_h50p15_t8_dualview5_worldh15_va1024_qwen08_last6_denseall_v8"
+JOINT_DATA_CONTRACT = "libero_4suite_h50p15_t8_dualview5_p15complete_joint_v9"
 FRESH_INITIALIZATION = "t8_dense_continue_from_t4_s1000_v1"
 FUSION_LAYERS = list(range(18, 24))
 CROSS_MODAL_VA_LAYERS = list(range(len(FUSION_LAYERS)))
@@ -135,10 +136,11 @@ def _attach_dense_world_action_donors(payload: dict) -> None:
     )
 
 
-def _validate_data(path: Path) -> dict:
+def _validate_data(path: Path, *, architecture_version: str = "legacy") -> dict:
     payload = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
     metadata = payload.get("metadata", {})
-    if metadata.get("contract") != DATA_CONTRACT:
+    joint = architecture_version == "dual_tower_expert_v1"
+    if metadata.get("contract") != (JOINT_DATA_CONTRACT if joint else DATA_CONTRACT):
         raise ValueError(f"unexpected data contract in {path}")
     tasks = list(metadata.get("tasks") or [])
     specs = list(metadata.get("task_specs") or [])
@@ -174,6 +176,8 @@ def _validate_data(path: Path) -> dict:
         "short_horizon_padding": "repeat_last_masked_v1",
         "minimum_real_action_prefix": EXECUTION_HORIZON,
     }
+    if joint:
+        expected_metadata["window_bound"] = "complete_p15_masked_h50_v1"
     mismatch = {
         key: (metadata.get(key), value)
         for key, value in expected_metadata.items()
@@ -189,7 +193,12 @@ def _validate_data(path: Path) -> dict:
     world_valid = payload.get("world_target_valid_mask")
     if not isinstance(world_valid, Tensor) or world_valid.shape != valid.shape[:2]:
         raise ValueError("LIBERO H50 World targets require an aligned [N,T] mask")
-    if n_tasks == 2 and (not bool(valid.all()) or not bool(world_valid.all())):
+    if joint:
+        if valid.dtype != torch.bool or world_valid.dtype != torch.bool:
+            raise ValueError("joint validity masks must be boolean")
+        if bool((valid[:, :, 1:] & ~valid[:, :, :-1]).any()) or not bool(world_valid.all()):
+            raise ValueError("joint data requires contiguous real actions and complete World targets")
+    if not joint and n_tasks == 2 and (not bool(valid.all()) or not bool(world_valid.all())):
         raise ValueError("the two LIBERO-Long tasks require complete action and World targets")
     crop_start = payload.get("crop_start")
     if not isinstance(crop_start, Tensor) or crop_start.shape != instruction_ids.shape:
@@ -238,8 +247,11 @@ def _validate_run_schedule(payload: dict, args: argparse.Namespace) -> tuple[int
         "local_task_ids": None if n_tasks == 40 else local_task_ids,
     }
     if getattr(args, "architecture_version", "legacy") == "dual_tower_expert_v1":
-        for key in ("stage1_steps", "epochs", "max_steps"):
+        for key in ("rows", "stage1_steps", "epochs", "max_steps"):
             expected.pop(key)
+        counts = metadata.get("task_counts", [])
+        if len(counts) != n_tasks or any(c <= 0 for c in counts) or sum(counts) != actual["rows"]:
+            raise ValueError("joint task_counts must match positive dataset rows")
         if args.stage1_steps < 0 or args.epochs < 1:
             raise ValueError("joint training requires stage1_steps >= 0 and epochs >= 1")
     mismatch = {key: (actual[key], value) for key, value in expected.items() if actual[key] != value}

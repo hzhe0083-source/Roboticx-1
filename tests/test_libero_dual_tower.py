@@ -75,6 +75,8 @@ def test_joint_checkpoint_restores_next_adamw_update(tmp_path):
         source_global_step=-1, sampler=sampler, world_sampler=sampler,
     )
     saved = torch.load(path, weights_only=True)
+    assert saved["training_contract"]["execution_gradient_contract"] == "p15_live_h50_tail_detached_v1"
+    assert saved["training_contract"]["data_contract"] == trainer.JOINT_DATA_CONTRACT
     assert saved["training_contract"]["optimizer_initialization"] == "fresh_adamw_v1"
     assert saved["training_contract"]["qwen_world_cache"] == "per_observation_joint_live_v1"
     assert saved["training_contract"]["stage1_world_current_vision_cache"] == "disabled_joint_frontend_v1"
@@ -100,7 +102,7 @@ def test_joint_schedule_allows_two_stage_probe_without_relaxing_legacy():
     from va_compound.data.libero import RUN_SCHEDULE_PROFILES, _validate_run_schedule
     profile = RUN_SCHEDULE_PROFILES[2]
     payload = {"actions": range(profile["rows"]), "metadata": {
-        "n_tasks": 2, "suites": profile["suites"],
+        "n_tasks": 2, "suites": profile["suites"], "task_counts": [4684, 5159],
         "task_specs": [{"local_task_id": i} for i in profile["local_task_ids"]],
     }}
     args = SimpleNamespace(batch_size=profile["batch_size"], mixed_tasks=profile["mixed_tasks"],
