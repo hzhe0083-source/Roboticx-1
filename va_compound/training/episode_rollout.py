@@ -24,7 +24,12 @@ def rollout_episode_windows(rollout, options):
         raise ValueError("episode rollout requires joint architecture")
     size, length, horizon, action_dim = batch["actions"].shape
     zero = next(model.parameters()).sum() * 0.0
-    velocities, conditions, records = [], [], []
+    velocities, conditions, records = [None] * size, [None] * size, []
+    groups = {}
+    from va_compound.training.memory_batch import memory_signature, stack_memories
+    max_group = int(getattr(model, "episode_microbatch", 1))
+    if max_group < 1:
+        raise ValueError("episode_microbatch must be positive")
     for row in range(size):
         active = bool(batch["stream_active"][row])
         count = int(batch["decision_count"][row]) if active else 0
@@ -33,8 +38,8 @@ def rollout_episode_windows(rollout, options):
         if count < 0 or count > length or not torch.equal(mask, expected):
             raise ValueError("episode window requires a contiguous real decision prefix")
         if not active:
-            velocities.append(batch["actions"].new_zeros((1, length, horizon, action_dim)) + zero)
-            conditions.append(batch["actions"].new_zeros((1, length, 3, horizon, model.config.hidden_dim)) + zero)
+            velocities[row] = batch["actions"].new_zeros((1, length, horizon, action_dim)) + zero
+            conditions[row] = batch["actions"].new_zeros((1, length, 3, horizon, model.config.hidden_dim)) + zero
             continue
         if count == 0:
             raise ValueError("active episode window is empty")
@@ -55,31 +60,44 @@ def rollout_episode_windows(rollout, options):
                         else model.vision_projection.weight.dtype)
         memory = bank.begin(stream, episode, start, bool(batch["episode_start"][row]),
                             device=device, dtype=memory_dtype)
-        single = {}
-        temporal = {"actions", "proprio", "previous_action", "vision_tokens", "dino_last4",
-                    "action_valid_mask", "recovery_mask", "world_target_valid_mask",
-                    "world_rank_shuffle_action", "world_rank_shuffle_mask", "world_target_map",
-                    "world_state_delta", "decision_valid_mask"}
-        if batch["language_hidden"].ndim == 4:
-            temporal.update(("language_hidden", "language_mask"))
-        for key, value in batch.items():
-            if isinstance(value, torch.Tensor) and value.ndim and value.shape[0] == size:
-                value = value[row:row + 1]
-                if key in temporal:
-                    value = value[:, :count]
-            single[key] = value
-        call = dict(options, batch=single,
-                    noisy_actions=options["noisy_actions"][row:row + 1, :count],
-                    flow_time=options["flow_time"][row:row + 1, :count],
-                    initial_visual_memory=memory)
-        velocity, condition = rollout(**call)
-        bank.finish(stream, episode, start + count * model.config.planning_stride,
-                    bool(batch["episode_end"][row]), model.last_rollout_visual_memory)
-        velocities.append(F.pad(velocity, (0, 0, 0, 0, 0, length - count)))
-        conditions.append(F.pad(condition, (0, 0, 0, 0, 0, 0, 0, length - count)))
-        records.append((int(batch["instruction_id"][row]), count,
-                        {name: getattr(model, name, None) for name in _METRICS},
-                        dict(model.last_wmrm_task_losses)))
+        masks = tuple((key, tuple(batch[key][row, :count].flatten().tolist()))
+                      for key in ("world_target_valid_mask", "world_rank_shuffle_mask") if key in batch)
+        key = (int(batch["instruction_id"][row]), count, memory_signature(memory), masks)
+        if float(options.get("wmrm_late_stage_anchor_weight", 0)) > 0:
+            key = (*key, row)
+        groups.setdefault(key, []).append((row, stream, episode, start, memory))
+    for entries in groups.values():
+        for begin in range(0, len(entries), max_group):
+            members = entries[begin:begin + max_group]
+            rows = [entry[0] for entry in members]
+            count = int(batch["decision_count"][rows[0]])
+            single = {}
+            temporal = {"actions", "proprio", "previous_action", "vision_tokens", "dino_last4",
+                        "action_valid_mask", "recovery_mask", "world_target_valid_mask",
+                        "world_rank_shuffle_action", "world_rank_shuffle_mask", "world_target_map",
+                        "world_state_delta", "decision_valid_mask"}
+            if batch["language_hidden"].ndim == 4:
+                temporal.update(("language_hidden", "language_mask"))
+            for key, value in batch.items():
+                if isinstance(value, torch.Tensor) and value.ndim and value.shape[0] == size:
+                    value = value[rows]
+                    if key in temporal:
+                        value = value[:, :count]
+                single[key] = value
+            call = dict(options, batch=single,
+                        noisy_actions=options["noisy_actions"][rows, :count],
+                        flow_time=options["flow_time"][rows, :count],
+                        initial_visual_memory=stack_memories([entry[4] for entry in members]))
+            velocity, condition = rollout(**call)
+            for position, (row, stream, episode, start, _) in enumerate(members):
+                memory = model.last_rollout_visual_memory.index_select(torch.tensor([position], device=velocity.device))
+                bank.finish(stream, episode, start + count * model.config.planning_stride,
+                            bool(batch["episode_end"][row]), memory)
+                velocities[row] = F.pad(velocity[position:position + 1], (0, 0, 0, 0, 0, length - count))
+                conditions[row] = F.pad(condition[position:position + 1], (0, 0, 0, 0, 0, 0, 0, length - count))
+            records.append((int(batch["instruction_id"][rows[0]]), count * len(rows),
+                            {name: getattr(model, name, None) for name in _METRICS},
+                            dict(model.last_wmrm_task_losses)))
     def reduce_metric(name, task=None):
         values = [(count, metrics[name])
                   for task_id, count, metrics, _ in records

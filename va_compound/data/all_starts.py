@@ -13,7 +13,10 @@ MEMORY_CONTRACT = "offset_replay_tbptt8_v1"
 
 
 class AllStartsWindowBatchSampler(EpisodeWindowBatchSampler):
-    def __init__(self, payload, batch_size, seed=0, mixed_tasks_per_batch=2, rank=0, world_size=1):
+    def __init__(self, payload, batch_size, seed=0, mixed_tasks_per_batch=2, rank=0, world_size=1, *, epoch_offset=0):
+        self.epoch_offset = int(epoch_offset)
+        if self.epoch_offset < 0:
+            raise ValueError("epoch offset must be nonnegative")
         starts = payload["crop_start"]
         replay_payload = dict(payload, episode_id=payload["episode_id"] * 15 + starts.remainder(15))
         super().__init__(replay_payload, batch_size, seed, mixed_tasks_per_batch, rank, world_size)
@@ -27,7 +30,7 @@ class AllStartsWindowBatchSampler(EpisodeWindowBatchSampler):
     def _build(self):
         if self._cached_epoch == self.epoch:
             return
-        rng = random.Random(self.seed + self.epoch)
+        rng = random.Random(self.seed + self.epoch_offset + self.epoch)
         windows = {}
         for task, episodes in sorted(self.rows.items()):
             windows[task] = {}
@@ -84,7 +87,10 @@ class AllStartsWindowBatchSampler(EpisodeWindowBatchSampler):
             self.epoch, self._cached_epoch, self._schedule = old
 
     def state_dict(self):
-        return dict(super().state_dict(), contract=SAMPLING_CONTRACT)
+        state = dict(super().state_dict(), contract=SAMPLING_CONTRACT)
+        if self.epoch_offset:
+            state["epoch_offset"] = self.epoch_offset
+        return state
 
 
 class AllStartsStreamDataset:

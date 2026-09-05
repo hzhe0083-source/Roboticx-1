@@ -199,6 +199,24 @@ def _parser() -> argparse.ArgumentParser:
         default="episode_contiguous_p15_v1",
         help="Window sampling strategy for LIBERO joint training.",
     )
+    parser.add_argument(
+        "--episode-microbatch",
+        type=int,
+        default=1,
+        help="Microbatch size for joint episode window rollout execution.",
+    )
+    parser.add_argument(
+        "--joint-observation-chunk",
+        type=int,
+        default=0,
+        help="Chunk size for joint frontend dual-tower observation encoding (0 disables chunking).",
+    )
+    parser.add_argument(
+        "--epoch-offset",
+        type=int,
+        default=0,
+        help="Epoch offset for all-starts stream sampling.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--gpus", type=int, default=2)
     return parser
@@ -396,6 +414,10 @@ def preflight(args: argparse.Namespace) -> None:
     _qwen_weight_file(args.qwen)
     if not math.isfinite(args.world_state_loss_weight) or args.world_state_loss_weight < 0:
         raise ValueError("--world-state-loss-weight must be finite and >= 0")
+    if args.episode_microbatch < 1:
+        raise ValueError("--episode-microbatch must be >= 1")
+    if args.joint_observation_chunk < 0:
+        raise ValueError("--joint-observation-chunk must be >= 0")
     config = _fresh_config(
         va_last3_cross_attn=args.va_last3_cross_attn,
         dino_qwen_cross_modal_bridge=args.dino_qwen_cross_modal_bridge,
@@ -421,6 +443,7 @@ def preflight(args: argparse.Namespace) -> None:
                 mixed_tasks_per_batch=args.mixed_tasks,
                 rank=0,
                 world_size=args.gpus,
+                epoch_offset=args.epoch_offset,
             )
             lengths = temp_sampler.epoch_lengths(max(2, args.epochs))
             args.stage1_steps = sum(lengths[:2])
@@ -454,6 +477,7 @@ def _prepare_batch(
     joint_text=None,
     joint_tasks=None,
     joint_fusion=None,
+    joint_observation_chunk: int = 0,
 ) -> dict:
     raw = dict(raw)
     frames = raw.pop("frames")
@@ -463,8 +487,11 @@ def _prepare_batch(
         if cached_vision is not None or layerwise_cross_modal:
             raise ValueError("joint frontend cannot use independent feature caches or legacy bridge")
         instructions = [joint_tasks[int(task_id)] for task_id in raw["instruction_id"]]
+        encode_kwargs = {"grid": 16}
+        if joint_observation_chunk:
+            encode_kwargs["observation_chunk_size"] = joint_observation_chunk
         raw["vision_tokens"], raw["language_hidden"], raw["language_mask"] = encode_dual_tower_batch(
-            frames, instructions, vision, joint_text, joint_fusion, device, grid=16,
+            frames, instructions, vision, joint_text, joint_fusion, device, **encode_kwargs,
         )
     else:
         encoded = cached_vision
@@ -672,6 +699,7 @@ def _atomic_checkpoint(
     episode_runtime_states: list[dict] | None = None,
     window_sampling: str = "episode_contiguous_p15_v1",
     epoch_lengths: list[int] | None = None,
+    execution_config: dict | None = None,
 ) -> None:
     if window_sampling == ALL_STARTS_SAMPLING_CONTRACT:
         if config.architecture_version != "dual_tower_h15_v1" or not epoch_lengths or any(n < 1 for n in epoch_lengths):
@@ -832,6 +860,7 @@ def _atomic_checkpoint(
                 "dino_qwen_cross_modal_bridge": (
                     config.dino_qwen_cross_modal_bridge
                 ),
+                **({"execution_config": dict(execution_config)} if execution_config is not None else {}),
             },
         },
         temporary,
@@ -866,6 +895,10 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("the H50/P15 run requires --prev-dropout 1")
     if args.lr != 1e-5 or args.lr_new != 3e-5:
         raise ValueError("the all-fixes run requires --lr 1e-5 --lr-new 3e-5")
+    if args.episode_microbatch < 1:
+        raise ValueError("--episode-microbatch must be >= 1")
+    if args.joint_observation_chunk < 0:
+        raise ValueError("--joint-observation-chunk must be >= 0")
 
     is_all_starts = getattr(args, "window_sampling", None) == ALL_STARTS_SAMPLING_CONTRACT
     if is_all_starts and getattr(args, "architecture_version", "legacy") != "dual_tower_h15_v1":
@@ -892,6 +925,7 @@ def train(args: argparse.Namespace) -> None:
                 mixed_tasks_per_batch=args.mixed_tasks,
                 rank=0,
                 world_size=args.gpus,
+                epoch_offset=args.epoch_offset,
             )
             lengths = temp_sampler.epoch_lengths(max(2, args.epochs))
             args.stage1_steps = sum(lengths[:2])
@@ -937,6 +971,7 @@ def train(args: argparse.Namespace) -> None:
                 mixed_tasks_per_batch=args.mixed_tasks,
                 rank=topology.rank,
                 world_size=topology.world_size,
+                epoch_offset=args.epoch_offset,
             )
             world_sampler = AllStartsWindowBatchSampler(
                 world_dataset.payload,
@@ -945,6 +980,7 @@ def train(args: argparse.Namespace) -> None:
                 mixed_tasks_per_batch=args.mixed_tasks,
                 rank=topology.rank,
                 world_size=topology.world_size,
+                epoch_offset=args.epoch_offset,
             )
         elif joint_frontend:
             sampler = EpisodeWindowBatchSampler(
@@ -1072,6 +1108,7 @@ def train(args: argparse.Namespace) -> None:
                 world_dataset.payload.get("metadata") or {}
             )
         model = VACompoundPolicy(config)
+        model.episode_microbatch = args.episode_microbatch
         if source is not None:
             model.load_state_dict(source["model"], strict=True)
         else:
@@ -1241,6 +1278,20 @@ def train(args: argparse.Namespace) -> None:
             }
             if not joint_frontend:
                 required.pop("architecture_version")
+            if "execution_config" in contract:
+                expected_exec = {
+                    "episode_microbatch": args.episode_microbatch,
+                    "joint_observation_chunk": args.joint_observation_chunk,
+                }
+                if contract["execution_config"] != expected_exec:
+                    raise ValueError(
+                        f"execution_config mismatch: checkpoint {contract['execution_config']} != args {expected_exec}"
+                    )
+            else:
+                if args.episode_microbatch != 1 or args.joint_observation_chunk != 0:
+                    raise ValueError(
+                        "checkpoints without execution_config require default episode_microbatch=1 and joint_observation_chunk=0"
+                    )
             mismatch = {
                 key: (contract.get(key), value)
                 for key, value in required.items()
@@ -1475,6 +1526,7 @@ def train(args: argparse.Namespace) -> None:
                         encode_batch=args.encode_batch,
                         joint_text=text_backbone, joint_tasks=tasks,
                         joint_fusion=model.dual_tower_fusion,
+                        joint_observation_chunk=args.joint_observation_chunk,
                         world=False,
                         prev_dropout=args.prev_dropout,
                         layerwise_cross_modal=active_stage2 and not joint_frontend,
@@ -1578,6 +1630,7 @@ def train(args: argparse.Namespace) -> None:
                         encode_batch=args.encode_batch,
                         joint_text=text_backbone, joint_tasks=tasks,
                         joint_fusion=model.dual_tower_fusion,
+                        joint_observation_chunk=args.joint_observation_chunk,
                         world=True,
                         prev_dropout=args.prev_dropout,
                         layerwise_cross_modal=active_stage2 and not joint_frontend,
@@ -1811,6 +1864,10 @@ def train(args: argparse.Namespace) -> None:
                         episode_runtime_states=episode_runtime_states,
                         window_sampling=getattr(args, "window_sampling", "episode_contiguous_p15_v1"),
                         epoch_lengths=epoch_lengths if is_all_starts else None,
+                        execution_config={
+                            "episode_microbatch": args.episode_microbatch,
+                            "joint_observation_chunk": args.joint_observation_chunk,
+                        },
                     )
                     print(f"saved {args.save} at step {step}", flush=True)
                 barrier(topology)

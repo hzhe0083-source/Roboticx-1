@@ -687,6 +687,7 @@ def _validate_run_schedule(payload: dict, args: argparse.Namespace) -> tuple[int
             args.mixed_tasks,
             rank=0,
             world_size=args.gpus,
+            epoch_offset=getattr(args, "epoch_offset", 0),
         )
         epoch_lens = sampler.epoch_lengths(args.epochs)
         first_epoch_length = epoch_lens[0]

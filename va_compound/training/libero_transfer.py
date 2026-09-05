@@ -1,5 +1,5 @@
 """Validate an explicit fixed-H15 to all-starts training transfer."""
-from va_compound.data.libero import H15_DATA_CONTRACT
+from va_compound.data.libero import H15_DATA_CONTRACT, ALL_STARTS_DATA_CONTRACT
 
 TRANSFER_INITIALIZATION = "continue_h15_fixed_to_all_starts_v1"
 
@@ -13,11 +13,26 @@ def is_all_starts_transfer(args):
 def validate_transfer_source(source):
     config = source.get("config", {})
     contract = source.get("training_contract", {})
+    rebatch = contract.get("data_contract") == ALL_STARTS_DATA_CONTRACT
+    if rebatch:
+        lengths = contract.get("epoch_lengths", [])
+        state = source.get("sampler_state", {})
+        epoch = state.get("epoch", -1)
+        if not isinstance(epoch, int) or not 0 < epoch <= len(lengths) or state.get("batch_cursor") != 0:
+            raise ValueError("rebatching requires a completed epoch boundary")
+        if source.get("global_step") != sum(lengths[:epoch]):
+            raise ValueError("rebatching epoch progress mismatch")
+        other = source.get("world_sampler_state", {})
+        if other != state:
+            raise ValueError("rebatching requires aligned action/world samplers")
+        runtime = source.get("episode_runtime_states", [])
+        if not runtime or any(bank.get("entries") for rank in runtime for bank in rank.values()):
+            raise ValueError("rebatching requires empty epoch-boundary memory")
     required = {
         "architecture_version": "dual_tower_h15_v1",
-        "data_contract": H15_DATA_CONTRACT,
+        "data_contract": ALL_STARTS_DATA_CONTRACT if rebatch else H15_DATA_CONTRACT,
         "action_horizon": 15,
-        "memory_contract": "episode_tbptt8_v1",
+        "memory_contract": "offset_replay_tbptt8_v1" if rebatch else "episode_tbptt8_v1",
         "execution_gradient_contract": "h15_unified_live_va_v1",
         "main_vision_joint_trained": True,
         "flow_prefix_weight": 1.0,
