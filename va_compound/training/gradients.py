@@ -4,6 +4,7 @@ import argparse
 from collections.abc import Callable
 import math
 import random
+from types import GeneratorType
 
 import numpy as np
 import torch
@@ -59,22 +60,28 @@ def backward_pcgrad(
     for index, loss_or_forward in enumerate(task_losses):
         deferred = callable(loss_or_forward)
         result = loss_or_forward() if deferred else loss_or_forward
-        losses = result if isinstance(result, list) else [result]
-        if not losses:
+        streamed = isinstance(result, GeneratorType)
+        losses = result if streamed else (result if isinstance(result, list) else [result])
+        if not streamed and not losses:
             raise ValueError("PCGrad task forward returned no losses")
+        accumulated = [None] * len(trainable)
+        seen = False
         for group_index, loss in enumerate(losses):
+            seen = True
             if not isinstance(loss, Tensor) or loss.ndim != 0:
                 raise ValueError("PCGrad task losses must be scalar tensors")
             gradients = torch.autograd.grad(
-                loss,
-                trainable,
-                retain_graph=(
-                    group_index + 1 < len(losses)
-                    if deferred
-                    else index + 1 < len(task_losses)
-                ),
-                allow_unused=True,
+                loss, trainable,
+                retain_graph=False if streamed else (
+                    group_index + 1 < len(losses) if deferred else index + 1 < len(task_losses)
+                ), allow_unused=True,
             )
+            if streamed:
+                for j, gradient in enumerate(gradients):
+                    if gradient is not None:
+                        accumulated[j] = gradient if accumulated[j] is None else accumulated[j] + gradient
+                del loss, gradients
+                continue
             for parameter, gradient in zip(trainable, gradients, strict=True):
                 parameter.grad = gradient
             if topology is not None:
@@ -99,6 +106,26 @@ def backward_pcgrad(
                     for parameter, use_compact in zip(trainable, compact, strict=True)
                 ]
             )
+            for parameter in trainable:
+                parameter.grad = None
+        if streamed:
+            if not seen:
+                raise ValueError("empty gradient microbatch stream")
+            for parameter, gradient in zip(trainable, accumulated, strict=True):
+                parameter.grad = gradient
+            if topology is not None:
+                if allow_inactive_ranks and topology.is_distributed:
+                    import torch.distributed as dist
+                    present = torch.tensor([p.grad is not None for p in trainable], device=trainable[0].device, dtype=torch.int32)
+                    dist.all_reduce(present, op=dist.ReduceOp.MAX)
+                    for parameter, used in zip(trainable, present.tolist(), strict=True):
+                        if used and parameter.grad is None:
+                            parameter.grad = torch.zeros_like(parameter)
+                reduce_update_gradients(trainable_named, topology)
+            task_gradients.append([
+                None if p.grad is None else p.grad.detach().to(dtype=torch.bfloat16 if compacted else p.grad.dtype).clone()
+                for p, compacted in zip(trainable, compact, strict=True)
+            ])
             for parameter in trainable:
                 parameter.grad = None
     if len(task_gradients) == 1 and allow_single_task:

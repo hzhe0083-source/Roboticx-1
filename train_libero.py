@@ -39,6 +39,7 @@ from va_compound.data.all_starts import (
     SAMPLING_CONTRACT as ALL_STARTS_SAMPLING_CONTRACT,
 )
 from va_compound.training.episode_memory import EpisodeMemoryBank
+from va_compound.training.gradient_microbatch import task_microbatch_forward
 from va_compound.training.libero_transfer import is_all_starts_transfer, validate_transfer_source, TRANSFER_INITIALIZATION
 from va_compound.vision.dual_tower_batch import encode_dual_tower_batch
 from va_compound.vision.encoding import _dino_main_online_encode
@@ -217,6 +218,7 @@ def _parser() -> argparse.ArgumentParser:
         default=0,
         help="Epoch offset for all-starts stream sampling.",
     )
+    parser.add_argument("--gradient-microbatch", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--gpus", type=int, default=2)
     return parser
@@ -414,6 +416,8 @@ def preflight(args: argparse.Namespace) -> None:
     _qwen_weight_file(args.qwen)
     if not math.isfinite(args.world_state_loss_weight) or args.world_state_loss_weight < 0:
         raise ValueError("--world-state-loss-weight must be finite and >= 0")
+    if args.gradient_microbatch < 0 or (args.gradient_microbatch and (args.mixed_tasks != 1 or args.architecture_version != "dual_tower_h15_v1")):
+        raise ValueError("gradient microbatch requires single-task H15 and a nonnegative size")
     if args.episode_microbatch < 1:
         raise ValueError("--episode-microbatch must be >= 1")
     if args.joint_observation_chunk < 0:
@@ -895,6 +899,8 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("the H50/P15 run requires --prev-dropout 1")
     if args.lr != 1e-5 or args.lr_new != 3e-5:
         raise ValueError("the all-fixes run requires --lr 1e-5 --lr-new 3e-5")
+    if args.gradient_microbatch < 0 or (args.gradient_microbatch and (args.mixed_tasks != 1 or args.architecture_version != "dual_tower_h15_v1")):
+        raise ValueError("gradient microbatch requires single-task H15 and a nonnegative size")
     if args.episode_microbatch < 1:
         raise ValueError("--episode-microbatch must be >= 1")
     if args.joint_observation_chunk < 0:
@@ -1282,13 +1288,16 @@ def train(args: argparse.Namespace) -> None:
                 expected_exec = {
                     "episode_microbatch": args.episode_microbatch,
                     "joint_observation_chunk": args.joint_observation_chunk,
+                    "gradient_microbatch": args.gradient_microbatch,
                 }
-                if contract["execution_config"] != expected_exec:
+                saved_exec = dict(contract["execution_config"])
+                saved_exec.setdefault("gradient_microbatch", 0)
+                if saved_exec != expected_exec:
                     raise ValueError(
                         f"execution_config mismatch: checkpoint {contract['execution_config']} != args {expected_exec}"
                     )
             else:
-                if args.episode_microbatch != 1 or args.joint_observation_chunk != 0:
+                if args.episode_microbatch != 1 or args.joint_observation_chunk != 0 or args.gradient_microbatch:
                     raise ValueError(
                         "checkpoints without execution_config require default episode_microbatch=1 and joint_observation_chunk=0"
                     )
@@ -1597,7 +1606,7 @@ def train(args: argparse.Namespace) -> None:
                                     prefix_count = act_mask[..., :split].sum().float()
                                     tail_count = act_mask[..., split:].sum().float()
                                     local_count = prefix_weight * prefix_count + tail_weight * tail_count
-                            if joint_frontend:
+                            if joint_frontend and not args.gradient_microbatch:
                                 loss = _rescale_task_loss_by_effective_count(
                                     loss, local_count, topology, device
                                 )
@@ -1605,7 +1614,7 @@ def train(args: argparse.Namespace) -> None:
                             action_values.append(loss.detach())
                     return losses
 
-                action_forwards.append(action_forward)
+                action_forwards.append(task_microbatch_forward(action_forward, task_raw, group_ids, args.gradient_microbatch, topology, device) if args.gradient_microbatch else action_forward)
             world_values = []
             world_forwards = []
             for offset in range(0, len(world_tasks), group_size):
@@ -1689,7 +1698,7 @@ def train(args: argparse.Namespace) -> None:
                     ordered = []
                     for task_id in group_ids:
                         loss = losses[task_id]
-                        if joint_frontend:
+                        if joint_frontend and not args.gradient_microbatch:
                             task_mask = world_batch["instruction_id"] == task_id
                             local_count = (
                                 world_batch["decision_count"][task_mask].sum().float()
@@ -1703,7 +1712,7 @@ def train(args: argparse.Namespace) -> None:
                     world_values.extend(loss.detach() for loss in ordered)
                     return ordered
 
-                world_forwards.append(world_forward)
+                world_forwards.append(task_microbatch_forward(world_forward, task_raw, group_ids, args.gradient_microbatch, topology, device) if args.gradient_microbatch else world_forward)
 
             action_private = []
             world_private = []
@@ -1867,6 +1876,7 @@ def train(args: argparse.Namespace) -> None:
                         execution_config={
                             "episode_microbatch": args.episode_microbatch,
                             "joint_observation_chunk": args.joint_observation_chunk,
+                    "gradient_microbatch": args.gradient_microbatch,
                         },
                     )
                     print(f"saved {args.save} at step {step}", flush=True)
