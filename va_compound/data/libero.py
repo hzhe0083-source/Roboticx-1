@@ -237,6 +237,11 @@ def _validate_run_schedule(payload: dict, args: argparse.Namespace) -> tuple[int
         "suites": list(metadata["suites"]),
         "local_task_ids": None if n_tasks == 40 else local_task_ids,
     }
+    if getattr(args, "architecture_version", "legacy") == "dual_tower_expert_v1":
+        for key in ("stage1_steps", "epochs", "max_steps"):
+            expected.pop(key)
+        if args.stage1_steps < 0 or args.epochs < 1:
+            raise ValueError("joint training requires stage1_steps >= 0 and epochs >= 1")
     mismatch = {key: (actual[key], value) for key, value in expected.items() if actual[key] != value}
     if mismatch:
         raise ValueError(f"LIBERO run schedule mismatch: {mismatch}")

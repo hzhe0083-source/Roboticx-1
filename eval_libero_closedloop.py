@@ -23,6 +23,7 @@ import torch
 
 from va_compound import VACompoundConfig, VACompoundPolicy
 from va_compound.backbones import QwenTextBackbone, TimmActionVisionBackbone
+from va_compound.vision.dual_tower_batch import encode_dual_tower_batch
 from va_compound.vision.encoding import _dino_main_online_encode
 
 
@@ -255,6 +256,8 @@ def _language_caches(
         }
         _load_exact_parameters(text, qwen_state, expected, state_label)
         text.eval()
+        if model.config.architecture_version == "dual_tower_expert_v1":
+            return {spec["global_task_id"]: None for spec in specs}, text
         with torch.inference_mode():
             hidden_by_layer, mask = text.encode_trainable(
                 [spec["language"] for spec in specs],
@@ -321,6 +324,8 @@ def rollout_trial(
     policy_seed: int,
     previous_action_zero: bool,
     dual_view: bool,
+    joint_text=None,
+    instruction: str | None = None,
 ) -> tuple[bool, int]:
     np.random.seed(policy_seed)
     torch.manual_seed(policy_seed)
@@ -357,25 +362,36 @@ def rollout_trial(
             model.config.dino_qwen_cross_modal_bridge
             and model.runtime_dino_qwen_bridge_enabled
         )
-        encoded = _dino_main_online_encode(
-            frames,
-            vision,
-            device,
-            encode_batch=4,
-            grid=model.config.main_vision_grid,
-            window=model.config.main_vision_frames,
-            return_last_layers=(
-                model.config.dino_qwen_cross_modal_layers
-                if layerwise_bridge
-                else 0
-            ),
-        )
-        if layerwise_bridge:
-            tokens, cross_modal_vision_layers = encoded
-            cross_modal_vision_layers = cross_modal_vision_layers[:, 0]
-        else:
-            tokens = encoded
+        if model.config.architecture_version == "dual_tower_expert_v1":
+            if joint_text is None or instruction is None:
+                raise ValueError("joint evaluation requires live Qwen and instruction")
+            tokens, language, mask = encode_dual_tower_batch(
+                frames, [instruction], vision, joint_text, model.dual_tower_fusion,
+                device, grid=model.config.main_vision_grid,
+            )
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+                language_cache = model.build_language_cache(language[:, 0], mask[:, 0])
             cross_modal_vision_layers = None
+        else:
+            encoded = _dino_main_online_encode(
+                frames,
+                vision,
+                device,
+                encode_batch=4,
+                grid=model.config.main_vision_grid,
+                window=model.config.main_vision_frames,
+                return_last_layers=(
+                    model.config.dino_qwen_cross_modal_layers
+                    if layerwise_bridge
+                    else 0
+                ),
+            )
+            if layerwise_bridge:
+                tokens, cross_modal_vision_layers = encoded
+                cross_modal_vision_layers = cross_modal_vision_layers[:, 0]
+            else:
+                tokens = encoded
+                cross_modal_vision_layers = None
         tokens = tokens[:, 0]
         expected_tokens = (
             1,
@@ -420,6 +436,8 @@ def rollout_trial(
                 model.config.action_horizon,
                 model.config.hidden_dim,
             )
+            if model.config.architecture_version == "dual_tower_expert_v1":
+                expected_condition = (1, 3, model.config.action_horizon, model.config.hidden_dim)
             if condition.shape != expected_condition or not torch.isfinite(condition).all():
                 raise RuntimeError(f"invalid VA condition: {tuple(condition.shape)}")
             chunk = model.decode_actions(condition, steps=flow_steps)[0].float()
@@ -507,6 +525,9 @@ def main() -> None:
     if missing_task_ids:
         raise ValueError(f"task ids are absent from payload: {missing_task_ids}")
     config = VACompoundConfig(**checkpoint["config"])
+    joint_frontend = config.architecture_version == "dual_tower_expert_v1"
+    if joint_frontend and args.qwen is None:
+        raise ValueError("dual_tower_expert_v1 evaluation requires --qwen")
     expected = {
         "num_layers": 8,
         "action_dim": 7,
@@ -606,6 +627,8 @@ def main() -> None:
         )
     else:
         raise ValueError(f"unsupported LIBERO action horizon: {config.action_horizon}")
+    if joint_frontend:
+        expected.update(va_last3_cross_attn=False, dino_qwen_cross_modal_bridge=False, flow_layers=3)
     mismatches = {
         key: (getattr(config, key), value)
         for key, value in expected.items()
@@ -829,6 +852,24 @@ def main() -> None:
                     else "frozen_dino_base_block23_norm_v1"
                 ),
             )
+        if joint_frontend:
+            stage1_steps = contract.get("stage1_steps")
+            total_steps = contract.get("total_steps")
+            if not isinstance(stage1_steps, int) or stage1_steps < 0:
+                raise ValueError("joint checkpoint requires a nonnegative stage1_steps")
+            if not isinstance(total_steps, int) or total_steps < 1:
+                raise ValueError("joint checkpoint requires a positive total_steps")
+            required_four_suite.update(
+                initialization="fresh_dual_tower_expert_v1",
+                fusion_initialization="dual_tower_zero_output_v1",
+                architecture_version="dual_tower_expert_v1",
+                source_global_step=-1,
+                stage1_steps=stage1_steps,
+                total_steps=total_steps,
+                optimizer_initialization="fresh_adamw_v1",
+                qwen_world_cache="per_observation_joint_live_v1",
+                stage1_world_current_vision_cache="disabled_joint_frontend_v1",
+            )
         bad_four_suite = {
             key: (contract.get(key), value)
             for key, value in required_four_suite.items()
@@ -905,7 +946,10 @@ def main() -> None:
         task_caches, task_language_layers = _language_caches(
             payload, model, device, task_specs, checkpoint, args.qwen
         )
-    if device.type == "cuda" and any(
+    joint_text = task_language_layers if joint_frontend else None
+    if joint_frontend:
+        task_language_layers = {}
+    if not joint_frontend and device.type == "cuda" and any(
         layer.key.dtype != torch.bfloat16 or layer.value.dtype != torch.bfloat16
         for cache in task_caches.values()
         for layer in cache.layers
@@ -996,6 +1040,8 @@ def main() -> None:
                     policy_seed=trial_seed,
                     previous_action_zero=previous_action_zero,
                     dual_view=dual_view,
+                    joint_text=joint_text,
+                    instruction=spec["language"],
                 )
                 task_wins += int(success)
                 records.append(

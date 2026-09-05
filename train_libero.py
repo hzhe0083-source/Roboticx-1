@@ -30,6 +30,7 @@ from va_compound.training.prefetch import (
     peer_prefetch_must_wait_for_commit,
 )
 from va_compound.data.samplers import TaskLocalityWeightedSampler
+from va_compound.vision.dual_tower_batch import encode_dual_tower_batch
 from va_compound.vision.encoding import _dino_main_online_encode
 from va_compound.utils.exact_resume import _sha256_file
 from va_compound.training.rollout import rollout_policy
@@ -167,6 +168,12 @@ def _parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    parser.add_argument(
+        "--architecture-version",
+        choices=("legacy", "dual_tower_expert_v1"),
+        default="legacy",
+        help="Architecture version for LIBERO policy training.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--gpus", type=int, default=2)
     return parser
@@ -176,8 +183,11 @@ def _fresh_config(
     *,
     va_last3_cross_attn: bool = False,
     dino_qwen_cross_modal_bridge: bool = False,
+    architecture_version: str = "legacy",
 ) -> VACompoundConfig:
     return VACompoundConfig(
+        architecture_version=architecture_version,
+        fusion_pair_count=len(FUSION_LAYERS),
         language_dim=1024,
         vision_dim=1024,
         hidden_dim=1024,
@@ -186,7 +196,7 @@ def _fresh_config(
         action_horizon=ACTION_HORIZON,
         action_dim=7,
         proprio_dim=9,
-        flow_layers=6,
+        flow_layers=3 if architecture_version == "dual_tower_expert_v1" else 6,
         flow_hidden_dim=512,
         dropout=0.0,
         mode="bidir_va",
@@ -224,14 +234,16 @@ def _fresh_config(
         main_vision_temporal=True,
         main_vision_temporal_scale=1.0,
         slot_free_policy=True,
-        va_last3_cross_attn=va_last3_cross_attn,
-        dino_qwen_cross_modal_bridge=dino_qwen_cross_modal_bridge,
+        va_last3_cross_attn=va_last3_cross_attn if architecture_version == "legacy" else False,
+        dino_qwen_cross_modal_bridge=dino_qwen_cross_modal_bridge if architecture_version == "legacy" else False,
         dino_qwen_cross_modal_layers=len(FUSION_LAYERS),
     )
 
 
 def _initialize_scratch_fusion(model: VACompoundPolicy) -> None:
     """Identity at step zero, but with a full-matrix learning path."""
+    if getattr(getattr(model, "config", None), "architecture_version", "legacy") == "dual_tower_expert_v1":
+        return
     if model.dino_qwen_bridge is None or model.va_last3_readout is None:
         raise ValueError("scratch LIBERO requires both fusion readers")
     readers = [
@@ -282,6 +294,8 @@ def _validate_model_contract(config: VACompoundConfig) -> None:
         "dino_qwen_cross_modal_bridge": True,
         "dino_qwen_cross_modal_layers": len(FUSION_LAYERS),
     }
+    if config.architecture_version == "dual_tower_expert_v1":
+        expected.update(va_last3_cross_attn=False, dino_qwen_cross_modal_bridge=False, flow_layers=3, fusion_pair_count=6)
     mismatch = {
         key: (getattr(config, key), value)
         for key, value in expected.items()
@@ -297,7 +311,9 @@ def preflight(args: argparse.Namespace) -> None:
             raise FileNotFoundError(path)
     if args.resume is not None and args.resume_weights is not None:
         raise ValueError("choose --resume or --resume-weights, not both")
-    if args.resume is None and args.resume_weights is None:
+    if args.resume_weights is not None and getattr(args, "architecture_version", "legacy") != "legacy":
+        raise ValueError("dual_tower_expert_v1 requires fresh initialization or same-version --resume; --resume-weights is legacy-only")
+    if args.resume is None and args.resume_weights is None and getattr(args, "architecture_version", "legacy") == "legacy":
         raise ValueError("dense continuation requires --resume-weights")
     if args.resume is not None and not args.resume.is_file():
         raise FileNotFoundError(args.resume)
@@ -330,6 +346,7 @@ def preflight(args: argparse.Namespace) -> None:
     config = _fresh_config(
         va_last3_cross_attn=args.va_last3_cross_attn,
         dino_qwen_cross_modal_bridge=args.dino_qwen_cross_modal_bridge,
+        architecture_version=getattr(args, "architecture_version", "legacy"),
     )
     _validate_model_contract(config)
     if config.dino_qwen_cross_modal_bridge:
@@ -355,26 +372,37 @@ def _prepare_batch(
     prev_dropout: float,
     layerwise_cross_modal: bool,
     cached_vision: Tensor | None = None,
+    joint_text=None,
+    joint_tasks=None,
+    joint_fusion=None,
 ) -> dict:
     raw = dict(raw)
     frames = raw.pop("frames")
     if isinstance(frames, Tensor):
         frames = frames.cpu().numpy()
-    encoded = cached_vision
-    if encoded is None:
-        encoded = _dino_main_online_encode(
-            frames,
-            vision,
-            device,
-            encode_batch=encode_batch,
-            grid=16,
-            window=5,
-            return_last_layers=len(FUSION_LAYERS) if layerwise_cross_modal else 0,
+    if joint_fusion is not None:
+        if cached_vision is not None or layerwise_cross_modal:
+            raise ValueError("joint frontend cannot use independent feature caches or legacy bridge")
+        instructions = [joint_tasks[int(task_id)] for task_id in raw["instruction_id"]]
+        raw["vision_tokens"], raw["language_hidden"], raw["language_mask"] = encode_dual_tower_batch(
+            frames, instructions, vision, joint_text, joint_fusion, device, grid=16,
         )
-    if layerwise_cross_modal:
-        raw["vision_tokens"], raw["dino_last4"] = encoded
     else:
-        raw["vision_tokens"] = encoded
+        encoded = cached_vision
+        if encoded is None:
+            encoded = _dino_main_online_encode(
+                frames,
+                vision,
+                device,
+                encode_batch=encode_batch,
+                grid=16,
+                window=5,
+                return_last_layers=len(FUSION_LAYERS) if layerwise_cross_modal else 0,
+            )
+        if layerwise_cross_modal:
+            raw["vision_tokens"], raw["dino_last4"] = encoded
+        else:
+            raw["vision_tokens"] = encoded
     target = raw.pop("world_target_frames", None)
     if world:
         if target is None:
@@ -448,6 +476,8 @@ def _encode_language(
     *,
     layerwise_cross_modal: bool,
 ) -> None:
+    if batch["language_hidden"].ndim == 4:
+        return
     task_ids, inverse = torch.unique(
         batch["instruction_id"], sorted=True, return_inverse=True
     )
@@ -535,10 +565,10 @@ def _atomic_checkpoint(
             "source_checkpoint": source_checkpoint,
             "source_global_step": source_global_step,
             "training_contract": {
-                "initialization": FRESH_INITIALIZATION,
+                "initialization": ("fresh_dual_tower_expert_v1" if config.architecture_version == "dual_tower_expert_v1" else FRESH_INITIALIZATION),
                 "source_checkpoint": source_checkpoint,
                 "source_global_step": source_global_step,
-                "optimizer_initialization": "continued_from_source_v1",
+                "optimizer_initialization": ("fresh_adamw_v1" if config.architecture_version == "dual_tower_expert_v1" else "continued_from_source_v1"),
                 "suites": list(run_metadata["suites"]),
                 "n_tasks": int(run_metadata["n_tasks"]),
                 "task_specs": list(run_metadata["task_specs"]),
@@ -575,7 +605,7 @@ def _atomic_checkpoint(
                 "qwen_base_readout": "layer23_final_norm",
                 "qwen_fusion_reduce": "none",
                 "qwen_gradient_checkpointing": False,
-                "qwen_world_cache": "same_step_action_detached_v1",
+                "qwen_world_cache": ("per_observation_joint_live_v1" if config.architecture_version == "dual_tower_expert_v1" else "same_step_action_detached_v1"),
                 "qwen_base_sha256": qwen_sha256,
                 "main_vision_joint_trained": step > stage1_steps,
                 "main_vision_trainable_layers": FUSION_LAYERS,
@@ -584,10 +614,11 @@ def _atomic_checkpoint(
                 "main_vision_frames": 5,
                 "vision_input": "agentview_history4_plus_current_wrist_v2",
                 "world_target_view": "eye_in_hand_rgb",
-                "fusion_initialization": "zero_output_unit_gate_v1",
+                "fusion_initialization": ("dual_tower_zero_output_v1" if config.architecture_version == "dual_tower_expert_v1" else "zero_output_unit_gate_v1"),
+                "architecture_version": config.architecture_version,
                 "main_vision_encode_batch": encode_batch,
                 "stage1_world_current_vision_cache": (
-                    "same_step_action_detached_v1"
+                    "disabled_joint_frontend_v1" if config.architecture_version == "dual_tower_expert_v1" else "same_step_action_detached_v1"
                 ),
                 "flow_slot_identity": "per_slot_action_condition_v1",
                 "flow_prefix_steps": EXECUTION_HORIZON,
@@ -625,11 +656,13 @@ def _stage2_enabled(step: int, stage1_steps: int) -> bool:
 def train(args: argparse.Namespace) -> None:
     if args.resume is not None and args.resume_weights is not None:
         raise ValueError("choose --resume or --resume-weights, not both")
+    if args.resume_weights is not None and getattr(args, "architecture_version", "legacy") != "legacy":
+        raise ValueError("dual_tower_expert_v1 requires fresh initialization or same-version --resume; --resume-weights is legacy-only")
     if args.resume is None and args.save.exists():
         raise FileExistsError(f"refusing to overwrite {args.save}")
     if args.reset_optimizer and args.resume is None:
         raise ValueError("--reset-optimizer requires --resume")
-    if args.resume is None and args.resume_weights is None:
+    if args.resume is None and args.resume_weights is None and getattr(args, "architecture_version", "legacy") == "legacy":
         raise ValueError("dense continuation requires --resume-weights")
     if args.prev_dropout != 1.0:
         raise ValueError("the H50/P15 run requires --prev-dropout 1")
@@ -733,8 +766,12 @@ def train(args: argparse.Namespace) -> None:
             else _fresh_config(
                 va_last3_cross_attn=args.va_last3_cross_attn,
                 dino_qwen_cross_modal_bridge=args.dino_qwen_cross_modal_bridge,
+                architecture_version=getattr(args, "architecture_version", "legacy"),
             )
         )
+        joint_frontend = config.architecture_version == "dual_tower_expert_v1"
+        if config.architecture_version != getattr(args, "architecture_version", "legacy"):
+            raise ValueError("checkpoint architecture mismatch; start a fresh run for the new architecture")
         _validate_model_contract(config)
         if config.dino_qwen_cross_modal_bridge:
             validate_cross_modal_language_contract(dataset.payload.get("metadata") or {})
@@ -783,20 +820,21 @@ def train(args: argparse.Namespace) -> None:
             start_step, args.stage1_steps
         )
         model.runtime_dino_qwen_bridge_enabled = stage2
-        model.dino_qwen_bridge.requires_grad_(stage2)
+        if model.dino_qwen_bridge is not None:
+            model.dino_qwen_bridge.requires_grad_(stage2)
         if stage2:
             vision.unfreeze_last(len(FUSION_LAYERS))
         if args.resume:
             contract = source.get("training_contract") or {}
-            if not source.get("source_checkpoint") or int(
+            if not joint_frontend and (not source.get("source_checkpoint") or int(
                 source.get("source_global_step", -1)
-            ) != 1_000:
+            ) != 1_000):
                 raise ValueError("dense resume checkpoint lacks T4 s1000 lineage")
             required = {
-                "initialization": FRESH_INITIALIZATION,
+                "initialization": ("fresh_dual_tower_expert_v1" if config.architecture_version == "dual_tower_expert_v1" else FRESH_INITIALIZATION),
                 "source_checkpoint": source["source_checkpoint"],
-                "source_global_step": 1_000,
-                "optimizer_initialization": "continued_from_source_v1",
+                "source_global_step": (int(source.get("source_global_step", -1)) if joint_frontend else 1_000),
+                "optimizer_initialization": ("fresh_adamw_v1" if config.architecture_version == "dual_tower_expert_v1" else "continued_from_source_v1"),
                 "data_contract": DATA_CONTRACT,
                 "data_sha256": data_sha256,
                 "suites": list(metadata["suites"]),
@@ -817,7 +855,7 @@ def train(args: argparse.Namespace) -> None:
                 "qwen_base_readout": "layer23_final_norm",
                 "qwen_fusion_reduce": "none",
                 "qwen_gradient_checkpointing": False,
-                "qwen_world_cache": "same_step_action_detached_v1",
+                "qwen_world_cache": ("per_observation_joint_live_v1" if config.architecture_version == "dual_tower_expert_v1" else "same_step_action_detached_v1"),
                 "wmrm_evidence": "post_va_vl_fused_tokens_v1",
                 "pcgrad_scope": "per_task_action_and_world_separate_dino_guard_v1",
                 "pcgrad_forward_grouping": pcgrad_forward_grouping,
@@ -832,15 +870,18 @@ def train(args: argparse.Namespace) -> None:
                 "vision_input": "agentview_history4_plus_current_wrist_v2",
                 "world_target_view": "eye_in_hand_rgb",
                 "wmrm_target_teacher": "shared_online_dino_block23_stopgrad_v1",
-                "fusion_initialization": "zero_output_unit_gate_v1",
+                "fusion_initialization": ("dual_tower_zero_output_v1" if config.architecture_version == "dual_tower_expert_v1" else "zero_output_unit_gate_v1"),
+                "architecture_version": config.architecture_version,
                 "main_vision_encode_batch": args.encode_batch,
                 "stage1_world_current_vision_cache": (
-                    "same_step_action_detached_v1"
+                    "disabled_joint_frontend_v1" if config.architecture_version == "dual_tower_expert_v1" else "same_step_action_detached_v1"
                 ),
                 "phase": (
                     "stage2_qwen_va_dino_joint" if stage2 else "stage1_qwen_va"
                 ),
             }
+            if not joint_frontend:
+                required.pop("architecture_version")
             mismatch = {
                 key: (contract.get(key), value)
                 for key, value in required.items()
@@ -866,7 +907,12 @@ def train(args: argparse.Namespace) -> None:
         fast_prefixes = (
             "action_queries",
             "state_projection.",
+            "state_type_embed.",
+            "dual_tower_fusion.",
             "flow_condition_projection.",
+            "action_expert.",
+            "tail_action_expert.",
+            "extension_action_expert.",
             "flow_head.",
             "tail_flow_head.",
             "extension_flow_head.",
@@ -943,12 +989,12 @@ def train(args: argparse.Namespace) -> None:
         lineage_source = (
             str(args.resume_weights)
             if args.resume_weights is not None
-            else source.get("source_checkpoint")
+            else (source or {}).get("source_checkpoint", "fresh_dual_tower_expert_v1")
         )
         lineage_step = (
             int(source["global_step"])
             if args.resume_weights is not None
-            else int(source.get("source_global_step", -1))
+            else int((source or {}).get("source_global_step", -1))
         )
         del source
         total_steps = planned_total_steps
@@ -978,7 +1024,8 @@ def train(args: argparse.Namespace) -> None:
             next_stage2 = _stage2_enabled(step, args.stage1_steps)
             if next_stage2 != active_stage2:
                 model.runtime_dino_qwen_bridge_enabled = next_stage2
-                model.dino_qwen_bridge.requires_grad_(next_stage2)
+                if model.dino_qwen_bridge is not None:
+                    model.dino_qwen_bridge.requires_grad_(next_stage2)
                 if next_stage2:
                     vision.unfreeze_last(len(FUSION_LAYERS))
                 else:
@@ -1042,9 +1089,11 @@ def train(args: argparse.Namespace) -> None:
                         vision=vision,
                         device=device,
                         encode_batch=args.encode_batch,
+                        joint_text=text_backbone, joint_tasks=tasks,
+                        joint_fusion=model.dual_tower_fusion,
                         world=False,
                         prev_dropout=args.prev_dropout,
-                        layerwise_cross_modal=active_stage2,
+                        layerwise_cross_modal=active_stage2 and not joint_frontend,
                     )
                     noisy, flow_time, target_velocity = sample_flow_matching_inputs(
                         batch["actions"]
@@ -1054,7 +1103,7 @@ def train(args: argparse.Namespace) -> None:
                             batch,
                             text_backbone,
                             tasks,
-                            layerwise_cross_modal=active_stage2,
+                            layerwise_cross_modal=active_stage2 and not joint_frontend,
                         )
                         for task_id in group_ids:
                             mask = batch["instruction_id"] == task_id
@@ -1067,7 +1116,7 @@ def train(args: argparse.Namespace) -> None:
                                 )
                                 if key in batch
                             }
-                            if not active_stage2:
+                            if not active_stage2 and not joint_frontend:
                                 action_vision_cache[task_id] = batch[
                                     "vision_tokens"
                                 ][mask].detach()
@@ -1114,7 +1163,7 @@ def train(args: argparse.Namespace) -> None:
                 def world_forward(task_raw=task_raw, group_ids=group_ids):
                     cached_vision = (
                         None
-                        if active_stage2
+                        if active_stage2 or joint_frontend
                         else torch.cat(
                             [action_vision_cache[task_id] for task_id in group_ids],
                             dim=0,
@@ -1125,28 +1174,31 @@ def train(args: argparse.Namespace) -> None:
                         vision=vision,
                         device=device,
                         encode_batch=args.encode_batch,
+                        joint_text=text_backbone, joint_tasks=tasks,
+                        joint_fusion=model.dual_tower_fusion,
                         world=True,
                         prev_dropout=args.prev_dropout,
-                        layerwise_cross_modal=active_stage2,
+                        layerwise_cross_modal=active_stage2 and not joint_frontend,
                         cached_vision=cached_vision,
                     )
                     world_noisy, world_time, _ = sample_flow_matching_inputs(
                         world_batch["actions"]
                     )
                     with feature_policy_autocast(device, True):
-                        first = action_language_cache[group_ids[0]]
-                        world_batch.update(
-                            {
-                                key: torch.cat(
-                                    [
-                                        action_language_cache[task_id][key]
-                                        for task_id in group_ids
-                                    ],
-                                    dim=0,
-                                )
-                                for key in first
-                            }
-                        )
+                        if not joint_frontend:
+                            first = action_language_cache[group_ids[0]]
+                            world_batch.update(
+                                {
+                                    key: torch.cat(
+                                        [
+                                            action_language_cache[task_id][key]
+                                            for task_id in group_ids
+                                        ],
+                                        dim=0,
+                                    )
+                                    for key in first
+                                }
+                            )
                         rollout_policy(
                             model,
                             world_batch,

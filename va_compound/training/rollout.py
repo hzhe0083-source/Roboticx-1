@@ -102,7 +102,8 @@ def rollout_policy(
         metric_tokens, action_dense_evidence, metric_g,
     )):
         raise ValueError("legacy encoder and servo training inputs are retired")
-    language_cache = model.build_language_cache(
+    per_decision_language = batch["language_hidden"].ndim == 4
+    language_cache = None if per_decision_language else model.build_language_cache(
         batch["language_hidden"], batch.get("language_mask")
     )
     visual_memory = None
@@ -169,6 +170,12 @@ def rollout_policy(
             )
     for time_index in range(batch["actions"].shape[1]):
         pre_step_visual_memory = visual_memory
+        if per_decision_language:
+            mask = batch.get("language_mask")
+            language_cache = model.build_language_cache(
+                batch["language_hidden"][:, time_index],
+                None if mask is None else mask[:, time_index],
+            )
         vision_in = batch["vision_tokens"][:, time_index]
         world_action = None
         if model.wmrm is not None:

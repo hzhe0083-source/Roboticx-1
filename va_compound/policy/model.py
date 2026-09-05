@@ -256,6 +256,9 @@ class VACompoundConfig:
     # 从旧架构迁移时初始行为等价；默认关闭保持旧 state_dict 键集合不变。
     metric_geometry_inject: bool = False
     metric_geometry_dim: int = 8
+    # 架构版本：'legacy' 保持既有行为与 state_dict；'dual_tower_expert_v1' 启用双塔融合与逐层动作专家。
+    architecture_version: str = "legacy"
+    fusion_pair_count: int = 6
 
     def __post_init__(self) -> None:
         if self.hidden_dim % self.num_heads:
@@ -491,6 +494,41 @@ class VACompoundConfig:
                 )
             if self.wmrm_inject != "all":
                 raise ValueError("peer_sync_h6 requires wmrm_inject=all")
+        if self.architecture_version not in ("legacy", "dual_tower_expert_v1"):
+            raise ValueError(
+                f"unsupported architecture_version: {self.architecture_version}"
+            )
+        if self.architecture_version == "dual_tower_expert_v1":
+            if self.num_layers < 3:
+                raise ValueError(
+                    "dual_tower_expert_v1 requires num_layers >= 3"
+                )
+            if self.direct_head or self.c2_controller:
+                raise ValueError(
+                    "dual_tower_expert_v1 rejects direct_head and c2_controller"
+                )
+            if self.dino_qwen_cross_modal_bridge:
+                raise ValueError(
+                    "dual_tower_expert_v1 rejects dino_qwen_cross_modal_bridge"
+                )
+            if self.va_last3_cross_attn:
+                raise ValueError(
+                    "dual_tower_expert_v1 rejects va_last3_cross_attn"
+                )
+            if self.local_slots:
+                raise ValueError(
+                    "dual_tower_expert_v1 rejects local_slots"
+                )
+            if self.memory_split:
+                raise ValueError(
+                    "dual_tower_expert_v1 rejects memory_split"
+                )
+            if self.flow_semantic or self.future_predict:
+                raise ValueError("dual_tower_expert_v1 rejects legacy semantic and future routes")
+            if self.fusion_pair_count < 1:
+                raise ValueError(
+                    "fusion_pair_count must be positive"
+                )
 
     def wmrm_stage_count(self) -> int:
         """World ``propose()`` steps per encode. Peer is one shorter than VA."""
@@ -2302,6 +2340,22 @@ class VACompoundPolicy(nn.Module):
         self.runtime_dino_qwen_bridge_enabled = True
         self.vision_projection = nn.Linear(config.vision_dim, config.hidden_dim)
         self.state_projection = nn.Linear(config.proprio_dim + config.action_dim, config.hidden_dim)
+        if config.architecture_version == "dual_tower_expert_v1":
+            from va_compound.vision.dual_tower_fusion import MultiLayerDualTowerFusion
+
+            # Learned type embedding table for vision (0) vs robot state (1) tokens
+            self.state_type_embed = nn.Embedding(2, config.hidden_dim)
+            nn.init.normal_(self.state_type_embed.weight, std=0.02)
+            self.dual_tower_fusion = MultiLayerDualTowerFusion(
+                vision_dim=config.vision_dim,
+                language_dim=config.language_dim,
+                hidden_dim=config.hidden_dim,
+                num_heads=config.num_heads,
+                num_pairs=config.fusion_pair_count,
+            )
+        else:
+            self.state_type_embed = None
+            self.dual_tower_fusion = None
         # Optional treatment-only modules must not consume the parent RNG stream:
         # otherwise a temporal/geometry ablation changes every common parameter
         # constructed below it and ceases to be a matched initialization.  Their
@@ -2574,7 +2628,7 @@ class VACompoundPolicy(nn.Module):
         flow_hidden_dim = config.flow_hidden_dim or config.hidden_dim
         self.flow_condition_projection = (
             nn.Identity()
-            if flow_hidden_dim == config.hidden_dim
+            if flow_hidden_dim == config.hidden_dim or config.architecture_version == "dual_tower_expert_v1"
             else nn.Linear(config.hidden_dim, flow_hidden_dim)
         )
         flow_head_kwargs = dict(
@@ -2593,22 +2647,57 @@ class VACompoundPolicy(nn.Module):
                 else None
             ),
         )
-        self.flow_head = FlowMatchingHead(**flow_head_kwargs)
-        self.tail_flow_head = (
-            FlowMatchingHead(**flow_head_kwargs)
-            if config.va_world_mode == "peer_sync_h6"
-            and config.action_horizon in {15, 50}
-            and (config.deployment_execution_horizon or config.planning_stride)
-            == 15
-            else None
-        )
-        self.extension_flow_head = (
-            FlowMatchingHead(**flow_head_kwargs)
-            if config.va_world_mode == "peer_sync_h6"
-            and config.action_horizon == 50
-            and (config.deployment_execution_horizon or config.planning_stride) == 15
-            else None
-        )
+        if config.architecture_version == "dual_tower_expert_v1":
+            from va_compound.policy.action_expert import LayerwiseActionExpert
+
+            expert_kwargs = dict(
+                action_dim=config.action_dim,
+                condition_dim=config.hidden_dim,
+                hidden_dim=flow_hidden_dim,
+                num_heads=config.num_heads,
+                max_horizon=config.action_horizon,
+                num_layers=3,
+                dropout=config.dropout,
+            )
+            self.action_expert = LayerwiseActionExpert(**expert_kwargs)
+            self.tail_action_expert = (
+                LayerwiseActionExpert(**expert_kwargs)
+                if config.va_world_mode == "peer_sync_h6"
+                and config.action_horizon in {15, 50}
+                and (config.deployment_execution_horizon or config.planning_stride)
+                == 15
+                else None
+            )
+            self.extension_action_expert = (
+                LayerwiseActionExpert(**expert_kwargs)
+                if config.va_world_mode == "peer_sync_h6"
+                and config.action_horizon == 50
+                and (config.deployment_execution_horizon or config.planning_stride) == 15
+                else None
+            )
+            self.flow_head = None
+            self.tail_flow_head = None
+            self.extension_flow_head = None
+        else:
+            self.action_expert = None
+            self.tail_action_expert = None
+            self.extension_action_expert = None
+            self.flow_head = FlowMatchingHead(**flow_head_kwargs)
+            self.tail_flow_head = (
+                FlowMatchingHead(**flow_head_kwargs)
+                if config.va_world_mode == "peer_sync_h6"
+                and config.action_horizon in {15, 50}
+                and (config.deployment_execution_horizon or config.planning_stride)
+                == 15
+                else None
+            )
+            self.extension_flow_head = (
+                FlowMatchingHead(**flow_head_kwargs)
+                if config.va_world_mode == "peer_sync_h6"
+                and config.action_horizon == 50
+                and (config.deployment_execution_horizon or config.planning_stride) == 15
+                else None
+            )
         if config.direct_head:
             self.direct_head = DirectActionHead(
                 hidden_dim=config.hidden_dim,
@@ -2851,6 +2940,14 @@ class VACompoundPolicy(nn.Module):
             raise ValueError(
                 "slot_free_policy rejects metric_g and metric_tokens at the policy boundary"
             )
+        if self.config.architecture_version == "dual_tower_expert_v1":
+            if (
+                cross_modal_vision_layers is not None
+                or cross_modal_language_layers is not None
+            ):
+                raise ValueError(
+                    "dual_tower_expert_v1 rejects legacy cross_modal_* inputs"
+                )
 
         target_dtype = self.vision_projection.weight.dtype
         vision = self.project_shared_eye(vision_tokens)
@@ -2902,7 +2999,20 @@ class VACompoundPolicy(nn.Module):
                 language_cache.attention_mask,
             )
 
-        action = self.action_queries[None].expand(vision.shape[0], -1, -1) + state[:, None]
+        if self.config.architecture_version == "dual_tower_expert_v1":
+            # Explicit robot state token: append projected state token with learned type embedding
+            # to vision tokens BEFORE the VA loop. Keep WM dino raw anchor unchanged.
+            state_token = state.unsqueeze(1)  # [B, 1, hidden_dim]
+            vision_type = self.state_type_embed(
+                torch.zeros(vision.shape[1], dtype=torch.long, device=vision.device)
+            ).unsqueeze(0)  # [1, N_vis, hidden_dim]
+            state_type = self.state_type_embed(
+                torch.ones(1, dtype=torch.long, device=state.device)
+            ).unsqueeze(0)  # [1, 1, hidden_dim]
+            vision = torch.cat((vision + vision_type, state_token + state_type), dim=1)
+            action = self.action_queries[None].expand(vision.shape[0], -1, -1)
+        else:
+            action = self.action_queries[None].expand(vision.shape[0], -1, -1) + state[:, None]
         if self.config.action_query_cond:
             # Qwen-conditioned action queries：语言摘要（第 0 层投影 key 的 mask 加权均值）
             # 经 MLP 生成每 horizon 步偏移，zero-init 保证初始等价于静态 query。
@@ -3089,7 +3199,7 @@ class VACompoundPolicy(nn.Module):
                         dense_input=dense_input,
                         action_dense_input=action_dense_input,
                     )
-                if self.va_last3_readout is not None and index >= len(self.layers) - 3:
+                if (self.va_last3_readout is not None or self.config.architecture_version == "dual_tower_expert_v1") and index >= len(self.layers) - 3:
                     last_action_layers.append(action)
             # The VA layers propose a speculative task update; with EVSM it
             # goes to scratch (task_spec) and is only committed after evidence
@@ -3215,7 +3325,7 @@ class VACompoundPolicy(nn.Module):
                 )
             vision, action = va_vision, va_action
             next_memory.append(vision)
-            if self.va_last3_readout is not None and index >= len(self.layers) - 3:
+            if (self.va_last3_readout is not None or self.config.architecture_version == "dual_tower_expert_v1") and index >= len(self.layers) - 3:
                 last_action_layers.append(action)
             if (
                 self.wmrm is not None
@@ -3370,7 +3480,11 @@ class VACompoundPolicy(nn.Module):
                 self.last_wmrm_pre_actions.append(snapshot_action)
         if self.va_last3_readout is not None:
             action = self.va_last3_readout(tuple(last_action_layers))
-        action_condition = self.action_norm(action)
+        action_condition = (
+            torch.stack([self.action_norm(value) for value in last_action_layers], dim=1)
+            if self.config.architecture_version == "dual_tower_expert_v1"
+            else self.action_norm(action)
+        )
         if return_visual_memory:
             return action_condition, VisualMemory(
                 layers=tuple(next_memory),
@@ -3385,7 +3499,28 @@ class VACompoundPolicy(nn.Module):
         flow_time: Tensor,
         semantic_context: Tensor | None = None,
     ) -> Tensor:
-        """``semantic_context``（第二轮架构重构）透传给 flow head（默认 None）。"""
+        """Predict velocity using the checkpoint's action decoder contract."""
+        if self.config.architecture_version == "dual_tower_expert_v1":
+            expected = (noisy_actions.shape[0], 3, self.config.action_horizon, self.config.hidden_dim)
+            if tuple(action_condition.shape) != expected:
+                raise ValueError(f"layerwise action condition must have shape {expected}")
+            if tuple(noisy_actions.shape) != (expected[0], expected[2], self.config.action_dim):
+                raise ValueError("noisy action shape does not match policy horizon")
+            if semantic_context is not None:
+                raise ValueError("layerwise Expert reads VA conditions, not separate semantic context")
+
+            def predict(head, context, horizon):
+                return head(noisy_actions[:, :horizon], tuple(context[:, i, :horizon] for i in range(3)), flow_time)
+
+            if self.tail_action_expert is None:
+                return predict(self.action_expert, action_condition, self.config.action_horizon)
+            prefix = predict(self.action_expert, action_condition, 6)
+            tail_condition = action_condition if self.config.tail_flow_condition_grad else action_condition.detach()
+            middle = predict(self.tail_action_expert, tail_condition, 15)[:, 6:15]
+            if self.config.action_horizon == 50:
+                tail = predict(self.extension_action_expert, tail_condition, 50)[:, 15:]
+                return torch.cat((prefix, middle, tail), dim=1)
+            return torch.cat((prefix, middle), dim=1)
         expected = (
             action_condition.shape[0],
             self.config.action_horizon,
