@@ -59,6 +59,7 @@ from va_compound.data.libero import (
     EXECUTION_HORIZON,
     FRESH_INITIALIZATION,
     FUSION_LAYERS,
+    H15_DATA_CONTRACT,
     JOINT_DATA_CONTRACT,
     LIBERO_SUITES,
     SEQUENCE,
@@ -174,7 +175,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--architecture-version",
-        choices=("legacy", "dual_tower_expert_v1"),
+        choices=("legacy", "dual_tower_expert_v1", "dual_tower_h15_v1"),
         default="legacy",
         help="Architecture version for LIBERO policy training.",
     )
@@ -196,6 +197,8 @@ def _fresh_config(
     architecture_version: str = "legacy",
     world_state_loss_weight: float = 1.0,
 ) -> VACompoundConfig:
+    is_h15 = architecture_version == "dual_tower_h15_v1"
+    is_joint = architecture_version in ("dual_tower_expert_v1", "dual_tower_h15_v1")
     return VACompoundConfig(
         architecture_version=architecture_version,
         fusion_pair_count=len(FUSION_LAYERS),
@@ -204,12 +207,12 @@ def _fresh_config(
         hidden_dim=1024,
         num_layers=8,
         num_heads=16,
-        action_horizon=ACTION_HORIZON,
+        action_horizon=15 if is_h15 else ACTION_HORIZON,
         action_dim=7,
         proprio_dim=9,
-        world_state_supervision=True if architecture_version == "dual_tower_expert_v1" else False,
+        world_state_supervision=True if is_joint else False,
         world_state_loss_weight=world_state_loss_weight,
-        flow_layers=3 if architecture_version == "dual_tower_expert_v1" else 6,
+        flow_layers=3 if is_joint else 6,
         flow_hidden_dim=512,
         dropout=0.0,
         mode="bidir_va",
@@ -255,7 +258,7 @@ def _fresh_config(
 
 def _initialize_scratch_fusion(model: VACompoundPolicy) -> None:
     """Identity at step zero, but with a full-matrix learning path."""
-    if getattr(getattr(model, "config", None), "architecture_version", "legacy") == "dual_tower_expert_v1":
+    if getattr(getattr(model, "config", None), "architecture_version", "legacy") in ("dual_tower_expert_v1", "dual_tower_h15_v1"):
         return
     if model.dino_qwen_bridge is None or model.va_last3_readout is None:
         raise ValueError("scratch LIBERO requires both fusion readers")
@@ -276,7 +279,7 @@ def _initialize_scratch_fusion(model: VACompoundPolicy) -> None:
 
 def _validate_model_contract(config: VACompoundConfig) -> None:
     expected = {
-        "action_horizon": 50,
+        "action_horizon": 15 if config.architecture_version == "dual_tower_h15_v1" else 50,
         "action_dim": 7,
         "proprio_dim": 9,
         "language_dim": 1024,
@@ -307,7 +310,7 @@ def _validate_model_contract(config: VACompoundConfig) -> None:
         "dino_qwen_cross_modal_bridge": True,
         "dino_qwen_cross_modal_layers": len(FUSION_LAYERS),
     }
-    if config.architecture_version == "dual_tower_expert_v1":
+    if config.architecture_version in ("dual_tower_expert_v1", "dual_tower_h15_v1"):
         expected.update(
             va_last3_cross_attn=False,
             dino_qwen_cross_modal_bridge=False,
@@ -321,12 +324,12 @@ def _validate_model_contract(config: VACompoundConfig) -> None:
         for key, value in expected.items()
         if getattr(config, key) != value
     }
-    if config.architecture_version == "dual_tower_expert_v1":
+    if config.architecture_version in ("dual_tower_expert_v1", "dual_tower_h15_v1"):
         weight = getattr(config, "world_state_loss_weight", None)
         if weight is None or not math.isfinite(weight) or weight < 0:
             mismatch["world_state_loss_weight"] = (weight, "finite >= 0")
     if mismatch:
-        raise ValueError(f"LIBERO H50/P15 model contract mismatch: {mismatch}")
+        raise ValueError(f"LIBERO H{config.action_horizon}/P15 model contract mismatch: {mismatch}")
 
 
 def preflight(args: argparse.Namespace) -> None:
@@ -336,7 +339,8 @@ def preflight(args: argparse.Namespace) -> None:
     if args.resume is not None and args.resume_weights is not None:
         raise ValueError("choose --resume or --resume-weights, not both")
     if args.resume_weights is not None and getattr(args, "architecture_version", "legacy") != "legacy":
-        raise ValueError("dual_tower_expert_v1 requires fresh initialization or same-version --resume; --resume-weights is legacy-only")
+        arch = getattr(args, "architecture_version", "legacy")
+        raise ValueError(f"{arch} requires fresh initialization or same-version --resume; --resume-weights is legacy-only")
     if args.resume is None and args.resume_weights is None and getattr(args, "architecture_version", "legacy") == "legacy":
         raise ValueError("dense continuation requires --resume-weights")
     if args.resume is not None and not args.resume.is_file():
@@ -638,24 +642,36 @@ def _atomic_checkpoint(
             "source_global_step": source_global_step,
             **({"episode_runtime_states": episode_runtime_states} if episode_runtime_states is not None else {}),
             "training_contract": {
-                "initialization": ("fresh_dual_tower_expert_v1" if config.architecture_version == "dual_tower_expert_v1" else FRESH_INITIALIZATION),
+                "initialization": (
+                    "fresh_dual_tower_h15_v1"
+                    if config.architecture_version == "dual_tower_h15_v1"
+                    else "fresh_dual_tower_expert_v1"
+                    if config.architecture_version == "dual_tower_expert_v1"
+                    else FRESH_INITIALIZATION
+                ),
                 "source_checkpoint": source_checkpoint,
                 "source_global_step": source_global_step,
-                "optimizer_initialization": ("fresh_adamw_v1" if config.architecture_version == "dual_tower_expert_v1" else "continued_from_source_v1"),
+                "optimizer_initialization": (
+                    "fresh_adamw_v1"
+                    if config.architecture_version in ("dual_tower_expert_v1", "dual_tower_h15_v1")
+                    else "continued_from_source_v1"
+                ),
                 "suites": list(run_metadata["suites"]),
                 "n_tasks": int(run_metadata["n_tasks"]),
                 "task_specs": list(run_metadata["task_specs"]),
                 "data_contract": (
-                    JOINT_DATA_CONTRACT
+                    H15_DATA_CONTRACT
+                    if config.architecture_version == "dual_tower_h15_v1"
+                    else JOINT_DATA_CONTRACT
                     if config.architecture_version == "dual_tower_expert_v1"
                     else DATA_CONTRACT
                 ),
                 "data_sha256": data_sha256,
                 "action_decoder": "conditional_flow_matching",
                 "flow_steps": 8,
-                "action_horizon": ACTION_HORIZON,
+                "action_horizon": config.action_horizon,
                 "sequence_length": SEQUENCE,
-                "memory_reset_every": 0 if config.architecture_version == "dual_tower_expert_v1" else SEQUENCE,
+                "memory_reset_every": 0 if config.architecture_version in ("dual_tower_expert_v1", "dual_tower_h15_v1") else SEQUENCE,
                 "planning_stride": EXECUTION_HORIZON,
                 "deployment_execution_horizon": EXECUTION_HORIZON,
                 "wmrm_cycle_steps": WORLD_HORIZON,
@@ -682,7 +698,11 @@ def _atomic_checkpoint(
                 "qwen_base_readout": "layer23_final_norm",
                 "qwen_fusion_reduce": "none",
                 "qwen_gradient_checkpointing": False,
-                "qwen_world_cache": ("per_observation_joint_live_v1" if config.architecture_version == "dual_tower_expert_v1" else "same_step_action_detached_v1"),
+                "qwen_world_cache": (
+                    "per_observation_joint_live_v1"
+                    if config.architecture_version in ("dual_tower_expert_v1", "dual_tower_h15_v1")
+                    else "same_step_action_detached_v1"
+                ),
                 "qwen_base_sha256": qwen_sha256,
                 "main_vision_joint_trained": step > stage1_steps,
                 "main_vision_trainable_layers": FUSION_LAYERS,
@@ -691,26 +711,36 @@ def _atomic_checkpoint(
                 "main_vision_frames": 5,
                 "vision_input": "agentview_history4_plus_current_wrist_v2",
                 "world_target_view": "eye_in_hand_rgb",
-                "fusion_initialization": ("dual_tower_zero_output_v1" if config.architecture_version == "dual_tower_expert_v1" else "zero_output_unit_gate_v1"),
+                "fusion_initialization": (
+                    "dual_tower_zero_output_v1"
+                    if config.architecture_version in ("dual_tower_expert_v1", "dual_tower_h15_v1")
+                    else "zero_output_unit_gate_v1"
+                ),
                 "architecture_version": config.architecture_version,
                 **(
                     {
-                        "execution_gradient_contract": "p15_live_h50_tail_detached_v1",
+                        "execution_gradient_contract": (
+                            "h15_unified_live_va_v1"
+                            if config.architecture_version == "dual_tower_h15_v1"
+                            else "p15_live_h50_tail_detached_v1"
+                        ),
                         "memory_contract": "episode_tbptt8_v1",
                         "state_delta_contract": "joint7_gripper2_unclipped_q01q99_delta_h15_v1",
                         "world_state_loss_weight": config.world_state_loss_weight,
                     }
-                    if config.architecture_version == "dual_tower_expert_v1"
+                    if config.architecture_version in ("dual_tower_expert_v1", "dual_tower_h15_v1")
                     else {}
                 ),
                 "main_vision_encode_batch": encode_batch,
                 "stage1_world_current_vision_cache": (
-                    "disabled_joint_frontend_v1" if config.architecture_version == "dual_tower_expert_v1" else "same_step_action_detached_v1"
+                    "disabled_joint_frontend_v1"
+                    if config.architecture_version in ("dual_tower_expert_v1", "dual_tower_h15_v1")
+                    else "same_step_action_detached_v1"
                 ),
                 "flow_slot_identity": "per_slot_action_condition_v1",
                 "flow_prefix_steps": EXECUTION_HORIZON,
-                "flow_prefix_weight": 3.0,
-                "flow_tail_weight": 1.0,
+                "flow_prefix_weight": 1.0 if config.architecture_version == "dual_tower_h15_v1" else 3.0,
+                "flow_tail_weight": 0.0 if config.architecture_version == "dual_tower_h15_v1" else 1.0,
                 "previous_action_input": "zero_v1",
                 "dino_fusion_layers": FUSION_LAYERS,
                 "dino_base_readout": "block23_norm",
@@ -747,11 +777,12 @@ def _unfreeze_vision_tail(vision, *, joint_frontend: bool) -> None:
 
 
 def train(args: argparse.Namespace) -> None:
-    joint_frontend = getattr(args, "architecture_version", "legacy") == "dual_tower_expert_v1"
+    joint_frontend = getattr(args, "architecture_version", "legacy") in ("dual_tower_expert_v1", "dual_tower_h15_v1")
     if args.resume is not None and args.resume_weights is not None:
         raise ValueError("choose --resume or --resume-weights, not both")
     if args.resume_weights is not None and getattr(args, "architecture_version", "legacy") != "legacy":
-        raise ValueError("dual_tower_expert_v1 requires fresh initialization or same-version --resume; --resume-weights is legacy-only")
+        arch = getattr(args, "architecture_version", "legacy")
+        raise ValueError(f"{arch} requires fresh initialization or same-version --resume; --resume-weights is legacy-only")
     if args.resume is None and args.save.exists():
         raise FileExistsError(f"refusing to overwrite {args.save}")
     if args.reset_optimizer and args.resume is None:
@@ -889,7 +920,7 @@ def train(args: argparse.Namespace) -> None:
                 world_state_loss_weight=args.world_state_loss_weight,
             )
         )
-        joint_frontend = config.architecture_version == "dual_tower_expert_v1"
+        joint_frontend = config.architecture_version in ("dual_tower_expert_v1", "dual_tower_h15_v1")
         if config.architecture_version != getattr(args, "architecture_version", "legacy"):
             raise ValueError("checkpoint architecture mismatch; start a fresh run for the new architecture")
         if source is not None and joint_frontend:
@@ -957,12 +988,24 @@ def train(args: argparse.Namespace) -> None:
             ) != 1_000):
                 raise ValueError("dense resume checkpoint lacks T4 s1000 lineage")
             required = {
-                "initialization": ("fresh_dual_tower_expert_v1" if config.architecture_version == "dual_tower_expert_v1" else FRESH_INITIALIZATION),
+                "initialization": (
+                    "fresh_dual_tower_h15_v1"
+                    if config.architecture_version == "dual_tower_h15_v1"
+                    else "fresh_dual_tower_expert_v1"
+                    if config.architecture_version == "dual_tower_expert_v1"
+                    else FRESH_INITIALIZATION
+                ),
                 "source_checkpoint": source["source_checkpoint"],
                 "source_global_step": (int(source.get("source_global_step", -1)) if joint_frontend else 1_000),
-                "optimizer_initialization": ("fresh_adamw_v1" if config.architecture_version == "dual_tower_expert_v1" else "continued_from_source_v1"),
+                "optimizer_initialization": (
+                    "fresh_adamw_v1"
+                    if joint_frontend
+                    else "continued_from_source_v1"
+                ),
                 "data_contract": (
-                    JOINT_DATA_CONTRACT
+                    H15_DATA_CONTRACT
+                    if config.architecture_version == "dual_tower_h15_v1"
+                    else JOINT_DATA_CONTRACT
                     if config.architecture_version == "dual_tower_expert_v1"
                     else DATA_CONTRACT
                 ),
@@ -971,6 +1014,12 @@ def train(args: argparse.Namespace) -> None:
                 "n_tasks": int(metadata["n_tasks"]),
                 "task_specs": list(metadata["task_specs"]),
                 "sequence_length": SEQUENCE,
+                **({
+                    "action_horizon": 15,
+                    "flow_prefix_steps": 15,
+                    "flow_prefix_weight": 1.0,
+                    "flow_tail_weight": 0.0,
+                } if config.architecture_version == "dual_tower_h15_v1" else {}),
                 "memory_reset_every": 0 if joint_frontend else SEQUENCE,
                 "stage1_steps": args.stage1_steps,
                 "total_steps": planned_total_steps,
@@ -985,7 +1034,11 @@ def train(args: argparse.Namespace) -> None:
                 "qwen_base_readout": "layer23_final_norm",
                 "qwen_fusion_reduce": "none",
                 "qwen_gradient_checkpointing": False,
-                "qwen_world_cache": ("per_observation_joint_live_v1" if config.architecture_version == "dual_tower_expert_v1" else "same_step_action_detached_v1"),
+                "qwen_world_cache": (
+                    "per_observation_joint_live_v1"
+                    if joint_frontend
+                    else "same_step_action_detached_v1"
+                ),
                 "wmrm_evidence": "post_va_vl_fused_tokens_v1",
                 "pcgrad_scope": "per_task_action_and_world_separate_dino_guard_v1",
                 "pcgrad_forward_grouping": pcgrad_forward_grouping,
@@ -1000,11 +1053,19 @@ def train(args: argparse.Namespace) -> None:
                 "vision_input": "agentview_history4_plus_current_wrist_v2",
                 "world_target_view": "eye_in_hand_rgb",
                 "wmrm_target_teacher": "shared_online_dino_block23_stopgrad_v1",
-                "fusion_initialization": ("dual_tower_zero_output_v1" if config.architecture_version == "dual_tower_expert_v1" else "zero_output_unit_gate_v1"),
+                "fusion_initialization": (
+                    "dual_tower_zero_output_v1"
+                    if joint_frontend
+                    else "zero_output_unit_gate_v1"
+                ),
                 "architecture_version": config.architecture_version,
                 **(
                     {
-                        "execution_gradient_contract": "p15_live_h50_tail_detached_v1",
+                        "execution_gradient_contract": (
+                            "h15_unified_live_va_v1"
+                            if config.architecture_version == "dual_tower_h15_v1"
+                            else "p15_live_h50_tail_detached_v1"
+                        ),
                         "memory_contract": "episode_tbptt8_v1",
                         "state_delta_contract": "joint7_gripper2_unclipped_q01q99_delta_h15_v1",
                         "world_state_loss_weight": config.world_state_loss_weight,
@@ -1014,7 +1075,9 @@ def train(args: argparse.Namespace) -> None:
                 ),
                 "main_vision_encode_batch": args.encode_batch,
                 "stage1_world_current_vision_cache": (
-                    "disabled_joint_frontend_v1" if config.architecture_version == "dual_tower_expert_v1" else "same_step_action_detached_v1"
+                    "disabled_joint_frontend_v1"
+                    if joint_frontend
+                    else "same_step_action_detached_v1"
                 ),
                 "phase": (
                     "stage2_qwen_va_dino_joint" if stage2 else "stage1_qwen_va"
@@ -1143,7 +1206,12 @@ def train(args: argparse.Namespace) -> None:
         lineage_source = (
             str(args.resume_weights)
             if args.resume_weights is not None
-            else (source or {}).get("source_checkpoint", "fresh_dual_tower_expert_v1")
+            else (source or {}).get(
+                "source_checkpoint",
+                "fresh_dual_tower_h15_v1"
+                if config.architecture_version == "dual_tower_h15_v1"
+                else "fresh_dual_tower_expert_v1",
+            )
         )
         lineage_step = (
             int(source["global_step"])
@@ -1296,6 +1364,9 @@ def train(args: argparse.Namespace) -> None:
                                 else value
                                 for key, value in batch.items()
                             }
+                            is_h15 = config.architecture_version == "dual_tower_h15_v1"
+                            prefix_weight = 1.0 if is_h15 else 3.0
+                            tail_weight = 0.0 if is_h15 else 1.0
                             if joint_frontend and not bool(task_batch["action_valid_mask"].any()):
                                 loss = predicted[mask].sum() * 0
                                 local_count = 0.0
@@ -1305,15 +1376,15 @@ def train(args: argparse.Namespace) -> None:
                                     target_velocity[mask],
                                     task_batch,
                                     prefix_steps=EXECUTION_HORIZON,
-                                    prefix_weight=3.0,
-                                    tail_weight=1.0,
+                                    prefix_weight=prefix_weight,
+                                    tail_weight=tail_weight,
                                 )[0]
                                 if joint_frontend:
                                     act_mask = task_batch["action_valid_mask"]
                                     split = min(EXECUTION_HORIZON, act_mask.shape[-1])
                                     prefix_count = act_mask[..., :split].sum().float()
                                     tail_count = act_mask[..., split:].sum().float()
-                                    local_count = 3.0 * prefix_count + 1.0 * tail_count
+                                    local_count = prefix_weight * prefix_count + tail_weight * tail_count
                             if joint_frontend:
                                 loss = _rescale_task_loss_by_effective_count(
                                     loss, local_count, topology, device

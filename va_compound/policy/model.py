@@ -496,11 +496,16 @@ class VACompoundConfig:
                 )
             if self.wmrm_inject != "all":
                 raise ValueError("peer_sync_h6 requires wmrm_inject=all")
-        if self.architecture_version not in ("legacy", "dual_tower_expert_v1"):
+        if self.architecture_version not in ("legacy", "dual_tower_expert_v1", "dual_tower_h15_v1"):
             raise ValueError(
                 f"unsupported architecture_version: {self.architecture_version}"
             )
-        if self.architecture_version == "dual_tower_expert_v1":
+        if self.architecture_version == "dual_tower_h15_v1":
+            if self.action_horizon != 15 or self.planning_stride != 15 or self.deployment_execution_horizon != 15:
+                raise ValueError("unified H15 requires prediction and execution horizons of 15")
+            if self.va_world_mode != "peer_sync_h6" or not self.wmrm or self.wmrm_cycle_steps != 15:
+                raise ValueError("unified H15 requires a P15 peer World endpoint")
+        if self.architecture_version in ("dual_tower_expert_v1", "dual_tower_h15_v1"):
             if self.num_layers < 3:
                 raise ValueError(
                     "dual_tower_expert_v1 requires num_layers >= 3"
@@ -2342,7 +2347,7 @@ class VACompoundPolicy(nn.Module):
         self.runtime_dino_qwen_bridge_enabled = True
         self.vision_projection = nn.Linear(config.vision_dim, config.hidden_dim)
         self.state_projection = nn.Linear(config.proprio_dim + config.action_dim, config.hidden_dim)
-        if config.architecture_version == "dual_tower_expert_v1":
+        if config.architecture_version in ("dual_tower_expert_v1", "dual_tower_h15_v1"):
             from va_compound.vision.dual_tower_fusion import MultiLayerDualTowerFusion
 
             # Learned type embedding table for vision (0) vs robot state (1) tokens
@@ -2413,7 +2418,7 @@ class VACompoundPolicy(nn.Module):
         else:
             self.wmrm = None
         if config.world_state_supervision:
-            if config.architecture_version != "dual_tower_expert_v1" or self.wmrm is None:
+            if config.architecture_version not in ("dual_tower_expert_v1", "dual_tower_h15_v1") or self.wmrm is None:
                 raise ValueError("state transition supervision requires joint World architecture")
             if not math.isfinite(config.world_state_loss_weight) or config.world_state_loss_weight < 0:
                 raise ValueError("World state loss weight must be finite and nonnegative")
@@ -2523,6 +2528,7 @@ class VACompoundPolicy(nn.Module):
             nn.init.zeros_(self.lang_to_query[-1].bias)
 
         protected_action_prefixes = (
+            () if config.architecture_version == "dual_tower_h15_v1" else
             (6, 15)
             if config.va_world_mode == "peer_sync_h6"
             and config.action_horizon == 50
@@ -2641,7 +2647,7 @@ class VACompoundPolicy(nn.Module):
         flow_hidden_dim = config.flow_hidden_dim or config.hidden_dim
         self.flow_condition_projection = (
             nn.Identity()
-            if flow_hidden_dim == config.hidden_dim or config.architecture_version == "dual_tower_expert_v1"
+            if flow_hidden_dim == config.hidden_dim or config.architecture_version in ("dual_tower_expert_v1", "dual_tower_h15_v1")
             else nn.Linear(config.hidden_dim, flow_hidden_dim)
         )
         flow_head_kwargs = dict(
@@ -2660,7 +2666,7 @@ class VACompoundPolicy(nn.Module):
                 else None
             ),
         )
-        if config.architecture_version == "dual_tower_expert_v1":
+        if config.architecture_version in ("dual_tower_expert_v1", "dual_tower_h15_v1"):
             from va_compound.policy.action_expert import LayerwiseActionExpert
 
             expert_kwargs = dict(
@@ -2675,7 +2681,8 @@ class VACompoundPolicy(nn.Module):
             self.action_expert = LayerwiseActionExpert(**expert_kwargs)
             self.tail_action_expert = (
                 LayerwiseActionExpert(**expert_kwargs)
-                if config.va_world_mode == "peer_sync_h6"
+                if config.architecture_version == "dual_tower_expert_v1"
+                and config.va_world_mode == "peer_sync_h6"
                 and config.action_horizon in {15, 50}
                 and (config.deployment_execution_horizon or config.planning_stride)
                 == 15
@@ -2953,7 +2960,7 @@ class VACompoundPolicy(nn.Module):
             raise ValueError(
                 "slot_free_policy rejects metric_g and metric_tokens at the policy boundary"
             )
-        if self.config.architecture_version == "dual_tower_expert_v1":
+        if self.config.architecture_version in ("dual_tower_expert_v1", "dual_tower_h15_v1"):
             if (
                 cross_modal_vision_layers is not None
                 or cross_modal_language_layers is not None
@@ -3012,7 +3019,7 @@ class VACompoundPolicy(nn.Module):
                 language_cache.attention_mask,
             )
 
-        if self.config.architecture_version == "dual_tower_expert_v1":
+        if self.config.architecture_version in ("dual_tower_expert_v1", "dual_tower_h15_v1"):
             # Explicit robot state token: append projected state token with learned type embedding
             # to vision tokens BEFORE the VA loop. Keep WM dino raw anchor unchanged.
             state_token = state.unsqueeze(1)  # [B, 1, hidden_dim]
@@ -3213,7 +3220,7 @@ class VACompoundPolicy(nn.Module):
                         dense_input=dense_input,
                         action_dense_input=action_dense_input,
                     )
-                if (self.va_last3_readout is not None or self.config.architecture_version == "dual_tower_expert_v1") and index >= len(self.layers) - 3:
+                if (self.va_last3_readout is not None or self.config.architecture_version in ("dual_tower_expert_v1", "dual_tower_h15_v1")) and index >= len(self.layers) - 3:
                     last_action_layers.append(action)
             # The VA layers propose a speculative task update; with EVSM it
             # goes to scratch (task_spec) and is only committed after evidence
@@ -3340,7 +3347,7 @@ class VACompoundPolicy(nn.Module):
                 )
             vision, action = va_vision, va_action
             next_memory.append(vision)
-            if (self.va_last3_readout is not None or self.config.architecture_version == "dual_tower_expert_v1") and index >= len(self.layers) - 3:
+            if (self.va_last3_readout is not None or self.config.architecture_version in ("dual_tower_expert_v1", "dual_tower_h15_v1")) and index >= len(self.layers) - 3:
                 last_action_layers.append(action)
             if (
                 self.wmrm is not None
@@ -3504,7 +3511,7 @@ class VACompoundPolicy(nn.Module):
             action = self.va_last3_readout(tuple(last_action_layers))
         action_condition = (
             torch.stack([self.action_norm(value) for value in last_action_layers], dim=1)
-            if self.config.architecture_version == "dual_tower_expert_v1"
+            if self.config.architecture_version in ("dual_tower_expert_v1", "dual_tower_h15_v1")
             else self.action_norm(action)
         )
         if return_visual_memory:
@@ -3522,7 +3529,7 @@ class VACompoundPolicy(nn.Module):
         semantic_context: Tensor | None = None,
     ) -> Tensor:
         """Predict velocity using the checkpoint's action decoder contract."""
-        if self.config.architecture_version == "dual_tower_expert_v1":
+        if self.config.architecture_version in ("dual_tower_expert_v1", "dual_tower_h15_v1"):
             expected = (noisy_actions.shape[0], 3, self.config.action_horizon, self.config.hidden_dim)
             if tuple(action_condition.shape) != expected:
                 raise ValueError(f"layerwise action condition must have shape {expected}")

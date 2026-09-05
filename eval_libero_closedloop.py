@@ -22,7 +22,7 @@ import numpy as np
 import torch
 
 from va_compound import VACompoundConfig, VACompoundPolicy
-from va_compound.data.libero import JOINT_DATA_CONTRACT, _validate_data
+from va_compound.data.libero import H15_DATA_CONTRACT, JOINT_DATA_CONTRACT, _validate_data
 from va_compound.backbones import QwenTextBackbone, TimmActionVisionBackbone
 from va_compound.vision.dual_tower_batch import encode_dual_tower_batch
 from va_compound.vision.encoding import _dino_main_online_encode
@@ -257,7 +257,7 @@ def _language_caches(
         }
         _load_exact_parameters(text, qwen_state, expected, state_label)
         text.eval()
-        if model.config.architecture_version == "dual_tower_expert_v1":
+        if model.config.architecture_version in ("dual_tower_expert_v1", "dual_tower_h15_v1"):
             return {spec["global_task_id"]: None for spec in specs}, text
         with torch.inference_mode():
             hidden_by_layer, mask = text.encode_trainable(
@@ -363,7 +363,7 @@ def rollout_trial(
             model.config.dino_qwen_cross_modal_bridge
             and model.runtime_dino_qwen_bridge_enabled
         )
-        if model.config.architecture_version == "dual_tower_expert_v1":
+        if model.config.architecture_version in ("dual_tower_expert_v1", "dual_tower_h15_v1"):
             if joint_text is None or instruction is None:
                 raise ValueError("joint evaluation requires live Qwen and instruction")
             tokens, language, mask = encode_dual_tower_batch(
@@ -437,7 +437,7 @@ def rollout_trial(
                 model.config.action_horizon,
                 model.config.hidden_dim,
             )
-            if model.config.architecture_version == "dual_tower_expert_v1":
+            if model.config.architecture_version in ("dual_tower_expert_v1", "dual_tower_h15_v1"):
                 expected_condition = (1, 3, model.config.action_horizon, model.config.hidden_dim)
             if condition.shape != expected_condition or not torch.isfinite(condition).all():
                 raise RuntimeError(f"invalid VA condition: {tuple(condition.shape)}")
@@ -500,6 +500,7 @@ def main() -> None:
         DENSE_WORLD_LAST6_DATA_CONTRACT,
         T8_DENSE_WORLD_LAST6_DATA_CONTRACT,
         JOINT_DATA_CONTRACT,
+        H15_DATA_CONTRACT,
     }
     dual_view = payload_contract in {
         DUAL_VIEW_DATA_CONTRACT,
@@ -507,6 +508,7 @@ def main() -> None:
         DENSE_WORLD_LAST6_DATA_CONTRACT,
         T8_DENSE_WORLD_LAST6_DATA_CONTRACT,
         JOINT_DATA_CONTRACT,
+        H15_DATA_CONTRACT,
     }
     world_horizon = (
         15
@@ -516,11 +518,16 @@ def main() -> None:
             DENSE_WORLD_LAST6_DATA_CONTRACT,
             T8_DENSE_WORLD_LAST6_DATA_CONTRACT,
             JOINT_DATA_CONTRACT,
+            H15_DATA_CONTRACT,
         }
         else None
     )
     dense_t4 = payload_contract == DENSE_WORLD_LAST6_DATA_CONTRACT
-    dense_t8 = payload_contract in {T8_DENSE_WORLD_LAST6_DATA_CONTRACT, JOINT_DATA_CONTRACT}
+    dense_t8 = payload_contract in {
+        T8_DENSE_WORLD_LAST6_DATA_CONTRACT,
+        JOINT_DATA_CONTRACT,
+        H15_DATA_CONTRACT,
+    }
     dense_continuation = dense_t4 or dense_t8
     task_specs = _task_specs(payload)
     specs_by_id = {spec["global_task_id"]: spec for spec in task_specs}
@@ -529,13 +536,22 @@ def main() -> None:
     if missing_task_ids:
         raise ValueError(f"task ids are absent from payload: {missing_task_ids}")
     config = VACompoundConfig(**checkpoint["config"])
-    joint_frontend = config.architecture_version == "dual_tower_expert_v1"
-    if joint_frontend != (payload_contract == JOINT_DATA_CONTRACT):
+    joint_frontend = config.architecture_version in ("dual_tower_expert_v1", "dual_tower_h15_v1")
+    expected_data_contract = (
+        H15_DATA_CONTRACT
+        if config.architecture_version == "dual_tower_h15_v1"
+        else JOINT_DATA_CONTRACT
+        if config.architecture_version == "dual_tower_expert_v1"
+        else None
+    )
+    if joint_frontend != (payload_contract in {JOINT_DATA_CONTRACT, H15_DATA_CONTRACT}) or (
+        joint_frontend and payload_contract != expected_data_contract
+    ):
         raise ValueError("checkpoint architecture and data coverage contract disagree")
     if joint_frontend:
         _validate_data(args.data, architecture_version=config.architecture_version)
     if joint_frontend and args.qwen is None:
-        raise ValueError("dual_tower_expert_v1 evaluation requires --qwen")
+        raise ValueError(f"{config.architecture_version} evaluation requires --qwen")
     expected = {
         "num_layers": 8,
         "action_dim": 7,
@@ -611,7 +627,7 @@ def main() -> None:
         expected_wmrm = True
         data_contract = (
             payload_contract
-            if four_suite and config.action_horizon == 50
+            if four_suite and (config.action_horizon == 50 or joint_frontend)
             else f"libero_spatial_h15p{execution_horizon}_t4_v1"
         )
         protocol = (
@@ -636,7 +652,11 @@ def main() -> None:
     else:
         raise ValueError(f"unsupported LIBERO action horizon: {config.action_horizon}")
     if joint_frontend:
-        protocol = "libero_fixed_init_t8_p15complete_dual_tower_expert_v1"
+        protocol = (
+            "libero_fixed_init_t8_p15complete_dual_tower_h15_v1"
+            if config.architecture_version == "dual_tower_h15_v1"
+            else "libero_fixed_init_t8_p15complete_dual_tower_expert_v1"
+        )
         expected.update(va_last3_cross_attn=False, dino_qwen_cross_modal_bridge=False, flow_layers=3, fusion_pair_count=6, tail_flow_condition_grad=False)
     mismatches = {
         key: (getattr(config, key), value)
@@ -870,20 +890,32 @@ def main() -> None:
                 raise ValueError("joint checkpoint requires a nonnegative stage1_steps")
             if not isinstance(total_steps, int) or total_steps < 1:
                 raise ValueError("joint checkpoint requires a positive total_steps")
+            is_h15 = config.architecture_version == "dual_tower_h15_v1"
             required_four_suite.update(
-                initialization="fresh_dual_tower_expert_v1",
+                initialization=(
+                    "fresh_dual_tower_h15_v1"
+                    if is_h15
+                    else "fresh_dual_tower_expert_v1"
+                ),
                 suites=list(metadata["suites"]),
+                action_horizon=config.action_horizon,
+                flow_prefix_weight=1.0 if is_h15 else 3.0,
+                flow_tail_weight=0.0 if is_h15 else 1.0,
                 memory_reset_every=0,
                 memory_contract="episode_tbptt8_v1",
                 state_delta_contract="joint7_gripper2_unclipped_q01q99_delta_h15_v1",
                 world_state_loss_weight=config.world_state_loss_weight,
                 fusion_initialization="dual_tower_zero_output_v1",
-                architecture_version="dual_tower_expert_v1",
+                architecture_version=config.architecture_version,
                 source_global_step=-1,
                 stage1_steps=stage1_steps,
                 total_steps=total_steps,
                 optimizer_initialization="fresh_adamw_v1",
-                execution_gradient_contract="p15_live_h50_tail_detached_v1",
+                execution_gradient_contract=(
+                    "h15_unified_live_va_v1"
+                    if is_h15
+                    else "p15_live_h50_tail_detached_v1"
+                ),
                 qwen_world_cache="per_observation_joint_live_v1",
                 stage1_world_current_vision_cache="disabled_joint_frontend_v1",
             )

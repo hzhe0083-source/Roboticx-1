@@ -16,6 +16,7 @@ from va_compound.data.libero import (
     EXECUTION_HORIZON,
     FUSION_LAYERS,
     JOINT_DATA_CONTRACT,
+    H15_DATA_CONTRACT,
     LIBERO_SUITES,
     SEQUENCE,
     SOURCE_DATA_CONTRACT,
@@ -129,7 +130,9 @@ def _window_max_start(length: int, *, joint_frontend: bool) -> int:
 def prepare_data(args: argparse.Namespace) -> None:
     import h5py
 
-    joint_frontend = getattr(args, "architecture_version", "legacy") == "dual_tower_expert_v1"
+    is_h15 = getattr(args, "architecture_version", "legacy") == "dual_tower_h15_v1"
+    action_horizon = EXECUTION_HORIZON if is_h15 else ACTION_HORIZON
+    joint_frontend = getattr(args, "architecture_version", "legacy") in ("dual_tower_expert_v1", "dual_tower_h15_v1")
     if joint_frontend and not args.dense_windows:
         raise ValueError("dual_tower_expert_v1 requires --dense-windows")
     if args.windows_per_demo < 1:
@@ -237,27 +240,27 @@ def prepare_data(args: argparse.Namespace) -> None:
 
                         for i in range(SEQUENCE):
                             decision = int(storage_decisions[i])
-                            chunk = raw_actions[decision + 1 : decision + 1 + ACTION_HORIZON]
+                            chunk = raw_actions[decision + 1 : decision + 1 + action_horizon]
                             if i < valid_k:
-                                valid = np.arange(ACTION_HORIZON) < len(chunk)
+                                valid = np.arange(action_horizon) < len(chunk)
                                 if len(chunk) < EXECUTION_HORIZON:
                                     raise RuntimeError("every valid joint decision must have a real P15 prefix")
-                                if len(chunk) < ACTION_HORIZON:
+                                if len(chunk) < action_horizon:
                                     chunk = np.concatenate(
                                         (
                                             chunk,
-                                            np.repeat(chunk[-1:], ACTION_HORIZON - len(chunk), axis=0),
+                                            np.repeat(chunk[-1:], action_horizon - len(chunk), axis=0),
                                         ),
                                         axis=0,
                                     )
                                 delta = 2.0 * (raw_state[decision + 15] - raw_state[decision]) / state_delta_scale
                             else:
-                                valid = np.zeros(ACTION_HORIZON, dtype=bool)
-                                if len(chunk) < ACTION_HORIZON:
+                                valid = np.zeros(action_horizon, dtype=bool)
+                                if len(chunk) < action_horizon:
                                     chunk = np.concatenate(
                                         (
                                             chunk,
-                                            np.repeat(chunk[-1:], ACTION_HORIZON - len(chunk), axis=0),
+                                            np.repeat(chunk[-1:], action_horizon - len(chunk), axis=0),
                                         ),
                                         axis=0,
                                     )
@@ -313,17 +316,17 @@ def prepare_data(args: argparse.Namespace) -> None:
                         chunks, masks = [], []
                         for decision in decisions:
                             chunk = raw_actions[
-                                decision + 1 : decision + 1 + ACTION_HORIZON
+                                decision + 1 : decision + 1 + action_horizon
                             ]
-                            valid = np.arange(ACTION_HORIZON) < len(chunk)
+                            valid = np.arange(action_horizon) < len(chunk)
                             if len(chunk) < EXECUTION_HORIZON:
                                 raise RuntimeError("every H50 row must have a real P15 prefix")
-                            if len(chunk) < ACTION_HORIZON:
+                            if len(chunk) < action_horizon:
                                 chunk = np.concatenate(
                                     (
                                         chunk,
                                         np.repeat(
-                                            chunk[-1:], ACTION_HORIZON - len(chunk), axis=0
+                                            chunk[-1:], action_horizon - len(chunk), axis=0
                                         ),
                                     ),
                                     axis=0,
@@ -364,7 +367,7 @@ def prepare_data(args: argparse.Namespace) -> None:
     language_hidden = torch.zeros((len(actions), 1, 1), dtype=torch.float16)
     language_mask = torch.ones((len(actions), 1), dtype=torch.bool)
     contract_str = (
-        JOINT_DATA_CONTRACT
+        H15_DATA_CONTRACT if is_h15 else JOINT_DATA_CONTRACT
         if joint_frontend
         else (DATA_CONTRACT if args.dense_windows else SOURCE_DATA_CONTRACT)
     )
@@ -387,7 +390,7 @@ def prepare_data(args: argparse.Namespace) -> None:
         ),
         "task_counts": task_counts,
         "sequence_length": SEQUENCE,
-        "action_horizon": ACTION_HORIZON,
+        "action_horizon": action_horizon,
         "planning_stride": EXECUTION_HORIZON,
         "control_stride": EXECUTION_HORIZON,
         "decision_offsets": DECISION_OFFSETS.tolist(),
@@ -401,13 +404,13 @@ def prepare_data(args: argparse.Namespace) -> None:
             "eye_in_hand_d",
         ],
         "world_target_view": "eye_in_hand_rgb",
-        "logged_action_chunk": "masked_h50_real_p15_prefix",
+        "logged_action_chunk": "real_p15" if is_h15 else "masked_h50_real_p15_prefix",
         "world_target_horizon": WORLD_HORIZON,
         "world_target_offsets": (
             DECISION_OFFSETS + WORLD_HORIZON
         ).tolist(),
         "world_target_alignment": f"obs[d+{WORLD_HORIZON}]",
-        "target_alignment": "obs[d]_to_actions[d+1:d+51]_masked_tail",
+        "target_alignment": "obs[d]_to_actions[d+1:d+16]" if is_h15 else "obs[d]_to_actions[d+1:d+51]_masked_tail",
         "previous_action_alignment": "actions[d]",
         "previous_action_model_input": "zero_v1",
         "orientation_contract": "vertical_flip_opengl_to_upright_once",
@@ -419,11 +422,11 @@ def prepare_data(args: argparse.Namespace) -> None:
         "qwen_fusion_layers": FUSION_LAYERS,
         "qwen_base_readout": "layer23_final_norm",
         "qwen_fusion_reduce": "none",
-        "short_horizon_padding": "repeat_last_masked_v1",
+        "short_horizon_padding": "episode_storage_only_v1" if is_h15 else "repeat_last_masked_v1",
         "minimum_real_action_prefix": EXECUTION_HORIZON,
     }
     if joint_frontend:
-        metadata_payload["window_bound"] = "complete_p15_masked_h50_v1"
+        metadata_payload["window_bound"] = "complete_p15_v1" if is_h15 else "complete_p15_masked_h50_v1"
         metadata_payload["state_delta_contract"] = "joint7_gripper2_unclipped_q01q99_delta_h15_v1"
         metadata_payload["memory_contract"] = "episode_tbptt8_v1"
     normalization_payload = {
@@ -479,7 +482,7 @@ def prepare_data(args: argparse.Namespace) -> None:
     else:
         assert expected == len(specs) * 50 * args.windows_per_demo
         assert min(task_counts) == max(task_counts) == 50 * args.windows_per_demo
-    assert tuple(actions.shape) == (expected, SEQUENCE, ACTION_HORIZON, 7)
+    assert tuple(actions.shape) == (expected, SEQUENCE, action_horizon, 7)
     assert tuple(proprio.shape) == (expected, SEQUENCE, 9)
     if joint_frontend:
         dec_v = payload["decision_valid_mask"]
@@ -526,7 +529,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--dense-windows", action="store_true")
     parser.add_argument(
         "--architecture-version",
-        choices=("legacy", "dual_tower_expert_v1"),
+        choices=("legacy", "dual_tower_expert_v1", "dual_tower_h15_v1"),
         default="legacy",
         help="Architecture version for LIBERO data preparation.",
     )

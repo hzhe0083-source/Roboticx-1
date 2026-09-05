@@ -9,17 +9,29 @@ import train_libero as trainer
 
 def test_fresh_dual_configuration_and_parser():
     assert trainer._parser().parse_args(["train"]).architecture_version == "legacy"
+    assert trainer._parser().parse_args(["train", "--architecture-version", "dual_tower_h15_v1"]).architecture_version == "dual_tower_h15_v1"
     config = trainer._fresh_config(architecture_version="dual_tower_expert_v1")
     trainer._validate_model_contract(config)
     assert config.architecture_version == "dual_tower_expert_v1"
+    assert config.action_horizon == 50
     assert config.flow_layers == 3
     assert not config.dino_qwen_cross_modal_bridge
     assert not config.va_last3_cross_attn
+
+    config_h15 = trainer._fresh_config(architecture_version="dual_tower_h15_v1")
+    trainer._validate_model_contract(config_h15)
+    assert config_h15.architecture_version == "dual_tower_h15_v1"
+    assert config_h15.action_horizon == 15
+    assert config_h15.world_state_supervision is True
+    assert config_h15.flow_layers == 3
+    assert not config_h15.dino_qwen_cross_modal_bridge
+    assert not config_h15.va_last3_cross_attn
 
 
 @pytest.mark.parametrize("architecture,contract", [
     ("legacy", trainer.DATA_CONTRACT),
     ("dual_tower_expert_v1", trainer.JOINT_DATA_CONTRACT),
+    ("dual_tower_h15_v1", trainer.H15_DATA_CONTRACT),
 ])
 def test_train_binds_validated_identity_to_both_samplers(monkeypatch, tmp_path, architecture, contract):
     args = trainer._parser().parse_args([
@@ -46,7 +58,7 @@ def test_train_binds_validated_identity_to_both_samplers(monkeypatch, tmp_path, 
     monkeypatch.setattr(trainer, "_StaticAnchorDataset", lambda dataset: dataset)
     monkeypatch.setattr(trainer, "_sha256_file", lambda path: "test-data-sha")
     samplers = []
-    sampler_name = "EpisodeWindowBatchSampler" if architecture == "dual_tower_expert_v1" else "TaskLocalityWeightedSampler"
+    sampler_name = "EpisodeWindowBatchSampler" if architecture in ("dual_tower_expert_v1", "dual_tower_h15_v1") else "TaskLocalityWeightedSampler"
     original_sampler = getattr(trainer, sampler_name)
 
     def capture_sampler(*a, **kw):
@@ -210,3 +222,53 @@ def test_single_task_joint_schedule_authorizes_drawer3_and_rejects_legacy():
     args.architecture_version = "legacy"
     with pytest.raises(ValueError, match="40-task"):
         _validate_run_schedule(payload, args)
+
+
+def test_fresh_config_h15_one_head_and_checkpoint_contract(tmp_path):
+    from va_compound import VACompoundPolicy
+
+    config_h15 = trainer._fresh_config(architecture_version="dual_tower_h15_v1")
+    trainer._validate_model_contract(config_h15)
+    assert config_h15.architecture_version == "dual_tower_h15_v1"
+    assert config_h15.action_horizon == 15
+    assert config_h15.flow_layers == 3
+    assert config_h15.world_state_supervision is True
+
+    model = VACompoundPolicy(config_h15).eval()
+    assert model.action_expert is not None
+    assert model.tail_action_expert is None
+    assert model.extension_action_expert is None
+
+    text, vision = torch.nn.Linear(2, 2), torch.nn.Linear(2, 2)
+    parameters = list(model.parameters())
+    optimizer = torch.optim.AdamW([
+        {"params": parameters[:1]}, {"params": parameters[1:]},
+        {"params": text.parameters()}, {"params": vision.parameters()},
+    ], lr=1e-4)
+    path = tmp_path / "h15_joint.pt"
+    sampler = SimpleNamespace(state_dict=lambda: {"epoch": 0, "batch_cursor": 1})
+    trainer._atomic_checkpoint(
+        path, config=model.config, model=model, text_backbone=text, vision=vision,
+        optimizer=optimizer, step=1, total_steps=10, stage1_steps=0, encode_batch=5,
+        qwen_sha256="test-qwen", dino_sha256="test-dino", data_sha256="test-data",
+        run_metadata={"suites": ["libero_10"], "n_tasks": 1, "task_specs": []},
+        pcgrad_forward_grouping="test", source_checkpoint="fresh_dual_tower_h15_v1",
+        source_global_step=-1, sampler=sampler, world_sampler=sampler,
+        episode_runtime_states=[{"action": trainer.EpisodeMemoryBank().state_dict(),
+                                 "world": trainer.EpisodeMemoryBank().state_dict()}],
+    )
+    saved = torch.load(path, weights_only=True)
+    contract = saved["training_contract"]
+    assert contract["architecture_version"] == "dual_tower_h15_v1"
+    assert contract["action_horizon"] == 15
+    assert contract["initialization"] == "fresh_dual_tower_h15_v1"
+    assert contract["data_contract"] == trainer.H15_DATA_CONTRACT
+    assert contract["execution_gradient_contract"] == "h15_unified_live_va_v1"
+    assert contract["flow_prefix_weight"] == 1.0
+    assert contract["flow_tail_weight"] == 0.0
+    assert contract["optimizer_initialization"] == "fresh_adamw_v1"
+    assert contract["memory_reset_every"] == 0
+    assert contract["memory_contract"] == "episode_tbptt8_v1"
+    assert contract["world_state_loss_weight"] == 1.0
+    assert contract["qwen_world_cache"] == "per_observation_joint_live_v1"
+    assert contract["stage1_world_current_vision_cache"] == "disabled_joint_frontend_v1"

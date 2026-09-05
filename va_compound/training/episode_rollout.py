@@ -20,7 +20,7 @@ def rollout_episode_windows(rollout, options):
     model, batch = options["model"], options["batch"]
     bank = options.pop("episode_memory")
     options.pop("initial_visual_memory", None)
-    if model.config.architecture_version != "dual_tower_expert_v1":
+    if model.config.architecture_version not in ("dual_tower_expert_v1", "dual_tower_h15_v1"):
         raise ValueError("episode rollout requires joint architecture")
     size, length, horizon, action_dim = batch["actions"].shape
     zero = next(model.parameters()).sum() * 0.0

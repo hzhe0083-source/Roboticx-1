@@ -23,6 +23,7 @@ SOURCE_DATA_CONTRACT = "libero_4suite_h50p15_t4_dualview5_worldh15_va1024_qwen08
 SOURCE_INITIALIZATION = "dense_all_windows_continue_from_s5000_v1"
 DATA_CONTRACT = "libero_4suite_h50p15_t8_dualview5_worldh15_va1024_qwen08_last6_denseall_v8"
 JOINT_DATA_CONTRACT = "libero_joint_episode_t8_p15_state_delta_v10"
+H15_DATA_CONTRACT = "libero_joint_episode_t8_h15_state_delta_v11"
 FRESH_INITIALIZATION = "t8_dense_continue_from_t4_s1000_v1"
 FUSION_LAYERS = list(range(18, 24))
 CROSS_MODAL_VA_LAYERS = list(range(len(FUSION_LAYERS)))
@@ -185,8 +186,14 @@ def _attach_joint_world_action_donors(payload: dict) -> None:
 def _validate_data(path: Path, *, architecture_version: str = "legacy") -> dict:
     payload = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
     metadata = payload.get("metadata", {})
-    joint = architecture_version == "dual_tower_expert_v1"
-    if metadata.get("contract") != (JOINT_DATA_CONTRACT if joint else DATA_CONTRACT):
+    is_h15 = architecture_version == "dual_tower_h15_v1"
+    joint = architecture_version in ("dual_tower_expert_v1", "dual_tower_h15_v1")
+    expected_contract = (
+        H15_DATA_CONTRACT
+        if is_h15
+        else (JOINT_DATA_CONTRACT if joint else DATA_CONTRACT)
+    )
+    if metadata.get("contract") != expected_contract:
         raise ValueError(f"unexpected data contract in {path}")
     tasks = list(metadata.get("tasks") or [])
     specs = list(metadata.get("task_specs") or [])
@@ -201,8 +208,9 @@ def _validate_data(path: Path, *, architecture_version: str = "legacy") -> dict:
     ):
         raise ValueError("LIBERO task metadata and instruction ids are inconsistent")
     actions = payload.get("actions")
-    if not isinstance(actions, Tensor) or tuple(actions.shape[1:]) != (SEQUENCE, ACTION_HORIZON, 7):
-        raise ValueError("LIBERO training data must be T8/H50/A7")
+    local_action_horizon = EXECUTION_HORIZON if is_h15 else ACTION_HORIZON
+    if not isinstance(actions, Tensor) or tuple(actions.shape[1:]) != (SEQUENCE, local_action_horizon, 7):
+        raise ValueError(f"LIBERO training data must be T8/H{local_action_horizon}/A7")
     if not torch.isfinite(actions).all():
         raise ValueError("LIBERO actions must be finite")
     proprio = payload.get("proprio")
@@ -231,11 +239,14 @@ def _validate_data(path: Path, *, architecture_version: str = "legacy") -> dict:
         "previous_action_model_input": "zero_v1",
         "vision_input": "agentview_history4_plus_current_wrist_v2",
         "world_target_view": "eye_in_hand_rgb",
-        "short_horizon_padding": "repeat_last_masked_v1",
+        "short_horizon_padding": "episode_storage_only_v1" if is_h15 else "repeat_last_masked_v1",
         "minimum_real_action_prefix": EXECUTION_HORIZON,
+        "action_horizon": local_action_horizon,
+        "logged_action_chunk": "real_p15" if is_h15 else "masked_h50_real_p15_prefix",
+        "target_alignment": "obs[d]_to_actions[d+1:d+16]" if is_h15 else "obs[d]_to_actions[d+1:d+51]_masked_tail",
     }
     if joint:
-        expected_metadata["window_bound"] = "complete_p15_masked_h50_v1"
+        expected_metadata["window_bound"] = "complete_p15_v1" if is_h15 else "complete_p15_masked_h50_v1"
         expected_metadata["state_delta_contract"] = "joint7_gripper2_unclipped_q01q99_delta_h15_v1"
         expected_metadata["memory_contract"] = "episode_tbptt8_v1"
     mismatch = {
@@ -244,7 +255,7 @@ def _validate_data(path: Path, *, architecture_version: str = "legacy") -> dict:
         if metadata.get(key) != value
     }
     if mismatch:
-        raise ValueError(f"LIBERO H50/P15 metadata mismatch: {mismatch}")
+        raise ValueError(f"LIBERO H{local_action_horizon}/P15 metadata mismatch: {mismatch}")
     valid = payload.get("action_valid_mask")
     if not isinstance(valid, Tensor) or valid.shape != actions.shape[:-1]:
         raise ValueError("LIBERO H50 data requires an aligned action_valid_mask")
@@ -388,7 +399,7 @@ def _validate_data(path: Path, *, architecture_version: str = "legacy") -> dict:
 def _validate_run_schedule(payload: dict, args: argparse.Namespace) -> tuple[int, int, str]:
     metadata = payload["metadata"]
     n_tasks = int(metadata["n_tasks"])
-    is_joint = getattr(args, "architecture_version", "legacy") == "dual_tower_expert_v1"
+    is_joint = getattr(args, "architecture_version", "legacy") in ("dual_tower_expert_v1", "dual_tower_h15_v1")
     if n_tasks == 1:
         if not is_joint:
             raise ValueError("this trainer supports the 40-task run or the LIBERO-Long task3+4 probe")
@@ -447,7 +458,7 @@ def _validate_run_schedule(payload: dict, args: argparse.Namespace) -> tuple[int
         "suites": list(metadata["suites"]),
         "local_task_ids": None if n_tasks == 40 else local_task_ids,
     }
-    if getattr(args, "architecture_version", "legacy") == "dual_tower_expert_v1":
+    if getattr(args, "architecture_version", "legacy") in ("dual_tower_expert_v1", "dual_tower_h15_v1"):
         for key in ("rows", "stage1_steps", "epochs", "max_steps"):
             expected.pop(key)
         expected["anchor_fraction"] = 0.0
@@ -459,7 +470,7 @@ def _validate_run_schedule(payload: dict, args: argparse.Namespace) -> tuple[int
     mismatch = {key: (actual[key], value) for key, value in expected.items() if actual[key] != value}
     if mismatch:
         raise ValueError(f"LIBERO run schedule mismatch: {mismatch}")
-    if getattr(args, "architecture_version", "legacy") == "dual_tower_expert_v1":
+    if getattr(args, "architecture_version", "legacy") in ("dual_tower_expert_v1", "dual_tower_h15_v1"):
         from va_compound.data.episode_stream import EpisodeWindowBatchSampler
         steps_per_epoch = len(EpisodeWindowBatchSampler(
             payload, args.batch_size, getattr(args, "seed", 0), args.mixed_tasks,
