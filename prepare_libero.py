@@ -22,6 +22,7 @@ from va_compound.data.libero import (
     VISION_OFFSETS,
     WORLD_HORIZON,
     _attach_dense_world_action_donors,
+    _attach_joint_world_action_donors,
     _local_task_ids,
     _normalize,
     _official_task_specs,
@@ -175,10 +176,14 @@ def prepare_data(args: argparse.Namespace) -> None:
         raise ValueError("HDF5 files do not map one-to-one onto official LIBERO tasks")
     all_states = np.concatenate(states).astype(np.float32)
     state_low, state_high = np.quantile(all_states, (0.01, 0.99), axis=0).astype(np.float32)
+    state_delta_scale = np.where(np.abs(state_high - state_low) < 1e-6, 1.0, state_high - state_low).astype(np.float32)
 
     actions_out, previous_out, proprio_out = [], [], []
     valid_out, world_valid_out = [], []
     instruction_ids, episode_ids, crop_starts, frame_refs, target_refs = [], [], [], [], []
+    decision_valid_out, decision_counts_out = [], []
+    episode_starts_out, episode_ends_out = [], []
+    world_state_delta_out = []
     task_counts = [0] * len(specs)
     global_episode = 0
     for task_id, suite, local_task_id, description, source in ordered:
@@ -205,64 +210,149 @@ def prepare_data(args: argparse.Namespace) -> None:
                 raw_state = np.concatenate(
                     (obs["joint_states"][()], obs["gripper_states"][()]), axis=1
                 ).astype(np.float32)
-                max_start = _window_max_start(len(raw_actions), joint_frontend=joint_frontend)
-                if max_start < 0:
-                    raise ValueError(f"demo too short for T8/H50/P15: {source}:{name}")
-                starts = (
-                    np.arange(max_start + 1, dtype=np.int64)
-                    if args.dense_windows
-                    else np.linspace(
-                        0,
-                        max_start,
-                        args.windows_per_demo,
-                        dtype=np.int64,
+                if joint_frontend:
+                    if raw_state.shape != (len(raw_actions), 9) or not np.isfinite(raw_state).all():
+                        raise ValueError(f"invalid joint/gripper state stream: {source}:{name}")
+                    demo_decisions = np.arange(0, len(raw_actions) - EXECUTION_HORIZON, EXECUTION_HORIZON, dtype=np.int64)
+                    if len(demo_decisions) == 0:
+                        raise ValueError(f"demo too short for joint decisions: {source}:{name}")
+                    num_windows = (len(demo_decisions) + SEQUENCE - 1) // SEQUENCE
+                    for w_idx in range(num_windows):
+                        win_decisions = demo_decisions[w_idx * SEQUENCE : (w_idx + 1) * SEQUENCE]
+                        valid_k = len(win_decisions)
+                        crop_start_val = int(win_decisions[0])
+                        is_ep_start = bool(w_idx == 0)
+                        is_ep_end = bool(w_idx == num_windows - 1)
+
+                        d_valid = np.zeros(SEQUENCE, dtype=bool)
+                        d_valid[:valid_k] = True
+
+                        chunks, masks = [], []
+                        deltas = []
+                        last_d = int(win_decisions[-1])
+
+                        storage_decisions = np.empty(SEQUENCE, dtype=np.int64)
+                        storage_decisions[:valid_k] = win_decisions
+                        storage_decisions[valid_k:] = last_d
+
+                        for i in range(SEQUENCE):
+                            decision = int(storage_decisions[i])
+                            chunk = raw_actions[decision + 1 : decision + 1 + ACTION_HORIZON]
+                            if i < valid_k:
+                                valid = np.arange(ACTION_HORIZON) < len(chunk)
+                                if len(chunk) < EXECUTION_HORIZON:
+                                    raise RuntimeError("every valid joint decision must have a real P15 prefix")
+                                if len(chunk) < ACTION_HORIZON:
+                                    chunk = np.concatenate(
+                                        (
+                                            chunk,
+                                            np.repeat(chunk[-1:], ACTION_HORIZON - len(chunk), axis=0),
+                                        ),
+                                        axis=0,
+                                    )
+                                delta = 2.0 * (raw_state[decision + 15] - raw_state[decision]) / state_delta_scale
+                            else:
+                                valid = np.zeros(ACTION_HORIZON, dtype=bool)
+                                if len(chunk) < ACTION_HORIZON:
+                                    chunk = np.concatenate(
+                                        (
+                                            chunk,
+                                            np.repeat(chunk[-1:], ACTION_HORIZON - len(chunk), axis=0),
+                                        ),
+                                        axis=0,
+                                    )
+                                delta = np.zeros(9, dtype=np.float32)
+
+                            chunks.append(chunk)
+                            masks.append(valid)
+                            deltas.append(delta)
+
+                        actions_out.append(np.stack(chunks))
+                        valid_out.append(np.stack(masks))
+                        previous_out.append(raw_actions[storage_decisions])
+                        proprio_out.append(_normalize(raw_state[storage_decisions], state_low, state_high))
+                        world_state_delta_out.append(np.stack(deltas).astype(np.float32))
+
+                        agent_history = np.maximum(storage_decisions[:, None] + VISION_OFFSETS[None], 0)
+                        wrist_current = (len(raw_actions) + storage_decisions)[:, None]
+                        current = np.concatenate((agent_history, wrist_current), axis=1)
+
+                        future = storage_decisions + WORLD_HORIZON
+                        w_valid = np.zeros(SEQUENCE, dtype=bool)
+                        w_valid[:valid_k] = True
+                        world_valid_out.append(w_valid)
+
+                        target = (len(raw_actions) + np.minimum(future, len(raw_actions) - 1))[:, None]
+                        frame_refs.append((task_key, demo_index, current.tolist()))
+                        target_refs.append((task_key, demo_index, target.tolist()))
+                        instruction_ids.append(task_id)
+                        episode_ids.append(global_episode)
+                        crop_starts.append(crop_start_val)
+                        decision_valid_out.append(d_valid)
+                        decision_counts_out.append(valid_k)
+                        episode_starts_out.append(is_ep_start)
+                        episode_ends_out.append(is_ep_end)
+                        task_counts[task_id] += 1
+                    global_episode += 1
+                else:
+                    max_start = _window_max_start(len(raw_actions), joint_frontend=joint_frontend)
+                    if max_start < 0:
+                        raise ValueError(f"demo too short for T8/H50/P15: {source}:{name}")
+                    starts = (
+                        np.arange(max_start + 1, dtype=np.int64)
+                        if args.dense_windows
+                        else np.linspace(
+                            0,
+                            max_start,
+                            args.windows_per_demo,
+                            dtype=np.int64,
+                        )
                     )
-                )
-                for start in starts:
-                    decisions = start + DECISION_OFFSETS
-                    chunks, masks = [], []
-                    for decision in decisions:
-                        chunk = raw_actions[
-                            decision + 1 : decision + 1 + ACTION_HORIZON
-                        ]
-                        valid = np.arange(ACTION_HORIZON) < len(chunk)
-                        if len(chunk) < EXECUTION_HORIZON:
-                            raise RuntimeError("every H50 row must have a real P15 prefix")
-                        if len(chunk) < ACTION_HORIZON:
-                            chunk = np.concatenate(
-                                (
-                                    chunk,
-                                    np.repeat(
-                                        chunk[-1:], ACTION_HORIZON - len(chunk), axis=0
+                    for start in starts:
+                        decisions = start + DECISION_OFFSETS
+                        chunks, masks = [], []
+                        for decision in decisions:
+                            chunk = raw_actions[
+                                decision + 1 : decision + 1 + ACTION_HORIZON
+                            ]
+                            valid = np.arange(ACTION_HORIZON) < len(chunk)
+                            if len(chunk) < EXECUTION_HORIZON:
+                                raise RuntimeError("every H50 row must have a real P15 prefix")
+                            if len(chunk) < ACTION_HORIZON:
+                                chunk = np.concatenate(
+                                    (
+                                        chunk,
+                                        np.repeat(
+                                            chunk[-1:], ACTION_HORIZON - len(chunk), axis=0
+                                        ),
                                     ),
-                                ),
-                                axis=0,
-                            )
-                        chunks.append(chunk)
-                        masks.append(valid)
-                    actions_out.append(np.stack(chunks))
-                    valid_out.append(np.stack(masks))
-                    previous_out.append(raw_actions[decisions])
-                    proprio_out.append(_normalize(raw_state[decisions], state_low, state_high))
-                    agent_history = np.maximum(
-                        decisions[:, None] + VISION_OFFSETS[None], 0
-                    )
-                    wrist_current = (len(raw_actions) + decisions)[:, None]
-                    current = np.concatenate((agent_history, wrist_current), axis=1)
-                    # WAM predicts the future wrist map, which is the last view in
-                    # the five-frame source layout and the precision-critical view.
-                    future = decisions + WORLD_HORIZON
-                    world_valid_out.append(future < len(raw_actions))
-                    target = (
-                        len(raw_actions) + np.minimum(future, len(raw_actions) - 1)
-                    )[:, None]
-                    frame_refs.append((task_key, demo_index, current.tolist()))
-                    target_refs.append((task_key, demo_index, target.tolist()))
-                    instruction_ids.append(task_id)
-                    episode_ids.append(global_episode)
-                    crop_starts.append(int(start))
-                    task_counts[task_id] += 1
-                global_episode += 1
+                                    axis=0,
+                                )
+                            chunks.append(chunk)
+                            masks.append(valid)
+                        actions_out.append(np.stack(chunks))
+                        valid_out.append(np.stack(masks))
+                        previous_out.append(raw_actions[decisions])
+                        proprio_out.append(_normalize(raw_state[decisions], state_low, state_high))
+                        agent_history = np.maximum(
+                            decisions[:, None] + VISION_OFFSETS[None], 0
+                        )
+                        wrist_current = (len(raw_actions) + decisions)[:, None]
+                        current = np.concatenate((agent_history, wrist_current), axis=1)
+                        # WAM predicts the future wrist map, which is the last view in
+                        # the five-frame source layout and the precision-critical view.
+                        future = decisions + WORLD_HORIZON
+                        world_valid_out.append(future < len(raw_actions))
+                        target = (
+                            len(raw_actions) + np.minimum(future, len(raw_actions) - 1)
+                        )[:, None]
+                        frame_refs.append((task_key, demo_index, current.tolist()))
+                        target_refs.append((task_key, demo_index, target.tolist()))
+                        instruction_ids.append(task_id)
+                        episode_ids.append(global_episode)
+                        crop_starts.append(int(start))
+                        task_counts[task_id] += 1
+                    global_episode += 1
 
     instruction_id = torch.tensor(instruction_ids, dtype=torch.long)
     actions = torch.from_numpy(np.stack(actions_out)).float()
@@ -287,7 +377,13 @@ def prepare_data(args: argparse.Namespace) -> None:
         "n_demos": global_episode,
         "windows_per_demo": None if args.dense_windows else args.windows_per_demo,
         "window_sampling": (
-            "all_legal_starts_v1" if args.dense_windows else "fixed_linspace16_v1"
+            (
+                "episode_contiguous_p15_v1"
+                if joint_frontend
+                else "all_legal_starts_v1"
+            )
+            if args.dense_windows
+            else "fixed_linspace16_v1"
         ),
         "task_counts": task_counts,
         "sequence_length": SEQUENCE,
@@ -328,6 +424,16 @@ def prepare_data(args: argparse.Namespace) -> None:
     }
     if joint_frontend:
         metadata_payload["window_bound"] = "complete_p15_masked_h50_v1"
+        metadata_payload["state_delta_contract"] = "joint7_gripper2_unclipped_q01q99_delta_h15_v1"
+        metadata_payload["memory_contract"] = "episode_tbptt8_v1"
+    normalization_payload = {
+        "action_q01": torch.full((7,), -1.0),
+        "action_q99": torch.full((7,), 1.0),
+        "state_q01": torch.from_numpy(state_low),
+        "state_q99": torch.from_numpy(state_high),
+    }
+    if joint_frontend:
+        normalization_payload["state_delta_scale"] = torch.from_numpy(state_delta_scale)
     payload = {
         "actions": actions,
         "previous_action": previous,
@@ -344,15 +450,19 @@ def prepare_data(args: argparse.Namespace) -> None:
         "recovery_mask": torch.zeros_like(valid),
         "world_target_valid_mask": world_valid,
         "anchor_eligible": torch.ones(len(actions), dtype=torch.bool),
-        "normalization": {
-            "action_q01": torch.full((7,), -1.0),
-            "action_q99": torch.full((7,), 1.0),
-            "state_q01": torch.from_numpy(state_low),
-            "state_q99": torch.from_numpy(state_high),
-        },
+        "normalization": normalization_payload,
         "metadata": metadata_payload,
     }
-    if args.dense_windows:
+    if joint_frontend:
+        payload["decision_valid_mask"] = torch.from_numpy(np.stack(decision_valid_out))
+        payload["decision_count"] = torch.tensor(decision_counts_out, dtype=torch.long)
+        payload["episode_start"] = torch.tensor(episode_starts_out, dtype=torch.bool)
+        payload["episode_end"] = torch.tensor(episode_ends_out, dtype=torch.bool)
+        payload["world_state_delta"] = torch.from_numpy(np.stack(world_state_delta_out)).float()
+
+    if joint_frontend:
+        _attach_joint_world_action_donors(payload)
+    elif args.dense_windows:
         _attach_dense_world_action_donors(payload)
     else:
         prepare_visual_world_action_ranking(
@@ -371,10 +481,18 @@ def prepare_data(args: argparse.Namespace) -> None:
         assert min(task_counts) == max(task_counts) == 50 * args.windows_per_demo
     assert tuple(actions.shape) == (expected, SEQUENCE, ACTION_HORIZON, 7)
     assert tuple(proprio.shape) == (expected, SEQUENCE, 9)
-    assert bool(valid[:, :, :EXECUTION_HORIZON].all())
-    assert torch.equal(
-        previous[:, 1:], actions[:, :-1, EXECUTION_HORIZON - 1]
-    )
+    if joint_frontend:
+        dec_v = payload["decision_valid_mask"]
+        assert bool(valid[dec_v][:, :EXECUTION_HORIZON].all())
+        valid_pairs = dec_v[:, 1:] & dec_v[:, :-1]
+        assert torch.equal(
+            previous[:, 1:][valid_pairs], actions[:, :-1, EXECUTION_HORIZON - 1][valid_pairs]
+        )
+    else:
+        assert bool(valid[:, :, :EXECUTION_HORIZON].all())
+        assert torch.equal(
+            previous[:, 1:], actions[:, :-1, EXECUTION_HORIZON - 1]
+        )
     _save_new(payload, args.data)
     print(f"PASS prepared {args.data}: {tuple(actions.shape)}")
 

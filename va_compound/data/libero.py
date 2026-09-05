@@ -22,7 +22,7 @@ LIBERO_SUITES = ("libero_spatial", "libero_object", "libero_goal", "libero_10")
 SOURCE_DATA_CONTRACT = "libero_4suite_h50p15_t4_dualview5_worldh15_va1024_qwen08_last6_denseall_v7"
 SOURCE_INITIALIZATION = "dense_all_windows_continue_from_s5000_v1"
 DATA_CONTRACT = "libero_4suite_h50p15_t8_dualview5_worldh15_va1024_qwen08_last6_denseall_v8"
-JOINT_DATA_CONTRACT = "libero_4suite_h50p15_t8_dualview5_p15complete_joint_v9"
+JOINT_DATA_CONTRACT = "libero_joint_episode_t8_p15_state_delta_v10"
 FRESH_INITIALIZATION = "t8_dense_continue_from_t4_s1000_v1"
 FUSION_LAYERS = list(range(18, 24))
 CROSS_MODAL_VA_LAYERS = list(range(len(FUSION_LAYERS)))
@@ -136,6 +136,52 @@ def _attach_dense_world_action_donors(payload: dict) -> None:
     )
 
 
+def _attach_joint_world_action_donors(payload: dict) -> None:
+    """Use same task next episode at relative decision progress, valid donors only."""
+    actions = payload["actions"]
+    tasks = payload["instruction_id"]
+    episodes = payload["episode_id"]
+    decision_counts = payload["decision_count"]
+
+    table = actions.new_zeros((*actions.shape[:2], WORLD_HORIZON, actions.shape[-1]))
+    mask = torch.zeros(actions.shape[:2], dtype=torch.bool)
+
+    for task in torch.unique(tasks, sorted=True):
+        task_rows = torch.where(tasks == task)[0]
+        task_episodes = torch.unique(episodes[task_rows], sorted=True)
+        for position, episode in enumerate(task_episodes):
+            own_rows = torch.where(episodes == episode)[0]
+            donor_episode = task_episodes[(position + 1) % len(task_episodes)]
+            donor_rows = torch.where(episodes == donor_episode)[0]
+
+            donor_decisions: list[tuple[int, int]] = []
+            for d_row in donor_rows.tolist():
+                d_count = int(decision_counts[d_row].item())
+                for dt in range(d_count):
+                    donor_decisions.append((d_row, dt))
+
+            d_donor = len(donor_decisions)
+            d_own = int(decision_counts[own_rows].sum().item())
+
+            k = 0
+            for row in own_rows.tolist():
+                count = int(decision_counts[row].item())
+                for t in range(count):
+                    donor_idx = int(round(k * max(d_donor - 1, 0) / max(d_own - 1, 1)))
+                    donor_idx = min(max(donor_idx, 0), d_donor - 1)
+                    donor_row, donor_t = donor_decisions[donor_idx]
+                    candidate = actions[donor_row, donor_t, :WORLD_HORIZON]
+                    table[row, t] = candidate
+                    mask[row, t] = candidate.ne(actions[row, t, :WORLD_HORIZON]).any()
+                    k += 1
+
+    payload["world_rank_shuffle_action"] = table
+    payload["world_rank_shuffle_mask"] = mask
+    payload["metadata"]["world_action_donor_contract"] = (
+        "task_next_episode_relative_progress_v1"
+    )
+
+
 def _validate_data(path: Path, *, architecture_version: str = "legacy") -> dict:
     payload = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
     metadata = payload.get("metadata", {})
@@ -154,12 +200,24 @@ def _validate_data(path: Path, *, architecture_version: str = "legacy") -> dict:
         or sorted(torch.unique(instruction_ids).tolist()) != list(range(n_tasks))
     ):
         raise ValueError("LIBERO task metadata and instruction ids are inconsistent")
-    if tuple(payload["actions"].shape[1:]) != (SEQUENCE, ACTION_HORIZON, 7):
+    actions = payload.get("actions")
+    if not isinstance(actions, Tensor) or tuple(actions.shape[1:]) != (SEQUENCE, ACTION_HORIZON, 7):
         raise ValueError("LIBERO training data must be T8/H50/A7")
-    if tuple(payload["proprio"].shape[1:]) != (SEQUENCE, 9):
+    if not torch.isfinite(actions).all():
+        raise ValueError("LIBERO actions must be finite")
+    proprio = payload.get("proprio")
+    if not isinstance(proprio, Tensor) or tuple(proprio.shape[1:]) != (SEQUENCE, 9):
         raise ValueError("LIBERO training data must contain T8/D9 proprio")
+    if not torch.isfinite(proprio).all():
+        raise ValueError("LIBERO proprio must be finite")
+    previous = payload.get("previous_action")
+    if not isinstance(previous, Tensor) or tuple(previous.shape[1:]) != (SEQUENCE, 7):
+        raise ValueError("LIBERO training data must contain T8/A7 previous_action")
+    if not torch.isfinite(previous).all():
+        raise ValueError("LIBERO previous_action must be finite")
+
     expected_metadata = {
-        "window_sampling": "all_legal_starts_v1",
+        "window_sampling": "episode_contiguous_p15_v1" if joint else "all_legal_starts_v1",
         "planning_stride": EXECUTION_HORIZON,
         "control_stride": EXECUTION_HORIZON,
         "decision_offsets": DECISION_OFFSETS.tolist(),
@@ -178,6 +236,8 @@ def _validate_data(path: Path, *, architecture_version: str = "legacy") -> dict:
     }
     if joint:
         expected_metadata["window_bound"] = "complete_p15_masked_h50_v1"
+        expected_metadata["state_delta_contract"] = "joint7_gripper2_unclipped_q01q99_delta_h15_v1"
+        expected_metadata["memory_contract"] = "episode_tbptt8_v1"
     mismatch = {
         key: (metadata.get(key), value)
         for key, value in expected_metadata.items()
@@ -186,28 +246,138 @@ def _validate_data(path: Path, *, architecture_version: str = "legacy") -> dict:
     if mismatch:
         raise ValueError(f"LIBERO H50/P15 metadata mismatch: {mismatch}")
     valid = payload.get("action_valid_mask")
-    if not isinstance(valid, Tensor) or valid.shape != payload["actions"].shape[:-1]:
+    if not isinstance(valid, Tensor) or valid.shape != actions.shape[:-1]:
         raise ValueError("LIBERO H50 data requires an aligned action_valid_mask")
-    if not bool(valid[:, :, :EXECUTION_HORIZON].all()):
-        raise ValueError("every LIBERO H50 training decision requires a real P15 prefix")
     world_valid = payload.get("world_target_valid_mask")
     if not isinstance(world_valid, Tensor) or world_valid.shape != valid.shape[:2]:
         raise ValueError("LIBERO H50 World targets require an aligned [N,T] mask")
-    if joint:
-        if valid.dtype != torch.bool or world_valid.dtype != torch.bool:
-            raise ValueError("joint validity masks must be boolean")
-        if bool((valid[:, :, 1:] & ~valid[:, :, :-1]).any()) or not bool(world_valid.all()):
-            raise ValueError("joint data requires contiguous real actions and complete World targets")
-    if not joint and n_tasks == 2 and (not bool(valid.all()) or not bool(world_valid.all())):
-        raise ValueError("the two LIBERO-Long tasks require complete action and World targets")
     crop_start = payload.get("crop_start")
     if not isinstance(crop_start, Tensor) or crop_start.shape != instruction_ids.shape:
         raise ValueError("dense LIBERO data requires one crop_start per row")
-    if not torch.equal(
-        payload["previous_action"][:, 1:],
-        payload["actions"][:, :-1, EXECUTION_HORIZON - 1],
-    ):
-        raise ValueError("LIBERO P15 previous_action is not aligned to action token14")
+
+    if joint:
+        if valid.dtype != torch.bool or world_valid.dtype != torch.bool:
+            raise ValueError("joint validity masks must be boolean")
+        decision_valid = payload.get("decision_valid_mask")
+        if not isinstance(decision_valid, Tensor) or decision_valid.shape != (len(actions), SEQUENCE):
+            raise ValueError("joint data requires decision_valid_mask of shape [N, 8]")
+        if decision_valid.dtype != torch.bool:
+            raise ValueError("decision_valid_mask must be boolean")
+        if bool((decision_valid[:, 1:] & ~decision_valid[:, :-1]).any()):
+            raise ValueError("decision_valid_mask must be a true prefix mask")
+
+        decision_count = payload.get("decision_count")
+        if not isinstance(decision_count, Tensor) or decision_count.shape != (len(actions),):
+            raise ValueError("joint data requires decision_count of shape [N]")
+        if bool((decision_count < 1).any()) or bool((decision_count > SEQUENCE).any()):
+            raise ValueError("decision_count must be in 1..8")
+        if decision_count.dtype != torch.long or crop_start.dtype != torch.long:
+            raise ValueError("joint decision counts and crop starts must be int64")
+        if not torch.equal(decision_count, decision_valid.sum(dim=-1)):
+            raise ValueError("decision_count must match decision_valid_mask count")
+
+        episode_start = payload.get("episode_start")
+        episode_end = payload.get("episode_end")
+        if not isinstance(episode_start, Tensor) or episode_start.shape != (len(actions),) or episode_start.dtype != torch.bool:
+            raise ValueError("joint data requires boolean episode_start [N]")
+        if not isinstance(episode_end, Tensor) or episode_end.shape != (len(actions),) or episode_end.dtype != torch.bool:
+            raise ValueError("joint data requires boolean episode_end [N]")
+
+        # real P15 only valid decisions, padded action_valid_mask all false
+        valid_act = valid[decision_valid]
+        if bool((valid_act[:, 1:] & ~valid_act[:, :-1]).any()):
+            raise ValueError("action_valid_mask must be a true prefix on valid decisions")
+        if not bool(valid_act[:, :EXECUTION_HORIZON].all()):
+            raise ValueError("every valid joint decision requires a real P15 prefix")
+        if bool(valid[~decision_valid].any()):
+            raise ValueError("padded decisions must have all-false action_valid_mask")
+
+        # all world valid == decision_valid
+        if not torch.equal(world_valid, decision_valid):
+            raise ValueError("world_target_valid_mask must equal decision_valid_mask for joint data")
+
+        # delta validation
+        delta = payload.get("world_state_delta")
+        if not isinstance(delta, Tensor) or tuple(delta.shape) != (len(actions), SEQUENCE, 9) or delta.dtype != torch.float32:
+            raise ValueError("joint data requires world_state_delta of shape [N, 8, 9] float32")
+        if not torch.isfinite(delta).all():
+            raise ValueError("world_state_delta must be finite")
+        if bool(delta[~decision_valid].any()):
+            raise ValueError("padded decisions must have zero world_state_delta")
+
+        # state_delta_scale validation
+        normalization = payload.get("normalization", {})
+        scale = normalization.get("state_delta_scale")
+        if not isinstance(scale, Tensor) or tuple(scale.shape) != (9,) or not torch.isfinite(scale).all() or not bool((scale > 0).all()):
+            raise ValueError("joint normalization must include positive state_delta_scale of shape (9,)")
+
+        # episode continuity: next crop_start = prior crop_start + 15 * decision_count, start/end correct, no duplicate starts
+        episode_ids = payload.get("episode_id")
+        if not isinstance(episode_ids, Tensor) or episode_ids.shape != (len(actions),):
+            raise ValueError("joint data requires episode_id of shape [N]")
+        if episode_ids.dtype != torch.long:
+            raise ValueError("joint episode ids must be int64")
+        scale_expected = normalization["state_q99"] - normalization["state_q01"]
+        scale_expected = torch.where(scale_expected.abs() < 1e-6, torch.ones_like(scale_expected), scale_expected)
+        if not torch.equal(scale, scale_expected):
+            raise ValueError("state_delta_scale differs from state quantiles")
+        if any(len(payload[key]) != len(actions) for key in ("proprio", "previous_action", "instruction_id", "frame_refs", "world_target_frame_refs")):
+            raise ValueError("joint payload rows must align")
+        for ep in torch.unique(episode_ids, sorted=True):
+            ep_rows = torch.where(episode_ids == ep)[0]
+            if len(torch.unique(instruction_ids[ep_rows])) != 1:
+                raise ValueError("episode cannot cross tasks")
+            if not bool((decision_count[ep_rows[:-1]] == SEQUENCE).all()):
+                raise ValueError("nonfinal episode windows must contain T8 decisions")
+            if not torch.equal(previous[ep_rows[1:], 0], actions[ep_rows[:-1], SEQUENCE - 1, EXECUTION_HORIZON - 1]):
+                raise ValueError("previous_action must continue across episode windows")
+            if not bool(episode_start[ep_rows[0]]) or bool(episode_start[ep_rows[1:]].any()):
+                raise ValueError(f"episode {ep} must have exactly one start at first window")
+            if not bool(episode_end[ep_rows[-1]]) or bool(episode_end[ep_rows[:-1]].any()):
+                raise ValueError(f"episode {ep} must have exactly one end at last window")
+            if int(crop_start[ep_rows[0]].item()) != 0:
+                raise ValueError(f"episode {ep} must start at crop_start 0")
+            ep_crops = crop_start[ep_rows]
+            if len(torch.unique(ep_crops)) != len(ep_crops):
+                raise ValueError(f"episode {ep} has duplicate crop_starts")
+            expected_next = ep_crops[:-1] + EXECUTION_HORIZON * decision_count[ep_rows[:-1]]
+            if not torch.equal(ep_crops[1:], expected_next):
+                raise ValueError(f"episode {ep} crop_start continuity broken")
+            identity = payload["frame_refs"][int(ep_rows[0])][:2]
+            wrist_base = None
+            for row in ep_rows.tolist():
+                current_ref = payload["frame_refs"][row]
+                future_ref = payload["world_target_frame_refs"][row]
+                if current_ref[:2] != identity or future_ref[:2] != identity:
+                    raise ValueError("episode frame references cross demonstrations")
+                for t in range(int(decision_count[row])):
+                    d = int(crop_start[row]) + EXECUTION_HORIZON * t
+                    current = current_ref[2][t]
+                    future = future_ref[2][t]
+                    base = current[-1] - d
+                    if wrist_base is None:
+                        wrist_base = base
+                    if current[:4] != np.maximum(d + VISION_OFFSETS, 0).tolist() or base != wrist_base or future != [base + d + WORLD_HORIZON]:
+                        raise ValueError("episode frame references do not match decision endpoints")
+
+        # previous_action alignment checked only consecutive valid positions
+        valid_pairs = decision_valid[:, 1:] & decision_valid[:, :-1]
+        if not torch.equal(
+            previous[:, 1:][valid_pairs],
+            actions[:, :-1, EXECUTION_HORIZON - 1][valid_pairs],
+        ):
+            raise ValueError("joint previous_action is not aligned on consecutive valid positions")
+    else:
+        if not bool(valid[:, :, :EXECUTION_HORIZON].all()):
+            raise ValueError("every LIBERO H50 training decision requires a real P15 prefix")
+        if n_tasks == 2 and (not bool(valid.all()) or not bool(world_valid.all())):
+            raise ValueError("the two LIBERO-Long tasks require complete action and World targets")
+        if not torch.equal(
+            previous[:, 1:],
+            actions[:, :-1, EXECUTION_HORIZON - 1],
+        ):
+            raise ValueError("LIBERO P15 previous_action is not aligned to action token14")
+
     if any(len(decision) != 5 for _, _, decisions in payload["frame_refs"] for decision in decisions):
         raise ValueError("LIBERO dual-view source requires four agent frames plus one wrist frame")
     if any(len(decision) != 1 for _, _, decisions in payload["world_target_frame_refs"] for decision in decisions):
@@ -249,6 +419,7 @@ def _validate_run_schedule(payload: dict, args: argparse.Namespace) -> tuple[int
     if getattr(args, "architecture_version", "legacy") == "dual_tower_expert_v1":
         for key in ("rows", "stage1_steps", "epochs", "max_steps"):
             expected.pop(key)
+        expected["anchor_fraction"] = 0.0
         counts = metadata.get("task_counts", [])
         if len(counts) != n_tasks or any(c <= 0 for c in counts) or sum(counts) != actual["rows"]:
             raise ValueError("joint task_counts must match positive dataset rows")
@@ -257,7 +428,14 @@ def _validate_run_schedule(payload: dict, args: argparse.Namespace) -> tuple[int
     mismatch = {key: (actual[key], value) for key, value in expected.items() if actual[key] != value}
     if mismatch:
         raise ValueError(f"LIBERO run schedule mismatch: {mismatch}")
-    steps_per_epoch = (actual["rows"] + args.batch_size - 1) // args.batch_size
+    if getattr(args, "architecture_version", "legacy") == "dual_tower_expert_v1":
+        from va_compound.data.episode_stream import EpisodeWindowBatchSampler
+        steps_per_epoch = len(EpisodeWindowBatchSampler(
+            payload, args.batch_size, getattr(args, "seed", 0), args.mixed_tasks,
+            rank=0, world_size=args.gpus,
+        ))
+    else:
+        steps_per_epoch = (actual["rows"] + args.batch_size - 1) // args.batch_size
     return steps_per_epoch, steps_per_epoch * args.epochs, str(profile["grouping"])
 
 

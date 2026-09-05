@@ -37,6 +37,7 @@ def backward_pcgrad(
     topology=None,
     auxiliary_loss_or_forward=None,
     compact_prefixes: tuple[str, ...] = (),
+    allow_inactive_ranks: bool = False,
 ):
     """PCGrad task losses; optionally project only an auxiliary gradient."""
     if not task_losses or (len(task_losses) < 2 and not callable(task_losses[0])):
@@ -76,6 +77,15 @@ def backward_pcgrad(
             for parameter, gradient in zip(trainable, gradients, strict=True):
                 parameter.grad = gradient
             if topology is not None:
+                # Exhausted episode slots contribute zero, while other ranks may still be active.
+                if allow_inactive_ranks and topology.is_distributed:
+                    import torch.distributed as dist
+                    present = torch.tensor([p.grad is not None for p in trainable],
+                                           device=trainable[0].device, dtype=torch.int32)
+                    dist.all_reduce(present, op=dist.ReduceOp.MAX)
+                    for parameter, used in zip(trainable, present.tolist(), strict=True):
+                        if used and parameter.grad is None:
+                            parameter.grad = torch.zeros_like(parameter)
                 # PCGrad is nonlinear: reduce each task gradient first, then project.
                 reduce_update_gradients(trainable_named, topology)
             task_gradients.append(

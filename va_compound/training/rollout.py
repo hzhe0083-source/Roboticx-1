@@ -78,7 +78,14 @@ def rollout_policy(
     feature_autocast_bf16: bool = False,
     train_world_model: bool = True,
     compute_action_output: bool = True,
+    episode_memory=None,
+    initial_visual_memory=None,
 ) -> tuple[Tensor, Tensor]:
+    if episode_memory is not None:
+        from va_compound.training.episode_rollout import rollout_episode_windows
+        options = dict(locals())
+        options.pop("rollout_episode_windows")
+        return rollout_episode_windows(rollout_policy, options)
     if world_action_rank_step < 0:
         raise ValueError("world_action_rank_step must be non-negative")
     if world_action_rank_stage not in {"final", "cycle"}:
@@ -106,10 +113,11 @@ def rollout_policy(
     language_cache = None if per_decision_language else model.build_language_cache(
         batch["language_hidden"], batch.get("language_mask")
     )
-    visual_memory = None
+    visual_memory = initial_visual_memory
     predicted_velocities = []
     action_conditions = []
     wmrm_world_terms: list[Tensor] = []
+    state_delta_records = []
     visual_world_stage_records: list[list[tuple[Tensor, Tensor, Tensor]]] = []
     visual_world_objective_stage_records: list[
         list[tuple[Tensor, Tensor, Tensor]]
@@ -237,6 +245,16 @@ def rollout_policy(
         finally:
             if original_peer_propose is not None:
                 model.wmrm.propose = original_peer_propose
+        if visual_world_supervision and model.config.world_state_supervision:
+            target_state = batch["world_state_delta"][:, time_index].detach()
+            predictions = model.last_world_state_predictions
+            if not predictions or target_state.shape != predictions[0].shape:
+                raise ValueError("World state delta labels must match published state predictions")
+            per_sample = torch.stack([
+                F.smooth_l1_loss(pred.float(), target_state.float(), reduction="none").mean(-1)
+                for pred in predictions
+            ]).mean(0)
+            state_delta_records.append((batch["instruction_id"], transition_validity[:, time_index], per_sample))
         proposal_auxes = list(getattr(model, "last_wmrm_auxes", None) or ())
         if not proposal_auxes and getattr(model, "last_wmrm", None) is not None:
             proposal_auxes = [model.last_wmrm]
@@ -732,5 +750,19 @@ def rollout_policy(
         model.last_wmrm_progress_counts = {}
         model.last_visual_world_metrics = {}
         model.last_wmrm_task_losses = {}
+    model.last_world_state_delta_loss = None
+    if state_delta_records:
+        def state_loss(task_id=None):
+            return masked_world_reduction(
+                [value for _, _, value in state_delta_records],
+                [valid if task_id is None else valid & tasks.eq(task_id)
+                 for tasks, valid, _ in state_delta_records],
+            )
+        model.last_world_state_delta_loss = state_loss()
+        weight = model.config.world_state_loss_weight
+        model.last_wmrm_loss = model.last_wmrm_loss + weight * model.last_world_state_delta_loss
+        for task_id in model.last_wmrm_task_losses:
+            model.last_wmrm_task_losses[task_id] = model.last_wmrm_task_losses[task_id] + weight * state_loss(task_id)
+    model.last_rollout_visual_memory = visual_memory
     model.last_wmrm_adep_loss = None
     return out

@@ -433,6 +433,12 @@ class LongTrajFramesDataset:
         item = {key: self.payload[key][index] for key in self.REQUIRED}
         for key in (
             "episode_id",
+            "crop_start",
+            "decision_valid_mask",
+            "decision_count",
+            "episode_start",
+            "episode_end",
+            "world_state_delta",
             "world_rank_shuffle_action",
             "world_rank_shuffle_mask",
             "world_target_valid_mask",

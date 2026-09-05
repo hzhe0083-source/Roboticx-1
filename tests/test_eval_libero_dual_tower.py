@@ -115,7 +115,7 @@ def test_eval_libero_dual_tower_closedloop_decisions(monkeypatch):
         device=torch.device("cpu"),
         state_q01=np.zeros(9, dtype=np.float32),
         state_q99=np.ones(9, dtype=np.float32),
-        horizon=6,
+        horizon=30,
         flow_steps=3,
         settle_steps=0,
         memory_reset_every=0,
@@ -126,19 +126,22 @@ def test_eval_libero_dual_tower_closedloop_decisions(monkeypatch):
         instruction="test instruction",
     )
 
-    assert steps == 6
+    assert steps == 30
     assert not success
-
-    # Verify frontend called once per decision (2 decisions total), not per flow integration step (2*3=6)
-    assert frontend_calls == 2
-
-    # Verify language cache was refreshed each decision with decision-dependent language
-    assert len(built_caches) == 2
+    assert frontend_calls == 10
+    assert len(built_caches) == 10
     assert built_caches[0].tokens.shape == built_caches[1].tokens.shape
     assert not torch.allclose(built_caches[0].tokens, built_caches[1].tokens)
 
-    # Verify visual memory propagated across decisions
-    assert len(passed_visual_memories) == 2
+    assert len(passed_visual_memories) == 10
     assert passed_visual_memories[0] is None
-    assert passed_visual_memories[1] is not None
-    assert isinstance(passed_visual_memories[1], VisualMemory)
+    assert all(isinstance(memory, VisualMemory) for memory in passed_visual_memories[1:])
+    eval_libero_closedloop.rollout_trial(
+        model=model, vision=MagicMock(), language_cache=None,
+        cross_modal_language_layers=None, env=env, init_state=np.zeros(10),
+        device=torch.device("cpu"), state_q01=np.zeros(9), state_q99=np.ones(9),
+        horizon=3, flow_steps=3, settle_steps=0, memory_reset_every=0,
+        policy_seed=43, previous_action_zero=False, dual_view=True,
+        joint_text=MagicMock(), instruction="test instruction",
+    )
+    assert passed_visual_memories[10] is None

@@ -61,6 +61,8 @@ class VACompoundConfig:
     deployment_execution_horizon: int = 0
     action_dim: int = 7
     proprio_dim: int = 14
+    world_state_supervision: bool = False
+    world_state_loss_weight: float = 1.0
     flow_layers: int = 2
     # Optional smaller action-decoder width. 0 keeps the historical shared width.
     flow_hidden_dim: int = 0
@@ -2410,6 +2412,17 @@ class VACompoundPolicy(nn.Module):
                 )
         else:
             self.wmrm = None
+        if config.world_state_supervision:
+            if config.architecture_version != "dual_tower_expert_v1" or self.wmrm is None:
+                raise ValueError("state transition supervision requires joint World architecture")
+            if not math.isfinite(config.world_state_loss_weight) or config.world_state_loss_weight < 0:
+                raise ValueError("World state loss weight must be finite and nonnegative")
+            self.wmrm.state_delta_head = nn.Sequential(
+                nn.LayerNorm(config.hidden_dim),
+                nn.Linear(config.hidden_dim, config.hidden_dim),
+                nn.SiLU(),
+                nn.Linear(config.hidden_dim, config.proprio_dim),
+            )
         if config.va_world_mode == "peer_sync_h6":
             from va_compound.wmrm import ExecutableActionReadout
 
@@ -3290,6 +3303,7 @@ class VACompoundPolicy(nn.Module):
         self.last_wmrm = None
         self.last_wmrm_auxes: list = []
         self.last_wmrm_pre_actions: list = []
+        self.last_world_state_predictions: list = []
         inject_layers = (
             self._wmrm_inject_layers() if self.wmrm is not None else set()
         )
@@ -3470,6 +3484,13 @@ class VACompoundPolicy(nn.Module):
                     if peer_mode and world_state.world_map is not None
                     else proposal.world_message
                 )
+                if self.config.world_state_supervision and torch.is_grad_enabled():
+                    state_message = self._peer_world_message(
+                        world_state, index, detach_world_map=False
+                    )
+                    self.last_world_state_predictions.append(
+                        self.wmrm.state_delta_head(state_message.mean(dim=1))
+                    )
                 world_message = published_message.to(
                     device=vision.device, dtype=target_dtype
                 )

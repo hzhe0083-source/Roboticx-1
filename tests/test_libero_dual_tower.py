@@ -32,6 +32,7 @@ def test_train_binds_validated_identity_to_both_samplers(monkeypatch, tmp_path, 
         "metadata": {"contract": contract, "tasks": ["pick", "place", "open", "close"]},
         "instruction_id": torch.arange(4).repeat_interleave(8),
         "episode_id": torch.arange(32),
+        "crop_start": torch.zeros(32, dtype=torch.long),
         "anchor_eligible": torch.ones(32, dtype=torch.bool),
     }
     monkeypatch.setattr(trainer, "_validate_data", lambda *a, **kw: payload)
@@ -45,7 +46,8 @@ def test_train_binds_validated_identity_to_both_samplers(monkeypatch, tmp_path, 
     monkeypatch.setattr(trainer, "_StaticAnchorDataset", lambda dataset: dataset)
     monkeypatch.setattr(trainer, "_sha256_file", lambda path: "test-data-sha")
     samplers = []
-    original_sampler = trainer.TaskLocalityWeightedSampler
+    sampler_name = "EpisodeWindowBatchSampler" if architecture == "dual_tower_expert_v1" else "TaskLocalityWeightedSampler"
+    original_sampler = getattr(trainer, sampler_name)
 
     def capture_sampler(*a, **kw):
         sampler = original_sampler(*a, **kw)
@@ -58,7 +60,7 @@ def test_train_binds_validated_identity_to_both_samplers(monkeypatch, tmp_path, 
     def stop_at_loader(*a, **kw):
         raise ReachedLoader
 
-    monkeypatch.setattr(trainer, "TaskLocalityWeightedSampler", capture_sampler)
+    monkeypatch.setattr(trainer, sampler_name, capture_sampler)
     monkeypatch.setattr(trainer, "DataLoader", stop_at_loader)
     with pytest.raises(ReachedLoader):
         trainer.train(args)
@@ -103,7 +105,7 @@ def test_joint_checkpoint_restores_next_adamw_update(tmp_path):
     from va_compound import VACompoundConfig, VACompoundPolicy
 
     torch.manual_seed(13)
-    model = VACompoundPolicy(config()).eval()
+    model = VACompoundPolicy(config(world_state_supervision=True)).eval()
     text, vision = torch.nn.Linear(2, 2), torch.nn.Linear(2, 2)
     parameters = list(model.parameters())
     optimizer = torch.optim.AdamW([
@@ -126,8 +128,14 @@ def test_joint_checkpoint_restores_next_adamw_update(tmp_path):
         run_metadata={"suites": ["libero_10"], "n_tasks": 2, "task_specs": []},
         pcgrad_forward_grouping="test", source_checkpoint="fresh_dual_tower_expert_v1",
         source_global_step=-1, sampler=sampler, world_sampler=sampler,
+        episode_runtime_states=[{"action": trainer.EpisodeMemoryBank().state_dict(),
+                                 "world": trainer.EpisodeMemoryBank().state_dict()}],
     )
     saved = torch.load(path, weights_only=True)
+    assert saved["training_contract"]["memory_reset_every"] == 0
+    assert saved["training_contract"]["memory_contract"] == "episode_tbptt8_v1"
+    assert saved["training_contract"]["world_state_loss_weight"] == 1.0
+    assert saved["episode_runtime_states"][0]["action"]["entries"] == {}
     assert saved["training_contract"]["execution_gradient_contract"] == "p15_live_h50_tail_detached_v1"
     assert saved["training_contract"]["data_contract"] == trainer.JOINT_DATA_CONTRACT
     assert saved["training_contract"]["optimizer_initialization"] == "fresh_adamw_v1"
@@ -154,10 +162,11 @@ def test_joint_schedule_allows_two_stage_probe_without_relaxing_legacy():
     import pytest
     from va_compound.data.libero import RUN_SCHEDULE_PROFILES, _validate_run_schedule
     profile = RUN_SCHEDULE_PROFILES[2]
-    payload = {"actions": range(profile["rows"]), "metadata": {
-        "n_tasks": 2, "suites": profile["suites"], "task_counts": [4684, 5159],
+    payload = {"actions": range(8), "metadata": {
+        "n_tasks": 2, "suites": profile["suites"], "task_counts": [4, 4],
         "task_specs": [{"local_task_id": i} for i in profile["local_task_ids"]],
-    }}
+    }, "instruction_id": torch.arange(2).repeat_interleave(4),
+       "episode_id": torch.arange(8), "crop_start": torch.zeros(8, dtype=torch.long)}
     args = SimpleNamespace(batch_size=profile["batch_size"], mixed_tasks=profile["mixed_tasks"],
                            stage1_steps=10, epochs=1, gpus=2, anchor_fraction=0,
                            max_steps=12, architecture_version="dual_tower_expert_v1")

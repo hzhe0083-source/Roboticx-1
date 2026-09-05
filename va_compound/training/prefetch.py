@@ -4,6 +4,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
 from va_compound.data.samplers import TaskLocalityWeightedSampler, TaskWeightedSampler
+from va_compound.data.episode_stream import EpisodeWindowBatchSampler
 
 def iter_forever(loader):
     """无限循环迭代 DataLoader（epoch 结束自动重启）。"""
@@ -100,7 +101,7 @@ class PeerJointBatchPrefetcher:
 def peer_prefetch_must_wait_for_commit(*samplers) -> bool:
     """Do not rebuild an exhausted iterator until its sampler enters next epoch."""
     return any(
-        isinstance(sampler, (TaskLocalityWeightedSampler, TaskWeightedSampler))
+        isinstance(sampler, (TaskLocalityWeightedSampler, TaskWeightedSampler, EpisodeWindowBatchSampler))
         and sampler.batch_cursor + 1 >= len(sampler)
         for sampler in samplers
         if sampler is not None
@@ -118,7 +119,7 @@ def peer_prefetch_fill_limit(
     locality_samplers = [
         sampler
         for sampler in samplers
-        if isinstance(sampler, (TaskLocalityWeightedSampler, TaskWeightedSampler))
+        if isinstance(sampler, (TaskLocalityWeightedSampler, TaskWeightedSampler, EpisodeWindowBatchSampler))
     ]
     if not locality_samplers:
         return int(remaining_steps)

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 import sys
@@ -30,6 +31,8 @@ from va_compound.training.prefetch import (
     peer_prefetch_must_wait_for_commit,
 )
 from va_compound.data.samplers import TaskLocalityWeightedSampler
+from va_compound.data.episode_stream import EpisodeStreamDataset, EpisodeWindowBatchSampler
+from va_compound.training.episode_memory import EpisodeMemoryBank
 from va_compound.vision.dual_tower_batch import encode_dual_tower_batch
 from va_compound.vision.encoding import _dino_main_online_encode
 from va_compound.utils.exact_resume import _sha256_file
@@ -175,6 +178,12 @@ def _parser() -> argparse.ArgumentParser:
         default="legacy",
         help="Architecture version for LIBERO policy training.",
     )
+    parser.add_argument(
+        "--world-state-loss-weight",
+        type=float,
+        default=1.0,
+        help="Loss weight for World state delta transition prediction.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--gpus", type=int, default=2)
     return parser
@@ -185,6 +194,7 @@ def _fresh_config(
     va_last3_cross_attn: bool = False,
     dino_qwen_cross_modal_bridge: bool = False,
     architecture_version: str = "legacy",
+    world_state_loss_weight: float = 1.0,
 ) -> VACompoundConfig:
     return VACompoundConfig(
         architecture_version=architecture_version,
@@ -197,6 +207,8 @@ def _fresh_config(
         action_horizon=ACTION_HORIZON,
         action_dim=7,
         proprio_dim=9,
+        world_state_supervision=True if architecture_version == "dual_tower_expert_v1" else False,
+        world_state_loss_weight=world_state_loss_weight,
         flow_layers=3 if architecture_version == "dual_tower_expert_v1" else 6,
         flow_hidden_dim=512,
         dropout=0.0,
@@ -296,12 +308,23 @@ def _validate_model_contract(config: VACompoundConfig) -> None:
         "dino_qwen_cross_modal_layers": len(FUSION_LAYERS),
     }
     if config.architecture_version == "dual_tower_expert_v1":
-        expected.update(va_last3_cross_attn=False, dino_qwen_cross_modal_bridge=False, flow_layers=3, fusion_pair_count=6, tail_flow_condition_grad=False)
+        expected.update(
+            va_last3_cross_attn=False,
+            dino_qwen_cross_modal_bridge=False,
+            flow_layers=3,
+            fusion_pair_count=6,
+            tail_flow_condition_grad=False,
+            world_state_supervision=True,
+        )
     mismatch = {
         key: (getattr(config, key), value)
         for key, value in expected.items()
         if getattr(config, key) != value
     }
+    if config.architecture_version == "dual_tower_expert_v1":
+        weight = getattr(config, "world_state_loss_weight", None)
+        if weight is None or not math.isfinite(weight) or weight < 0:
+            mismatch["world_state_loss_weight"] = (weight, "finite >= 0")
     if mismatch:
         raise ValueError(f"LIBERO H50/P15 model contract mismatch: {mismatch}")
 
@@ -347,10 +370,13 @@ def preflight(args: argparse.Namespace) -> None:
     ):
         raise ValueError("--qwen must be the full 24-layer Qwen3.5-0.8B")
     _qwen_weight_file(args.qwen)
+    if not math.isfinite(args.world_state_loss_weight) or args.world_state_loss_weight < 0:
+        raise ValueError("--world-state-loss-weight must be finite and >= 0")
     config = _fresh_config(
         va_last3_cross_attn=args.va_last3_cross_attn,
         dino_qwen_cross_modal_bridge=args.dino_qwen_cross_modal_bridge,
         architecture_version=getattr(args, "architecture_version", "legacy"),
+        world_state_loss_weight=args.world_state_loss_weight,
     )
     _validate_model_contract(config)
     if config.dino_qwen_cross_modal_bridge:
@@ -424,13 +450,54 @@ def _prepare_batch(
             )
         batch, sequence, patches, dim = tokens.shape
         raw["world_target_map"] = tokens.reshape(batch, sequence, 16, 16, dim).permute(0, 1, 4, 2, 3).detach()
+    row_fields = {}
+    for key in (
+        "decision_valid_mask",
+        "stream_id",
+        "stream_active",
+        "episode_id",
+        "crop_start",
+        "decision_count",
+        "episode_start",
+        "episode_end",
+        "world_rank_shuffle_action",
+        "world_rank_shuffle_mask",
+        "world_state_delta",
+    ):
+        if key in raw:
+            row_fields[key] = raw.pop(key)
     prepared = ensure_sequence(move_batch(raw, device), SEQUENCE)
+    for key, value in row_fields.items():
+        prepared[key] = value.to(device=device) if isinstance(value, Tensor) else value
     if prev_dropout >= 1.0:
         prepared["previous_action"].zero_()
     elif prev_dropout > 0:
         drop = torch.rand(prepared["previous_action"].shape[0], device=device) < prev_dropout
         prepared["previous_action"] *= (~drop).view(-1, 1, 1)
     return prepared
+
+
+def _rescale_task_loss_by_effective_count(
+    loss: Tensor,
+    local_count: Tensor | float,
+    topology,
+    device: torch.device,
+) -> Tensor:
+    if topology.world_size <= 1 or not topology.is_distributed:
+        return loss
+    import torch.distributed as dist
+
+    local_tensor = (
+        local_count.detach().clone().float().to(device)
+        if isinstance(local_count, Tensor)
+        else torch.tensor([float(local_count)], device=device, dtype=torch.float32)
+    )
+    if local_tensor.ndim == 0:
+        local_tensor = local_tensor.unsqueeze(0)
+    global_count = local_tensor.clone()
+    dist.all_reduce(global_count, op=dist.ReduceOp.SUM)
+    scale = (local_tensor * float(topology.world_size) / global_count.clamp_min(1.0))[0]
+    return loss * scale
 
 
 def _split_raw_tasks(raw: dict) -> list[dict]:
@@ -551,6 +618,7 @@ def _atomic_checkpoint(
     source_global_step: int,
     sampler,
     world_sampler,
+    episode_runtime_states: list[dict] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
@@ -568,6 +636,7 @@ def _atomic_checkpoint(
             "world_sampler_state": world_sampler.state_dict(),
             "source_checkpoint": source_checkpoint,
             "source_global_step": source_global_step,
+            **({"episode_runtime_states": episode_runtime_states} if episode_runtime_states is not None else {}),
             "training_contract": {
                 "initialization": ("fresh_dual_tower_expert_v1" if config.architecture_version == "dual_tower_expert_v1" else FRESH_INITIALIZATION),
                 "source_checkpoint": source_checkpoint,
@@ -586,7 +655,7 @@ def _atomic_checkpoint(
                 "flow_steps": 8,
                 "action_horizon": ACTION_HORIZON,
                 "sequence_length": SEQUENCE,
-                "memory_reset_every": SEQUENCE,
+                "memory_reset_every": 0 if config.architecture_version == "dual_tower_expert_v1" else SEQUENCE,
                 "planning_stride": EXECUTION_HORIZON,
                 "deployment_execution_horizon": EXECUTION_HORIZON,
                 "wmrm_cycle_steps": WORLD_HORIZON,
@@ -625,7 +694,12 @@ def _atomic_checkpoint(
                 "fusion_initialization": ("dual_tower_zero_output_v1" if config.architecture_version == "dual_tower_expert_v1" else "zero_output_unit_gate_v1"),
                 "architecture_version": config.architecture_version,
                 **(
-                    {"execution_gradient_contract": "p15_live_h50_tail_detached_v1"}
+                    {
+                        "execution_gradient_contract": "p15_live_h50_tail_detached_v1",
+                        "memory_contract": "episode_tbptt8_v1",
+                        "state_delta_contract": "joint7_gripper2_unclipped_q01q99_delta_h15_v1",
+                        "world_state_loss_weight": config.world_state_loss_weight,
+                    }
                     if config.architecture_version == "dual_tower_expert_v1"
                     else {}
                 ),
@@ -667,6 +741,7 @@ def _stage2_enabled(step: int, stage1_steps: int) -> bool:
 
 
 def train(args: argparse.Namespace) -> None:
+    joint_frontend = getattr(args, "architecture_version", "legacy") == "dual_tower_expert_v1"
     if args.resume is not None and args.resume_weights is not None:
         raise ValueError("choose --resume or --resume-weights, not both")
     if args.resume_weights is not None and getattr(args, "architecture_version", "legacy") != "legacy":
@@ -717,46 +792,66 @@ def train(args: argparse.Namespace) -> None:
         )
         task_weights = torch.ones(len(tasks), dtype=torch.float64)
         data_sha256 = _sha256_file(args.data)
-        sampler = TaskLocalityWeightedSampler(
-            dataset.payload["instruction_id"],
-            dataset.payload["episode_id"],
-            task_weights,
-            args.batch_size,
-            args.seed,
-            16,
-            "mixed",
-            mixed_tasks_per_batch=args.mixed_tasks,
-            anchor_replay_fraction=args.anchor_fraction,
-            rank=topology.rank,
-            world_size=topology.world_size,
-            anchor_eligible=dataset.payload["anchor_eligible"],
-        )
-        world_sampler = TaskLocalityWeightedSampler(
-            world_dataset.payload["instruction_id"],
-            world_dataset.payload["episode_id"],
-            task_weights,
-            args.batch_size,
-            args.seed,
-            16,
-            "mixed",
-            mixed_tasks_per_batch=args.mixed_tasks,
-            anchor_replay_fraction=args.anchor_fraction,
-            rank=topology.rank,
-            world_size=topology.world_size,
-            anchor_eligible=world_dataset.payload["anchor_eligible"],
-        )
+        if joint_frontend:
+            sampler = EpisodeWindowBatchSampler(
+                dataset.payload,
+                batch_size=args.batch_size,
+                seed=args.seed,
+                mixed_tasks_per_batch=args.mixed_tasks,
+                rank=topology.rank,
+                world_size=topology.world_size,
+            )
+            world_sampler = EpisodeWindowBatchSampler(
+                world_dataset.payload,
+                batch_size=args.batch_size,
+                seed=args.seed,
+                mixed_tasks_per_batch=args.mixed_tasks,
+                rank=topology.rank,
+                world_size=topology.world_size,
+            )
+        else:
+            sampler = TaskLocalityWeightedSampler(
+                dataset.payload["instruction_id"],
+                dataset.payload["episode_id"],
+                task_weights,
+                args.batch_size,
+                args.seed,
+                16,
+                "mixed",
+                mixed_tasks_per_batch=args.mixed_tasks,
+                anchor_replay_fraction=args.anchor_fraction,
+                rank=topology.rank,
+                world_size=topology.world_size,
+                anchor_eligible=dataset.payload["anchor_eligible"],
+            )
+            world_sampler = TaskLocalityWeightedSampler(
+                world_dataset.payload["instruction_id"],
+                world_dataset.payload["episode_id"],
+                task_weights,
+                args.batch_size,
+                args.seed,
+                16,
+                "mixed",
+                mixed_tasks_per_batch=args.mixed_tasks,
+                anchor_replay_fraction=args.anchor_fraction,
+                rank=topology.rank,
+                world_size=topology.world_size,
+                anchor_eligible=world_dataset.payload["anchor_eligible"],
+            )
         data_identity = {"contract": metadata["contract"], "sha256": data_sha256}
         sampler.bind_dataset_content_identity(data_identity)
         world_sampler.bind_dataset_content_identity(data_identity)
+        action_train_dataset = EpisodeStreamDataset(dataset) if joint_frontend else _StaticAnchorDataset(dataset)
+        world_train_dataset = EpisodeStreamDataset(world_dataset) if joint_frontend else _StaticAnchorDataset(world_dataset)
         loader = DataLoader(
-            _StaticAnchorDataset(dataset),
+            action_train_dataset,
             batch_sampler=sampler,
             collate_fn=mtvj_collate,
             num_workers=0,
             generator=torch.Generator().manual_seed(args.seed + topology.rank),
         )
         world_loader = DataLoader(
-            _StaticAnchorDataset(world_dataset),
+            world_train_dataset,
             batch_sampler=world_sampler,
             collate_fn=mtvj_collate,
             num_workers=0,
@@ -764,6 +859,8 @@ def train(args: argparse.Namespace) -> None:
                 args.seed + topology.rank + 10_000
             ),
         )
+        action_memory = EpisodeMemoryBank() if joint_frontend else None
+        world_memory = EpisodeMemoryBank() if joint_frontend else None
 
         source_path = args.resume if args.resume is not None else args.resume_weights
         source = (
@@ -783,11 +880,18 @@ def train(args: argparse.Namespace) -> None:
                 va_last3_cross_attn=args.va_last3_cross_attn,
                 dino_qwen_cross_modal_bridge=args.dino_qwen_cross_modal_bridge,
                 architecture_version=getattr(args, "architecture_version", "legacy"),
+                world_state_loss_weight=args.world_state_loss_weight,
             )
         )
         joint_frontend = config.architecture_version == "dual_tower_expert_v1"
         if config.architecture_version != getattr(args, "architecture_version", "legacy"):
             raise ValueError("checkpoint architecture mismatch; start a fresh run for the new architecture")
+        if source is not None and joint_frontend:
+            config_weight = getattr(config, "world_state_loss_weight", None)
+            if config_weight != args.world_state_loss_weight:
+                raise ValueError(
+                    f"resume world_state_loss_weight {config_weight} != args {args.world_state_loss_weight}"
+                )
         _validate_model_contract(config)
         if config.dino_qwen_cross_modal_bridge:
             validate_cross_modal_language_contract(dataset.payload.get("metadata") or {})
@@ -861,7 +965,7 @@ def train(args: argparse.Namespace) -> None:
                 "n_tasks": int(metadata["n_tasks"]),
                 "task_specs": list(metadata["task_specs"]),
                 "sequence_length": SEQUENCE,
-                "memory_reset_every": SEQUENCE,
+                "memory_reset_every": 0 if joint_frontend else SEQUENCE,
                 "stage1_steps": args.stage1_steps,
                 "total_steps": planned_total_steps,
                 "step_rng": "seed_plus_source_and_phase_step_times_world_plus_rank_v1",
@@ -893,8 +997,13 @@ def train(args: argparse.Namespace) -> None:
                 "fusion_initialization": ("dual_tower_zero_output_v1" if config.architecture_version == "dual_tower_expert_v1" else "zero_output_unit_gate_v1"),
                 "architecture_version": config.architecture_version,
                 **(
-                    {"execution_gradient_contract": "p15_live_h50_tail_detached_v1"}
-                    if config.architecture_version == "dual_tower_expert_v1"
+                    {
+                        "execution_gradient_contract": "p15_live_h50_tail_detached_v1",
+                        "memory_contract": "episode_tbptt8_v1",
+                        "state_delta_contract": "joint7_gripper2_unclipped_q01q99_delta_h15_v1",
+                        "world_state_loss_weight": config.world_state_loss_weight,
+                    }
+                    if joint_frontend
                     else {}
                 ),
                 "main_vision_encode_batch": args.encode_batch,
@@ -992,6 +1101,20 @@ def train(args: argparse.Namespace) -> None:
                     raise ValueError(
                         f"{label} sampler position {completed} != checkpoint step {start_step}"
                     )
+            if joint_frontend:
+                if "episode_runtime_states" not in source:
+                    raise ValueError("joint resume checkpoint missing episode_runtime_states")
+                runtime_states = source["episode_runtime_states"]
+                if not isinstance(runtime_states, list) or len(runtime_states) != topology.world_size:
+                    raise ValueError(
+                        f"episode_runtime_states must be a list of length {topology.world_size}, "
+                        f"got {type(runtime_states)} of length {len(runtime_states) if isinstance(runtime_states, list) else 'N/A'}"
+                    )
+                rank_state = runtime_states[topology.rank]
+                if not isinstance(rank_state, dict) or "action" not in rank_state or "world" not in rank_state:
+                    raise ValueError(f"rank {topology.rank} episode_runtime_state invalid format")
+                action_memory.load_state_dict(rank_state["action"])
+                world_memory.load_state_dict(rank_state["world"])
         elif args.resume_weights:
             optimizer.load_state_dict(source["optimizer"])
 
@@ -1102,6 +1225,8 @@ def train(args: argparse.Namespace) -> None:
                 "rank": [],
                 "readout": [],
             }
+            if joint_frontend:
+                world_components["state"] = []
             for offset in range(0, len(action_tasks), group_size):
                 group_ids = action_task_ids[offset : offset + group_size]
                 task_raw = _merge_raw_tasks(
@@ -1152,6 +1277,7 @@ def train(args: argparse.Namespace) -> None:
                             flow_time,
                             train_world_model=False,
                             feature_autocast_bf16=True,
+                            episode_memory=action_memory if joint_frontend else None,
                         )
                         losses = []
                         for task_id in group_ids:
@@ -1164,14 +1290,28 @@ def train(args: argparse.Namespace) -> None:
                                 else value
                                 for key, value in batch.items()
                             }
-                            loss = masked_flow_matching_loss(
-                                predicted[mask],
-                                target_velocity[mask],
-                                task_batch,
-                                prefix_steps=EXECUTION_HORIZON,
-                                prefix_weight=3.0,
-                                tail_weight=1.0,
-                            )[0]
+                            if joint_frontend and not bool(task_batch["action_valid_mask"].any()):
+                                loss = predicted[mask].sum() * 0
+                                local_count = 0.0
+                            else:
+                                loss = masked_flow_matching_loss(
+                                    predicted[mask],
+                                    target_velocity[mask],
+                                    task_batch,
+                                    prefix_steps=EXECUTION_HORIZON,
+                                    prefix_weight=3.0,
+                                    tail_weight=1.0,
+                                )[0]
+                                if joint_frontend:
+                                    act_mask = task_batch["action_valid_mask"]
+                                    split = min(EXECUTION_HORIZON, act_mask.shape[-1])
+                                    prefix_count = act_mask[..., :split].sum().float()
+                                    tail_count = act_mask[..., split:].sum().float()
+                                    local_count = 3.0 * prefix_count + 1.0 * tail_count
+                            if joint_frontend:
+                                loss = _rescale_task_loss_by_effective_count(
+                                    loss, local_count, topology, device
+                                )
                             losses.append(loss)
                             action_values.append(loss.detach())
                     return losses
@@ -1235,14 +1375,18 @@ def train(args: argparse.Namespace) -> None:
                             wmrm_feature_metric="cosine",
                             summarize_visual_world_metrics=False,
                             feature_autocast_bf16=True,
+                            episode_memory=world_memory if joint_frontend else None,
                         )
-                    for name, attribute in (
+                    metric_attrs = [
                         ("visual", "last_wmrm_base_loss"),
                         ("guard", "last_world_no_regression_loss"),
                         ("static", "last_world_static_constraint_loss"),
                         ("rank", "last_world_action_rank_loss"),
                         ("readout", "last_world_action_readout_loss"),
-                    ):
+                    ]
+                    if joint_frontend:
+                        metric_attrs.append(("state", "last_world_state_delta_loss"))
+                    for name, attribute in metric_attrs:
                         value = getattr(model, attribute, None)
                         if value is None:
                             raise RuntimeError(f"World did not expose {attribute}")
@@ -1252,7 +1396,20 @@ def train(args: argparse.Namespace) -> None:
                         raise RuntimeError(
                             "grouped World forward produced the wrong task losses"
                         )
-                    ordered = [losses[task_id] for task_id in group_ids]
+                    ordered = []
+                    for task_id in group_ids:
+                        loss = losses[task_id]
+                        if joint_frontend:
+                            task_mask = world_batch["instruction_id"] == task_id
+                            local_count = (
+                                world_batch["decision_count"][task_mask].sum().float()
+                                if "decision_count" in world_batch
+                                else world_batch["decision_valid_mask"][task_mask].sum().float()
+                            )
+                            loss = _rescale_task_loss_by_effective_count(
+                                loss, local_count, topology, device
+                            )
+                        ordered.append(loss)
                     world_values.extend(loss.detach() for loss in ordered)
                     return ordered
 
@@ -1279,6 +1436,7 @@ def train(args: argparse.Namespace) -> None:
                 seed=args.seed + step,
                 topology=topology,
                 compact_prefixes=("qwen.", "main_vision."),
+                allow_inactive_ranks=joint_frontend,
             )
             action_gradients = pop_update_gradients(
                 [*action_private, *shared_dino]
@@ -1289,6 +1447,7 @@ def train(args: argparse.Namespace) -> None:
                 seed=args.seed + step,
                 topology=topology,
                 compact_prefixes=("main_vision.",),
+                allow_inactive_ranks=joint_frontend,
             )
             dino_stats = merge_separate_pcgrad_gradients(
                 action_private,
@@ -1314,6 +1473,9 @@ def train(args: argparse.Namespace) -> None:
             ]
             grad = torch.nn.utils.clip_grad_norm_(clip_parameters, 1.0)
             optimizer.step()
+            if joint_frontend:
+                action_memory.commit()
+                world_memory.commit()
             sampler.advance()
             world_sampler.advance()
             if prefetch_after_commit:
@@ -1345,7 +1507,7 @@ def train(args: argparse.Namespace) -> None:
                     for name, values in world_components.items()
                 }
             if topology.is_primary and log_step:
-                print(
+                msg = (
                     f"step={step}/{total_steps} action={action_value:.6f} "
                     f"world={world_logged:.6f} grad={float(grad):.4f} "
                     f"world_visual={component_log['visual']:.6f} "
@@ -1353,11 +1515,30 @@ def train(args: argparse.Namespace) -> None:
                     f"world_static={component_log['static']:.6f} "
                     f"world_rank={component_log['rank']:.6f} "
                     f"world_readout={component_log['readout']:.6f} "
-                    f"pcgrad={stats['conflicts']}/{stats['comparisons']} "
-                    f"world_guard={stats['world_conflicts']}/{stats['world_comparisons']}",
-                    flush=True,
                 )
+                if joint_frontend:
+                    state_raw = component_log["state"]
+                    state_weighted = state_raw * config.world_state_loss_weight
+                    msg += f"world_state_raw={state_raw:.6f} world_state_weighted={state_weighted:.6f} "
+                msg += (
+                    f"pcgrad={stats['conflicts']}/{stats['comparisons']} "
+                    f"world_guard={stats['world_conflicts']}/{stats['world_comparisons']}"
+                )
+                print(msg, flush=True)
             if step % args.save_every == 0 or step == total_steps:
+                episode_runtime_states = None
+                if joint_frontend:
+                    local_runtime_state = {
+                        "action": action_memory.state_dict(),
+                        "world": world_memory.state_dict(),
+                    }
+                    if topology.is_distributed:
+                        import torch.distributed as dist
+
+                        episode_runtime_states = [None] * topology.world_size
+                        dist.all_gather_object(episode_runtime_states, local_runtime_state)
+                    else:
+                        episode_runtime_states = [local_runtime_state]
                 barrier(topology)
                 if topology.is_primary:
                     _atomic_checkpoint(
@@ -1380,6 +1561,7 @@ def train(args: argparse.Namespace) -> None:
                         source_global_step=lineage_step,
                         sampler=sampler,
                         world_sampler=world_sampler,
+                        episode_runtime_states=episode_runtime_states,
                     )
                     print(f"saved {args.save} at step {step}", flush=True)
                 barrier(topology)

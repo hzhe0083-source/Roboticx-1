@@ -475,7 +475,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--horizon", type=int, default=0)
     parser.add_argument("--flow-steps", type=int, default=8)
     parser.add_argument("--settle-steps", type=int, default=10)
-    parser.add_argument("--memory-reset-every", type=int, default=4)
+    parser.add_argument("--memory-reset-every", type=int, default=None)
     parser.add_argument("--seed", type=int, default=1000)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output", type=Path)
@@ -862,6 +862,8 @@ def main() -> None:
                 ),
             )
         if joint_frontend:
+            if not config.world_state_supervision:
+                raise ValueError("joint episode evaluation requires state transition supervision")
             stage1_steps = contract.get("stage1_steps")
             total_steps = contract.get("total_steps")
             if not isinstance(stage1_steps, int) or stage1_steps < 0:
@@ -870,6 +872,10 @@ def main() -> None:
                 raise ValueError("joint checkpoint requires a positive total_steps")
             required_four_suite.update(
                 initialization="fresh_dual_tower_expert_v1",
+                memory_reset_every=0,
+                memory_contract="episode_tbptt8_v1",
+                state_delta_contract="joint7_gripper2_unclipped_q01q99_delta_h15_v1",
+                world_state_loss_weight=config.world_state_loss_weight,
                 fusion_initialization="dual_tower_zero_output_v1",
                 architecture_version="dual_tower_expert_v1",
                 source_global_step=-1,
@@ -906,6 +912,8 @@ def main() -> None:
     if contract.get("flow_steps", 8) != 8 or args.flow_steps != 8:
         raise ValueError("formal LIBERO evaluation requires 8 Flow steps")
     expected_memory_reset = int(contract.get("memory_reset_every", 4))
+    if args.memory_reset_every is None:
+        args.memory_reset_every = expected_memory_reset
     if args.memory_reset_every != expected_memory_reset:
         raise ValueError(
             "formal LIBERO evaluation requires memory reset every "

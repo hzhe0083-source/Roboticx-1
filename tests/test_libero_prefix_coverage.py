@@ -50,15 +50,20 @@ def test_real_hdf5_preparation_covers_tail_and_validates_masks(tmp_path, monkeyp
     prepare.prepare_data(args)
     payload = _validate_data(args.data, architecture_version=args.architecture_version)
     assert payload["metadata"]["contract"] == JOINT_DATA_CONTRACT
-    assert payload["metadata"]["task_counts"] == [50 * 40]
-    terminal_row = payload["crop_start"] == 39
-    assert torch.all(payload["action_valid_mask"][terminal_row, -1, :15])
-    assert not torch.any(payload["action_valid_mask"][terminal_row, -1, 15:])
-    torch.testing.assert_close(payload["actions"][terminal_row, -1, 14, 0], torch.full((50,), 159 / 160))
+    assert payload["metadata"]["task_counts"] == [50 * 2]
+    terminal_row = payload["crop_start"] == 120
+    assert torch.all(payload["action_valid_mask"][terminal_row, 0, :39])
+    assert not torch.any(payload["action_valid_mask"][terminal_row, 0, 39:])
+    assert torch.all(payload["action_valid_mask"][terminal_row, 1, :24])
+    assert not torch.any(payload["action_valid_mask"][terminal_row, 1, 24:])
+    assert not torch.any(payload["action_valid_mask"][terminal_row, 2:])
+    assert payload["decision_count"][terminal_row][0] == 2
+    torch.testing.assert_close(payload["actions"][terminal_row, 0, 14, 0], torch.full((50,), 120 + 15) / 160)
+    torch.testing.assert_close(payload["actions"][terminal_row, 1, 14, 0], torch.full((50,), 135 + 15) / 160)
     assert all(ref[2][-1][0] < 2 * length for ref in payload["world_target_frame_refs"])
     with pytest.raises(ValueError, match="unexpected data contract"):
         _validate_data(args.data)
-    payload["action_valid_mask"][0, 0, 0] = False
+    payload["action_valid_mask"][0, 0, :] = False
     bad = tmp_path / "bad.pt"
     torch.save(payload, bad)
     with pytest.raises(ValueError, match="real P15"):
