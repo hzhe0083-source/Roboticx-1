@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 import train_libero as trainer
@@ -14,6 +15,58 @@ def test_fresh_dual_configuration_and_parser():
     assert config.flow_layers == 3
     assert not config.dino_qwen_cross_modal_bridge
     assert not config.va_last3_cross_attn
+
+
+@pytest.mark.parametrize("architecture,contract", [
+    ("legacy", trainer.DATA_CONTRACT),
+    ("dual_tower_expert_v1", trainer.JOINT_DATA_CONTRACT),
+])
+def test_train_binds_validated_identity_to_both_samplers(monkeypatch, tmp_path, architecture, contract):
+    args = trainer._parser().parse_args([
+        "train", "--architecture-version", architecture,
+        "--save", str(tmp_path / "checkpoint.pt"),
+    ])
+    if architecture == "legacy":
+        args.resume_weights = tmp_path / "source.pt"
+    payload = {
+        "metadata": {"contract": contract, "tasks": ["pick", "place", "open", "close"]},
+        "instruction_id": torch.arange(4).repeat_interleave(8),
+        "episode_id": torch.arange(32),
+        "anchor_eligible": torch.ones(32, dtype=torch.bool),
+    }
+    monkeypatch.setattr(trainer, "_validate_data", lambda *a, **kw: payload)
+    monkeypatch.setattr(trainer, "_validate_run_schedule", lambda *a: (1, 1, "test"))
+    topology = SimpleNamespace(local_rank=0, rank=0, world_size=1, is_distributed=False)
+    monkeypatch.setattr(trainer, "resolve_world_topology", lambda: topology)
+    monkeypatch.setattr(trainer, "initialize", lambda *a: None)
+    monkeypatch.setattr(trainer, "shutdown", lambda *a: None)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(trainer, "LongTrajFramesDataset", lambda *a, **kw: SimpleNamespace(payload=payload))
+    monkeypatch.setattr(trainer, "_StaticAnchorDataset", lambda dataset: dataset)
+    monkeypatch.setattr(trainer, "_sha256_file", lambda path: "test-data-sha")
+    samplers = []
+    original_sampler = trainer.TaskLocalityWeightedSampler
+
+    def capture_sampler(*a, **kw):
+        sampler = original_sampler(*a, **kw)
+        samplers.append(sampler)
+        return sampler
+
+    class ReachedLoader(Exception):
+        pass
+
+    def stop_at_loader(*a, **kw):
+        raise ReachedLoader
+
+    monkeypatch.setattr(trainer, "TaskLocalityWeightedSampler", capture_sampler)
+    monkeypatch.setattr(trainer, "DataLoader", stop_at_loader)
+    with pytest.raises(ReachedLoader):
+        trainer.train(args)
+    assert len(samplers) == 2
+    for sampler in samplers:
+        assert sampler.dataset_content_identity == {
+            "contract": contract, "sha256": "test-data-sha",
+        }
 
 
 def test_joint_batch_preserves_language_graph_and_detaches_world_target(monkeypatch):

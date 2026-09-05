@@ -745,7 +745,7 @@ def train(args: argparse.Namespace) -> None:
             world_size=topology.world_size,
             anchor_eligible=world_dataset.payload["anchor_eligible"],
         )
-        data_identity = {"contract": DATA_CONTRACT, "sha256": data_sha256}
+        data_identity = {"contract": metadata["contract"], "sha256": data_sha256}
         sampler.bind_dataset_content_identity(data_identity)
         world_sampler.bind_dataset_content_identity(data_identity)
         loader = DataLoader(
