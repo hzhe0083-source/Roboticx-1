@@ -221,3 +221,43 @@ def test_dense_continuation_requires_completed_source():
     source["global_step"] = 800
     with pytest.raises(ValueError, match="source mismatch"):
         _validate_dense_source(source)
+
+
+def test_single_task_joint_schedule_drawer_task3_23epochs():
+    payload = {
+        "actions": torch.zeros(16, 8, 50, 7),
+        "metadata": {
+            "n_tasks": 1,
+            "suites": ["libero_10"],
+            "task_counts": [16],
+            "task_specs": [{"local_task_id": 3}],
+        },
+        "instruction_id": torch.zeros(16, dtype=torch.long),
+        "episode_id": torch.arange(4).repeat_interleave(4),
+        "crop_start": torch.arange(4).repeat(4) * 120,
+    }
+    args = SimpleNamespace(
+        batch_size=4,
+        mixed_tasks=1,
+        stage1_steps=0,
+        epochs=23,
+        gpus=2,
+        anchor_fraction=0.0,
+        max_steps=None,
+        architecture_version="dual_tower_expert_v1",
+    )
+    steps_per_epoch, total_steps, grouping = _validate_run_schedule(payload, args)
+    assert steps_per_epoch == 4
+    assert total_steps == 4 * 23
+    assert grouping == "single_task_t8_local1_deferred_v1"
+
+    # Legacy rejects single task
+    args.architecture_version = "legacy"
+    with pytest.raises(ValueError, match="40-task"):
+        _validate_run_schedule(payload, args)
+
+    # Indivisible batch and gpus rejects
+    args.architecture_version = "dual_tower_expert_v1"
+    args.batch_size = 3
+    with pytest.raises(ValueError, match="positive batch_size divisible by gpus"):
+        _validate_run_schedule(payload, args)

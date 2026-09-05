@@ -42,6 +42,20 @@ def run(model, data, bank, world=True):
                           train_world_model=world, summarize_visual_world_metrics=False)
 
 
+def test_joint_state_token_preserves_autocast_dtype():
+    model = VACompoundPolicy(config(world_state_supervision=True)).eval()
+    bank = EpisodeMemoryBank()
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        velocity, _ = run(model, batch(), bank)
+    assert torch.isfinite(velocity).all()
+    model.last_wmrm_loss.backward()
+    bank.commit()
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        velocity, _ = run(model, batch(count=1, start=30, end=True), bank)
+    model.last_wmrm_loss.backward()
+    assert torch.isfinite(velocity).all()
+
+
 def test_state_supervision_updates_shared_world_and_not_labels():
     torch.manual_seed(42)
     model = VACompoundPolicy(config(world_state_supervision=True)).eval()

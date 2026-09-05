@@ -740,6 +740,12 @@ def _stage2_enabled(step: int, stage1_steps: int) -> bool:
     return step > stage1_steps
 
 
+def _unfreeze_vision_tail(vision, *, joint_frontend: bool) -> None:
+    vision.unfreeze_last(len(FUSION_LAYERS))
+    if joint_frontend:
+        vision.model.set_grad_checkpointing(False)
+
+
 def train(args: argparse.Namespace) -> None:
     joint_frontend = getattr(args, "architecture_version", "legacy") == "dual_tower_expert_v1"
     if args.resume is not None and args.resume_weights is not None:
@@ -943,7 +949,7 @@ def train(args: argparse.Namespace) -> None:
         if model.dino_qwen_bridge is not None:
             model.dino_qwen_bridge.requires_grad_(stage2)
         if stage2:
-            vision.unfreeze_last(len(FUSION_LAYERS))
+            _unfreeze_vision_tail(vision, joint_frontend=joint_frontend)
         if args.resume:
             contract = source.get("training_contract") or {}
             if not joint_frontend and (not source.get("source_checkpoint") or int(
@@ -1175,7 +1181,7 @@ def train(args: argparse.Namespace) -> None:
                 if model.dino_qwen_bridge is not None:
                     model.dino_qwen_bridge.requires_grad_(next_stage2)
                 if next_stage2:
-                    vision.unfreeze_last(len(FUSION_LAYERS))
+                    _unfreeze_vision_tail(vision, joint_frontend=joint_frontend)
                 else:
                     vision.freeze_all()
                 active_stage2 = next_stage2
@@ -1209,7 +1215,7 @@ def train(args: argparse.Namespace) -> None:
                 raise RuntimeError("PCGrad batch does not contain the configured tasks")
             group_size = (
                 1
-                if args.mixed_tasks == 2
+                if args.mixed_tasks in (1, 2)
                 else 2
                 if active_stage2
                 else args.mixed_tasks
@@ -1437,6 +1443,7 @@ def train(args: argparse.Namespace) -> None:
                 topology=topology,
                 compact_prefixes=("qwen.", "main_vision."),
                 allow_inactive_ranks=joint_frontend,
+                allow_single_task=joint_frontend and args.mixed_tasks == 1,
             )
             action_gradients = pop_update_gradients(
                 [*action_private, *shared_dino]
@@ -1448,6 +1455,7 @@ def train(args: argparse.Namespace) -> None:
                 topology=topology,
                 compact_prefixes=("main_vision.",),
                 allow_inactive_ranks=joint_frontend,
+                allow_single_task=joint_frontend and args.mixed_tasks == 1,
             )
             dino_stats = merge_separate_pcgrad_gradients(
                 action_private,

@@ -388,6 +388,37 @@ def _validate_data(path: Path, *, architecture_version: str = "legacy") -> dict:
 def _validate_run_schedule(payload: dict, args: argparse.Namespace) -> tuple[int, int, str]:
     metadata = payload["metadata"]
     n_tasks = int(metadata["n_tasks"])
+    is_joint = getattr(args, "architecture_version", "legacy") == "dual_tower_expert_v1"
+    if n_tasks == 1:
+        if not is_joint:
+            raise ValueError("this trainer supports the 40-task run or the LIBERO-Long task3+4 probe")
+        suites = list(metadata.get("suites", []))
+        if len(suites) != 1 or suites[0] not in LIBERO_SUITES:
+            raise ValueError(f"single-task joint training requires exactly one suite from {LIBERO_SUITES}")
+        task_specs = metadata.get("task_specs", [])
+        if len(task_specs) != 1:
+            raise ValueError("single-task joint training requires exactly one task spec")
+        local_task_id = int(task_specs[0].get("local_task_id", -1))
+        if local_task_id not in range(10):
+            raise ValueError(f"single-task joint training requires local_task_id in 0..9, got {local_task_id}")
+        if args.mixed_tasks != 1:
+            raise ValueError(f"single-task joint training requires mixed_tasks == 1, got {args.mixed_tasks}")
+        if args.anchor_fraction != 0.0:
+            raise ValueError(f"single-task joint training requires anchor_fraction == 0.0, got {args.anchor_fraction}")
+        if args.batch_size <= 0 or args.gpus <= 0 or args.batch_size % args.gpus != 0:
+            raise ValueError("single-task joint training requires positive batch_size divisible by gpus")
+        if args.stage1_steps < 0 or args.epochs < 1:
+            raise ValueError("joint training requires stage1_steps >= 0 and epochs >= 1")
+        counts = metadata.get("task_counts", [])
+        if len(counts) != 1 or any(c <= 0 for c in counts) or sum(counts) != len(payload["actions"]):
+            raise ValueError("joint task_counts must match positive dataset rows")
+        from va_compound.data.episode_stream import EpisodeWindowBatchSampler
+        steps_per_epoch = len(EpisodeWindowBatchSampler(
+            payload, args.batch_size, getattr(args, "seed", 0), args.mixed_tasks,
+            rank=0, world_size=args.gpus,
+        ))
+        return steps_per_epoch, steps_per_epoch * args.epochs, "single_task_t8_local1_deferred_v1"
+
     if n_tasks not in RUN_SCHEDULE_PROFILES:
         raise ValueError("this trainer supports the 40-task run or the LIBERO-Long task3+4 probe")
     profile = RUN_SCHEDULE_PROFILES[n_tasks]

@@ -175,3 +175,38 @@ def test_joint_schedule_allows_two_stage_probe_without_relaxing_legacy():
     args.architecture_version = "legacy"
     with pytest.raises(ValueError, match="schedule mismatch"):
         _validate_run_schedule(payload, args)
+
+
+def test_single_task_joint_schedule_authorizes_drawer3_and_rejects_legacy():
+    from va_compound.data.libero import _validate_run_schedule
+    payload = {
+        "actions": torch.zeros(8, 8, 50, 7),
+        "metadata": {
+            "n_tasks": 1,
+            "suites": ["libero_10"],
+            "task_counts": [8],
+            "task_specs": [{"local_task_id": 3}],
+        },
+        "instruction_id": torch.zeros(8, dtype=torch.long),
+        "episode_id": torch.zeros(8, dtype=torch.long),
+        "crop_start": torch.arange(8, dtype=torch.long) * 120,
+    }
+    args = SimpleNamespace(
+        batch_size=2,
+        mixed_tasks=1,
+        stage1_steps=0,
+        epochs=23,
+        gpus=1,
+        anchor_fraction=0.0,
+        max_steps=None,
+        architecture_version="dual_tower_expert_v1",
+    )
+    per_epoch, total, grouping = _validate_run_schedule(payload, args)
+    assert per_epoch == 8
+    assert total == per_epoch * 23
+    assert grouping == "single_task_t8_local1_deferred_v1"
+
+    # Legacy must reject single-task
+    args.architecture_version = "legacy"
+    with pytest.raises(ValueError, match="40-task"):
+        _validate_run_schedule(payload, args)

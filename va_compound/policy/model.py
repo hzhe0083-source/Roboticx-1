@@ -3022,7 +3022,8 @@ class VACompoundPolicy(nn.Module):
             state_type = self.state_type_embed(
                 torch.ones(1, dtype=torch.long, device=state.device)
             ).unsqueeze(0)  # [1, 1, hidden_dim]
-            vision = torch.cat((vision + vision_type, state_token + state_type), dim=1)
+            vision = torch.cat((vision + vision_type.to(vision.dtype),
+                                state_token.to(vision.dtype) + state_type.to(vision.dtype)), dim=1)
             action = self.action_queries[None].expand(vision.shape[0], -1, -1)
         else:
             action = self.action_queries[None].expand(vision.shape[0], -1, -1) + state[:, None]

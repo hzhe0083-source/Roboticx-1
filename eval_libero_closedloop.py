@@ -872,6 +872,7 @@ def main() -> None:
                 raise ValueError("joint checkpoint requires a positive total_steps")
             required_four_suite.update(
                 initialization="fresh_dual_tower_expert_v1",
+                suites=list(metadata["suites"]),
                 memory_reset_every=0,
                 memory_contract="episode_tbptt8_v1",
                 state_delta_contract="joint7_gripper2_unclipped_q01q99_delta_h15_v1",

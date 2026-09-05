@@ -41,9 +41,12 @@ def rollout_episode_windows(rollout, options):
         stream = int(batch["stream_id"][row])
         episode = int(batch["episode_id"][row])
         start = int(batch["crop_start"][row])
+        device = batch["vision_tokens"].device
+        memory_dtype = (torch.get_autocast_dtype(device.type)
+                        if torch.is_autocast_enabled(device.type)
+                        else model.vision_projection.weight.dtype)
         memory = bank.begin(stream, episode, start, bool(batch["episode_start"][row]),
-                            device=batch["vision_tokens"].device,
-                            dtype=model.vision_projection.weight.dtype)
+                            device=device, dtype=memory_dtype)
         single = {}
         temporal = {"actions", "proprio", "previous_action", "vision_tokens", "dino_last4",
                     "action_valid_mask", "recovery_mask", "world_target_valid_mask",

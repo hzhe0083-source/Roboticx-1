@@ -38,9 +38,10 @@ def backward_pcgrad(
     auxiliary_loss_or_forward=None,
     compact_prefixes: tuple[str, ...] = (),
     allow_inactive_ranks: bool = False,
+    allow_single_task: bool = False,
 ):
     """PCGrad task losses; optionally project only an auxiliary gradient."""
-    if not task_losses or (len(task_losses) < 2 and not callable(task_losses[0])):
+    if not task_losses or (not allow_single_task and len(task_losses) < 2 and not callable(task_losses[0])):
         raise ValueError("PCGrad requires at least two task losses")
     trainable_named = [
         (name, parameter)
@@ -100,6 +101,12 @@ def backward_pcgrad(
             )
             for parameter in trainable:
                 parameter.grad = None
+    if len(task_gradients) == 1 and allow_single_task:
+        if auxiliary_loss_or_forward is not None:
+            raise ValueError("single-task gradients require separate explicit objectives")
+        for parameter, gradient in zip(trainable, task_gradients[0], strict=True):
+            parameter.grad = None if gradient is None else gradient.to(dtype=parameter.dtype)
+        return {"conflicts": 0, "comparisons": 0}
     if len(task_gradients) < 2:
         raise ValueError("PCGrad requires at least two task losses")
 
