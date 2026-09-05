@@ -24,6 +24,7 @@ SOURCE_INITIALIZATION = "dense_all_windows_continue_from_s5000_v1"
 DATA_CONTRACT = "libero_4suite_h50p15_t8_dualview5_worldh15_va1024_qwen08_last6_denseall_v8"
 JOINT_DATA_CONTRACT = "libero_joint_episode_t8_p15_state_delta_v10"
 H15_DATA_CONTRACT = "libero_joint_episode_t8_h15_state_delta_v11"
+ALL_STARTS_DATA_CONTRACT = "libero_joint_all_starts_t8_h15_state_delta_v12"
 FRESH_INITIALIZATION = "t8_dense_continue_from_t4_s1000_v1"
 FUSION_LAYERS = list(range(18, 24))
 CROSS_MODAL_VA_LAYERS = list(range(len(FUSION_LAYERS)))
@@ -183,9 +184,267 @@ def _attach_joint_world_action_donors(payload: dict) -> None:
     )
 
 
-def _validate_data(path: Path, *, architecture_version: str = "legacy") -> dict:
+def _attach_all_starts_world_action_donors(payload: dict) -> None:
+    """Attach next-episode relative progress donors for compact all-starts payload [N, 1, 15, 7]."""
+    actions = payload["actions"]
+    tasks = payload["instruction_id"]
+    episodes = payload["episode_id"]
+
+    table = actions.new_zeros(actions.shape)
+    mask = torch.zeros(actions.shape[:2], dtype=torch.bool)
+
+    for task in torch.unique(tasks, sorted=True):
+        task_rows = torch.where(tasks == task)[0]
+        task_episodes = torch.unique(episodes[task_rows], sorted=True)
+        for position, episode in enumerate(task_episodes):
+            own_rows = torch.where(episodes == episode)[0]
+            donor_episode = task_episodes[(position + 1) % len(task_episodes)]
+            donor_rows = torch.where(episodes == donor_episode)[0]
+
+            d_own = len(own_rows)
+            d_donor = len(donor_rows)
+            for t in range(d_own):
+                donor_idx = int(round(t * max(d_donor - 1, 0) / max(d_own - 1, 1)))
+                donor_idx = min(max(donor_idx, 0), d_donor - 1)
+                candidate = actions[donor_rows[donor_idx]]
+                table[own_rows[t]] = candidate
+                mask[own_rows[t]] = candidate.ne(actions[own_rows[t]]).any(dim=-1).any(dim=-1)
+
+    payload["world_rank_shuffle_action"] = table
+    payload["world_rank_shuffle_mask"] = mask
+    payload["metadata"]["world_action_donor_contract"] = (
+        "task_next_episode_relative_progress_v1"
+    )
+
+
+def _validate_all_starts_data(payload: dict, path: Path) -> dict:
+    metadata = payload.get("metadata", {})
+    if metadata.get("contract") != ALL_STARTS_DATA_CONTRACT:
+        raise ValueError(f"unexpected data contract in {path}: expected {ALL_STARTS_DATA_CONTRACT}")
+    tasks = list(metadata.get("tasks") or [])
+    specs = list(metadata.get("task_specs") or [])
+    n_tasks = int(metadata.get("n_tasks", 0))
+    n_demos = int(metadata.get("n_demos", 0))
+    if (
+        n_tasks < 1
+        or len(tasks) != n_tasks
+        or len(specs) != n_tasks
+        or [spec.get("task_id") for spec in specs] != list(range(n_tasks))
+    ):
+        raise ValueError("LIBERO task metadata and task specs are inconsistent")
+
+    episode_lengths = metadata.get("episode_lengths")
+    if (
+        not isinstance(episode_lengths, list)
+        or len(episode_lengths) != n_demos
+        or any(not isinstance(L, int) or L <= EXECUTION_HORIZON for L in episode_lengths)
+    ):
+        raise ValueError("metadata episode_lengths must be a list of demo lengths > 15")
+
+    expected_metadata = {
+        "contract": ALL_STARTS_DATA_CONTRACT,
+        "sampling_contract": "all_starts_random_tbptt8_v1",
+        "window_sampling": "all_starts_random_tbptt8_v1",
+        "storage_sequence_length": 1,
+        "sequence_length": SEQUENCE,
+        "action_horizon": EXECUTION_HORIZON,
+        "planning_stride": EXECUTION_HORIZON,
+        "control_stride": EXECUTION_HORIZON,
+        "decision_offsets": [0],
+        "vision_offsets": VISION_OFFSETS.tolist(),
+        "vision_input": "agentview_history4_plus_current_wrist_v2",
+        "world_target_view": "eye_in_hand_rgb",
+        "world_target_horizon": WORLD_HORIZON,
+        "world_target_offsets": [WORLD_HORIZON],
+        "world_target_alignment": f"obs[d+{WORLD_HORIZON}]",
+        "target_alignment": f"obs[d]_to_actions[d+1:d+{EXECUTION_HORIZON + 1}]",
+        "logged_action_chunk": "real_p15",
+        "language_source": "online_qwen35_0_8b_last6_full_v1",
+        "language_dim": 1024,
+        "state_delta_contract": "joint7_gripper2_unclipped_q01q99_delta_h15_v1",
+        "memory_contract": "offset_replay_tbptt8_v1",
+        "world_action_donor_contract": "task_next_episode_relative_progress_v1",
+    }
+    mismatch = {
+        key: (metadata.get(key), value)
+        for key, value in expected_metadata.items()
+        if metadata.get(key) != value
+    }
+    if mismatch:
+        raise ValueError(f"LIBERO all-starts metadata mismatch: {mismatch}")
+
+    actions = payload.get("actions")
+    if not isinstance(actions, Tensor) or tuple(actions.shape[1:]) != (1, EXECUTION_HORIZON, 7):
+        raise ValueError("LIBERO compact data actions must be [N, 1, 15, 7]")
+    if not torch.isfinite(actions).all():
+        raise ValueError("LIBERO actions must be finite")
+    N = len(actions)
+
+    instruction_ids = payload.get("instruction_id")
+    if (
+        not isinstance(instruction_ids, Tensor)
+        or tuple(instruction_ids.shape) != (N,)
+        or instruction_ids.dtype != torch.long
+        or sorted(torch.unique(instruction_ids).tolist()) != list(range(n_tasks))
+    ):
+        raise ValueError("LIBERO task metadata and instruction ids are inconsistent")
+
+    proprio = payload.get("proprio")
+    if not isinstance(proprio, Tensor) or tuple(proprio.shape) != (N, 1, 9):
+        raise ValueError("LIBERO compact data proprio must be [N, 1, 9]")
+    if not torch.isfinite(proprio).all():
+        raise ValueError("LIBERO proprio must be finite")
+
+    previous = payload.get("previous_action")
+    if not isinstance(previous, Tensor) or tuple(previous.shape) != (N, 1, 7):
+        raise ValueError("LIBERO compact data previous_action must be [N, 1, 7]")
+    if not torch.isfinite(previous).all():
+        raise ValueError("LIBERO previous_action must be finite")
+
+    delta = payload.get("world_state_delta")
+    if not isinstance(delta, Tensor) or tuple(delta.shape) != (N, 1, 9) or delta.dtype != torch.float32:
+        raise ValueError("LIBERO compact data world_state_delta must be [N, 1, 9] float32")
+    if not torch.isfinite(delta).all():
+        raise ValueError("LIBERO world_state_delta must be finite")
+
+    valid = payload.get("action_valid_mask")
+    if not isinstance(valid, Tensor) or tuple(valid.shape) != (N, 1, EXECUTION_HORIZON) or valid.dtype != torch.bool:
+        raise ValueError("LIBERO compact data action_valid_mask must be [N, 1, 15] bool")
+    if not bool(valid.all()):
+        raise ValueError("all compact decisions must have full action_valid_mask")
+
+    world_valid = payload.get("world_target_valid_mask")
+    if not isinstance(world_valid, Tensor) or tuple(world_valid.shape) != (N, 1) or world_valid.dtype != torch.bool:
+        raise ValueError("LIBERO compact data world_target_valid_mask must be [N, 1] bool")
+    if not bool(world_valid.all()):
+        raise ValueError("all compact decisions must have full world_target_valid_mask")
+
+    donor_actions = payload.get("world_rank_shuffle_action")
+    if not isinstance(donor_actions, Tensor) or tuple(donor_actions.shape) != (N, 1, EXECUTION_HORIZON, 7):
+        raise ValueError("LIBERO compact data world_rank_shuffle_action must be [N, 1, 15, 7]")
+    if not torch.isfinite(donor_actions).all():
+        raise ValueError("LIBERO donor actions must be finite")
+
+    donor_mask = payload.get("world_rank_shuffle_mask")
+    if not isinstance(donor_mask, Tensor) or tuple(donor_mask.shape) != (N, 1) or donor_mask.dtype != torch.bool:
+        raise ValueError("LIBERO compact data world_rank_shuffle_mask must be [N, 1] bool")
+
+    crop_start = payload.get("crop_start")
+    if not isinstance(crop_start, Tensor) or tuple(crop_start.shape) != (N,) or crop_start.dtype != torch.long:
+        raise ValueError("LIBERO compact data crop_start must be [N] int64")
+
+    episode_ids = payload.get("episode_id")
+    if not isinstance(episode_ids, Tensor) or tuple(episode_ids.shape) != (N,) or episode_ids.dtype != torch.long:
+        raise ValueError("LIBERO compact data episode_id must be [N] int64")
+
+    pair_id = payload.get("pair_id")
+    if not isinstance(pair_id, Tensor) or tuple(pair_id.shape) != (N,) or pair_id.dtype != torch.long:
+        raise ValueError("LIBERO compact data pair_id must be [N] int64")
+
+    anchor_eligible = payload.get("anchor_eligible")
+    if not isinstance(anchor_eligible, Tensor) or tuple(anchor_eligible.shape) != (N,) or anchor_eligible.dtype != torch.bool:
+        raise ValueError("LIBERO compact data anchor_eligible must be [N] bool")
+
+    language_hidden = payload.get("language_hidden")
+    if not isinstance(language_hidden, Tensor) or tuple(language_hidden.shape) != (N, 1, 1) or language_hidden.dtype != torch.float16:
+        raise ValueError("LIBERO compact data language_hidden must be [N, 1, 1] float16")
+
+    language_mask = payload.get("language_mask")
+    if not isinstance(language_mask, Tensor) or tuple(language_mask.shape) != (N, 1) or language_mask.dtype != torch.bool:
+        raise ValueError("LIBERO compact data language_mask must be [N, 1] bool")
+
+    normalization = payload.get("normalization", {})
+    state_q01 = normalization.get("state_q01")
+    state_q99 = normalization.get("state_q99")
+    if (
+        not isinstance(state_q01, Tensor)
+        or tuple(state_q01.shape) != (9,)
+        or not torch.isfinite(state_q01).all()
+        or not isinstance(state_q99, Tensor)
+        or tuple(state_q99.shape) != (9,)
+        or not torch.isfinite(state_q99).all()
+    ):
+        raise ValueError("normalization must include finite state_q01 and state_q99 of shape (9,)")
+
+    scale = normalization.get("state_delta_scale")
+    if not isinstance(scale, Tensor) or tuple(scale.shape) != (9,) or not torch.isfinite(scale).all() or not bool((scale > 0).all()):
+        raise ValueError("normalization must include positive state_delta_scale of shape (9,)")
+    scale_expected = state_q99 - state_q01
+    scale_expected = torch.where(scale_expected.abs() < 1e-6, torch.ones_like(scale_expected), scale_expected)
+    if not torch.equal(scale, scale_expected):
+        raise ValueError("state_delta_scale differs from state quantiles")
+
+    frame_refs = payload.get("frame_refs")
+    target_refs = payload.get("world_target_frame_refs")
+    if not isinstance(frame_refs, list) or len(frame_refs) != N:
+        raise ValueError("LIBERO compact data frame_refs must be list of length N")
+    if not isinstance(target_refs, list) or len(target_refs) != N:
+        raise ValueError("LIBERO compact data world_target_frame_refs must be list of length N")
+
+    expected_total = sum(L - EXECUTION_HORIZON for L in episode_lengths)
+    if N != expected_total:
+        raise ValueError(f"total rows {N} does not match expected decisions {expected_total} from episode_lengths")
+
+    unique_episodes = torch.unique(episode_ids, sorted=True).tolist()
+    if unique_episodes != list(range(n_demos)):
+        raise ValueError(f"episode_ids must cover 0..{n_demos - 1} exactly")
+
+    for ep in range(n_demos):
+        ep_rows = torch.where(episode_ids == ep)[0]
+        if not torch.equal(ep_rows, torch.arange(ep_rows[0].item(), ep_rows[0].item() + len(ep_rows))):
+            raise ValueError(f"episode {ep} rows are not contiguous")
+        if len(torch.unique(instruction_ids[ep_rows])) != 1:
+            raise ValueError(f"episode {ep} crosses tasks")
+        L = episode_lengths[ep]
+        expected_d = L - EXECUTION_HORIZON
+        if len(ep_rows) != expected_d:
+            raise ValueError(f"episode {ep} row count {len(ep_rows)} does not match L-15={expected_d}")
+        if not torch.equal(crop_start[ep_rows], torch.arange(expected_d, dtype=torch.long)):
+            raise ValueError(f"episode {ep} crop_starts must be contiguous 0..{expected_d - 1}")
+
+        if len(ep_rows) > 1:
+            if not torch.equal(previous[ep_rows[1:], 0], actions[ep_rows[:-1], 0, 0]):
+                raise ValueError(f"episode {ep} previous_action continuity broken")
+            if not torch.equal(actions[ep_rows[:-1], 0, 1:], actions[ep_rows[1:], 0, :-1]):
+                raise ValueError(f"episode {ep} inner action target continuity broken")
+
+        ep_task_key, ep_demo_idx, _ = frame_refs[int(ep_rows[0])]
+        for row in ep_rows.tolist():
+            c_key, c_demo, c_frames = frame_refs[row]
+            t_key, t_demo, t_frames = target_refs[row]
+            if (c_key, c_demo) != (ep_task_key, ep_demo_idx) or (t_key, t_demo) != (ep_task_key, ep_demo_idx):
+                raise ValueError(f"episode {ep} frame references cross demos")
+            if len(c_frames) != 1 or len(c_frames[0]) != 5 or len(t_frames) != 1 or len(t_frames[0]) != 1:
+                raise ValueError("compact frame_refs must have shape [1, 5] and target [1, 1]")
+            d = int(crop_start[row].item())
+            if c_frames[0][:4] != np.maximum(d + VISION_OFFSETS, 0).tolist():
+                raise ValueError(f"episode {ep} agentview frame refs mismatch at d={d}")
+            if c_frames[0][4] - d != L:
+                raise ValueError(f"episode {ep} wrist base does not match demo length {L} at d={d}")
+            if t_frames[0] != [L + d + WORLD_HORIZON]:
+                raise ValueError(f"episode {ep} future wrist target mismatch at d={d}")
+
+    return payload
+
+
+def _validate_data(
+    path: Path,
+    *,
+    architecture_version: str = "legacy",
+    window_sampling: str | None = None,
+) -> dict:
     payload = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
     metadata = payload.get("metadata", {})
+    if window_sampling is not None and metadata.get("window_sampling") != window_sampling:
+        raise ValueError(
+            f"window_sampling mismatch in {path}: expected {window_sampling}, got {metadata.get('window_sampling')}"
+        )
+    contract = metadata.get("contract")
+    if contract == ALL_STARTS_DATA_CONTRACT:
+        if architecture_version != "dual_tower_h15_v1":
+            raise ValueError(f"unexpected data contract in {path}")
+        return _validate_all_starts_data(payload, path)
+
     is_h15 = architecture_version == "dual_tower_h15_v1"
     joint = architecture_version in ("dual_tower_expert_v1", "dual_tower_h15_v1")
     expected_contract = (
@@ -193,7 +452,7 @@ def _validate_data(path: Path, *, architecture_version: str = "legacy") -> dict:
         if is_h15
         else (JOINT_DATA_CONTRACT if joint else DATA_CONTRACT)
     )
-    if metadata.get("contract") != expected_contract:
+    if contract != expected_contract:
         raise ValueError(f"unexpected data contract in {path}")
     tasks = list(metadata.get("tasks") or [])
     specs = list(metadata.get("task_specs") or [])
@@ -399,6 +658,50 @@ def _validate_data(path: Path, *, architecture_version: str = "legacy") -> dict:
 def _validate_run_schedule(payload: dict, args: argparse.Namespace) -> tuple[int, int, str]:
     metadata = payload["metadata"]
     n_tasks = int(metadata["n_tasks"])
+    is_all_starts = (
+        metadata.get("contract") == ALL_STARTS_DATA_CONTRACT
+        or getattr(args, "window_sampling", None) == "all_starts_random_tbptt8_v1"
+    )
+    if is_all_starts:
+        if metadata.get("contract") != ALL_STARTS_DATA_CONTRACT:
+            raise ValueError(f"all_starts_random_tbptt8_v1 requires contract {ALL_STARTS_DATA_CONTRACT}")
+        if getattr(args, "architecture_version", "legacy") != "dual_tower_h15_v1":
+            raise ValueError("all-starts training requires architecture_version dual_tower_h15_v1")
+        if args.anchor_fraction != 0.0:
+            raise ValueError(f"all-starts training requires anchor_fraction == 0.0, got {args.anchor_fraction}")
+        if args.batch_size <= 0 or args.gpus <= 0 or args.batch_size % args.gpus != 0:
+            raise ValueError("all-starts training requires positive batch_size divisible by gpus")
+        if args.epochs < 1:
+            raise ValueError("all-starts training requires epochs >= 1")
+        if args.stage1_steps < 0:
+            raise ValueError("all-starts training requires stage1_steps >= 0")
+        counts = metadata.get("task_counts", [])
+        if len(counts) != n_tasks or any(c <= 0 for c in counts) or sum(counts) != len(payload["actions"]):
+            raise ValueError("all-starts task_counts must match positive dataset rows")
+
+        from va_compound.data.all_starts import AllStartsWindowBatchSampler
+        sampler = AllStartsWindowBatchSampler(
+            payload,
+            args.batch_size,
+            getattr(args, "seed", 0),
+            args.mixed_tasks,
+            rank=0,
+            world_size=args.gpus,
+        )
+        epoch_lens = sampler.epoch_lengths(args.epochs)
+        first_epoch_length = epoch_lens[0]
+        total_steps = sum(epoch_lens)
+        grouping = (
+            str(RUN_SCHEDULE_PROFILES[n_tasks]["grouping"])
+            if n_tasks in RUN_SCHEDULE_PROFILES
+            else (
+                "single_task_t8_local1_deferred_v1"
+                if n_tasks == 1
+                else "all_starts_random_tbptt8_v1"
+            )
+        )
+        return first_epoch_length, total_steps, grouping
+
     is_joint = getattr(args, "architecture_version", "legacy") in ("dual_tower_expert_v1", "dual_tower_h15_v1")
     if n_tasks == 1:
         if not is_joint:

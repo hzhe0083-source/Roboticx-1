@@ -31,7 +31,9 @@ def _unpack(values):
 
 
 class EpisodeMemoryBank:
-    def __init__(self):
+    def __init__(self, *, replay_offsets=False):
+        self.replay_offsets = bool(replay_offsets)
+        self.contract = "offset_replay_tbptt8_v1" if self.replay_offsets else "episode_tbptt8_v1"
         self.entries = {}
         self.pending = {}
 
@@ -40,7 +42,8 @@ class EpisodeMemoryBank:
             raise ValueError("episode stream was forwarded twice before commit")
         prior = self.entries.get(stream)
         if is_start:
-            if start != 0 or prior is not None:
+            valid_start = start == episode % 15 if self.replay_offsets else start == 0
+            if not valid_start or prior is not None:
                 raise ValueError("episode start would overwrite live memory")
             return None
         if prior is None or prior[:2] != (episode, start):
@@ -61,13 +64,13 @@ class EpisodeMemoryBank:
     def state_dict(self):
         if self.pending:
             raise ValueError("checkpoint requires committed episode memory")
-        return {"contract": "episode_tbptt8_v1", "entries": {
+        return {"contract": self.contract, "entries": {
             stream: {"episode": episode, "next_start": start, "memory": _pack(memory)}
             for stream, (episode, start, memory) in self.entries.items()
         }}
 
     def load_state_dict(self, state):
-        if state.get("contract") != "episode_tbptt8_v1":
+        if state.get("contract") != self.contract:
             raise ValueError("episode memory contract mismatch")
         self.entries = {int(stream): (int(entry["episode"]), int(entry["next_start"]), _unpack(entry["memory"]).detach())
                         for stream, entry in state["entries"].items()}

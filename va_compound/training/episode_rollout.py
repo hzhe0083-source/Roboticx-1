@@ -41,6 +41,14 @@ def rollout_episode_windows(rollout, options):
         stream = int(batch["stream_id"][row])
         episode = int(batch["episode_id"][row])
         start = int(batch["crop_start"][row])
+        if bank.replay_offsets:
+            offset = int(batch["replay_offset"][row])
+            replay = int(batch["replay_id"][row])
+            if not 0 <= offset < 15 or replay != episode * 15 + offset or start % 15 != offset:
+                raise ValueError("invalid offset replay identity")
+            episode = replay
+        elif "replay_id" in batch:
+            raise ValueError("offset replay requires its own memory contract")
         device = batch["vision_tokens"].device
         memory_dtype = (torch.get_autocast_dtype(device.type)
                         if torch.is_autocast_enabled(device.type)

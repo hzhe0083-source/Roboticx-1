@@ -11,6 +11,7 @@ import torch
 
 from va_compound.data.libero import (
     ACTION_HORIZON,
+    ALL_STARTS_DATA_CONTRACT,
     DATA_CONTRACT,
     DECISION_OFFSETS,
     EXECUTION_HORIZON,
@@ -22,6 +23,7 @@ from va_compound.data.libero import (
     SOURCE_DATA_CONTRACT,
     VISION_OFFSETS,
     WORLD_HORIZON,
+    _attach_all_starts_world_action_donors,
     _attach_dense_world_action_donors,
     _attach_joint_world_action_donors,
     _local_task_ids,
@@ -130,7 +132,15 @@ def _window_max_start(length: int, *, joint_frontend: bool) -> int:
 def prepare_data(args: argparse.Namespace) -> None:
     import h5py
 
+    window_sampling = getattr(args, "window_sampling", "episode_contiguous_p15_v1")
+    is_all_starts = window_sampling == "all_starts_random_tbptt8_v1"
     is_h15 = getattr(args, "architecture_version", "legacy") == "dual_tower_h15_v1"
+    if is_all_starts:
+        if not is_h15:
+            raise ValueError("--window-sampling all_starts_random_tbptt8_v1 requires --architecture-version dual_tower_h15_v1")
+        if not args.dense_windows:
+            raise ValueError("--window-sampling all_starts_random_tbptt8_v1 requires --dense-windows")
+
     action_horizon = EXECUTION_HORIZON if is_h15 else ACTION_HORIZON
     joint_frontend = getattr(args, "architecture_version", "legacy") in ("dual_tower_expert_v1", "dual_tower_h15_v1")
     if joint_frontend and not args.dense_windows:
@@ -187,6 +197,7 @@ def prepare_data(args: argparse.Namespace) -> None:
     decision_valid_out, decision_counts_out = [], []
     episode_starts_out, episode_ends_out = [], []
     world_state_delta_out = []
+    episode_lengths = []
     task_counts = [0] * len(specs)
     global_episode = 0
     for task_id, suite, local_task_id, description, source in ordered:
@@ -213,7 +224,38 @@ def prepare_data(args: argparse.Namespace) -> None:
                 raw_state = np.concatenate(
                     (obs["joint_states"][()], obs["gripper_states"][()]), axis=1
                 ).astype(np.float32)
-                if joint_frontend:
+                if is_all_starts:
+                    if raw_state.shape != (len(raw_actions), 9) or not np.isfinite(raw_state).all():
+                        raise ValueError(f"invalid joint/gripper state stream: {source}:{name}")
+                    episode_lengths.append(len(raw_actions))
+                    demo_decisions = np.arange(0, len(raw_actions) - EXECUTION_HORIZON, dtype=np.int64)
+                    if len(demo_decisions) == 0:
+                        raise ValueError(f"demo too short for all-starts decisions: {source}:{name}")
+                    for d in demo_decisions:
+                        d_val = int(d)
+                        chunk = raw_actions[d_val + 1 : d_val + 1 + EXECUTION_HORIZON][None, ...]
+                        valid = np.ones((1, EXECUTION_HORIZON), dtype=bool)
+                        delta = 2.0 * (raw_state[d_val + 15 : d_val + 16] - raw_state[d_val : d_val + 1]) / state_delta_scale
+                        actions_out.append(chunk)
+                        valid_out.append(valid)
+                        previous_out.append(raw_actions[d_val : d_val + 1])
+                        proprio_out.append(_normalize(raw_state[d_val : d_val + 1], state_low, state_high))
+                        world_state_delta_out.append(delta.astype(np.float32))
+
+                        agent_history = np.maximum(d_val + VISION_OFFSETS, 0)
+                        wrist_current = len(raw_actions) + d_val
+                        current = np.concatenate((agent_history, [wrist_current]))[None, :]
+                        target = np.array([[len(raw_actions) + d_val + WORLD_HORIZON]])
+
+                        world_valid_out.append(np.ones(1, dtype=bool))
+                        frame_refs.append((task_key, demo_index, current.tolist()))
+                        target_refs.append((task_key, demo_index, target.tolist()))
+                        instruction_ids.append(task_id)
+                        episode_ids.append(global_episode)
+                        crop_starts.append(d_val)
+                        task_counts[task_id] += 1
+                    global_episode += 1
+                elif joint_frontend:
                     if raw_state.shape != (len(raw_actions), 9) or not np.isfinite(raw_state).all():
                         raise ValueError(f"invalid joint/gripper state stream: {source}:{name}")
                     demo_decisions = np.arange(0, len(raw_actions) - EXECUTION_HORIZON, EXECUTION_HORIZON, dtype=np.int64)
@@ -367,9 +409,11 @@ def prepare_data(args: argparse.Namespace) -> None:
     language_hidden = torch.zeros((len(actions), 1, 1), dtype=torch.float16)
     language_mask = torch.ones((len(actions), 1), dtype=torch.bool)
     contract_str = (
-        H15_DATA_CONTRACT if is_h15 else JOINT_DATA_CONTRACT
-        if joint_frontend
-        else (DATA_CONTRACT if args.dense_windows else SOURCE_DATA_CONTRACT)
+        ALL_STARTS_DATA_CONTRACT if is_all_starts else (
+            H15_DATA_CONTRACT if is_h15 else JOINT_DATA_CONTRACT
+            if joint_frontend
+            else (DATA_CONTRACT if args.dense_windows else SOURCE_DATA_CONTRACT)
+        )
     )
     metadata_payload = {
         "contract": contract_str,
@@ -380,20 +424,25 @@ def prepare_data(args: argparse.Namespace) -> None:
         "n_demos": global_episode,
         "windows_per_demo": None if args.dense_windows else args.windows_per_demo,
         "window_sampling": (
-            (
-                "episode_contiguous_p15_v1"
-                if joint_frontend
-                else "all_legal_starts_v1"
+            "all_starts_random_tbptt8_v1"
+            if is_all_starts
+            else (
+                (
+                    "episode_contiguous_p15_v1"
+                    if joint_frontend
+                    else "all_legal_starts_v1"
+                )
+                if args.dense_windows
+                else "fixed_linspace16_v1"
             )
-            if args.dense_windows
-            else "fixed_linspace16_v1"
         ),
         "task_counts": task_counts,
         "sequence_length": SEQUENCE,
+        "storage_sequence_length": 1 if is_all_starts else SEQUENCE,
         "action_horizon": action_horizon,
         "planning_stride": EXECUTION_HORIZON,
         "control_stride": EXECUTION_HORIZON,
-        "decision_offsets": DECISION_OFFSETS.tolist(),
+        "decision_offsets": [0] if is_all_starts else DECISION_OFFSETS.tolist(),
         "vision_offsets": VISION_OFFSETS.tolist(),
         "vision_input": "agentview_history4_plus_current_wrist_v2",
         "vision_frame_layout": [
@@ -406,7 +455,7 @@ def prepare_data(args: argparse.Namespace) -> None:
         "world_target_view": "eye_in_hand_rgb",
         "logged_action_chunk": "real_p15" if is_h15 else "masked_h50_real_p15_prefix",
         "world_target_horizon": WORLD_HORIZON,
-        "world_target_offsets": (
+        "world_target_offsets": [WORLD_HORIZON] if is_all_starts else (
             DECISION_OFFSETS + WORLD_HORIZON
         ).tolist(),
         "world_target_alignment": f"obs[d+{WORLD_HORIZON}]",
@@ -425,7 +474,12 @@ def prepare_data(args: argparse.Namespace) -> None:
         "short_horizon_padding": "episode_storage_only_v1" if is_h15 else "repeat_last_masked_v1",
         "minimum_real_action_prefix": EXECUTION_HORIZON,
     }
-    if joint_frontend:
+    if is_all_starts:
+        metadata_payload["sampling_contract"] = "all_starts_random_tbptt8_v1"
+        metadata_payload["state_delta_contract"] = "joint7_gripper2_unclipped_q01q99_delta_h15_v1"
+        metadata_payload["memory_contract"] = "offset_replay_tbptt8_v1"
+        metadata_payload["episode_lengths"] = episode_lengths
+    elif joint_frontend:
         metadata_payload["window_bound"] = "complete_p15_v1" if is_h15 else "complete_p15_masked_h50_v1"
         metadata_payload["state_delta_contract"] = "joint7_gripper2_unclipped_q01q99_delta_h15_v1"
         metadata_payload["memory_contract"] = "episode_tbptt8_v1"
@@ -435,7 +489,7 @@ def prepare_data(args: argparse.Namespace) -> None:
         "state_q01": torch.from_numpy(state_low),
         "state_q99": torch.from_numpy(state_high),
     }
-    if joint_frontend:
+    if is_all_starts or joint_frontend:
         normalization_payload["state_delta_scale"] = torch.from_numpy(state_delta_scale)
     payload = {
         "actions": actions,
@@ -456,14 +510,15 @@ def prepare_data(args: argparse.Namespace) -> None:
         "normalization": normalization_payload,
         "metadata": metadata_payload,
     }
-    if joint_frontend:
+    if is_all_starts:
+        payload["world_state_delta"] = torch.from_numpy(np.stack(world_state_delta_out)).float()
+        _attach_all_starts_world_action_donors(payload)
+    elif joint_frontend:
         payload["decision_valid_mask"] = torch.from_numpy(np.stack(decision_valid_out))
         payload["decision_count"] = torch.tensor(decision_counts_out, dtype=torch.long)
         payload["episode_start"] = torch.tensor(episode_starts_out, dtype=torch.bool)
         payload["episode_end"] = torch.tensor(episode_ends_out, dtype=torch.bool)
         payload["world_state_delta"] = torch.from_numpy(np.stack(world_state_delta_out)).float()
-
-    if joint_frontend:
         _attach_joint_world_action_donors(payload)
     elif args.dense_windows:
         _attach_dense_world_action_donors(payload)
@@ -472,19 +527,20 @@ def prepare_data(args: argparse.Namespace) -> None:
             payload, planning_stride=EXECUTION_HORIZON
         )
     expected = sum(task_counts)
-    if joint_frontend:
+    if is_all_starts:
         assert min(task_counts) > 0
-    elif args.dense_windows:
-        if len(specs) == 2:
-            assert task_counts == [4684, 5159]
-        else:
-            assert min(task_counts) > 0
-    else:
-        assert expected == len(specs) * 50 * args.windows_per_demo
-        assert min(task_counts) == max(task_counts) == 50 * args.windows_per_demo
-    assert tuple(actions.shape) == (expected, SEQUENCE, action_horizon, 7)
-    assert tuple(proprio.shape) == (expected, SEQUENCE, 9)
-    if joint_frontend:
+        assert tuple(actions.shape) == (expected, 1, EXECUTION_HORIZON, 7)
+        assert tuple(proprio.shape) == (expected, 1, 9)
+        assert bool(valid.all())
+        assert bool(world_valid.all())
+        for ep in range(global_episode):
+            ep_rows = torch.where(payload["episode_id"] == ep)[0]
+            if len(ep_rows) > 1:
+                assert torch.equal(previous[ep_rows[1:], 0], actions[ep_rows[:-1], 0, 0])
+    elif joint_frontend:
+        assert min(task_counts) > 0
+        assert tuple(actions.shape) == (expected, SEQUENCE, action_horizon, 7)
+        assert tuple(proprio.shape) == (expected, SEQUENCE, 9)
         dec_v = payload["decision_valid_mask"]
         assert bool(valid[dec_v][:, :EXECUTION_HORIZON].all())
         valid_pairs = dec_v[:, 1:] & dec_v[:, :-1]
@@ -492,6 +548,10 @@ def prepare_data(args: argparse.Namespace) -> None:
             previous[:, 1:][valid_pairs], actions[:, :-1, EXECUTION_HORIZON - 1][valid_pairs]
         )
     else:
+        assert expected == len(specs) * 50 * args.windows_per_demo
+        assert min(task_counts) == max(task_counts) == 50 * args.windows_per_demo
+        assert tuple(actions.shape) == (expected, SEQUENCE, action_horizon, 7)
+        assert tuple(proprio.shape) == (expected, SEQUENCE, 9)
         assert bool(valid[:, :, :EXECUTION_HORIZON].all())
         assert torch.equal(
             previous[:, 1:], actions[:, :-1, EXECUTION_HORIZON - 1]
@@ -532,6 +592,12 @@ def _parser() -> argparse.ArgumentParser:
         choices=("legacy", "dual_tower_expert_v1", "dual_tower_h15_v1"),
         default="legacy",
         help="Architecture version for LIBERO data preparation.",
+    )
+    parser.add_argument(
+        "--window-sampling",
+        choices=("episode_contiguous_p15_v1", "all_starts_random_tbptt8_v1"),
+        default="episode_contiguous_p15_v1",
+        help="Window sampling strategy for LIBERO data preparation.",
     )
     return parser
 

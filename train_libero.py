@@ -32,6 +32,12 @@ from va_compound.training.prefetch import (
 )
 from va_compound.data.samplers import TaskLocalityWeightedSampler
 from va_compound.data.episode_stream import EpisodeStreamDataset, EpisodeWindowBatchSampler
+from va_compound.data.all_starts import (
+    AllStartsStreamDataset,
+    AllStartsWindowBatchSampler,
+    MEMORY_CONTRACT as ALL_STARTS_MEMORY_CONTRACT,
+    SAMPLING_CONTRACT as ALL_STARTS_SAMPLING_CONTRACT,
+)
 from va_compound.training.episode_memory import EpisodeMemoryBank
 from va_compound.vision.dual_tower_batch import encode_dual_tower_batch
 from va_compound.vision.encoding import _dino_main_online_encode
@@ -60,6 +66,7 @@ from va_compound.data.libero import (
     FRESH_INITIALIZATION,
     FUSION_LAYERS,
     H15_DATA_CONTRACT,
+    ALL_STARTS_DATA_CONTRACT,
     JOINT_DATA_CONTRACT,
     LIBERO_SUITES,
     SEQUENCE,
@@ -158,7 +165,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr-new", type=float, default=3e-5)
     parser.add_argument("--lr-qwen", type=float, default=1e-6)
     parser.add_argument("--lr-dino", type=float, default=1e-6)
-    parser.add_argument("--stage1-steps", type=int, default=8000)
+    parser.add_argument("--stage1-steps", type=int, default=None)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--prev-dropout", type=float, default=1.0)
     parser.add_argument("--encode-batch", type=int, default=16)
@@ -184,6 +191,12 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="Loss weight for World state delta transition prediction.",
+    )
+    parser.add_argument(
+        "--window-sampling",
+        choices=("episode_contiguous_p15_v1", "all_starts_random_tbptt8_v1"),
+        default="episode_contiguous_p15_v1",
+        help="Window sampling strategy for LIBERO joint training.",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--gpus", type=int, default=2)
@@ -356,10 +369,16 @@ def preflight(args: argparse.Namespace) -> None:
                 mmap=True,
             )
         )
+    is_all_starts_preflight = getattr(args, "window_sampling", None) == ALL_STARTS_SAMPLING_CONTRACT
     payload = _validate_data(
         args.data,
         architecture_version=getattr(args, "architecture_version", "legacy"),
+        **({"window_sampling": ALL_STARTS_SAMPLING_CONTRACT} if is_all_starts_preflight else {}),
     )
+    if not is_all_starts_preflight and payload.get("metadata", {}).get("contract") == ALL_STARTS_DATA_CONTRACT:
+        raise ValueError("all-starts data contract requires --window-sampling all_starts_random_tbptt8_v1")
+    if is_all_starts_preflight and getattr(args, "architecture_version", "legacy") != "dual_tower_h15_v1":
+        raise ValueError("all_starts_random_tbptt8_v1 is only supported with dual_tower_h15_v1")
     if args.prev_dropout != 1.0:
         raise ValueError("the H50/P15 run requires --prev-dropout 1")
     if args.lr != 1e-5 or args.lr_new != 3e-5:
@@ -388,12 +407,33 @@ def preflight(args: argparse.Namespace) -> None:
     VACompoundPolicy(config)
     if args.batch_size % args.gpus or args.batch_size % args.mixed_tasks:
         raise ValueError("global batch must divide across GPUs and mixed tasks")
+    if args.stage1_steps is None:
+        if is_all_starts_preflight:
+            temp_sampler = AllStartsWindowBatchSampler(
+                payload,
+                args.batch_size,
+                seed=args.seed,
+                mixed_tasks_per_batch=args.mixed_tasks,
+                rank=0,
+                world_size=args.gpus,
+            )
+            lengths = temp_sampler.epoch_lengths(max(2, args.epochs))
+            args.stage1_steps = sum(lengths[:2])
+        else:
+            args.stage1_steps = 8000
     steps_per_epoch, total_steps, _ = _validate_run_schedule(payload, args)
-    print(
-        f"PASS T8 dense LIBERO H50/P15 VA8+WM+PCGrad; rows={len(payload['actions'])} "
-        f"tasks={payload['metadata']['n_tasks']} steps/epoch={steps_per_epoch} "
-        f"total_steps={total_steps}"
-    )
+    if is_all_starts_preflight:
+        print(
+            f"PASS T8 compact all-starts LIBERO H15 VA8+WM+PCGrad; rows={len(payload['actions'])} "
+            f"tasks={payload['metadata']['n_tasks']} epoch1_steps={steps_per_epoch} "
+            f"total_steps={total_steps}"
+        )
+    else:
+        print(
+            f"PASS T8 dense LIBERO H50/P15 VA8+WM+PCGrad; rows={len(payload['actions'])} "
+            f"tasks={payload['metadata']['n_tasks']} steps/epoch={steps_per_epoch} "
+            f"total_steps={total_steps}"
+        )
 
 
 def _prepare_batch(
@@ -460,6 +500,8 @@ def _prepare_batch(
         "stream_id",
         "stream_active",
         "episode_id",
+        "replay_id",
+        "replay_offset",
         "crop_start",
         "decision_count",
         "episode_start",
@@ -623,7 +665,14 @@ def _atomic_checkpoint(
     sampler,
     world_sampler,
     episode_runtime_states: list[dict] | None = None,
+    window_sampling: str = "episode_contiguous_p15_v1",
+    epoch_lengths: list[int] | None = None,
 ) -> None:
+    if window_sampling == ALL_STARTS_SAMPLING_CONTRACT:
+        if config.architecture_version != "dual_tower_h15_v1" or not epoch_lengths or any(n < 1 for n in epoch_lengths):
+            raise ValueError("all-start checkpoint requires H15 and positive epoch lengths")
+        if sum(epoch_lengths) != total_steps:
+            raise ValueError("all-start checkpoint total does not match epoch lengths")
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
     torch.save(
@@ -660,11 +709,22 @@ def _atomic_checkpoint(
                 "n_tasks": int(run_metadata["n_tasks"]),
                 "task_specs": list(run_metadata["task_specs"]),
                 "data_contract": (
-                    H15_DATA_CONTRACT
+                    ALL_STARTS_DATA_CONTRACT
+                    if window_sampling == ALL_STARTS_SAMPLING_CONTRACT
+                    else H15_DATA_CONTRACT
                     if config.architecture_version == "dual_tower_h15_v1"
                     else JOINT_DATA_CONTRACT
                     if config.architecture_version == "dual_tower_expert_v1"
                     else DATA_CONTRACT
+                ),
+                **(
+                    {
+                        "window_sampling": ALL_STARTS_SAMPLING_CONTRACT,
+                        "sampling_contract": ALL_STARTS_SAMPLING_CONTRACT,
+                        "epoch_lengths": list(epoch_lengths),
+                    }
+                    if window_sampling == ALL_STARTS_SAMPLING_CONTRACT and epoch_lengths is not None
+                    else {}
                 ),
                 "data_sha256": data_sha256,
                 "action_decoder": "conditional_flow_matching",
@@ -724,7 +784,11 @@ def _atomic_checkpoint(
                             if config.architecture_version == "dual_tower_h15_v1"
                             else "p15_live_h50_tail_detached_v1"
                         ),
-                        "memory_contract": "episode_tbptt8_v1",
+                        "memory_contract": (
+                            ALL_STARTS_MEMORY_CONTRACT
+                            if window_sampling == ALL_STARTS_SAMPLING_CONTRACT
+                            else "episode_tbptt8_v1"
+                        ),
                         "state_delta_contract": "joint7_gripper2_unclipped_q01q99_delta_h15_v1",
                         "world_state_loss_weight": config.world_state_loss_weight,
                     }
@@ -793,12 +857,35 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("the H50/P15 run requires --prev-dropout 1")
     if args.lr != 1e-5 or args.lr_new != 3e-5:
         raise ValueError("the all-fixes run requires --lr 1e-5 --lr-new 3e-5")
-    if args.stage1_steps < 0:
-        raise ValueError("stage1 steps must be non-negative")
+
+    is_all_starts = getattr(args, "window_sampling", None) == ALL_STARTS_SAMPLING_CONTRACT
+    if is_all_starts and getattr(args, "architecture_version", "legacy") != "dual_tower_h15_v1":
+        raise ValueError("all_starts_random_tbptt8_v1 is only supported with dual_tower_h15_v1")
+
     payload = _validate_data(
         args.data,
         architecture_version=getattr(args, "architecture_version", "legacy"),
+        **({"window_sampling": ALL_STARTS_SAMPLING_CONTRACT} if is_all_starts else {}),
     )
+    if not is_all_starts and payload.get("metadata", {}).get("contract") == ALL_STARTS_DATA_CONTRACT:
+        raise ValueError("all-starts data contract requires --window-sampling all_starts_random_tbptt8_v1")
+
+    if args.stage1_steps is None:
+        if is_all_starts:
+            temp_sampler = AllStartsWindowBatchSampler(
+                payload,
+                args.batch_size,
+                seed=args.seed,
+                mixed_tasks_per_batch=args.mixed_tasks,
+                rank=0,
+                world_size=args.gpus,
+            )
+            lengths = temp_sampler.epoch_lengths(max(2, args.epochs))
+            args.stage1_steps = sum(lengths[:2])
+        else:
+            args.stage1_steps = 8000
+    if args.stage1_steps < 0:
+        raise ValueError("stage1 steps must be non-negative")
     metadata = payload["metadata"]
     tasks = list(metadata["tasks"])
     _, expected_total_steps, pcgrad_forward_grouping = _validate_run_schedule(
@@ -829,7 +916,24 @@ def train(args: argparse.Namespace) -> None:
         )
         task_weights = torch.ones(len(tasks), dtype=torch.float64)
         data_sha256 = _sha256_file(args.data)
-        if joint_frontend:
+        if is_all_starts:
+            sampler = AllStartsWindowBatchSampler(
+                dataset.payload,
+                batch_size=args.batch_size,
+                seed=args.seed,
+                mixed_tasks_per_batch=args.mixed_tasks,
+                rank=topology.rank,
+                world_size=topology.world_size,
+            )
+            world_sampler = AllStartsWindowBatchSampler(
+                world_dataset.payload,
+                batch_size=args.batch_size,
+                seed=args.seed,
+                mixed_tasks_per_batch=args.mixed_tasks,
+                rank=topology.rank,
+                world_size=topology.world_size,
+            )
+        elif joint_frontend:
             sampler = EpisodeWindowBatchSampler(
                 dataset.payload,
                 batch_size=args.batch_size,
@@ -878,8 +982,15 @@ def train(args: argparse.Namespace) -> None:
         data_identity = {"contract": metadata["contract"], "sha256": data_sha256}
         sampler.bind_dataset_content_identity(data_identity)
         world_sampler.bind_dataset_content_identity(data_identity)
-        action_train_dataset = EpisodeStreamDataset(dataset) if joint_frontend else _StaticAnchorDataset(dataset)
-        world_train_dataset = EpisodeStreamDataset(world_dataset) if joint_frontend else _StaticAnchorDataset(world_dataset)
+        if is_all_starts:
+            action_train_dataset = AllStartsStreamDataset(dataset)
+            world_train_dataset = AllStartsStreamDataset(world_dataset)
+        elif joint_frontend:
+            action_train_dataset = EpisodeStreamDataset(dataset)
+            world_train_dataset = EpisodeStreamDataset(world_dataset)
+        else:
+            action_train_dataset = _StaticAnchorDataset(dataset)
+            world_train_dataset = _StaticAnchorDataset(world_dataset)
         loader = DataLoader(
             action_train_dataset,
             batch_sampler=sampler,
@@ -896,8 +1007,20 @@ def train(args: argparse.Namespace) -> None:
                 args.seed + topology.rank + 10_000
             ),
         )
-        action_memory = EpisodeMemoryBank() if joint_frontend else None
-        world_memory = EpisodeMemoryBank() if joint_frontend else None
+        action_memory = (
+            EpisodeMemoryBank(replay_offsets=True)
+            if is_all_starts
+            else EpisodeMemoryBank()
+            if joint_frontend
+            else None
+        )
+        world_memory = (
+            EpisodeMemoryBank(replay_offsets=True)
+            if is_all_starts
+            else EpisodeMemoryBank()
+            if joint_frontend
+            else None
+        )
 
         source_path = args.resume if args.resume is not None else args.resume_weights
         source = (
@@ -967,7 +1090,8 @@ def train(args: argparse.Namespace) -> None:
             local_files_only=True,
         )
         vision.freeze_all()
-        planned_total_steps = len(sampler) * args.epochs
+        epoch_lengths = sampler.epoch_lengths(args.epochs) if is_all_starts else [len(sampler)] * args.epochs
+        planned_total_steps = sum(epoch_lengths)
         if planned_total_steps != expected_total_steps:
             raise ValueError(
                 f"sampler produced {planned_total_steps} steps, expected {expected_total_steps}"
@@ -1003,7 +1127,9 @@ def train(args: argparse.Namespace) -> None:
                     else "continued_from_source_v1"
                 ),
                 "data_contract": (
-                    H15_DATA_CONTRACT
+                    ALL_STARTS_DATA_CONTRACT
+                    if is_all_starts
+                    else H15_DATA_CONTRACT
                     if config.architecture_version == "dual_tower_h15_v1"
                     else JOINT_DATA_CONTRACT
                     if config.architecture_version == "dual_tower_expert_v1"
@@ -1014,6 +1140,15 @@ def train(args: argparse.Namespace) -> None:
                 "n_tasks": int(metadata["n_tasks"]),
                 "task_specs": list(metadata["task_specs"]),
                 "sequence_length": SEQUENCE,
+                **(
+                    {
+                        "window_sampling": ALL_STARTS_SAMPLING_CONTRACT,
+                        "sampling_contract": ALL_STARTS_SAMPLING_CONTRACT,
+                        "epoch_lengths": list(epoch_lengths),
+                    }
+                    if is_all_starts
+                    else {}
+                ),
                 **({
                     "action_horizon": 15,
                     "flow_prefix_steps": 15,
@@ -1066,7 +1201,11 @@ def train(args: argparse.Namespace) -> None:
                             if config.architecture_version == "dual_tower_h15_v1"
                             else "p15_live_h50_tail_detached_v1"
                         ),
-                        "memory_contract": "episode_tbptt8_v1",
+                        "memory_contract": (
+                            ALL_STARTS_MEMORY_CONTRACT
+                            if is_all_starts
+                            else "episode_tbptt8_v1"
+                        ),
                         "state_delta_contract": "joint7_gripper2_unclipped_q01q99_delta_h15_v1",
                         "world_state_loss_weight": config.world_state_loss_weight,
                     }
@@ -1165,7 +1304,10 @@ def train(args: argparse.Namespace) -> None:
                 ("VA", sampler),
                 ("World", world_sampler),
             ):
-                completed = active_sampler.epoch * len(active_sampler) + active_sampler.batch_cursor
+                if is_all_starts:
+                    completed = sum(epoch_lengths[:active_sampler.epoch]) + active_sampler.batch_cursor
+                else:
+                    completed = active_sampler.epoch * len(active_sampler) + active_sampler.batch_cursor
                 if completed != start_step:
                     raise ValueError(
                         f"{label} sampler position {completed} != checkpoint step {start_step}"
@@ -1224,6 +1366,7 @@ def train(args: argparse.Namespace) -> None:
             if args.max_steps < 1:
                 raise ValueError("--max-steps must be positive")
             total_steps = min(total_steps, args.max_steps)
+        epoch_boundary_steps = set(np.cumsum(epoch_lengths).tolist()) if is_all_starts else set()
         iterator, world_iterator = iter(loader), iter(world_loader)
         prefetcher = PeerJointBatchPrefetcher(
             iterator, loader, world_iterator, world_loader, depth=1
@@ -1564,8 +1707,11 @@ def train(args: argparse.Namespace) -> None:
                     )
                 )
             if any(
-                active_sampler.epoch * len(active_sampler)
-                + active_sampler.batch_cursor
+                (
+                    sum(epoch_lengths[:active_sampler.epoch]) + active_sampler.batch_cursor
+                    if is_all_starts
+                    else active_sampler.epoch * len(active_sampler) + active_sampler.batch_cursor
+                )
                 != step
                 for active_sampler in (sampler, world_sampler)
             ):
@@ -1604,7 +1750,12 @@ def train(args: argparse.Namespace) -> None:
                     f"world_guard={stats['world_conflicts']}/{stats['world_comparisons']}"
                 )
                 print(msg, flush=True)
-            if step % args.save_every == 0 or step == total_steps:
+            save_checkpoint = (
+                (step in epoch_boundary_steps or step == total_steps)
+                if is_all_starts
+                else (step % args.save_every == 0 or step == total_steps)
+            )
+            if save_checkpoint:
                 episode_runtime_states = None
                 if joint_frontend:
                     local_runtime_state = {
@@ -1641,6 +1792,8 @@ def train(args: argparse.Namespace) -> None:
                         sampler=sampler,
                         world_sampler=world_sampler,
                         episode_runtime_states=episode_runtime_states,
+                        window_sampling=getattr(args, "window_sampling", "episode_contiguous_p15_v1"),
+                        epoch_lengths=epoch_lengths if is_all_starts else None,
                     )
                     print(f"saved {args.save} at step {step}", flush=True)
                 barrier(topology)

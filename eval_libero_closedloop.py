@@ -22,7 +22,12 @@ import numpy as np
 import torch
 
 from va_compound import VACompoundConfig, VACompoundPolicy
-from va_compound.data.libero import H15_DATA_CONTRACT, JOINT_DATA_CONTRACT, _validate_data
+from va_compound.data.libero import (
+    ALL_STARTS_DATA_CONTRACT,
+    H15_DATA_CONTRACT,
+    JOINT_DATA_CONTRACT,
+    _validate_data,
+)
 from va_compound.backbones import QwenTextBackbone, TimmActionVisionBackbone
 from va_compound.vision.dual_tower_batch import encode_dual_tower_batch
 from va_compound.vision.encoding import _dino_main_online_encode
@@ -501,6 +506,7 @@ def main() -> None:
         T8_DENSE_WORLD_LAST6_DATA_CONTRACT,
         JOINT_DATA_CONTRACT,
         H15_DATA_CONTRACT,
+        ALL_STARTS_DATA_CONTRACT,
     }
     dual_view = payload_contract in {
         DUAL_VIEW_DATA_CONTRACT,
@@ -509,6 +515,7 @@ def main() -> None:
         T8_DENSE_WORLD_LAST6_DATA_CONTRACT,
         JOINT_DATA_CONTRACT,
         H15_DATA_CONTRACT,
+        ALL_STARTS_DATA_CONTRACT,
     }
     world_horizon = (
         15
@@ -519,6 +526,7 @@ def main() -> None:
             T8_DENSE_WORLD_LAST6_DATA_CONTRACT,
             JOINT_DATA_CONTRACT,
             H15_DATA_CONTRACT,
+            ALL_STARTS_DATA_CONTRACT,
         }
         else None
     )
@@ -527,6 +535,7 @@ def main() -> None:
         T8_DENSE_WORLD_LAST6_DATA_CONTRACT,
         JOINT_DATA_CONTRACT,
         H15_DATA_CONTRACT,
+        ALL_STARTS_DATA_CONTRACT,
     }
     dense_continuation = dense_t4 or dense_t8
     task_specs = _task_specs(payload)
@@ -537,19 +546,23 @@ def main() -> None:
         raise ValueError(f"task ids are absent from payload: {missing_task_ids}")
     config = VACompoundConfig(**checkpoint["config"])
     joint_frontend = config.architecture_version in ("dual_tower_expert_v1", "dual_tower_h15_v1")
-    expected_data_contract = (
-        H15_DATA_CONTRACT
+    expected_data_contracts = (
+        {H15_DATA_CONTRACT, ALL_STARTS_DATA_CONTRACT}
         if config.architecture_version == "dual_tower_h15_v1"
-        else JOINT_DATA_CONTRACT
+        else {JOINT_DATA_CONTRACT}
         if config.architecture_version == "dual_tower_expert_v1"
-        else None
+        else set()
     )
-    if joint_frontend != (payload_contract in {JOINT_DATA_CONTRACT, H15_DATA_CONTRACT}) or (
-        joint_frontend and payload_contract != expected_data_contract
+    if joint_frontend != (payload_contract in {JOINT_DATA_CONTRACT, H15_DATA_CONTRACT, ALL_STARTS_DATA_CONTRACT}) or (
+        joint_frontend and payload_contract not in expected_data_contracts
     ):
         raise ValueError("checkpoint architecture and data coverage contract disagree")
     if joint_frontend:
-        _validate_data(args.data, architecture_version=config.architecture_version)
+        _validate_data(
+            args.data,
+            architecture_version=config.architecture_version,
+            window_sampling=payload.get("metadata", {}).get("window_sampling"),
+        )
     if joint_frontend and args.qwen is None:
         raise ValueError(f"{config.architecture_version} evaluation requires --qwen")
     expected = {
@@ -653,7 +666,11 @@ def main() -> None:
         raise ValueError(f"unsupported LIBERO action horizon: {config.action_horizon}")
     if joint_frontend:
         protocol = (
-            "libero_fixed_init_t8_p15complete_dual_tower_h15_v1"
+            (
+                "libero_fixed_init_t8_random_allstarts_dual_tower_h15_v1"
+                if payload_contract == ALL_STARTS_DATA_CONTRACT
+                else "libero_fixed_init_t8_p15complete_dual_tower_h15_v1"
+            )
             if config.architecture_version == "dual_tower_h15_v1"
             else "libero_fixed_init_t8_p15complete_dual_tower_expert_v1"
         )
@@ -671,20 +688,33 @@ def main() -> None:
         raise ValueError("unexpected LIBERO data contract")
     if four_suite:
         metadata = payload["metadata"]
+        is_all_starts = payload_contract == ALL_STARTS_DATA_CONTRACT
+        expected_target_offsets = (
+            [world_horizon]
+            if is_all_starts
+            else [world_horizon + 15 * index for index in range(8 if dense_t8 else 4)]
+        )
         if world_horizon and (
             metadata.get("world_target_horizon") != world_horizon
-            or metadata.get("world_target_offsets")
-            != [world_horizon + 15 * index for index in range(8 if dense_t8 else 4)]
+            or metadata.get("world_target_offsets") != expected_target_offsets
             or metadata.get("world_target_alignment")
             != f"obs[d+{world_horizon}]"
         ):
             raise ValueError("dual-view World supervision has the wrong horizon")
-        if dense_continuation and (
-            metadata.get("window_sampling") != "all_legal_starts_v1"
-            or (not joint_frontend and len(payload["actions"]) != (9_843 if dense_t8 else 15_843))
-            or metadata.get("sequence_length") != (8 if dense_t8 else 4)
-        ):
-            raise ValueError("dense continuation payload has the wrong window set")
+        if dense_continuation:
+            expected_window_samplings = (
+                {"all_starts_random_tbptt8_v1"}
+                if is_all_starts
+                else {"episode_contiguous_p15_v1"}
+                if joint_frontend
+                else {"all_legal_starts_v1"}
+            )
+            if (
+                metadata.get("window_sampling") not in expected_window_samplings
+                or (not joint_frontend and len(payload["actions"]) != (9_843 if dense_t8 else 15_843))
+                or metadata.get("sequence_length") != (8 if dense_t8 else 4)
+            ):
+                raise ValueError("dense continuation payload has the wrong window set")
         if int(metadata.get("n_tasks", 0)) != len(task_specs):
             raise ValueError("H50/P15 payload task count is inconsistent")
         if len(task_specs) == 40:
@@ -891,6 +921,7 @@ def main() -> None:
             if not isinstance(total_steps, int) or total_steps < 1:
                 raise ValueError("joint checkpoint requires a positive total_steps")
             is_h15 = config.architecture_version == "dual_tower_h15_v1"
+            is_all_starts = payload_contract == ALL_STARTS_DATA_CONTRACT
             required_four_suite.update(
                 initialization=(
                     "fresh_dual_tower_h15_v1"
@@ -902,7 +933,11 @@ def main() -> None:
                 flow_prefix_weight=1.0 if is_h15 else 3.0,
                 flow_tail_weight=0.0 if is_h15 else 1.0,
                 memory_reset_every=0,
-                memory_contract="episode_tbptt8_v1",
+                memory_contract=(
+                    "offset_replay_tbptt8_v1"
+                    if is_all_starts
+                    else "episode_tbptt8_v1"
+                ),
                 state_delta_contract="joint7_gripper2_unclipped_q01q99_delta_h15_v1",
                 world_state_loss_weight=config.world_state_loss_weight,
                 fusion_initialization="dual_tower_zero_output_v1",
@@ -919,6 +954,9 @@ def main() -> None:
                 qwen_world_cache="per_observation_joint_live_v1",
                 stage1_world_current_vision_cache="disabled_joint_frontend_v1",
             )
+            if is_all_starts:
+                required_four_suite["sampling_contract"] = "all_starts_random_tbptt8_v1"
+                required_four_suite["window_sampling"] = "all_starts_random_tbptt8_v1"
         bad_four_suite = {
             key: (contract.get(key), value)
             for key, value in required_four_suite.items()
