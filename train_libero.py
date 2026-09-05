@@ -39,6 +39,7 @@ from va_compound.data.all_starts import (
     SAMPLING_CONTRACT as ALL_STARTS_SAMPLING_CONTRACT,
 )
 from va_compound.training.episode_memory import EpisodeMemoryBank
+from va_compound.training.libero_transfer import is_all_starts_transfer, validate_transfer_source, TRANSFER_INITIALIZATION
 from va_compound.vision.dual_tower_batch import encode_dual_tower_batch
 from va_compound.vision.encoding import _dino_main_online_encode
 from va_compound.utils.exact_resume import _sha256_file
@@ -351,7 +352,7 @@ def preflight(args: argparse.Namespace) -> None:
             raise FileNotFoundError(path)
     if args.resume is not None and args.resume_weights is not None:
         raise ValueError("choose --resume or --resume-weights, not both")
-    if args.resume_weights is not None and getattr(args, "architecture_version", "legacy") != "legacy":
+    if args.resume_weights is not None and getattr(args, "architecture_version", "legacy") != "legacy" and not is_all_starts_transfer(args):
         arch = getattr(args, "architecture_version", "legacy")
         raise ValueError(f"{arch} requires fresh initialization or same-version --resume; --resume-weights is legacy-only")
     if args.resume is None and args.resume_weights is None and getattr(args, "architecture_version", "legacy") == "legacy":
@@ -361,7 +362,7 @@ def preflight(args: argparse.Namespace) -> None:
     if args.resume_weights is not None:
         if not args.resume_weights.is_file():
             raise FileNotFoundError(args.resume_weights)
-        _validate_dense_source(
+        (validate_transfer_source if is_all_starts_transfer(args) else _validate_dense_source)(
             torch.load(
                 args.resume_weights,
                 map_location="cpu",
@@ -407,6 +408,10 @@ def preflight(args: argparse.Namespace) -> None:
     VACompoundPolicy(config)
     if args.batch_size % args.gpus or args.batch_size % args.mixed_tasks:
         raise ValueError("global batch must divide across GPUs and mixed tasks")
+    if is_all_starts_transfer(args):
+        if args.stage1_steps not in (None, 0):
+            raise ValueError("H15 transfer requires stage1_steps=0; trained DINO remains unfrozen")
+        args.stage1_steps = 0
     if args.stage1_steps is None:
         if is_all_starts_preflight:
             temp_sampler = AllStartsWindowBatchSampler(
@@ -692,7 +697,9 @@ def _atomic_checkpoint(
             **({"episode_runtime_states": episode_runtime_states} if episode_runtime_states is not None else {}),
             "training_contract": {
                 "initialization": (
-                    "fresh_dual_tower_h15_v1"
+                    TRANSFER_INITIALIZATION
+                    if window_sampling == ALL_STARTS_SAMPLING_CONTRACT and source_global_step >= 0
+                    else "fresh_dual_tower_h15_v1"
                     if config.architecture_version == "dual_tower_h15_v1"
                     else "fresh_dual_tower_expert_v1"
                     if config.architecture_version == "dual_tower_expert_v1"
@@ -701,7 +708,9 @@ def _atomic_checkpoint(
                 "source_checkpoint": source_checkpoint,
                 "source_global_step": source_global_step,
                 "optimizer_initialization": (
-                    "fresh_adamw_v1"
+                    "continued_adamw_reset_streams_v1"
+                    if window_sampling == ALL_STARTS_SAMPLING_CONTRACT and source_global_step >= 0
+                    else "fresh_adamw_v1"
                     if config.architecture_version in ("dual_tower_expert_v1", "dual_tower_h15_v1")
                     else "continued_from_source_v1"
                 ),
@@ -844,7 +853,7 @@ def train(args: argparse.Namespace) -> None:
     joint_frontend = getattr(args, "architecture_version", "legacy") in ("dual_tower_expert_v1", "dual_tower_h15_v1")
     if args.resume is not None and args.resume_weights is not None:
         raise ValueError("choose --resume or --resume-weights, not both")
-    if args.resume_weights is not None and getattr(args, "architecture_version", "legacy") != "legacy":
+    if args.resume_weights is not None and getattr(args, "architecture_version", "legacy") != "legacy" and not is_all_starts_transfer(args):
         arch = getattr(args, "architecture_version", "legacy")
         raise ValueError(f"{arch} requires fresh initialization or same-version --resume; --resume-weights is legacy-only")
     if args.resume is None and args.save.exists():
@@ -870,6 +879,10 @@ def train(args: argparse.Namespace) -> None:
     if not is_all_starts and payload.get("metadata", {}).get("contract") == ALL_STARTS_DATA_CONTRACT:
         raise ValueError("all-starts data contract requires --window-sampling all_starts_random_tbptt8_v1")
 
+    if is_all_starts_transfer(args):
+        if args.stage1_steps not in (None, 0):
+            raise ValueError("H15 transfer requires stage1_steps=0; trained DINO remains unfrozen")
+        args.stage1_steps = 0
     if args.stage1_steps is None:
         if is_all_starts:
             temp_sampler = AllStartsWindowBatchSampler(
@@ -1098,7 +1111,7 @@ def train(args: argparse.Namespace) -> None:
             )
         start_step = int(source.get("global_step", 0)) if args.resume else 0
         stage2 = bool(args.resume_weights) or _stage2_enabled(
-            start_step, args.stage1_steps
+            max(1, start_step) if is_all_starts and args.stage1_steps == 0 else start_step, args.stage1_steps
         )
         model.runtime_dino_qwen_bridge_enabled = stage2
         if model.dino_qwen_bridge is not None:
@@ -1113,7 +1126,9 @@ def train(args: argparse.Namespace) -> None:
                 raise ValueError("dense resume checkpoint lacks T4 s1000 lineage")
             required = {
                 "initialization": (
-                    "fresh_dual_tower_h15_v1"
+                    TRANSFER_INITIALIZATION
+                    if is_all_starts and int(source.get("source_global_step", -1)) >= 0
+                    else "fresh_dual_tower_h15_v1"
                     if config.architecture_version == "dual_tower_h15_v1"
                     else "fresh_dual_tower_expert_v1"
                     if config.architecture_version == "dual_tower_expert_v1"
@@ -1122,7 +1137,9 @@ def train(args: argparse.Namespace) -> None:
                 "source_checkpoint": source["source_checkpoint"],
                 "source_global_step": (int(source.get("source_global_step", -1)) if joint_frontend else 1_000),
                 "optimizer_initialization": (
-                    "fresh_adamw_v1"
+                    "continued_adamw_reset_streams_v1"
+                    if is_all_starts and int(source.get("source_global_step", -1)) >= 0
+                    else "fresh_adamw_v1"
                     if joint_frontend
                     else "continued_from_source_v1"
                 ),
@@ -1238,7 +1255,7 @@ def train(args: argparse.Namespace) -> None:
                     raise ValueError("stage-2 resume lacks trained DINO state")
                 _load_selected_state(vision, state)
         elif args.resume_weights:
-            _validate_dense_source(source)
+            (validate_transfer_source if is_all_starts_transfer(args) else _validate_dense_source)(source)
             _load_selected_state(
                 text_backbone, source["qwen_trainable_state_dict"]
             )

@@ -922,9 +922,13 @@ def main() -> None:
                 raise ValueError("joint checkpoint requires a positive total_steps")
             is_h15 = config.architecture_version == "dual_tower_h15_v1"
             is_all_starts = payload_contract == ALL_STARTS_DATA_CONTRACT
+            from va_compound.training.libero_transfer import TRANSFER_INITIALIZATION
+            transferred = is_all_starts and contract.get("initialization") == TRANSFER_INITIALIZATION
+            if transferred and (not isinstance(contract.get("source_global_step"), int) or contract["source_global_step"] < 1 or not contract.get("source_checkpoint")):
+                raise ValueError("transferred checkpoint lacks source lineage")
             required_four_suite.update(
                 initialization=(
-                    "fresh_dual_tower_h15_v1"
+                    TRANSFER_INITIALIZATION if transferred else "fresh_dual_tower_h15_v1"
                     if is_h15
                     else "fresh_dual_tower_expert_v1"
                 ),
@@ -942,10 +946,10 @@ def main() -> None:
                 world_state_loss_weight=config.world_state_loss_weight,
                 fusion_initialization="dual_tower_zero_output_v1",
                 architecture_version=config.architecture_version,
-                source_global_step=-1,
+                source_global_step=contract["source_global_step"] if transferred else -1,
                 stage1_steps=stage1_steps,
                 total_steps=total_steps,
-                optimizer_initialization="fresh_adamw_v1",
+                optimizer_initialization="continued_adamw_reset_streams_v1" if transferred else "fresh_adamw_v1",
                 execution_gradient_contract=(
                     "h15_unified_live_va_v1"
                     if is_h15
