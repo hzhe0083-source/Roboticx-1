@@ -1,5 +1,6 @@
 """Stream complete-task microbatches with one global denominator."""
 import torch
+import numpy as np
 
 
 def task_microbatch_forward(forward, raw, task_ids, limit, topology, device):
@@ -12,7 +13,7 @@ def task_microbatch_forward(forward, raw, task_ids, limit, topology, device):
         dist.all_reduce(count)
     def generate():
         for start in range(0, size, limit):
-            chunk = {k: v[start:start + limit] if isinstance(v, torch.Tensor) and v.ndim and v.shape[0] == size else v
+            chunk = {k: v[start:start + limit] if isinstance(v, (torch.Tensor, np.ndarray)) and v.ndim and v.shape[0] == size else v
                      for k, v in raw.items()}
             local = chunk['decision_count'].sum().to(device=device, dtype=torch.float32)
             losses = forward(task_raw=chunk, group_ids=task_ids)
